@@ -24,7 +24,7 @@ tree-plugins/
 │   └── plugin-index.json        # 发布索引模板（发布时按它生成真正的索引）
 ├── hello_panel/                 # 一个目录 = 一个插件
 │   ├── plugin.json              # 开发期元数据（字段见下）
-│   └── hello_panel_plugin.py    # 插件本体（脚本或二进制）
+│   └── hello_panel_plugin.dart    # 插件本体（脚本）
 └── <plugin_id>/
     ├── plugin.json
     └── ...
@@ -96,6 +96,10 @@ hello_panel_plugin.py
 - `files[].bytes` 建议填：装机端拿它核对下载完整性。填了就必须等于真实字节数，
   不符 ⇒ 按"没拿到"处理，**不缓存半截文件**，旧文件一字不动。
 - `command` 必须出现在 `files[].target` 里（否则装完不知道拉哪个）。
+- `files[].target` **也不许撞上核心随包的文件名**（`sample_plugin.py`、`compact_plugin.py`、
+  `tree_ssh_executor[.exe]`、`tree_self_updater[.exe]`）：`plugins/` 里那些是插件源码与随包
+  成品，发布仓库只装自己的成品。撞上 ⇒ 整条在**列清单时**就被跳过并写下原因（不必等用户
+  点安装才失败）；内置 id 那一道在更前（在核心写下 400，任何磁盘动作之前）。
 - `runtime` 只能 `binary` / `python`；`python` 条目在装机端要先探到解释器
   （与内置插件同一套探测口径），探不到就**拒绝安装**而不是写一条注定起不来的配置。
 - `suspension` 只能留空或 `keep`；`granularity` 只能 `team` / `agent` / `session`。
@@ -110,12 +114,13 @@ gh release create v0.1.0 release/plugin-index.json <每个资产文件>
 
 ## 装机端装上一条插件时会发生什么（顺序不是随便排的）
 
-1. 资产下载到 `<数据根>/plugins_release/<id>/<version>/`（临时名 + 原子改名；
+1. 先把两道内置防线走完（都在核心那边，见下）：**内置 id 不给装**、**随包文件名不给盖**；
+2. 资产下载到 `<数据根>/plugins_release/<id>/<version>/`（临时名 + 原子改名；
    字节数不符就**不落地**）。缓存目录与 `plugins/` 分开：半成品不该出现在插件查找路径里。
-2. 复制到「可执行文件同级的 `plugins/`」**之前**必须先过闸门：该插件的旧进程**已确认退出**。
+3. 复制到「可执行文件同级的 `plugins/`」**之前**必须先过闸门：该插件的旧进程**已确认退出**。
    Windows 上正在运行的 exe 删不掉，"先换文件再重启"在这台机器上不成立。
-3. 复制到同目录的临时名（`.part-<随机>`），全部复制成功后再逐个**原子改名**覆盖。
-4. 写/更新一条 `plugins.yaml` 条目并热应用（等价于面板上打开开关那条路），条目上留
+4. 复制到同目录的临时名（`.part-<随机>`），全部复制成功后再逐个**原子改名**覆盖。
+5. 写/更新一条 `plugins.yaml` 条目并热应用（等价于面板上打开开关那条路），条目上留
    `source: release` 与 `repo_version`（只给面板显示；行为一律不读它们）。
 
 任何一步失败 ⇒ 旧文件保持原样 + 清掉临时名 + 回一句人话。核心**不会**为了换文件而杀进程：
