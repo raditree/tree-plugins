@@ -203,8 +203,18 @@ Map<String, dynamic> asJson(Object? value) {
 
 /// 执行站命令失败（原因已经是人话，直接转给日志或回包）。
 class CmdFailureException implements Exception {
-  CmdFailureException(this.message);
+  CmdFailureException(this.message, [this.payload = const <String, Object?>{}]);
   final String message;
+
+  /// 失败回包里**一并递回来的那份结果**。
+  ///
+  /// 为什么挂在异常上而不是只留一句 error：核心的 `llm.call` 在“调用失败”时也会把
+  /// `text` / `error_kind` / `truncated_suspect` 放进 payload（`StationCommandOutcome
+  /// .failedWith`，见 execute_mounts 的注释与 known-issues #31）——那是插件本地修复的
+  /// **唯一依据**。只把 error 抛出去就等于在这一跳把已经付过费的那次调用丢掉（现场：
+  /// 448k prompt 的总结已回来、只是正文不是合法 json，插件报“原文 0 字”当场弃权）。
+  final Map<String, Object?> payload;
+
   @override
   String toString() => message;
 }
@@ -303,7 +313,8 @@ class PluginChannel {
   /// 带身份"，team / mode 由它按目标 agent 的**真实归属**解析（插件声明只是上限）；
   /// 把身份塞进 `arguments` 也能过（那里也读），但两份真相写同一个东西一定漂。
   ///
-  /// 失败（未接线 / 归属不成立 / 未知命令）以 [CmdFailureException] 抛出，携带可读原因。
+  /// 失败（未接线 / 归属不成立 / 未知命令）以 [CmdFailureException] 抛出，携带可读原因
+  /// **与失败回包里的 payload**（两者都不能丢，见 [CmdFailureException.payload]）。
   Future<Map<String, dynamic>> command(
     String command, [
     Map<String, dynamic> arguments = const <String, dynamic>{},
@@ -324,7 +335,12 @@ class PluginChannel {
     );
     final Object? error = response['error'];
     if (error != null && error.toString().isNotEmpty) {
-      throw CmdFailureException(error.toString());
+      // **失败也要把 payload 带走**（不带走 = 插件只能弃权，见 [CmdFailureException.payload]）。
+      final Object? payload = response['payload'];
+      throw CmdFailureException(
+        error.toString(),
+        payload is Map ? asMap(payload) : const <String, Object?>{},
+      );
     }
     final Object? payload = response['payload'];
     return payload is Map ? asMap(payload) : response;

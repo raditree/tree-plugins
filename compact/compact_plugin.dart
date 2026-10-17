@@ -397,16 +397,23 @@ class CompactPlugin {
         began,
       );
     } on CmdFailureException catch (error) {
-      return _failed(command, error.message, began);
+      // **失败也带着 payload**：核心的 `llm.call` 在失败时把原文放在那里（known-issues #31），
+      // 接不住就等于把已经付费的那次总结扔掉——下面的“抢救三段”就没东西可救。
+      return _failed(command, error.message, began, payload: error.payload);
     } catch (error) {
       return _failed(command, '$error', began);
     }
   }
 
-  Map<String, Object?> _failed(String command, String error, DateTime began) =>
+  Map<String, Object?> _failed(
+    String command,
+    String error,
+    DateTime began, {
+    Map<String, Object?> payload = const <String, Object?>{},
+  }) =>
       <String, Object?>{
         'ok': false,
-        'payload': <String, dynamic>{},
+        'payload': payload,
         'error': error,
         'command': command,
         'ms': DateTime.now().difference(began).inMilliseconds,
@@ -1921,13 +1928,14 @@ class _Harness {
         'error': error,
       };
 
-  /// 把总结回包换成“成功返回、但正文不是合法 json”（抢救路径的入口）。
+  /// 把总结回包换成“调用失败、但**失败也带着原文**”（真核心的形状：
+  /// `StationCommandOutcome.failedWith(error, payload)`，抢救路径的入口）。
   static Map<String, dynamic> badText(String text, {bool truncated = false}) =>
       <String, dynamic>{
         'command': kCommandLlmCall,
-        'ok': true,
+        'ok': false,
         'mount_id': 'harness',
-        'error': '',
+        'error': '模型正文不是合法 JSON（本次按 text 形态发送）',
         'payload': <String, dynamic>{
           'ok': false,
           'error': '模型正文不是合法 JSON（text 形态）',
@@ -3009,6 +3017,13 @@ Future<void> _checkRecoveryPaths(SelfTest check, List<String> logs) async {
   );
   check.check(salvage.commands(kCommandLlmCall).length, 1, '⑯a 本地能修好就不该再调模型');
   check.check(salvage.plugin.counters['salvaged'], 1, '⑯a salvage 计数进 counters');
+  check.that(
+    salvage.core.logs.any((String line) => line.contains('正文 ${badText.length} 字')),
+    '⑯a “调用失败”回包里的原文必须走到插件（known-issues #31：报“原文 0 字”就是丢了 payload）',
+    actual: salvage.core.logs
+        .where((String line) => line.contains('正文'))
+        .join(' | '),
+  );
   logs.addAll(salvage.core.logs);
 
   const String truncatedText = '{"background": "背景", "trajectory": "轨迹被截断在';
