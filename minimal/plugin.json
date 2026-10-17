@@ -1,0 +1,12 @@
+{
+  "id": "minimal",
+  "name": "最小示例插件（Dart）",
+  "version": "0.2.0",
+  "description": "最小插件骨架：hello 握手 / ping 心跳 / 一个工具。这四件就是「一个插件能上线」的最小集合。",
+  "runtime": "binary",
+  "files": ["tree_minimal.exe"],
+  "command": "tree_minimal.exe",
+  "args": [],
+  "granularity": "team",
+  "scope": {}
+}

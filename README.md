@@ -22,17 +22,58 @@ tree-plugins/
 ├── README.md                    # 本文件
 ├── release/
 │   └── plugin-index.json        # 发布索引模板（发布时按它生成真正的索引）
+├── _kit/
+│   └── plugin_kit.dart          # **不是插件**：共用的读循环 / 帧收发 / 假核心自检
 ├── hello_panel/                 # 一个目录 = 一个插件
 │   ├── plugin.json              # 开发期元数据（字段见下）
-│   └── hello_panel_plugin.dart    # 插件本体（脚本）
+│   └── hello_panel_plugin.dart    # 插件本体（入口，名字是**约定**）
 └── <plugin_id>/
     ├── plugin.json
-    └── ...
+    └── <plugin_id>_plugin.dart
 ```
 
 - 顶层目录才是一个插件；子目录、点开头的目录（`.git`）、没有 `plugin.json` 的目录
   一律当"不是插件"跳过。
 - 只放源与要随包分发的成品文件：不放构建中间物、不放 `.dart_tool/`、不放依赖目录。
+
+## Dart 插件的四条约定
+
+为什么有 `_kit`：五个示例以前各自抄一份"读循环 + 帧收发 + 自检"，那五份副本各自漂
+（心跳漏答、异常不收敛、stdout 混日志在不同示例里表现不同，而**协议本身没有不同**）。
+现在一个插件一个文件、管道只一份：插件里只剩"这个插件干什么"。
+
+1. **入口名字是约定**：`<id>_plugin.dart`。构建脚本按它找入口，找不到就是**错误**不是跳过
+   （静默跳过在面板上只会变成"这个插件没得上"）。
+2. **零依赖**：只用 `dart:` SDK，不 `import package:tree_core` / `package:tree_protocol`——
+   否则第三方拿到这个仓编不出来。代价是插件侧要自带一张方法名常量表（`_kit` 里的 `M`），
+   所以桌面仓有一条用例把这张表逐个对回 `PluginRpcMethods`（漂了当场红）。
+3. **必须带 `--selftest`**：假核心在**同一个进程里**跑真读循环（不连真核心、不起副作用）。
+   它是装机后端到端验证读退出码的那一条，所以自检与生产**必须同码**。
+4. **`suspend` / 转储由骨架接手**：声明 `suspension: keep` 的插件只需交一份 payload，
+   递 `plugin.stateDump` 的命令、新一世 `plugin.stateFetch` 取回都在骨架里。
+
+## 构建与发布
+
+构建住在**桌面仓**（那边才有工具链与门禁），一个脚本负责整仓：
+
+```
+dart run tool/build_plugins.dart            # 逐个编译 + 产物自检 + 写出 build/plugins/plugin-index.json
+dart run tool/build_plugins.dart --only minimal
+```
+
+它读本仓的 `plugins/*/plugin.json`（所以新增插件不需要改任何构建脚本），产出：
+
+- `build/plugins/<command 文件名>`——成品可执行文件；
+- `build/plugins/plugin-index.json`——**发布合同本体**（`bytes` 是真实字节数）。
+
+发布时把索引与资产一起上传：
+
+```
+gh release create v0.1.0 build/plugins/plugin-index.json build/plugins/tree_minimal.exe
+```
+
+桌面安装包也读同一份索引拷成品（`tool/package_windows.dart` 的 ②f）——所以
+"发布仓库里有的"与"安装包里带的"不会漂成两套。
 
 ### `plugin.json`（开发期元数据）
 
@@ -104,12 +145,14 @@ hello_panel_plugin.py
   （与内置插件同一套探测口径），探不到就**拒绝安装**而不是写一条注定起不来的配置。
 - `suspension` 只能留空或 `keep`；`granularity` 只能 `team` / `agent` / `session`。
 
-发布动作（在本仓库根目录）：
+发布动作（索引由 `dart run tool/build_plugins.dart` 产出，**不手写**——`bytes` 要等于真实字节数）：
 
 ```
-gh release create v0.1.0 release/plugin-index.json <每个资产文件>
+gh release create v0.1.0 build/plugins/plugin-index.json <每个资产文件>
 ```
 
+本仓 `release/plugin-index.json` 是**字段形状的参考模板**（装机端读的那一份永远是构建出来的），
+两者字段必须同源：改合同就同时改 `plugin_downloader.dart` 的校验与这份模板。
 只改索引不传文件、或只传文件不改索引，都会被判成"发布与索引不同版"并给出可读原因。
 
 ## 装机端装上一条插件时会发生什么（顺序不是随便排的）
@@ -129,8 +172,9 @@ gh release create v0.1.0 release/plugin-index.json <每个资产文件>
 
 ## 怎么加一个插件
 
-1. 建目录 + 写 `plugin.json`（字段见上）与源码；
-2. 本地验证：`dart analyze` / 自带用例跑通，并确认 `command` 指向的文件真能产出；
+1. 建目录 + 写 `plugin.json`（字段见上）与 `<id>_plugin.dart`（Dart 插件的四条约定见上）；
+2. 本地验证：`dart run plugins/<id>/<id>_plugin.dart --selftest` 退 0，再到桌面仓跑
+   `dart run tool/build_plugins.dart --only <id>`（它会把编译 + 产物自检 + 写索引一次做完）；
 3. 提 PR（源和随包成品一起，构建中间物不要提）；
 4. 合并后由发布方按上面「发布合同」产出一版 release —— **面板能看到它，前提是这一版
    release 带上了 `plugin-index.json`**。
