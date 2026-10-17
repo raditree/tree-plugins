@@ -1,0 +1,12 @@
+{
+  "id": "terminal_probe",
+  "name": "终端稳定性探针",
+  "version": "0.2.0",
+  "description": "起一条 3 小时的 terminal 后台任务并逐拍量它：启动（hook: true）→ hook_action=status 轮询 → 记 system.tool.timeout 广播何时响。时间线推成左栏 activity 面板。",
+  "runtime": "binary",
+  "files": ["tree_terminal_probe.exe"],
+  "command": "tree_terminal_probe.exe",
+  "args": [],
+  "granularity": "team",
+  "scope": {}
+}

@@ -60,6 +60,99 @@ abstract final class Cmd {
   static const String stateFetch = 'plugin.stateFetch';
 }
 
+/// **插件 UI 的约定 method**（走通知，不是请求；也不在 `PluginRpcMethods` 里）。
+///
+/// 为什么单独一张表而不挂进 [M]：UI 帧的家在 `PluginUiFrameType`（核心把这两个
+/// 通知转成前端帧），它们不是插件↔核心的 RPC 登记面。混进 [M] 会让那条门禁用例
+/// 把"已登记的 UI method"误报成"未登记的协议方法"，于是两边谁也不信谁。
+abstract final class Ui {
+  /// 完整声明本插件的全部槽位（**发一次就够**：前端重连由核心按缓存补发）。
+  static const String manifest = 'ui/manifest';
+
+  /// 按 `slot_key` **整块替换**一个槽位的视图（`view: null` = 注销）。
+  static const String update = 'ui/update';
+}
+
+/// 受限控件集（与核心 `PluginUiViewType.all` 逐字对齐；漂了由
+/// `packages/tree_protocol/test/plugin_repo_contract_test.dart` 当场红）。
+///
+/// 为什么骨架要自带这份清单与校验：面板视图不合法的代价不在插件这边——核心
+/// 要么整帧拒发、要么把未知类型当占位渲染，而插件自己看到的是"声明成功了"。
+/// 三个插件都要造视图，校验写三遍就只会三种写法各自吞错。
+const List<String> kUiViewTypes = <String>[
+  'text',
+  'list',
+  'table',
+  'form',
+  'progress',
+  'actions',
+  'row',
+  'column',
+];
+
+/// 自检用：递归查一个视图节点合不合法，返回**可读问题清单**（空 = 合法）。
+///
+/// 只查协议里真会拒的那几条（类型在集内、text 非空、表格列数与单元格数相符、
+/// progress 在 0~1、actions 每个按钮都有 action_id + label）——**不拿它当渲染器写**，
+/// 渲染口径的权威在核心侧。
+List<String> validateUiView(Object? node, [String path = 'view']) {
+  if (node is! Map) return <String>['$path 不是对象'];
+  final Map<String, dynamic> view = asMap(node);
+  final String kind = asString(view['type']);
+  if (!kUiViewTypes.contains(kind)) {
+    return <String>['$path 的类型「$kind」不在受限控件集内（${kUiViewTypes.join(' / ')}）'];
+  }
+  final List<String> problems = <String>[];
+  switch (kind) {
+    case 'text':
+      if (asString(view['text']).isEmpty) problems.add('$path 是空文本');
+    case 'table':
+      final Object? columns = view['columns'];
+      final Object? rows = view['rows'];
+      if (columns is! List || columns.isEmpty) {
+        problems.add('$path 表格缺列名');
+      }
+      if (rows is! List) {
+        problems.add('$path 表格缺 rows');
+      } else if (columns is List) {
+        for (int index = 0; index < rows.length; index++) {
+          final Object? row = rows[index];
+          if (row is! List || row.length != columns.length) {
+            problems.add('$path 第 ${index + 1} 行的单元格数与本列表不符');
+          }
+        }
+      }
+    case 'progress':
+      final Object? value = view['value'];
+      final double number = value is num ? value.toDouble() : double.nan;
+      if (number.isNaN || number < 0 || number > 1) {
+        problems.add('$path 的 progress.value 必须在 0~1：$value');
+      }
+    case 'actions':
+      final Object? buttons = view['buttons'];
+      if (buttons is! List || buttons.isEmpty) {
+        problems.add('$path 的 actions 没有按钮');
+      } else {
+        for (int index = 0; index < buttons.length; index++) {
+          final Map<String, dynamic> button = asMap(buttons[index]);
+          if (asString(button['action_id']).isEmpty ||
+              asString(button['label']).isEmpty) {
+            problems.add('$path 第 ${index + 1} 个按钮缺 action_id / label');
+          }
+        }
+      }
+  }
+  final Object? children = view['children'];
+  if (children is List) {
+    for (int index = 0; index < children.length; index++) {
+      problems.addAll(
+        validateUiView(children[index], '$path.children[$index]'),
+      );
+    }
+  }
+  return problems;
+}
+
 /// 一帧 → 一行字节（行分隔 JSON，UTF-8，`\n` 结尾）。
 List<int> encodeFrame(Map<String, dynamic> frame) => <int>[
   ...utf8.encode(json.encode(frame, toEncodable: _encodable)),
@@ -205,19 +298,29 @@ class PluginChannel {
 
   /// 下执行站命令，并把**命令的 payload** 交回来（外层信封已由核心剥掉）。
   ///
+  /// [scope] 是**这一次命令的身份**（`agent_id` / `session_id` / `team_id` / `mode_key`）：
+  /// 写进 params 顶层，不是 `arguments` 里。原因是核心的口径就是"单实例 + 每条消息
+  /// 带身份"，team / mode 由它按目标 agent 的**真实归属**解析（插件声明只是上限）；
+  /// 把身份塞进 `arguments` 也能过（那里也读），但两份真相写同一个东西一定漂。
+  ///
   /// 失败（未接线 / 归属不成立 / 未知命令）以 [CmdFailureException] 抛出，携带可读原因。
   Future<Map<String, dynamic>> command(
     String command, [
     Map<String, dynamic> arguments = const <String, dynamic>{},
     String stationId = '',
+    Map<String, dynamic> scope = const <String, dynamic>{},
   ]) async {
+    final Map<String, dynamic> params = <String, dynamic>{
+      if (stationId.isNotEmpty) 'station_id': stationId,
+      'command': command,
+      'arguments': arguments,
+      // 空值不写：写了 `agent_id: ''` 在核心那边是"声明了一个不存在的 agent"。
+      for (final MapEntry<String, dynamic> entry in scope.entries)
+        if ('${entry.value}'.trim().isNotEmpty) entry.key: entry.value,
+    };
     final Map<String, dynamic> response = await request(
       M.stationCommand,
-      <String, dynamic>{
-        if (stationId.isNotEmpty) 'station_id': stationId,
-        'command': command,
-        'arguments': arguments,
-      },
+      params,
     );
     final Object? error = response['error'];
     if (error != null && error.toString().isNotEmpty) {
@@ -539,12 +642,46 @@ class FakeCore {
   final List<Map<String, dynamic>> _received = <Map<String, dynamic>>[];
   final List<String> _logs = <String>[];
   final Set<String> _answered = <String>{};
+  final Map<String, Map<String, dynamic> Function(Map<String, dynamic> params)>
+  _rules =
+      <String, Map<String, dynamic> Function(Map<String, dynamic> params)>{};
 
   void _onBytes(List<int> bytes) {
     for (final String line in utf8.decode(bytes).split('\n')) {
       final Map<String, dynamic>? frame = decodeFrame(line);
-      if (frame != null) _received.add(frame);
+      if (frame == null) continue;
+      _received.add(frame);
+      _autoAnswer(frame);
     }
+  }
+
+  /// 自动应答：插件**主动发的请求**（有 method、有 id）撞上已装规则就当场答一句。
+  ///
+  /// 为什么需要它：探针 / 压缩这类插件会**持续**下命令（每拍一次 `terminal.exec`），
+  /// 手写"轮询到一条、答一条"会把自检写成一台时序机器，而它真正要断言的是**形状**。
+  /// 规则按 method 装、按 params 造回包，所以同一条 method 的不同请求可以拿到不同结果。
+  void _autoAnswer(Map<String, dynamic> frame) {
+    final Object? id = frame['id'];
+    final Object? method = frame['method'];
+    if (id == null || method is! String || _toPlugin.isClosed) return;
+    final Map<String, dynamic> Function(Map<String, dynamic> params)? build =
+        _rules[method];
+    if (build == null) return;
+    _toPlugin.add(
+      encodeFrame(<String, dynamic>{
+        'jsonrpc': '2.0',
+        'id': id,
+        'result': build(asMap(frame['params'])),
+      }),
+    );
+  }
+
+  /// 装一条自动应答规则（[build] 收到那条请求的 params，返回回包的 `result`）。
+  void onMethod(
+    String method,
+    Map<String, dynamic> Function(Map<String, dynamic> params) build,
+  ) {
+    _rules[method] = build;
   }
 
   /// 跑起插件的读循环（不 await：它就是一条一直在听的服务）。
