@@ -14,13 +14,13 @@
 // 跑起来（**不需要真核心**）：
 //     dart run plugins/minimal/minimal_plugin.dart --selftest
 //   或编译后：
-//     dart compile exe plugins/minimal/minimal_plugin.dart -o build/plugins/tree_minimal_plugin.exe
-//     build/plugins/tree_minimal_plugin.exe --selftest
+//     dart compile exe plugins/minimal/minimal_plugin.dart -o build/plugins/tree_minimal.exe
+//     build/plugins/tree_minimal.exe --selftest
 //
 // 接进真核心（`plugins.yaml`，或直接把 plugins/minimal 这条丢进「设置 → 插件」）：
 //     plugins:
 //       - id: minimal
-//         command: "./plugins/tree_minimal_plugin.exe"
+//         command: "./plugins/tree_minimal.exe"
 //         args: []
 //         enabled: true
 //         scope: {}          # 空 scope = 作用于所有 team

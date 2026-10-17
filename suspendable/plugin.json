@@ -1,0 +1,13 @@
+{
+  "id": "suspendable",
+  "name": "可挂起插件（热重启示例）",
+  "version": "0.2.0",
+  "description": "把「转储 → 退出 → 新一世取回续跑」这条时序跑成真的：suspend 时先下 plugin.stateDump 并等回包、再 ack。工具 era 回跨进程递增的世数，用来证明续跑真的发生了。",
+  "runtime": "binary",
+  "files": ["tree_suspendable.exe"],
+  "command": "tree_suspendable.exe",
+  "args": [],
+  "suspension": "keep",
+  "granularity": "team",
+  "scope": {}
+}

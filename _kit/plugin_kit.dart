@@ -91,6 +91,23 @@ Map<String, dynamic> asMap(Object? value) => value is Map
 /// 宽松取字符串并 trim（缺失 / null → 空串，**不猜默认值**）。
 String asString(Object? value) => (value ?? '').toString().trim();
 
+/// 宽松取一段 JSON **对象**：已是 Map 就剥一层，是字符串就解析，都不像就回空 Map。
+///
+/// 为什么在骨架里：插件读工具参数、读执行站回包、读点位事件，到处都要"把这块东西变成
+/// Map"，而**解析失败不是异常**（铁律 3 说的是处理器抛出要收敛成响应，不是让数据问题
+/// 去炸读循环）。每个插件各自 `try { json.decode }` 的结局是五种写法五种吞法。
+Map<String, dynamic> asJson(Object? value) {
+  if (value is Map) return asMap(value);
+  final String text = asString(value);
+  if (text.isEmpty) return <String, dynamic>{};
+  try {
+    final Object? decoded = json.decode(text);
+    return decoded is Map ? asMap(decoded) : <String, dynamic>{};
+  } catch (_) {
+    return <String, dynamic>{};
+  }
+}
+
 /// 执行站命令失败（原因已经是人话，直接转给日志或回包）。
 class CmdFailureException implements Exception {
   CmdFailureException(this.message);
@@ -620,6 +637,12 @@ class FakeCore {
             (method == null || frame['method'] == method),
       )
       .toList();
+
+  /// 插件发出的**全部帧，按到达顺序**：要断言"A 必须排在 B 之前"（转储请求 vs 挂起
+  /// 的 ack）只能用这个——[outgoing] 滤掉了响应、[responses] 按 id 去过重，两边都
+  /// 看不出先后，而**时序恰恰是这类断言的全部内容**。
+  List<Map<String, dynamic>> get frames =>
+      List<Map<String, dynamic>>.unmodifiable(_received);
 
   /// 插件日志面（失败时整段打出来：只说"没回包"查不出为什么）。
   List<String> get logs => List<String>.unmodifiable(_logs);
