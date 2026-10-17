@@ -1,0 +1,12 @@
+{
+  "id": "sample",
+  "name": "示例插件",
+  "version": "0.2.0",
+  "description": "四站 + 插件布局的全链路参考实现：收集站申报 echo/rounds/read_probe 三个工具，事件按 (agent, session) 数工具轮次、超阈值（默认 200）经执行站发 agent.stop 并重置计数，fs.read/llm.call/tool.call/session.rename 四条演示命令各开一个开关，ui/manifest 申报 activity + panel + card 三个槽位。点位化新协议（llm.handle 流式接管、prompt.system 改写、tool.pre/post 广播）默认全关，开关见 --help。",
+  "runtime": "binary",
+  "files": ["tree_sample.exe"],
+  "command": "tree_sample.exe",
+  "args": [],
+  "granularity": "team",
+  "scope": {}
+}
