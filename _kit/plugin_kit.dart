@@ -420,7 +420,14 @@ class PluginKitServer {
   final List<Map<String, dynamic>> tools;
 
   /// 工具执行：返回 [toolText] 形状；未知工具请回 `isError: true` + 可读原因。
-  final Map<String, dynamic> Function(
+  ///
+  /// 类型是 [FutureOr] 而不是同步：示例插件的 `read_probe` 得**经执行站 fs.read**
+  /// 读一个文件才能回答，同步签名就只能把命令挂在后台、先给模型回一句"请稍后"——
+  /// 那等于把"工具里也能主动下命令"这条演示路径关掉（读循环不受影响：整条
+  /// `tools/call` 本来就挂在 unawaited 的后台任务上，铁律 2 一个字没改）。
+  /// 同步实现照样能传进来（返回类型协变：`Map` 是 `FutureOr<Map>` 的子类型），
+  /// 所以已有的那几个插件一个字都不用改。
+  final FutureOr<Map<String, dynamic>> Function(
     String name,
     Map<String, dynamic> arguments,
   )?
@@ -541,8 +548,15 @@ class PluginKitServer {
           return;
         case M.toolsCall:
           final String name = asString(params['name']);
+          if (name.isEmpty) {
+            // 缺参数是 **-32602**（协议表里的"参数非法"），不许塞进工具结果里：
+            // 塞进去模型读到的是"某个工具失败了"，而事实是"这条请求本来就不合法"，
+            // 两种东西混在一条通道上，排查时就只能猜。
+            channel.replyError(id, -32602, 'tools/call 需要 name（要调用的工具名）');
+            return;
+          }
           final Map<String, dynamic> result =
-              onToolCall?.call(name, asMap(params['arguments'])) ??
+              await onToolCall?.call(name, asMap(params['arguments'])) ??
               toolText('未知工具 $name', isError: true);
           channel.reply(id, result);
           return;
