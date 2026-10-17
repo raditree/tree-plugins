@@ -606,7 +606,7 @@ class Probe {
 
   /// `station/request`：站点投过来的请求。只认真实订阅的那个点位，其余一律"不改动"。
   Map<String, dynamic> handleStationRequest(Map<String, dynamic> params) {
-    final String point = _pointOf(asString(params['station_id']));
+    final String point = asString(params['station_id']);
     if (point != kPointToolTimeout) {
       // 非本点位：不改动。`null` 与"空集合"不是一回事（见 §5.2）。
       return <String, dynamic>{
@@ -627,13 +627,11 @@ class Probe {
     };
   }
 
-  /// 点位 id 从站点实例 id 里剥（`system.tool.timeout@team-1@local` → 前者）。
-  static String _pointOf(String stationId) {
-    final int at = stationId.indexOf('@');
-    return at < 0 ? stationId : stationId.substring(0, at);
-  }
-
   // ── 面板 ────────────────────────────────────────────────────────────
+  //
+  // 站点实例 id 的口径（记在这里免得后人又去"剥 @"）：站点已**全局化**（定稿：id 不含
+  // team / mode，team 是每次交互携带的信封），所以投过来的 `station_id` 就是点位常量
+  // 本身；自建站 id 是 `plugin.<id>.<kind>.<name>`，永远不会撞上它。
 
   /// 发一次 `ui/manifest`（**声明一次就够**：前端重连由核心按缓存补发）。
   void declarePanel() {
@@ -883,9 +881,8 @@ class _Harness {
       M.stationSubscribe,
       (Map<String, dynamic> params) => <String, dynamic>{
         'ok': true,
-        // 核心拼的实例 id 带 scope（点位@team@mode）——插件必须从前者认点位，
-        // 拿整串做相等比较的话，真核心下永远对不上。
-        'station_id': '$kPointToolTimeout@team-1@local',
+        // 站点已全局化：实例 id 就是点位常量本身（不含 @team@mode），与核心一致。
+        'station_id': kPointToolTimeout,
         'subscriber_count': 1,
       },
     );
@@ -1145,7 +1142,7 @@ Future<void> _checkTimeoutBroadcast(SelfTest check, List<String> logs) async {
   logs.addAll(h.core.logs);
   h.core.ask(7, M.stationRequest, <String, dynamic>{
     'request_id': 'r-1',
-    'station_id': '$kPointToolTimeout@team-1@local',
+    'station_id': kPointToolTimeout,
     'kind': 'broadcast',
     'payload': <String, dynamic>{
       'handle': 'h-1',
@@ -1173,7 +1170,7 @@ Future<void> _checkTimeoutBroadcast(SelfTest check, List<String> logs) async {
   // 非本插件订的点位：不改动，也不许把计数加上去。
   h.core.ask(8, M.stationRequest, <String, dynamic>{
     'request_id': 'r-2',
-    'station_id': 'system.relay.llm.handle@team-1@local',
+    'station_id': 'system.relay.llm.handle',
     'kind': 'relay',
     'payload': <String, dynamic>{'messages': <Object>[]},
   });
@@ -1314,7 +1311,7 @@ Future<void> _checkPanelContent(SelfTest check, List<String> logs) async {
   await h.probe.startProbe();
   await h.probe.pollOnce();
   h.probe.handleStationRequest(<String, dynamic>{
-    'station_id': '$kPointToolTimeout@team-1@local',
+    'station_id': kPointToolTimeout,
     'kind': 'broadcast',
     'payload': <String, dynamic>{'tool': 'terminal.exec', 'elapsed_ms': 120000},
   });
