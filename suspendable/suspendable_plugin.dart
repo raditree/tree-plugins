@@ -79,7 +79,10 @@ PluginKitServer buildServer({
       era.restarts = previous + 1;
       server.channel.log('续跑成功：第 ${era.restarts + 1} 世（上一世 $previous 次）');
     },
-    onToolCall: (String name, Map<String, dynamic> arguments) {
+    // 第三个参数 = 本次调用的身份（骨架随 `tools/call` 递下来）；本例的工具只报世数，
+    // 不下命令，所以上了签名不读它。
+    onToolCall: (String name, Map<String, dynamic> arguments,
+        Map<String, dynamic> scope) {
       if (name != 'era') return toolText('未知工具 $name', isError: true);
       return toolText(
         json.encode(<String, Object?>{

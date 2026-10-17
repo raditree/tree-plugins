@@ -563,11 +563,9 @@ class SamplePlugin {
   void log(String message, {bool notify = false, String level = 'info'}) {
     channel.log('[${_clock(DateTime.now())}] $message');
     if (!notify) return;
-    // 发不出去不算错误（核心已关通道），这里不能因为日志把业务带崩。
-    channel.notify(M.log, <String, dynamic>{
-      'level': level,
-      'message': message,
-    });
+    // 发不出去不算错误（核心已关通道）——骨架的 [PluginChannel.logNotify] 走通知面、
+    // 不等回包，这里不能因为日志把业务带崩。
+    channel.logNotify(message, level: level);
   }
 
   // ── ③ 执行站：插件主动下命令 ────────────────────────────────────────────
@@ -800,6 +798,7 @@ class SamplePlugin {
   Future<Map<String, dynamic>> callTool(
     String name,
     Map<String, dynamic> arguments,
+    Map<String, dynamic> scope,
   ) async {
     switch (name) {
       case 'echo':
@@ -819,9 +818,23 @@ class SamplePlugin {
           }),
         );
       case 'read_probe':
+        // 目标 agent 优先取**这一次调用的身份**（骨架从 `tools/call` 的 scope 里递下来），
+        // 没有才退回 `--agent-id` / 事件里见过的那个：核心按目标 agent 的**真实归属**
+        // 解析作用域，多 team / 空 scope 的配置下“猜第一个见到的 agent”就是错的，
+        // 错的结局是 fail-closed 拒绝而不是“帮你执行”。
+        final String caller = asString(scope['agent_id']);
+        if (caller.isNotEmpty) {
+          // 顺手把这份身份记下来（卡片与懒订阅靠它）：用户可能先点了工具、
+          // 一条事件都还没跑过。
+          learnIdentity(
+            agentId: caller,
+            sessionId: asString(scope['session_id']),
+          );
+        }
         final String? summary = await fsRead(
           path: asString(arguments['path']),
           reason: 'read_probe 工具调用',
+          agentId: caller,
         );
         if (summary == null) {
           return toolText('fs.read 失败（详见插件 stderr 日志）', isError: true);
@@ -1227,6 +1240,9 @@ class SamplePlugin {
   // ── ② 事件订阅：数轮次，超阈值就发停止信号 ───────────────────────
 
   /// 记下事件/站点请求里出现的第一个身份（卡片与懒订阅都靠它）。
+  ///
+  /// `tools/call` 带下来的那份也走这里（见 [callTool] 的 `read_probe`）：用户完全可能
+  /// 先点一次工具、还一条事件都没跑过，那时卡片与懒订阅也需要一个能用的归属。
   void learnIdentity({required String agentId, required String sessionId}) {
     if (agentId.isNotEmpty && firstAgentSeen.isEmpty) firstAgentSeen = agentId;
     if (sessionId.isNotEmpty && firstSessionSeen.isEmpty) {
@@ -1338,10 +1354,12 @@ class SamplePlugin {
 
   /// 解析“这次演示命令打给哪个 agent”；解析不出来返回空串。
   ///
-  /// 取法：`--agent-id` / 环境变量优先，其次事件 / 站点请求里见过的第一个 agent。
+  /// 取法（优先级就这三层）：**本次调用/请求带下来的身份**（[urgent]，由调用方递）>
+  /// `--agent-id` / 环境变量 > 事件 / 站点请求里见过的第一个 agent。
   /// **为什么不能猜**：核心按目标 agent 的**真实归属**（team / mode）解析命令作用
   /// 域，猜错的后果是 fail-closed 拒绝（有可读原因），而不是“帮你去执行”。
-  String resolveDemoAgent(String what) {
+  String resolveDemoAgent(String what, {String urgent = ''}) {
+    if (urgent.trim().isNotEmpty) return urgent.trim();
     final String target = options.agentId.isNotEmpty
         ? options.agentId
         : firstAgentSeen;
@@ -1356,8 +1374,15 @@ class SamplePlugin {
   }
 
   /// 下一条 `fs.read`，把结果打进日志；返回可读摘要（失败返回 null）。
-  Future<String?> fsRead({String path = '', String reason = '启动自检'}) async {
-    final String target = resolveDemoAgent('fs.read');
+  ///
+  /// [agentId] = **这次读取该打给谁**（`read_probe` 用它传本次调用的身份）；
+  /// 留空则走 [resolveDemoAgent] 那三层取法。
+  Future<String?> fsRead({
+    String path = '',
+    String reason = '启动自检',
+    String agentId = '',
+  }) async {
+    final String target = resolveDemoAgent('fs.read', urgent: agentId);
     final String targetPath = path.isNotEmpty ? path : options.readPath;
     if (target.isEmpty) return null;
     final CommandOutcome outcome = await command(
@@ -1886,8 +1911,9 @@ class SamplePlugin {
     displayName: kPluginName,
     capabilities: const <String>['tools', 'events', 'stations'],
     tools: SamplePlugin.toolsList(),
-    onToolCall: (String name, Map<String, dynamic> arguments) =>
-        plugin.callTool(name, arguments),
+    onToolCall: (String name, Map<String, dynamic> arguments,
+            Map<String, dynamic> scope) =>
+        plugin.callTool(name, arguments, scope),
     onRequest: (String method, Map<String, dynamic> params) async {
       if (method == M.stationRequest) {
         return plugin.handleStationRequest(params);
@@ -3486,6 +3512,39 @@ Future<void> _checkToolCallFromModel(SelfTest check, List<String> logs) async {
     read == null ? null : read['agent_id'],
     'agt_demo',
     '工具里的命令也得带身份（params 顶层）',
+  );
+  // **本次调用的身份压过 `--agent-id`**：骨架把 `tools/call` 的 scope 递下来，为的就是这一条。
+  // 不递的话，本例只会拿配置里写死的那个 agent——多 team / 空 scope 下那就是错的，
+  // 而核心按目标 agent 的真实归属解析作用域，错的结局是 fail-closed 拒绝。
+  final Map<String, dynamic> probe2 = await _askCore(
+    h.core,
+    'tc-probe2',
+    M.toolsCall,
+    <String, dynamic>{
+      'name': 'read_probe',
+      'arguments': <String, dynamic>{'path': 'b.txt'},
+      'scope': <String, dynamic>{
+        'agent_id': 'agt_caller',
+        'session_id': 'ses_caller',
+      },
+    },
+  );
+  final List<Map<String, dynamic>> reads = h.commands(kCommandFsRead);
+  final Map<String, dynamic> read2 = reads.isEmpty ? <String, dynamic>{} : reads.last;
+  check.check(
+    read2['agent_id'],
+    'agt_caller',
+    'fs.read 必须打给**这次调用的** agent（不是 --agent-id 里那个兜底）',
+  );
+  check.check(
+    frameArguments(read2)['path'],
+    'b.txt',
+    '第二次调用的 path 得跟着走（身份换了不能还拿着上一次的参数）',
+  );
+  check.that(
+    toolTextOf(probe2).contains('agent=agt_caller'),
+    '回给模型的摘要要说得出打给了谁（排障时靠这一行分辨“猜的”还是“跟着调用的”）',
+    actual: _clip(toolTextOf(probe2), 120),
   );
   // 未知工具：回可读原因 + isError（不能抛异常，否则整条工具调用变成协议错误）。
   final Map<String, dynamic> unknown = await _askCore(

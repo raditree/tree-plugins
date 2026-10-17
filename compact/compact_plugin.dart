@@ -1870,6 +1870,17 @@ class _Harness {
         case kCommandFsRead:
           final String path = asString(args['path']);
           if (path == 'missing.md') return _reject(command, '文件不存在');
+          // 骨架的失败判据得**两条都认**：核心回 `ok:false` 却没写原因（挂载实现漏了
+          // error 那一句）也必须算失败。只认 error 的结局是把失败当成功、把 payload
+          // 原样交回，而下面这些调用方会拿着“空 payload”继续算。
+          if (path == 'no_reason.md') {
+            return <String, dynamic>{
+              'command': command,
+              'ok': false,
+              'mount_id': 'harness',
+              'payload': null,
+            };
+          }
           return _envelope(command, <String, dynamic>{
             'path': path,
             'content': '// $path 的内容',
@@ -2768,6 +2779,21 @@ Future<void> _checkManualNotes(SelfTest check, List<String> logs) async {
     );
   }
   logs.addAll(<String>[...blind.core.logs, ...identified.core.logs]);
+  // ⑬d **`ok:false` 没带原因也算失败**（骨架的 command() 判据有两道，不只看 error）：
+  // 漏了这一条的现场是“插件以为命令成功了”，而 payload 里什么也没有。
+  final _Harness noReason = _Harness(testOptions());
+  final Map<String, Object?> silent = await noReason.plugin.exec(
+    kCommandFsRead,
+    <String, dynamic>{'path': 'no_reason.md'},
+    <String, dynamic>{'agent_id': 'agt_1', 'session_id': 'ses_1'},
+  );
+  check.check(silent['ok'], false, 'ok:false 且没写 error，也必须判成失败');
+  check.that(
+    asString(silent['error']).contains('ok:false'),
+    '补出来的原因要说得出“核心回 ok:false 且没有给出原因”（不许抛一个空消息）',
+    actual: asString(silent['error']),
+  );
+  logs.addAll(noReason.core.logs);
 }
 
 /// ⑫ 指令文本：占位已换、那个字面 `\n` 真的保住了（Python 版把它变成了真换行）。

@@ -45,7 +45,17 @@ const List<Map<String, dynamic>> kTools = <Map<String, dynamic>>[
 ];
 
 /// 工具执行：成功 `isError:false`；失败要把**可读原因**写进 text（模型看得到）。
-Map<String, dynamic> callTool(String name, Map<String, dynamic> arguments) {
+///
+/// 第三个参数 `scope` = **这一次调用的身份**（`agent_id` / `session_id` / `team_id` /
+/// `mode_key`，核心随 `tools/call` 下发）。本例不读它（它只会 echo），但**签名要跟骨架
+/// 一致**：工具要是打算经执行站下命令（`fs.read` / `agent.stop` / `tool.call`），目标
+/// 就得取这里的身份，而不是退回 `plugins.yaml` 里写死的那个 agent（参照
+/// `../sample/sample_plugin.dart` 的 `read_probe`，它就把这一位用上了）。
+Map<String, dynamic> callTool(
+  String name,
+  Map<String, dynamic> arguments,
+  Map<String, dynamic> scope,
+) {
   if (name != 'hello_tool') return toolText('未知工具 $name', isError: true);
   return toolText('hello_tool: ${arguments['text'] ?? ''}');
 }

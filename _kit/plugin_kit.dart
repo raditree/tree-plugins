@@ -268,6 +268,18 @@ class PluginChannel {
   /// **日志面唯一的出口**。
   void log(String message) => _writeError?.call('[$logTag] $message');
 
+  /// 向核心发一条 **`log` 通知**（`{level, message}`，方法名已登记在 [M.log]）。
+  ///
+  /// 与 [log]（stderr）**互补而不是重复**：stderr 进核心的插件日志缓冲（本地留痕、
+  /// 排障看那里），而这条通知会被原样转成前端的 `plugin_event`——**想让用户在界面上
+  /// 看到的结论**走这里。骨架以前只有 stderr 一面，[M.log] 这个已登记的名字从没人用；
+  /// 把它补成一个方法而不是让每个插件自己拼帧，是为了让“发得出去”这件事只有一份写法
+  /// （通知不等回包，发不出去就发不出去——日志不该把业务带崩）。
+  void logNotify(String message, {String level = 'info'}) => notify(
+    M.log,
+    <String, dynamic>{'level': level, 'message': message},
+  );
+
   /// 回一条响应（`id` 用收到的原值——JSON-RPC 的对应关系就在这一位上）。
   void reply(Object? id, Map<String, dynamic> result) =>
       send(<String, dynamic>{'jsonrpc': '2.0', 'id': id, 'result': result});
@@ -315,6 +327,12 @@ class PluginChannel {
   ///
   /// 失败（未接线 / 归属不成立 / 未知命令）以 [CmdFailureException] 抛出，携带可读原因
   /// **与失败回包里的 payload**（两者都不能丢，见 [CmdFailureException.payload]）。
+  ///
+  /// 失败判据是 `error` 非空**或顶层 `ok == false`**：执行站的口径是“命令被拒不是
+  /// JSON-RPC 错误，而是 `{ok: false, error: …}`”，所以 `ok` 才是结论；只认 `error`
+  /// 就会漏掉“回了 ok:false 却没写原因”那一条路——把失败当成功、把 payload 原样交回。
+  /// **只认顶层 `ok`**：payload 里也可能有一个 `ok:false`（那是命令自己的结论字段，
+  /// 例如 `llm.call` 失败时带的抢救依据），它不该在这里被读第二遍。
   Future<Map<String, dynamic>> command(
     String command, [
     Map<String, dynamic> arguments = const <String, dynamic>{},
@@ -322,6 +340,10 @@ class PluginChannel {
     Map<String, dynamic> scope = const <String, dynamic>{},
   ]) async {
     final Map<String, dynamic> params = <String, dynamic>{
+      // ⚠ 这个 `station_id` 对 `station/command` **不起作用**：核心按 `command` 名路由
+      // （`StationPoints.ownerOfCommand`）、按 agent/team 解析归属，`_handleStationCommand`
+      // 从头到尾不读 `station_id`；它只在 station/subscribe、unsubscribe、unregister、
+      // trigger 那几条上才有意义。这里保留只为与少数命令的回包字段同形。
       if (stationId.isNotEmpty) 'station_id': stationId,
       'command': command,
       'arguments': arguments,
@@ -334,11 +356,15 @@ class PluginChannel {
       params,
     );
     final Object? error = response['error'];
-    if (error != null && error.toString().isNotEmpty) {
+    final String reason = error?.toString() ?? '';
+    if (reason.trim().isNotEmpty || response['ok'] == false) {
       // **失败也要把 payload 带走**（不带走 = 插件只能弃权，见 [CmdFailureException.payload]）。
       final Object? payload = response['payload'];
       throw CmdFailureException(
-        error.toString(),
+        // 两条判据收敛成同一个异常：只缺原因就补一句可读的（不许抛一个空消息）。
+        reason.trim().isEmpty
+            ? '核心回 ok:false 且没有给出原因（command=$command）'
+            : reason,
         payload is Map ? asMap(payload) : const <String, Object?>{},
       );
     }
@@ -384,6 +410,32 @@ Map<String, dynamic> toolText(String text, {bool isError = false}) =>
       'isError': isError,
     };
 
+/// 从 `tools/call` 的 params 里取**这一次调用的身份**。
+///
+/// 真核心把四元组嵌在 `params['scope']`（`PluginBus._callIdentity` →
+/// `PluginHost.callTool`，与 station/request 的 scope 同源），而指南 §6.3 的老例子
+/// 把它们写成 params 顶层 `agent_id`/`session_id`——**两种形状都兜住，不赌单一来源**。
+/// 骨架此前谁都不读这一位，等于把这份身份整个丢了：工具看不出“谁在问”，多 team /
+/// 空 scope 的插件只能退回 `plugins.yaml` 里写死的那个 agent。
+Map<String, dynamic> _toolCallScope(Map<String, dynamic> params) {
+  final Map<String, dynamic> nested = asMap(params['scope']);
+  if (nested.isNotEmpty) return nested;
+  return <String, dynamic>{
+    for (final MapEntry<String, dynamic> entry in params.entries)
+      if (_toolScopeKeys.contains(entry.key) &&
+          asString(entry.value).isNotEmpty)
+        entry.key: entry.value,
+  };
+}
+
+/// `tools/call` 顶层可能出现的那几个身份键（兜底用，见 [_toolCallScope]）。
+const Set<String> _toolScopeKeys = <String>{
+  'agent_id',
+  'session_id',
+  'team_id',
+  'mode_key',
+};
+
 /// 一个插件服务：**骨架在这里，业务由回调递进来**。
 ///
 /// `hello` / `ping` / `tools/list` / `suspend` / `shutdown` 由骨架统一回答——它们没有
@@ -425,11 +477,18 @@ class PluginKitServer {
   /// 读一个文件才能回答，同步签名就只能把命令挂在后台、先给模型回一句"请稍后"——
   /// 那等于把"工具里也能主动下命令"这条演示路径关掉（读循环不受影响：整条
   /// `tools/call` 本来就挂在 unawaited 的后台任务上，铁律 2 一个字没改）。
-  /// 同步实现照样能传进来（返回类型协变：`Map` 是 `FutureOr<Map>` 的子类型），
-  /// 所以已有的那几个插件一个字都不用改。
+  /// 同步实现照样能传进来（返回类型协变：`Map` 是 `FutureOr<Map>` 的子类型）。
+  ///
+  /// 第三个参数 `scope` 是**这一次调用的身份**（`agent_id` / `session_id` /
+  /// `team_id` / `mode_key`）：核心随 `tools/call` 把它下发（取法见 [_toolCallScope]，
+  /// 没身份时为空 Map）。工具要“以调用者的归属去下执行站命令”（`fs.read` /
+  /// `agent.stop` / `tool.call`）靠的就是它——丢了它，插件就只能拿“事件里见过第一个
+  /// agent”或 `plugins.yaml` 里写死的那个去猜，而核心按目标 agent 的**真实归属**
+  /// 解析作用域，猜错就是 fail-closed 拒绝（不是“帮你执行”）。
   final FutureOr<Map<String, dynamic>> Function(
     String name,
     Map<String, dynamic> arguments,
+    Map<String, dynamic> scope,
   )?
   onToolCall;
 
@@ -556,7 +615,11 @@ class PluginKitServer {
             return;
           }
           final Map<String, dynamic> result =
-              await onToolCall?.call(name, asMap(params['arguments'])) ??
+              await onToolCall?.call(
+                name,
+                asMap(params['arguments']),
+                _toolCallScope(params),
+              ) ??
               toolText('未知工具 $name', isError: true);
           channel.reply(id, result);
           return;
