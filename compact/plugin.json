@@ -1,0 +1,12 @@
+{
+  "id": "compact",
+  "name": "上下文压缩",
+  "version": "0.2.0",
+  "description": "内置压缩器：订 system.relay.context.compact，把长会话压成「摘要 + 必读文件（精确行范围，以 tool_calls 形式拼进上下文）+ 待办快照」，尾部原文原样抄回。总结调用走前缀缓存三条件（tools 透传 / 不用 system / response_format=text）；任何一步失败都回 null 让核心内置压缩兜底。左栏 activity 面板记最近几次压缩与逐调用用量。",
+  "runtime": "binary",
+  "files": ["tree_compact.exe"],
+  "command": "tree_compact.exe",
+  "args": [],
+  "granularity": "team",
+  "scope": {}
+}
