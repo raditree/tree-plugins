@@ -44,13 +44,31 @@ tree-plugins/
 
 1. **入口名字是约定**：`<id>_plugin.dart`。构建脚本按它找入口，找不到就是**错误**不是跳过
    （静默跳过在面板上只会变成"这个插件没得上"）。
-2. **零依赖**：只用 `dart:` SDK，不 `import package:tree_core` / `package:tree_protocol`——
-   否则第三方拿到这个仓编不出来。代价是插件侧要自带一张方法名常量表（`_kit` 里的 `M`），
-   所以桌面仓有一条用例把这张表逐个对回 `PluginRpcMethods`（漂了当场红）。
+2. **不依赖核心**：`binary` 型示例插件只用 `dart:` SDK，谁都不 `import package:tree_core` /
+   `package:tree_protocol`——否则第三方拿到这个仓编不出来。代价是插件侧要自带一张方法名
+   常量表（`_kit` 里的 `M`），所以桌面仓有一条用例把这张表逐个对回 `PluginRpcMethods`（漂了当场红）。
+   **例外（见下面「两种形状」）**：`ssh_executor` / `self_updater` 是 package 型，它们可以依赖
+   `dartssh2` 这类第三方运行时库与协议包 `tree_tunnel_protocol`，但**仍然不许依赖 tree_core /
+   tree_protocol**——“不反向依赖核心”是那条纪律的本体，“只用 dart:”只是它的形状之一。
 3. **必须带 `--selftest`**：假核心在**同一个进程里**跑真读循环（不连真核心、不起副作用）。
    它是装机后端到端验证读退出码的那一条，所以自检与生产**必须同码**。
 4. **`suspend` / 转储由骨架接手**：声明 `suspension: keep` 的插件只需交一份 payload，
    递 `plugin.stateDump` 的命令、新一世 `plugin.stateFetch` 取回都在骨架里。
+
+## 两种形状（同一个入口约定）
+
+`plugin.json` 形状不区分它，构建脚本按**目录里有没有 `pubspec.yaml`** 判：
+
+| 形状 | 判据 | 编译方式 | 现有插件 |
+| --- | --- | --- | --- |
+| **单文件型** | 无 `pubspec.yaml` | 以**桌面仓根**为工作目录 `dart compile exe <id>_plugin.dart` | `minimal` / `suspendable` / `terminal_probe` / `compact` / `sample` |
+| **package 型** | 有 `pubspec.yaml` | 先在该目录 `dart pub get`，再以**该目录**为工作目录编译 | `ssh_executor` / `self_updater` |
+
+package 型的依赖里有 `path: ../../packages/tree_tunnel_protocol` ⇒ **本仓必须 clone 在桌面仓的
+`plugins/` 下才能编出这两条**。这不是意外，是取舍：“协议帧形状只住一处”比“本仓能独立编”值钱——
+两边各抄一份帧形状的代价是装机后“某个请求突然不认”，而原因分在两个仓里。代价也要说清：
+单独 clone 本仓的人，`dart run tool/build_plugins.dart --only ssh_executor` 会直接报路径不存在（
+而桌面仓的 `build_plugins.dart` 在插件仓未 clone 时直接退 2，不静默产出空索引）。
 
 ## 构建与发布
 
@@ -90,6 +108,7 @@ gh release create v0.1.0 build/plugins/plugin-index.json build/plugins/tree_mini
 | `suspension` | | `keep` = 声明可挂起（热重启先转储、新一世取回续跑）；留空 = 不可挂起。值域只有这两种 |
 | `granularity` | | `team`（缺省）/ `agent` / `session` |
 | `scope` | | 实例归属（键白名单 `team_id` / `agent_id` / `session_id` / `mode_key`；留空 = 不限定） |
+| `app_version_define` | | **开发期字段，不进索引**：声明“把仓根 pubspec 的 `x.y.z` 注进哪个 `String.fromEnvironment` 键”（如 `kAgentVersion` / `kSelfUpdaterVersion`）。给了它就变成 `-D<这个名字>=<版本>` 注入产物，所以必须是合法 Dart 标识符；**且源码里必须真的读同名键**（否则“看上去注入了”而插件拿着 `defaultValue` 自报一个假版本，而目标机驻留目录按版本命名 ⇒ 每次装都当新版重推）——键名必须在这条插件自己的源码里出现过，这件事由 `plugin_repo_contract_test.dart` 钉；而“注对了”由**产物自检**核（`ssh_executor --selftest` 第 7 条：自报版本不等于兜底值） |
 
 ## 发布合同（装机端唯一读的那一份）
 

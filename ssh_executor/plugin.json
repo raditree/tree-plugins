@@ -1,0 +1,13 @@
+{
+  "id": "ssh_executor",
+  "name": "SSH 执行器中转站",
+  "version": "0.2.0",
+  "description": "SSH 执行器的中转站插件（跑在用户本机，与核心同级）：一次 SSH 连接把随包 tree_agent 推到目标机并以一条常驻 exec 通道拉起它，此后所有 SSH 操作（建隧道 / 读写 / 命令 / PTY / 心跳）走这一条通道。订阅内置点位 system.relay.ssh.execute（别名 ssh.execute）；无订阅者 / 心跳丢 / 回包非法时核心 fail-open 回退内置 dartssh2，功能不变、只是没有中转站。自报版本由构建时注入（app_version_define=kAgentVersion），必须与随包 tree_agent 的打标同源。",
+  "runtime": "binary",
+  "files": ["tree_ssh_executor.exe"],
+  "command": "tree_ssh_executor.exe",
+  "args": [],
+  "granularity": "team",
+  "scope": {},
+  "app_version_define": "kAgentVersion"
+}

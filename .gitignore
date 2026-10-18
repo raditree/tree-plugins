@@ -1,0 +1,5 @@
+# 构建中间物：`dart pub get` 生成的包解析与 `dart compile` 的产物都不进本仓。
+# 理由与 README「怎么加一个插件」第 3 条同一条：提 PR 只提源与随包成品，
+# 中间物进了仓，下一个人在别的机器上就会拿着一份过期的 package_config 编出旧依赖。
+.dart_tool/
+build/
