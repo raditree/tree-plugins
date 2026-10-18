@@ -87,11 +87,15 @@ dart run tool/build_plugins.dart --only minimal
 发布时把索引与资产一起上传：
 
 ```
-gh release create v0.1.0 build/plugins/plugin-index.json build/plugins/tree_minimal.exe
+gh release create v1.0.4 build/plugins/plugin-index.json build/plugins/tree_minimal.exe …
 ```
 
-桌面安装包也读同一份索引拷成品（`tool/package_windows.dart` 的 ②f）——所以
-"发布仓库里有的"与"安装包里带的"不会漂成两套。
+**桌面安装包不读这份索引、也不带任何插件成品**（2026-10-18 的口径变化，用户指令）：
+成品只有本仓的 release 这一个出处，装机端在面板「从发布仓库更新」里把它装进
+`<exeDir>/plugins/`。桌面打包链反而自检“包里不许出现插件成品”
+（`tool/package_windows.dart` 的 `_assertNoBundledPluginBinaries`，多拷就拒绝出包）——
+因为那个目录里随包一份会被装机端当成“核心自带的那一份”保护起来，把用户从本仓装的那版
+锁在旧版上。
 
 ### `plugin.json`（开发期元数据）
 
