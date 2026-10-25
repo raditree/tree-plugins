@@ -1,7 +1,7 @@
 name: tree_agent_loop
 description: tree.agent 插件的领域库（批次 G）：从 tree_core 平移 agent/llm/team/tool 的共享包；不得反向依赖核心包。
 publish_to: 'none'
-version: 0.2.1
+version: 0.3.0
 
 environment:
   sdk: ^3.13.0
@@ -11,6 +11,8 @@ environment:
 dependencies:
   # 数据根的路径布局（handoff 后插件自己读盘；布局是数据接管的接口，不是核心代码）
   path: ^1.9.0
+  # agent/model 配置是 YAML（与核心同一批文件；插件自己解析，不 import 核心）
+  yaml: ^3.1.3
 
 dev_dependencies:
   lints: ^6.0.0

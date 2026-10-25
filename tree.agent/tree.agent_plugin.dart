@@ -92,10 +92,42 @@ Future<int> selfTest() async {
     'tree_agent_selftest_',
   );
   try {
-    // 数据根夹具：agent 配置（只验存在性）+ 待办 markdown（含一条裸行）。
+    // 数据根夹具：agent 配置（含模型覆盖项）+ 待办 markdown（含一条裸行）+ 模型池。
     File(p.join(temp.path, 'agents', 'agt.yaml'))
       ..createSync(recursive: true)
-      ..writeAsStringSync('id: agt\nname: 夹具\n');
+      ..writeAsStringSync(
+        'id: agt\n'
+        'name: 夹具\n'
+        'model_id: m1\n'
+        'system_prompt: 你是夹具\n'
+        'reasoning_effort: high\n'
+        'max_seqlen_override: 32000\n'
+        'max_output_tokens: 8192\n'
+        'compress_threshold: 0.8\n'
+        'thinking_override: true\n',
+      );
+    File(p.join(temp.path, 'config', 'models', 'm1.yaml'))
+      ..createSync(recursive: true)
+      ..writeAsStringSync(
+        'model_id: m1\n'
+        'name: 模型一\n'
+        'base_url: https://api.example.com/v1\n'
+        'api_key: sk-secret\n'
+        'thinking: true\n'
+        'if_vision: false\n'
+        'reasoning_effort: high\n'
+        'reasoning_effort_options: [low, high]\n'
+        'max_seqlen: 64000\n'
+        'max_output_tokens: 8192\n'
+        'token_scale: 2.5\n'
+        'longest_session_tokens: 12000\n',
+      );
+    File(p.join(temp.path, 'config', 'models', 'm2.yaml'))
+      ..createSync(recursive: true)
+      ..writeAsStringSync(
+        'model_id: m2\n'
+        'base_url: http://127.0.0.1:8080/\n',
+      );
     File(p.join(temp.path, 'data', 'agt', 'session_default', 'todos.md'))
       ..createSync(recursive: true)
       ..writeAsStringSync(
@@ -181,17 +213,20 @@ Future<int> selfTest() async {
     core.ask(5, M.apiDelegate, envelope(todosPattern, 'agt'));
     core.ask(6, M.apiDelegate, envelope(todosPattern, 'nope'));
     core.ask(7, M.apiDelegate, envelope(subagentsPattern, 'agt'));
+    core.ask(8, M.apiDelegate, envelope(modelsPattern, 'agt'));
+    core.ask(9, M.apiDelegate, envelope(agentModelsInfoPattern, 'agt'));
+    core.ask(10, M.apiDelegate, envelope(agentModelsInfoPattern, 'nope'));
     core.ask(
-      8,
+      11,
       M.apiDelegate,
       envelope('/api/agents/agt/sessions', 'agt'),
     );
 
     final Map<Object?, Map<String, dynamic>> byId = await core.waitFor(
-      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8],
+      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
     );
 
-    check.that(byId.length == 9, '九条请求都有回包', actual: '${byId.length}');
+    check.that(byId.length == 12, '十二条请求都有回包', actual: '${byId.length}');
     check.check(
       byId[0]?['result']?['plugin_id'],
       kPluginId,
@@ -288,8 +323,79 @@ Future<int> selfTest() async {
       'subagents：名册视图字段与时间口径（ISO / 毫秒都读）',
     );
 
-    final Map<String, dynamic> notImplemented =
+    // ── A2：模型池 / models-info ───────────────────────────────────────
+    const List<dynamic> expectedModels = <dynamic>[
+      <String, dynamic>{
+        'model_id': 'm1',
+        'name': '模型一',
+        'base_url': 'https://api.example.com',
+        'thinking': true,
+        'if_vision': false,
+        'reasoning_effort': 'high',
+        'reasoning_effort_options': <String>['low', 'high'],
+        'max_seqlen': 64000,
+        'max_output_tokens': 8192,
+        'token_scale': 2.5,
+        'longest_session_tokens': 12000,
+      },
+      <String, dynamic>{
+        'model_id': 'm2',
+        'name': 'm2',
+        'base_url': 'http://127.0.0.1:8080',
+        'thinking': false,
+        'if_vision': false,
+        'reasoning_effort': '',
+        'reasoning_effort_options': <String>['low', 'high', 'max'],
+        'max_seqlen': 0,
+        'max_output_tokens': 0,
+        'token_scale': 2.0,
+        'longest_session_tokens': 0,
+      },
+    ];
+
+    final Map<String, dynamic> modelsReply =
         (byId[8]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+    check.check(modelsReply['status'], 200, 'models：200');
+    check.check(
+      jsonDecode('${modelsReply['body'] ?? '{}'}'),
+      <String, dynamic>{'models': expectedModels},
+      'models：11 键 / 排序 / 脱敏 / 默认值',
+    );
+
+    final Map<String, dynamic> infoReply =
+        (byId[9]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+    check.check(infoReply['status'], 200, 'models-info：200');
+    check.check(
+      jsonDecode('${infoReply['body'] ?? '{}'}'),
+      <String, dynamic>{
+        'agent': <String, dynamic>{
+          'id': 'agt',
+          'model_id': 'm1',
+          'system_prompt': '你是夹具',
+        },
+        'models': expectedModels,
+        'overrides': <String, dynamic>{
+          'reasoning_effort': 'high',
+          'max_seqlen': 32000,
+          'max_output_tokens': 8192,
+          'compress_threshold': 0.8,
+          'thinking': true,
+        },
+      },
+      'models-info：agent 三键 + 模型池 + 覆盖项',
+    );
+
+    final Map<String, dynamic> infoMissing =
+        (byId[10]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+    check.check(infoMissing['status'], 404, 'models-info：未知 agent ⇒ 404');
+    check.check(
+      jsonDecode('${infoMissing['body'] ?? '{}'}'),
+      <String, dynamic>{'detail': 'agent 不存在'},
+      'models-info：404 错误体与核心一致',
+    );
+
+    final Map<String, dynamic> notImplemented =
+        (byId[11]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
     check.check(notImplemented['status'], 501, '未搬路由：501（不是 404）');
     check.that(
       jsonDecode('${notImplemented['body'] ?? '{}'}')['detail']

@@ -1,13 +1,17 @@
 import 'dart:convert';
-import 'dart:io';
 
+import 'agent_config.dart';
+import 'model_catalog.dart';
 import 'paths.dart';
 import 'subagent_store.dart';
 import 'todo_store.dart';
 
-/// A2 已搬的两条只读路由（`G-1 对照表` agent 定义 #7 / 子 agent #8）。
-const String todosPattern = '/api/agents/{agentId}/todos';
-const String subagentsPattern = '/api/agents/{agentId}/subagents';
+/// A2 已搬的只读路由（`G-1 对照表` 的编号见注释）。
+const String todosPattern = '/api/agents/{agentId}/todos'; // agent 定义 #7
+const String subagentsPattern = '/api/agents/{agentId}/subagents'; // 子 agent #8
+const String modelsPattern = '/api/models'; // 模型池 #14
+const String agentModelsInfoPattern =
+    '/api/agents/{agentId}/models-info'; // agent 定义 #6
 
 /// 处理一次 `api/delegate`（核心 → 插件）。
 ///
@@ -33,21 +37,35 @@ Future<Map<String, dynamic>> handleApiDelegate(
   }
   final AgentDataPaths paths = AgentDataPaths(dataDir);
 
+  // 全局只读：模型池（不需要 agent）。
+  if (method == 'GET' && _matches(modelsPattern, path)) {
+    return _jsonReply(200, <String, dynamic>{'models': readModels(paths)});
+  }
+
   if (method == 'GET' &&
-      (_matches(todosPattern, path) || _matches(subagentsPattern, path))) {
+      (_matches(todosPattern, path) ||
+          _matches(subagentsPattern, path) ||
+          _matches(agentModelsInfoPattern, path))) {
     final String agentId = _str(params['agentId']);
     final String sessionId = _sessionOf(query);
+    final AgentConfigView? agent;
     try {
-      if (!File(paths.agentFile(agentId)).existsSync()) {
-        return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
-      }
-      if (_matches(todosPattern, path)) {
-        final List<TodoItem> todos = readTodos(paths, agentId, sessionId);
-        return _jsonReply(200, <String, dynamic>{
-          'todos': todos.map((TodoItem todo) => todo.toApiJson()).toList(),
-          'session_id': sessionId,
-        });
-      }
+      agent = readAgentConfig(paths, agentId);
+    } on ArgumentError {
+      // 非法 id（含路径分隔符等）：按"agent 不存在"fail-closed，不回显路径规则。
+      return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
+    }
+    if (agent == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
+    }
+    if (_matches(todosPattern, path)) {
+      final List<TodoItem> todos = readTodos(paths, agentId, sessionId);
+      return _jsonReply(200, <String, dynamic>{
+        'todos': todos.map((TodoItem todo) => todo.toApiJson()).toList(),
+        'session_id': sessionId,
+      });
+    }
+    if (_matches(subagentsPattern, path)) {
       final List<Map<String, dynamic>> roster = readSubagentRoster(
         paths,
         agentId,
@@ -59,10 +77,17 @@ Future<Map<String, dynamic>> handleApiDelegate(
         'total': roster.length,
         'subagents': roster,
       });
-    } on ArgumentError {
-      // 非法 id（含路径分隔符等）：按"agent 不存在"fail-closed，不回显路径规则。
-      return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
     }
+    // models-info：agent 三键 + 模型池 + 真正设置过的覆盖项。
+    return _jsonReply(200, <String, dynamic>{
+      'agent': <String, dynamic>{
+        'id': agent.id,
+        'model_id': agent.modelId,
+        'system_prompt': agent.systemPrompt,
+      },
+      'models': readModels(paths),
+      'overrides': memberOverridesOf(agent),
+    });
   }
 
   return _jsonReply(501, <String, dynamic>{

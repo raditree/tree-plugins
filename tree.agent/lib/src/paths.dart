@@ -18,6 +18,9 @@ class AgentDataPaths {
   /// `<root>/data`：会话数据（`<agent>/<session>/`）。
   String get sessionsDataDir => p.join(root, 'data');
 
+  /// `<root>/config/models`：模型池配置（每个模型一个 yaml）。
+  String get modelsDir => p.join(root, 'config', 'models');
+
   /// 单个 agent 配置：`<root>/agents/<id>.yaml`。
   String agentFile(String agentId) =>
       p.join(agentsDir, '${safeSegment(agentId)}.yaml');
