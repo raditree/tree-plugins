@@ -14,7 +14,6 @@ class StationToolRunner implements ToolRunner {
     required this.scopeFor,
     this.contributed,
     this.toolRunsRunner,
-    this.mcpRunner,
     this.hooks,
   });
 
@@ -28,9 +27,6 @@ class StationToolRunner implements ToolRunner {
 
   /// `tool_runs` 的执行回调（未接线时不声明该工具）。
   final Future<ToolOutcome> Function(ToolInvocation invocation)? toolRunsRunner;
-
-  /// `mcp` 元工具（help/call）的执行回调。
-  final Future<ToolOutcome> Function(ToolInvocation invocation)? mcpRunner;
 
   /// terminal hook 管理器（start/status/cancel + 完成唤醒）。
   final TerminalHookManager? hooks;
@@ -119,22 +115,6 @@ class StationToolRunner implements ToolRunner {
             'required': <String>['file_path', 'old_text', 'new_text'],
           },
         ),
-        if (mcpRunner != null)
-          ToolSpec(
-            name: 'mcp',
-            description:
-                'MCP 工具发现与兜底调用：help 列出 mcp__<服务>__<工具>；'
-                'call 按 tool_name + arguments 调用。',
-            parameters: <String, dynamic>{
-              'type': 'object',
-              'properties': <String, dynamic>{
-                'action': <String, dynamic>{'type': 'string', 'enum': <String>['help', 'call']},
-                'tool_name': <String, dynamic>{'type': 'string'},
-                'arguments': <String, dynamic>{'type': 'object'},
-              },
-              'required': <String>['action'],
-            },
-          ),
         if (toolRunsRunner != null)
           ToolSpec(
             name: 'tool_runs',
@@ -172,11 +152,6 @@ class StationToolRunner implements ToolRunner {
           return await _write(invocation, scope);
         case 'edit':
           return await _edit(invocation, scope);
-        case 'mcp':
-          final Future<ToolOutcome> Function(ToolInvocation)? mcp = mcpRunner;
-          return mcp == null
-              ? const ToolOutcome('mcp 元工具未接线', isError: true)
-              : await mcp(invocation);
         case 'tool_runs':
           final Future<ToolOutcome> Function(ToolInvocation)? runner =
               toolRunsRunner;

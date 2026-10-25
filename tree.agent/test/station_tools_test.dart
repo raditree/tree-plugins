@@ -16,7 +16,6 @@ void main() {
   StationToolRunner runnerFor({
     String agentId = 'agt',
     Future<ToolOutcome> Function(ToolInvocation invocation)? toolRuns,
-    Future<ToolOutcome> Function(ToolInvocation invocation)? mcp,
   }) {
     Future<Map<String, dynamic>> client(
       String command,
@@ -67,7 +66,6 @@ void main() {
     return StationToolRunner(
       client: client,
       toolRunsRunner: toolRuns,
-      mcpRunner: mcp,
       scopeFor: (String agentId, String sessionId) => <String, dynamic>{
         'agent_id': agentId,
         'team_id': 'top',
@@ -151,27 +149,8 @@ void main() {
     expect(File(p.join(temp.path, 'notes', 'a.md')).readAsStringSync(), 'A BETA A');
   });
 
-  test('mcp：help/call 走回调；terminal hook 参数透传', () async {
-    final StationToolRunner runner = runnerFor(
-      mcp: (ToolInvocation invocation) async =>
-          ToolOutcome('mcp: ${invocation.arguments['action']}'),
-    );
-    final List<String> names = runner
-        .specsFor(agentId: 'agt', sessionId: 'session_default')
-        .map((ToolSpec spec) => spec.name)
-        .toList();
-    expect(names, contains('mcp'));
-    final ToolOutcome help = await runner.run(
-      const ToolInvocation(
-        id: 'm1',
-        name: 'mcp',
-        arguments: <String, dynamic>{'action': 'help'},
-        agentId: 'agt',
-        sessionId: 'session_default',
-      ),
-    );
-    expect(help.content, 'mcp: help');
-
+  test('terminal：hook 参数透传到执行器', () async {
+    final StationToolRunner runner = runnerFor();
     await runner.run(
       const ToolInvocation(
         id: 't9',
