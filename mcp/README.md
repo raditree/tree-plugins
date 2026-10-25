@@ -1,36 +1,42 @@
 # mcp（MCP 协议客户端插件）
 
-> 状态：**0.1.0**。stdio JSON-RPC MCP 客户端：能力协商、自发现、上下文管理与工具贡献。
+> 状态：**0.3.0**。MCP 是**能力来源**：插件连服务、自发现，工具化贡献给 tree.agent；
+> 不注册任何中转/执行站，tree.agent 也不认识 MCP 命令或元工具。
 
 ## 协议面
 
-| 阶段 | 已实现 |
-| --- | --- |
-| 握手 | `initialize`（protocolVersion / capabilities / clientInfo）→ `notifications/initialized` |
-| 能力 | 解析 tools / resources(subscribe,listChanged) / prompts / logging |
-| 自发现 | `tools/list`、`resources/list`、`resources/templates/list`、`prompts/list`，支持 `nextCursor` 分页 |
-| 变更 | `notifications/tools/list_changed` / `resources/list_changed` / `prompts/list_changed` 自动重拉 |
-| 上下文 | `resources/read`、`prompts/get`、按 agent 的 `select_context` / `build_context` |
-| 兜底调用 | `call_tool` 上下文命令 + tree.agent 的 `mcp` 元工具（help/call） |
-| 反向请求 | `roots/list`、`ping` |
-| 工具 | 把 MCP 工具以 `mcp__<server>__<tool>` 贡献给 tree.agent；`tools/call` 经本插件执行 |
+- `initialize` 能力协商（protocolVersion / capabilities / clientInfo）→ `notifications/initialized`
+- tools / resources(subscribe,listChanged) / prompts / logging 能力解析
+- `tools/list`、`resources/list`、`resources/templates/list`、`prompts/list`（分页）
+- `notifications/tools|resources|prompts/list_changed` 自动刷新
+- `resources/read`、`prompts/get`、`roots/list`、`ping`
+- 按 agent 的上下文选择与构建（`McpContextManager`）
 
-配置：环境变量 `TREE_MCP_SERVERS`（JSON 数组）：
+## 贡献给 tree.agent 的工具
+
+| 工具 | 作用 |
+| --- | --- |
+| `mcp__<服务>__<工具>` | 每个已发现 MCP 工具的原生入口 |
+| `mcp` | help / call 元工具（发现与兜底） |
+| `mcp_resources` | list / read 资源（上下文注入） |
+| `mcp_prompts` | list / get 提示词 |
+| `mcp_context` | inventory / select / build 上下文 |
+
+全部经 tree.agent 的工具收集站贡献，执行走 `plugin.toolCall` → 本插件；
+没有 MCP 专用执行站、没有 tree.agent 内硬编码的 MCP 分支。
+
+配置：`TREE_MCP_SERVERS`（JSON 数组）：
 ```json
 [{"name":"files","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"]}]
 ```
 
-上下文执行站：`plugin.mcp.execute.context`，命令
-`inventory` / `read_resource` / `get_prompt` / `build_context` / `select_context`。
-
 ## 测试
 
-`dart test`：5 条协议测试用真子进程假服务钉住
-initialize 能力协商、分页自发现、list_changed 刷新、resources/read、prompts/get、
-roots/list 与上下文构建。
+5 条真子进程协议测试：initialize 能力协商、分页自发现、list_changed 刷新、
+resources/read、prompts/get、roots/list、上下文构建。
 
 ## 未覆盖
 
-- 仅 stdio 传输；Streamable HTTP/SSE 未搬；
+- 仅 stdio；Streamable HTTP/SSE 未搬；
 - sampling / elicitation / completions、resources/subscribe 未接；
-- 无 MCP 服务时插件正常上线但零工具。
+- 核心仍保留 `tree_core/lib/src/mcp` 与 `/api/mcp/*`（A5 删除，UI 面板尚未迁到本插件）。
