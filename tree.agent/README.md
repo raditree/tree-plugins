@@ -32,7 +32,7 @@
 
 read / write / list / grep / terminal 不再由核心执行：tree.agent 先登记工作空间租约，
 再把 `workspace_id` 随 `fs.*` / `terminal.exec` 下发；这些命令由 `local_executor`
-插件挂载执行（`plugins/local_executor`）。没装该插件时工具会显式失败（不静默回退核心）。
+自建执行站（`plugin.local_executor.execute.local`，命令 `file.*` / `exec.command`）执行。没装该插件时工具会显式失败（不静默回退核心）。
 
 ## 跑
 

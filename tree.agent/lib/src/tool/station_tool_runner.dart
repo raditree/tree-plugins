@@ -129,7 +129,7 @@ class StationToolRunner implements ToolRunner {
   ) async {
     final String path = (invocation.arguments['path'] ?? '').toString().trim();
     if (path.isEmpty) return const ToolOutcome('read 需要 path', isError: true);
-    final Map<String, dynamic> result = await client('fs.read', <String, dynamic>{
+    final Map<String, dynamic> result = await client('file.read', <String, dynamic>{
       'path': path,
       if (invocation.arguments['start_line'] != null)
         'start_line': invocation.arguments['start_line'],
@@ -147,7 +147,7 @@ class StationToolRunner implements ToolRunner {
   ) async {
     final String path = (invocation.arguments['path'] ?? '').toString().trim();
     if (path.isEmpty) return const ToolOutcome('write 需要 path', isError: true);
-    final Map<String, dynamic> result = await client('fs.write', <String, dynamic>{
+    final Map<String, dynamic> result = await client('file.write', <String, dynamic>{
       'path': path,
       'content': (invocation.arguments['content'] ?? '').toString(),
     }, scope);
@@ -159,7 +159,7 @@ class StationToolRunner implements ToolRunner {
     ToolInvocation invocation,
     Map<String, dynamic> scope,
   ) async {
-    final Map<String, dynamic> result = await client('fs.list', <String, dynamic>{
+    final Map<String, dynamic> result = await client('file.list', <String, dynamic>{
       'path': (invocation.arguments['path'] ?? '.').toString(),
       if (invocation.arguments['max_depth'] != null)
         'max_depth': invocation.arguments['max_depth'],
@@ -175,7 +175,7 @@ class StationToolRunner implements ToolRunner {
   ) async {
     final String pattern = (invocation.arguments['pattern'] ?? '').toString();
     if (pattern.isEmpty) return const ToolOutcome('grep 需要 pattern', isError: true);
-    final Map<String, dynamic> result = await client('fs.grep', <String, dynamic>{
+    final Map<String, dynamic> result = await client('file.grep', <String, dynamic>{
       'pattern': pattern,
       if (invocation.arguments['path'] != null)
         'path': invocation.arguments['path'],
@@ -199,7 +199,7 @@ class StationToolRunner implements ToolRunner {
     final String command =
         (invocation.arguments['command'] ?? '').toString().trim();
     if (command.isEmpty) return const ToolOutcome('terminal 需要 command', isError: true);
-    final Map<String, dynamic> result = await client('terminal.exec', <String, dynamic>{
+    final Map<String, dynamic> result = await client('exec.command', <String, dynamic>{
       'command': command,
       if (invocation.arguments['timeout'] != null)
         'timeout': invocation.arguments['timeout'],

@@ -19,6 +19,12 @@ abstract interface class StationWorkspace {
   Future<List<String>> listFiles({String path = '.', int maxDepth = 2, int maxEntries = 500});
 
   Future<Uint8List> readBytes(String path);
+
+  Future<void> deleteFile(String path, {bool recursive = false});
+
+  Future<int> writeBytes(String path, List<int> bytes);
+
+  Future<void> makeDirectory(String path);
 }
 
 /// 执行站返回的读取结果（字段与核心 FileContent 对齐）。

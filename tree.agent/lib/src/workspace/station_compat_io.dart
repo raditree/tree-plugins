@@ -43,7 +43,12 @@ class StationCompatIo implements WorkspaceIO, WorkspaceFiles {
 
   @override
   Future<bool> deleteFile(String relativePath) async {
-    throw WorkspaceIoException('执行站尚未提供 fs.delete：无法删除 $relativePath');
+    try {
+      await station.deleteFile(relativePath);
+      return true;
+    } on Object {
+      return false;
+    }
   }
 
   @override
@@ -63,7 +68,7 @@ class StationCompatIo implements WorkspaceIO, WorkspaceFiles {
 
   @override
   Future<void> writeBytes(String relativePath, List<int> bytes) async {
-    throw WorkspaceIoException('执行站尚未提供二进制写入：$relativePath');
+    await station.writeBytes(relativePath, bytes);
   }
 
   @override
@@ -72,6 +77,6 @@ class StationCompatIo implements WorkspaceIO, WorkspaceFiles {
 
   @override
   Future<void> makeDirectory(String relativePath) async {
-    throw WorkspaceIoException('执行站尚未提供 fs.mkdir：$relativePath');
+    await station.makeDirectory(relativePath);
   }
 }

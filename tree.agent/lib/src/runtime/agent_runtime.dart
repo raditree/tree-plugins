@@ -342,7 +342,10 @@ class AgentRuntime {
       throw StateError('执行站未接线：station/command 不可用');
     }
     Map<String, dynamic> outgoing = arguments;
-    if (command.startsWith('fs.') || command == 'terminal.exec') {
+    if (command.startsWith('fs.') ||
+        command.startsWith('file.') ||
+        command == 'terminal.exec' ||
+        command == 'exec.command') {
       final String agentId = (scope['agent_id'] ?? '').toString();
       final String root = agentId.isEmpty ? '' : _workspaceDirOf(agentId);
       if (root.isNotEmpty) {

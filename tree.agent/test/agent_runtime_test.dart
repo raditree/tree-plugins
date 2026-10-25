@@ -115,11 +115,20 @@ void main() {
     expect(content.text, 'hello');
     expect(registered, hasLength(1));
     expect(registered.single['dir'], contains(temp.path));
-    expect(calls.single['command'], 'fs.read');
+    expect(calls.single['command'], 'file.read');
     final Map<String, dynamic> args =
         calls.single['arguments'] as Map<String, dynamic>;
     expect(args['lease_id'], registered.single['id']);
     expect(args.containsKey('root'), isFalse, reason: 'root 由核心注入，不由 agent 传');
+
+    await io.deleteFile('b.txt');
+    final WorkspaceFiles files = io as WorkspaceFiles;
+    await files.writeBytes('c.bin', <int>[1, 2, 3]);
+    await files.makeDirectory('d');
+    final List<String> commands = calls
+        .map((Map<String, dynamic> call) => '${call['command']}')
+        .toList();
+    expect(commands, containsAll(<String>['file.delete', 'file.writeBytes', 'file.mkdir']));
   });
 
   test('默认引擎是 LlmAgentEngine（生产路径）；未知 agent 返回 null（端点 404）', () async {

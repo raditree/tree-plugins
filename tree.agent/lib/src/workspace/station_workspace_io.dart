@@ -43,7 +43,7 @@ class StationWorkspaceIo implements StationWorkspace {
     int? startLine,
     int? lineCount,
   }) async {
-    final Map<String, dynamic> result = await _call('fs.read', <String, dynamic>{
+    final Map<String, dynamic> result = await _call('file.read', <String, dynamic>{
       'path': path,
       'start_line': ?startLine,
       'line_count': ?lineCount,
@@ -60,7 +60,7 @@ class StationWorkspaceIo implements StationWorkspace {
 
   @override
   Future<int> writeFile(String path, String content) async {
-    final Map<String, dynamic> result = await _call('fs.write', <String, dynamic>{
+    final Map<String, dynamic> result = await _call('file.write', <String, dynamic>{
       'path': path,
       'content': content,
     });
@@ -73,7 +73,7 @@ class StationWorkspaceIo implements StationWorkspace {
     int maxDepth = 2,
     int maxEntries = 500,
   }) async {
-    final Map<String, dynamic> result = await _call('fs.list', <String, dynamic>{
+    final Map<String, dynamic> result = await _call('file.list', <String, dynamic>{
       'path': path,
       'max_depth': maxDepth,
       'max_entries': maxEntries,
@@ -81,6 +81,34 @@ class StationWorkspaceIo implements StationWorkspace {
     final Object? entries = result['entries'];
     if (entries is! List) return <String>[];
     return <String>[for (final Object? entry in entries) entry.toString()];
+  }
+
+  @override
+  Future<void> deleteFile(String path, {bool recursive = false}) async {
+    await _call('file.delete', <String, dynamic>{
+      'path': path,
+      'recursive': recursive,
+    });
+  }
+
+  @override
+  Future<int> writeBytes(String path, List<int> bytes) async {
+    final Map<String, dynamic> result = await _call(
+      'file.writeBytes',
+      <String, dynamic>{
+        'path': path,
+        'base64': base64Encode(bytes),
+      },
+    );
+    return (result['bytes_written'] as num?)?.toInt() ?? 0;
+  }
+
+  @override
+  Future<void> makeDirectory(String path) async {
+    await _call('file.mkdir', <String, dynamic>{
+      'path': path,
+      'recursive': true,
+    });
   }
 
   @override

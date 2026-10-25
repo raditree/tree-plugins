@@ -25,7 +25,7 @@ void main() {
         'scope': scope,
       });
       switch (command) {
-        case 'fs.read':
+        case 'file.read':
           final content = await io.readFile(arguments['path'].toString());
           return <String, dynamic>{
             'path': arguments['path'],
@@ -34,24 +34,24 @@ void main() {
             'start_line': 1,
             'truncated': false,
           };
-        case 'fs.write':
+        case 'file.write':
           final bytes = await io.writeFile(
             arguments['path'].toString(),
             arguments['content'].toString(),
           );
           return <String, dynamic>{'bytes_written': bytes};
-        case 'fs.list':
+        case 'file.list':
           final entries = await io.listFiles(
             relativePath: arguments['path'].toString(),
           );
           return <String, dynamic>{'entries': entries};
-        case 'fs.grep':
+        case 'file.grep':
           return <String, dynamic>{
             'matches': <Map<String, dynamic>>[
               <String, dynamic>{'path': '.self/a.md', 'line': 1, 'text': '命中'},
             ],
           };
-        case 'terminal.exec':
+        case 'exec.command':
           return <String, dynamic>{
             'text': 'exit=0\nhello',
             'is_error': false,
