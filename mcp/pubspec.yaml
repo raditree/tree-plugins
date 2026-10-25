@@ -1,0 +1,14 @@
+name: tree_mcp
+description: MCP 协议客户端插件（stdio JSON-RPC）：能力协商、工具/资源/提示词自发现、上下文管理。
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.13.0
+
+dependencies:
+  path: ^1.9.0
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.0
