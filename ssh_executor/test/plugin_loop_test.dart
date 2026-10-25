@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:test/test.dart';
 import 'package:tree_ssh_plugin/tree_ssh_plugin.dart';
@@ -527,4 +528,152 @@ void main() {
       expect(events.last['params']['state'], TunnelStates.ready);
     });
   });
+
+  group('SSH 工作空间执行站（自建 execute + station/request）', () {
+    Future<Map<String, dynamic>> outgoingRequest(String method) async {
+      for (int i = 0; i < 400; i++) {
+        for (final Map<String, dynamic> frame in harness.frames) {
+          if (frame['method'] == method) return frame;
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      fail('插件没有发出 $method');
+    }
+
+    test('hello 后申报执行站：kind=execute / shared / 命令表 / readme', () async {
+      await harness.request(90, 'hello', <String, dynamic>{'protocol': 1});
+      final Map<String, dynamic> register = await outgoingRequest(
+        PluginMethods.stationRegister,
+      );
+      final Map<String, dynamic> params = asMap(register['params']);
+      expect(params['kind'], 'execute');
+      expect(params['name'], kSshWorkspaceStationName);
+      expect(params['shared'], isTrue);
+      expect(params['commands'], kSshWorkspaceCommands);
+      expect((params['readme'] ?? '').toString(), isNotEmpty);
+
+      harness.input.add(
+        encodeFrame(
+          rpcResult(register['id'] as int, <String, dynamic>{
+            'ok': true,
+            'station_id': sshWorkspaceStationId(kPluginId),
+          }),
+        ),
+      );
+      await pump(10);
+      expect(harness.loop.executeStationId, sshWorkspaceStationId(kPluginId));
+      expect(harness.logs.join('\n'), contains('已注册 SSH 工作空间执行站'));
+    });
+
+    test('station/request：ssh.lease.register 建隧道，ssh.file.read 走既有 L2', () async {
+      await harness.request(91, 'hello');
+      final Map<String, dynamic> register = await outgoingRequest(
+        PluginMethods.stationRegister,
+      );
+      harness.input.add(
+        encodeFrame(
+          rpcResult(register['id'] as int, <String, dynamic>{
+            'ok': true,
+            'station_id': sshWorkspaceStationId(kPluginId),
+          }),
+        ),
+      );
+      await pump(10);
+
+      await harness.request(92, StationMethods.request, <String, dynamic>{
+        'station_id': sshWorkspaceStationId(kPluginId),
+        'payload': <String, dynamic>{
+          'command': kSshLeaseRegisterCommand,
+          'arguments': <String, dynamic>{
+            'ssh': configJson(root: '/srv/ws'),
+            'ssh_lease_id': 'lease-1',
+          },
+        },
+      });
+      final Map<String, dynamic> reply = asMap(harness.resultOf(92)['reply']);
+      final Map<String, dynamic> lease = asMap(reply['payload']);
+      expect(lease['ok'], isTrue);
+      expect(lease['lease_id'], 'lease-1');
+      expect((lease['root'] ?? '').toString(), startsWith('/'));
+      expect(harness.loop.manager.tunnels, hasLength(1));
+      expect(harness.loop.manager.tunnels.single.state, TunnelStates.ready);
+
+      // 让假 agent 按 fs.* 契约回答（文件内容 hello）。
+      harness.remote.handler =
+          (String method, Map<String, dynamic> params) {
+            switch (method) {
+              case AgentMethods.fsStat:
+                return <String, dynamic>{'type': 'file', 'size': 5};
+              case AgentMethods.fsRead:
+                return <String, dynamic>{
+                  'data': base64Encode(utf8.encode('hello')),
+                  'size': 5,
+                  'offset': 0,
+                  'eof': true,
+                };
+              default:
+                return <String, dynamic>{'ok': true};
+            }
+          };
+
+      await harness.request(93, StationMethods.request, <String, dynamic>{
+        'station_id': sshWorkspaceStationId(kPluginId),
+        'payload': <String, dynamic>{
+          'command': 'ssh.file.read',
+          'arguments': <String, dynamic>{
+            'ssh_lease_id': 'lease-1',
+            'path': 'a.txt',
+          },
+        },
+      });
+      final Map<String, dynamic> readReply = asMap(
+        harness.resultOf(93)['reply'],
+      );
+      final Map<String, dynamic> file = asMap(readReply['payload']);
+      expect(file['content'], 'hello');
+      expect(file['total_lines'], 1);
+      expect(file['path'], 'a.txt');
+      // 确实经既有隧道发了 L2（不是本机文件系统）。
+      expect(harness.loop.manager.tunnels.single.state, TunnelStates.ready);
+      expect(harness.remote.spawned, isNotEmpty);
+
+      await harness.request(94, StationMethods.request, <String, dynamic>{
+        'station_id': sshWorkspaceStationId(kPluginId),
+        'payload': <String, dynamic>{
+          'command': 'ssh.file.read',
+          'arguments': <String, dynamic>{
+            'ssh_lease_id': 'lease-1',
+            'path': '../escape.txt',
+          },
+        },
+      });
+      final Map<String, dynamic> denied = asMap(
+        harness.resultOf(94)['reply'],
+      );
+      expect(denied['error'].toString(), contains('越出工作空间根目录'));
+    });
+
+    test('未登记租约经执行站回 ssh_lease_unknown（tree.agent 据此重登记）', () async {
+      await harness.request(95, StationMethods.request, <String, dynamic>{
+        'station_id': sshWorkspaceStationId(kPluginId),
+        'payload': <String, dynamic>{
+          'command': 'ssh.file.read',
+          'arguments': <String, dynamic>{
+            'ssh_lease_id': 'stale',
+            'path': 'a.txt',
+          },
+        },
+      });
+      final Map<String, dynamic> reply = asMap(harness.resultOf(95)['reply']);
+      expect(reply['error'].toString(), contains(kSshLeaseUnknownCode));
+    });
+  });
+}
+
+Map<String, dynamic> asMap(Object? raw) {
+  if (raw is! Map) return <String, dynamic>{};
+  return <String, dynamic>{
+    for (final MapEntry<Object?, Object?> entry in raw.entries)
+      entry.key.toString(): entry.value,
+  };
 }

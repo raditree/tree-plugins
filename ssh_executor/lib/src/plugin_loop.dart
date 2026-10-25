@@ -4,6 +4,7 @@ import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart';
 
 import 'agent_binary.dart';
 import 'bootstrap.dart';
+import 'exec_station.dart';
 import 'ssh_dialer.dart';
 import 'tunnel.dart';
 import 'tunnel_manager.dart';
@@ -29,6 +30,13 @@ abstract final class PluginMethods {
   static const String ping = 'ping';
   static const String toolsList = 'tools/list';
   static const String shutdown = 'shutdown';
+
+  /// 插件 → 核心：申报自建站点（执行站 / 收集站 / 中转站）。
+  ///
+  /// 与 `station/subscribe` 同属站点体系的标准上行方法；核心侧的名字在
+  /// `PluginRpcMethods.stationRegister`，插件 `_kit` 里也有一份。本插件只依赖
+  /// `tree_tunnel_protocol`、不依赖 `_kit`，所以在这里定义一次常量，不散落字面量。
+  static const String stationRegister = 'station/register';
 
   /// 核心**上行**给插件的通知 method（面板动作、工具事件等都在 `params['event']` 上）。
   static const String event = 'event';
@@ -77,6 +85,15 @@ class PluginLoop {
           now: now,
           log: log,
         );
+    // SSH 工作空间执行站：**复用同一个** [_manager] 台账（租约登记的隧道与核心
+    // 中转站看到的是同一条连接，不另建第二套状态）。
+    _executeStation = SshWorkspaceExecutor(
+      ensureTunnel: (Map<String, dynamic> config) =>
+          _manager.ensure(<String, dynamic>{'config': config}),
+      requestAgent: (String connId, String method, Map<String, dynamic> params) =>
+          _manager.request(connId, method, params),
+      log: log,
+    );
   }
 
   final void Function(Map<String, dynamic> message) send;
@@ -84,6 +101,10 @@ class PluginLoop {
 
   late final TunnelManager _manager;
   late final TunnelUiPanel _panel;
+
+  /// SSH 工作空间执行站（tree.agent 的 SSH 模式把 `file.*` / `exec.command`
+  /// 改写成 `ssh.*` 后下发到这里；见 `exec_station.dart`）。
+  late final SshWorkspaceExecutor _executeStation;
 
   final Set<Future<void>> _inFlight = <Future<void>>{};
   Completer<int>? _done;
@@ -97,9 +118,22 @@ class PluginLoop {
   // 「请求 → 等响应」的最小机制：出帧 id 单调递增，响应帧按 id 认领 completer。
   // **无静态超时**（同中转站其它请求）：只有进程收手（[_finish]）才把在途请求以
   // 可读错误收尾，绝不让一次订阅挂死读循环（读循环从不 await 这条链路）。
-  final RpcIds _outIds = RpcIds();
   final Map<Object, Completer<Map<String, dynamic>>> _pendingOut =
       <Object, Completer<Map<String, dynamic>>>{};
+
+  /// 出站请求 id 的**独立号段**：核心下行请求 id 也从 1 起，两向同号会让自检 /
+  /// 日志里的"这个 id 是谁的"不可分辨（协议按方向各自配对，不受影响；受影响的是
+  /// 读同一批帧的旁观者）。
+  int _outSeq = 0;
+  static const int _outIdBase = 1000000;
+
+  int _nextOutId() => _outIdBase + (++_outSeq);
+
+  /// 已注册的 SSH 工作空间执行站 id（未注册 / 旧核心时为 null）。
+  String? _executeStationId;
+
+  /// 执行站 id（测试 / 诊断用；未注册时为 null）。
+  String? get executeStationId => _executeStationId;
 
   /// 是否已经发过 `station/subscribe`（一次握手成功即订上；重复 hello 不再重订）。
   bool _subscribed = false;
@@ -208,6 +242,11 @@ class PluginLoop {
             _subscribed = true;
             unawaited(_subscribeSshExecute());
           }
+          // 同时申报自建执行站（tree.agent 的 SSH 工作空间 IO 走这里）。
+          // 与订阅一样**不阻塞读循环**：一次注册不会让 ping 迟到。
+          if (_executeStationId == null) {
+            unawaited(_registerExecuteStation());
+          }
           return;
         case PluginMethods.ping:
           _reply(id, <String, dynamic>{'ok': true});
@@ -253,10 +292,31 @@ class PluginLoop {
           _panel.refresh(force: true);
           return;
         case StationMethods.request:
-          // 「处理拓展点位」的新投递：核心把一次 SSH 操作投成 station/request，
+          final Map<String, dynamic> payload = _payloadOf(params);
+          // ① 自建**执行站**的投递：核心 `_forwardStationCommand` 的 payload 形状是
+          // `{command, arguments}`（与中转站的 `{action, ...}` 区分）。只有本插件
+          // 注册过执行站才会收到它；命令错误必须回 `{reply:{error}}`（不是 JSON-RPC
+          // error），与 `local_executor` 的错误面同形。
+          final String command = (payload['command'] ?? '').toString().trim();
+          if (command.isNotEmpty) {
+            try {
+              final Map<String, dynamic> executed = await _executeStation.execute(
+                command,
+                _argumentsOf(payload['arguments']),
+              );
+              _reply(id, <String, dynamic>{
+                'reply': <String, dynamic>{'payload': executed},
+              });
+            } catch (error) {
+              _reply(id, <String, dynamic>{
+                'reply': <String, dynamic>{'error': error.toString()},
+              });
+            }
+            return;
+          }
+          // ② 「处理拓展点位」的中转站投递：核心把一次 SSH 操作投成 station/request，
           // payload 里带 `action`（与 tunnel.* 去掉前缀同名）。回包形状必须与
           // `tunnel.*` 一致（{ok, conn_id, ...}），核心 relaySshExecute 原样透传。
-          final Map<String, dynamic> payload = _payloadOf(params);
           final Map<String, dynamic> result = await _runAction(payload);
           // 面板跟着台账走（与 tunnel.* 同口径）。
           final String action = (payload['action'] ?? '').toString();
@@ -311,6 +371,12 @@ class PluginLoop {
     return raw.map((dynamic k, dynamic v) => MapEntry('$k', v));
   }
 
+  /// 执行站投递里的 `arguments`（缺省 / 非对象 ⇒ 空映射，交给 [SshWorkspaceExecutor] 报参数错）。
+  static Map<String, dynamic> _argumentsOf(Object? raw) {
+    if (raw is! Map) return <String, dynamic>{};
+    return raw.map((dynamic k, dynamic v) => MapEntry('$k', v));
+  }
+
   /// **按 `action` 分发**到 [TunnelManager]（`station/request` 与旧 `tunnel.*` 共用同一套台账）。
   ///
   /// 回包形状与对应 `tunnel.*` 方法**完全一致**（`{ok, conn_id, ...}` / `{ok:false, error, error_kind}`），
@@ -357,11 +423,11 @@ class PluginLoop {
     String method,
     Map<String, dynamic> params,
   ) {
-    final Object id = _outIds.next();
+    final int id = _nextOutId();
     final Completer<Map<String, dynamic>> completer =
         Completer<Map<String, dynamic>>();
     _pendingOut[id] = completer;
-    send(rpcRequest(id as int, method, params));
+    send(rpcRequest(id, method, params));
     return completer.future;
   }
 
@@ -389,6 +455,41 @@ class PluginLoop {
       );
     } catch (error) {
       log?.call('订阅 SSH 执行点位异常（旧路径 tunnel.* 继续可用）：$error');
+    }
+  }
+
+  /// 申报 SSH 工作空间**执行站**（`kind: execute`，`shared: true` 让 tree.agent 能下命令）。
+  ///
+  /// 失败（旧核心不认 `station/register`）只记日志，不回归任何东西：旧 core 的 SSH
+  /// 执行仍走 `tunnel.*`；tree.agent 的 SSH IO 会显式失败（不静默回退本机 IO）。
+  Future<void> _registerExecuteStation() async {
+    try {
+      final Map<String, dynamic> response = await _requestCore(
+        PluginMethods.stationRegister,
+        <String, dynamic>{
+          'kind': 'execute',
+          'name': kSshWorkspaceStationName,
+          'description': 'SSH 工作空间执行站（file.* / exec.command 的远端等价物）',
+          'readme': kSshWorkspaceStationReadme,
+          'commands': kSshWorkspaceCommands,
+          // tree.agent 是唯一已知调用方；shared 是核心跨插件使用自建站的显式声明。
+          'shared': true,
+          'allowed_plugins': <String>['tree.agent'],
+        },
+      );
+      final Map<String, dynamic> result = _resultOf(response);
+      final bool ok = result['ok'] == true;
+      if (ok) {
+        _executeStationId = (result['station_id'] ?? '').toString().trim();
+      }
+      log?.call(
+        ok
+            ? '已注册 SSH 工作空间执行站（$_executeStationId，命令 ${kSshWorkspaceCommands.length} 条）'
+            : '注册 SSH 工作空间执行站未成功（tree.agent 的 SSH IO 将显式失败）：'
+                '${result['error'] ?? '核心未回 ok'}',
+      );
+    } catch (error) {
+      log?.call('注册 SSH 工作空间执行站异常（tree.agent 的 SSH IO 将显式失败）：$error');
     }
   }
 

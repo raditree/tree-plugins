@@ -17,6 +17,7 @@ import '../llm/llm_summarizer.dart';
 import '../paths.dart';
 import '../settings/core_settings.dart';
 import '../settings/file_settings_sink.dart';
+import '../settings/ssh_config.dart';
 import '../spec/spec_service.dart';
 import '../station/tool_contributions.dart';
 import '../store/file_store.dart';
@@ -44,6 +45,40 @@ import '../workspace/station_compat_io.dart';
 import '../workspace/station_workspace_io.dart';
 import '../workspace/workspace_io.dart';
 import '../ws/ws_hub.dart';
+
+/// SSH 模式下把**本机执行站命令名**映射到 `ssh_executor` 自建执行站的命令名。
+///
+/// 为什么必须改名：核心 `station/command` 只按命令名全局查执行站，而
+/// `local_executor` 已经占用了 `file.*` / `exec.command`。SSH 模式改走
+/// `ssh.*` 命令族（`ssh_executor` 的执行站），本机模式保持原命令名不变。
+///
+/// 语义逐条对齐 `local_executor`（参数 / 返回字段同形），由 ssh_executor 翻译成
+/// 目标机 tree_agent 的 `fs.*` / `exec.run`。
+const Map<String, String> kSshStationCommands = <String, String>{
+  'fs.read': 'ssh.file.read',
+  'file.read': 'ssh.file.read',
+  'fs.write': 'ssh.file.write',
+  'file.write': 'ssh.file.write',
+  'fs.list': 'ssh.file.list',
+  'file.list': 'ssh.file.list',
+  'fs.grep': 'ssh.file.grep',
+  'file.grep': 'ssh.file.grep',
+  'fs.delete': 'ssh.file.delete',
+  'file.delete': 'ssh.file.delete',
+  'fs.mkdir': 'ssh.file.mkdir',
+  'file.mkdir': 'ssh.file.mkdir',
+  'fs.writeBytes': 'ssh.file.writeBytes',
+  'file.writeBytes': 'ssh.file.writeBytes',
+  'terminal.exec': 'ssh.exec.command',
+  'exec.command': 'ssh.exec.command',
+};
+
+/// `ssh_executor` 执行站的**租约失效前缀**（契约，见其 `exec_station.dart`）：
+/// 只有看到它才丢弃缓存租约、重新登记并重试一次（其余失败可能是写了一半，绝不重试）。
+const String kSshLeaseUnknownCode = 'ssh_lease_unknown';
+
+/// 一条命令在 SSH 模式下的执行站命令名；`null` = 不归 `ssh_executor` 站管。
+String? sshStationCommandFor(String command) => kSshStationCommands[command];
 
 /// 插件进程内**单个数据根**的运行时：存储 + 设置 + 提问回路 + 会话服务 + 临时员工。
 ///
@@ -209,6 +244,13 @@ class AgentRuntime {
   /// 工作空间根 → 租约 id / 已登记集合（同一根只登记一次）。
   final Map<String, String> _workspaceIds = <String, String>{};
   final Set<String> _registeredWorkspaces = <String>{};
+
+  /// SSH 工作空间租约缓存：`agentId + ssh 指纹` → (lease_id, conn_id, 远端根)。
+  ///
+  /// 本地租约走核心 `workspace/register`（目录必须在本机存在）；**远端根不可能满足**
+  /// 那个校验，所以 SSH 租约由 `ssh_executor` 执行站持有，tree.agent 只缓存它的句柄。
+  final Map<String, _SshWorkspaceLease> _sshLeases =
+      <String, _SshWorkspaceLease>{};
 
   static final Map<String, AgentRuntime> _byRoot = <String, AgentRuntime>{};
 
@@ -511,7 +553,14 @@ class AgentRuntime {
     'is_error': false,
   };
 
-  /// 执行站命令的统一出口：fs.* / terminal.exec 自动带工作空间租约。
+  /// 执行站命令的统一出口：**本机命令自动带工作空间租约；SSH 命令改走 ssh.* 站**。
+  ///
+  /// 两条路必须分清（2026-10-25，任务 C）：
+  /// - **本机**：核心 `workspace/register` 登记目录 → 命令带 `lease_id`，由
+  ///   `local_executor` 自建站执行（原有行为，不变）；
+  /// - **SSH**：远端根在本机不存在，核心的租约校验过不了 ⇒ 租约由 `ssh_executor`
+  ///   执行站登记（`ssh.lease.register`），后续命令带 `ssh_lease_id` + 远端 `root`。
+  ///   **绝不降级回本机命令**：执行站不可用时显式失败（否则会静默读写本机工作空间）。
   Future<Map<String, dynamic>> _stationCommand(
     String command,
     Map<String, dynamic> arguments,
@@ -521,12 +570,39 @@ class AgentRuntime {
     if (client == null) {
       throw StateError('执行站未接线：station/command 不可用');
     }
+    final String agentId = (scope['agent_id'] ?? '').toString();
+    final String? sshCommand = sshStationCommandFor(command);
+    if (sshCommand != null && agentId.isNotEmpty) {
+      final CoreAgent? agent = store.agent(agentId);
+      final SshConfig? ssh =
+          agent == null ? null : teamSshConfigFor(agent, store.agent);
+      if (ssh != null) {
+        final _SshWorkspaceLease lease = await _sshLeaseFor(agentId, ssh);
+        try {
+          return await client(
+            sshCommand,
+            _sshArguments(arguments, lease),
+            scope,
+          );
+        } catch (error) {
+          // 只有"租约未登记"（插件重启过）才是**确定未执行**、可安全重试的失败；
+          // 其它失败可能是写了一半的业务错误，绝不重放。
+          if (!'$error'.contains(kSshLeaseUnknownCode)) rethrow;
+          _sshLeases.remove(_sshLeaseKey(agentId, ssh));
+          final _SshWorkspaceLease renewed = await _sshLeaseFor(agentId, ssh);
+          return client(
+            sshCommand,
+            _sshArguments(arguments, renewed),
+            scope,
+          );
+        }
+      }
+    }
     Map<String, dynamic> outgoing = arguments;
     if (command.startsWith('fs.') ||
         command.startsWith('file.') ||
         command == 'terminal.exec' ||
         command == 'exec.command') {
-      final String agentId = (scope['agent_id'] ?? '').toString();
       final String root = agentId.isEmpty ? '' : _workspaceDirOf(agentId);
       if (root.isNotEmpty) {
         final String workspaceId = _workspaceIds.putIfAbsent(
@@ -546,7 +622,95 @@ class AgentRuntime {
     return client(command, outgoing, scope);
   }
 
+  /// 以某 agent 的身份下发一条执行站命令（工具 / 工作空间 / 测试共用同一条路由）。
+  Future<Map<String, dynamic>> dispatchStationCommand(
+    String agentId,
+    String command,
+    Map<String, dynamic> arguments, {
+    String sessionId = '',
+  }) => _stationCommand(
+    command,
+    arguments,
+    _stationScopeFor(agentId, sessionId),
+  );
+
+  /// SSH 执行站命令参数：**不**带核心 `lease_id`（那是本机租约，核心会校验本机目录），
+  /// 只带插件的远端租约句柄与远端根。
+  static Map<String, dynamic> _sshArguments(
+    Map<String, dynamic> arguments,
+    _SshWorkspaceLease lease,
+  ) => <String, dynamic>{
+    ...arguments,
+    'ssh_lease_id': lease.leaseId,
+    'root': lease.root,
+  };
+
+  /// 取（或登记）SSH 工作空间租约。
+  ///
+  /// 凭据**只在登记时过线一次**（`ssh.toJson()`）；后续命令只带 `ssh_lease_id`。
+  /// 插件重启后租约失效 ⇒ 执行站回 `ssh_lease_unknown` ⇒ 这里重登记一次。
+  Future<_SshWorkspaceLease> _sshLeaseFor(String agentId, SshConfig ssh) async {
+    final String key = _sshLeaseKey(agentId, ssh);
+    final _SshWorkspaceLease? cached = _sshLeases[key];
+    if (cached != null) return cached;
+    final StationCommandClient? client = stationClient;
+    if (client == null) {
+      throw StateError('执行站未接线：SSH 工作空间租约不可用');
+    }
+    final String leaseId = _sshLeaseId(ssh);
+    final Map<String, dynamic> result;
+    try {
+      result = await client(
+        'ssh.lease.register',
+        <String, dynamic>{
+          'ssh': ssh.toJson(),
+          'ssh_lease_id': leaseId,
+          'root': ssh.root,
+        },
+        _stationScopeFor(agentId, ''),
+      );
+    } catch (error) {
+      throw WorkspaceIoException(
+        'SSH 工作空间租约登记失败（ssh_executor 执行站不可用？）：$error',
+      );
+    }
+    final _SshWorkspaceLease lease = _SshWorkspaceLease(
+      leaseId: (result['lease_id'] ?? leaseId).toString(),
+      connId: (result['conn_id'] ?? '').toString(),
+      root: (result['root'] ?? '').toString().trim(),
+    );
+    if (lease.root.isEmpty || !lease.root.startsWith('/')) {
+      throw WorkspaceIoException(
+        'SSH 工作空间租约登记未返回远端绝对根（agent=$agentId）',
+      );
+    }
+    _sshLeases[key] = lease;
+    return lease;
+  }
+
+  /// 租约缓存键：同一个 agent 的 SSH 配置变了（host/root/login_shell）就重新登记。
+  static String _sshLeaseKey(String agentId, SshConfig ssh) =>
+      '$agentId|${_sshLeaseId(ssh)}';
+
+  /// 确定性租约 id（与 ssh_executor 侧同形；仅作标识，不参与路径解析）。
+  static String _sshLeaseId(SshConfig ssh) {
+    final String loginShell = ssh.loginShell == null
+        ? '~'
+        : (ssh.loginShell!.isEmpty ? '!' : ssh.loginShell!);
+    final String identity = <String>[
+      ssh.host,
+      ssh.port.toString(),
+      ssh.username,
+      ssh.root,
+      loginShell,
+    ].join('|');
+    return 'ssh_ws_${base64Url.encode(utf8.encode(identity)).replaceAll('=', '')}';
+  }
+
   /// 工作空间根目录（本机绝对路径；SSH 团队返回空串）。
+  ///
+  /// SSH 返回空串是**刻意的**：核心 `workspace/register` 只认本机存在目录，
+  /// 远端根登记不进去；SSH 的租约路径见 [_sshLeaseFor]（插件侧租约）。
   String _workspaceDirOf(String agentId) {
     final CoreAgent? agent = store.agent(agentId);
     if (agent == null) return TreePaths(paths.root).defaultWorkspaceDir(agentId);
@@ -582,7 +746,18 @@ class AgentRuntime {
     if (agent == null) return null;
     if (stationClient == null) return null;
     final Map<String, dynamic> scope = _stationScopeFor(agentId, sessionId);
-    final String root = _workspaceDirOf(agentId);
+    String root = _workspaceDirOf(agentId);
+    if (root.isEmpty) {
+      // SSH：这里给的是**工作空间身份**而不是本机路径——只有登记租约后才知道远端
+      // 绝对根；而 WorkspaceIO.root 还被 vision file_id 缓存当键（换主机/账号/根
+      // 必须换键），所以带上 host/port/user。真正路径解析在 ssh_executor 站内完成。
+      final SshConfig? ssh = teamSshConfigFor(agent, store.agent);
+      if (ssh != null) {
+        final String configured = ssh.root.isEmpty ? '~' : ssh.root;
+        final String user = ssh.username.isEmpty ? '-' : ssh.username;
+        root = 'ssh://$user@${ssh.host}:${ssh.port}/$configured';
+      }
+    }
     return StationCompatIo(
       StationWorkspaceIo(
         client: _stationCommand,
@@ -631,4 +806,21 @@ class AgentRuntime {
     await store.close();
     _byRoot.removeWhere((String _, AgentRuntime runtime) => identical(runtime, this));
   }
+}
+
+/// tree.agent 视角的 SSH 工作空间租约（句柄；真实状态在 `ssh_executor` 执行站里）。
+class _SshWorkspaceLease {
+  const _SshWorkspaceLease({
+    required this.leaseId,
+    required this.connId,
+    required this.root,
+  });
+
+  final String leaseId;
+
+  /// ssh_executor 的隧道会话 id（诊断 / 测试用；不参与命令参数）。
+  final String connId;
+
+  /// 目标机上的绝对工作空间根（执行站登记时由 `agent.hello.root` 回填）。
+  final String root;
 }

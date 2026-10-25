@@ -141,7 +141,26 @@ Future<int> runSelfTest({void Function(String line)? emit}) async {
     '帧里没有 ui/manifest',
   );
 
-  // ── 7. 版本注入：产物自报的版本必须来自 -DkAgentVersion ─────────────────
+  // ── 7. hello 后申报 SSH 工作空间执行站（tree.agent 的 SSH IO 走它） ──────
+  Map<String, dynamic>? executeStation;
+  for (final Map<String, dynamic> frame in frames) {
+    if (frame['method'] == PluginMethods.stationRegister) {
+      executeStation = frame;
+      break;
+    }
+  }
+  final Object? stationParams = executeStation?['params'];
+  check(
+    'hello 后申报执行站（kind=execute / shared / 命令含 ssh.file.read）',
+    stationParams is Map &&
+        stationParams['kind'] == 'execute' &&
+        stationParams['shared'] == true &&
+        stationParams['commands'] is List &&
+        (stationParams['commands'] as List<dynamic>).contains('ssh.file.read'),
+    '帧里没有合法的 station/register',
+  );
+
+  // ── 8. 版本注入：产物自报的版本必须来自 -DkAgentVersion ─────────────────
   // 兜底值是 '0.0.0-dev'（tree_tunnel_protocol 的 constants.dart）。停在兜底值意味着
   // "release 产物说自己叫 0.0.0-dev"：目标机驻留目录按版本命名 ⇒ 每次装都当新版本重推，
   // 而面板上那一行版本号也是假的。
@@ -152,7 +171,7 @@ Future<int> runSelfTest({void Function(String line)? emit}) async {
   );
   say('  自报 agent 版本：$kAgentVersion');
 
-  // ── 8. shutdown 后自己退出，退出码 0 ───────────────────────────────────
+  // ── 9. shutdown 后自己退出，退出码 0 ───────────────────────────────────
   coreIn.add(encodeFrame(rpcNotification(PluginMethods.shutdown)));
   final int code = await exitCode.timeout(
     const Duration(seconds: 10),
@@ -162,7 +181,7 @@ Future<int> runSelfTest({void Function(String line)? emit}) async {
   await coreIn.close();
 
   if (failures.isEmpty) {
-    say('自检全绿：ssh_executor 协议面 8 条');
+    say('自检全绿：ssh_executor 协议面 9 条');
     return 0;
   }
   say('自检失败 ${failures.length} 条：${failures.join('；')}');
