@@ -1,7 +1,7 @@
 name: tree_local_executor
 description: 本机执行器插件（local_executor）：在 workspace 租约根目录内执行 fs.* 与 terminal.exec。
 publish_to: 'none'
-version: 0.1.0
+version: 0.2.0
 
 environment:
   sdk: ^3.13.0

@@ -11,13 +11,23 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'local_executor';
 const String kDisplayName = '本机执行器';
-const String kVersion = '0.1.0';
+const String kVersion = '0.2.0';
 
-/// 执行站点位 → 本插件接管的命令。
-const Map<String, List<String>> kMounts = <String, List<String>>{
-  'system.execute.fs': <String>['fs.read', 'fs.write', 'fs.list', 'fs.grep'],
-  'system.execute.terminal': <String>['terminal.exec'],
-};
+/// 自建执行站：插件内部定义命令，核心只登记与路由。
+const List<String> kExecutorCommands = <String>[
+  'file.read',
+  'file.write',
+  'file.list',
+  'file.grep',
+  'file.delete',
+  'file.mkdir',
+  'file.writeBytes',
+  'exec.command',
+];
+
+const String kStationReadme =
+    '本机执行器自建执行站：接 file.* / exec.command。调用方带 lease_id + '
+    '工作空间内相对路径，核心只登记 lease_id → 目录并路由，不碰文件、不起进程。';
 
 PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
   channel: PluginChannel.stdio(kPluginId),
@@ -30,21 +40,23 @@ PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
 
 Future<void> _onReady(PluginKitServer server) async {
   server.channel.log('已上线：v$kVersion（本机执行器，L-24）');
-  for (final MapEntry<String, List<String>> entry in kMounts.entries) {
-    try {
-      final Map<String, dynamic> result = await server.channel.command(
-        'plugin.mount',
-        <String, dynamic>{
-          'station_id': entry.key,
-          'commands': entry.value,
-        },
-      );
-      server.channel.log(
-        '挂载 $entry.key：${result['ok'] == true ? '成功' : result['error'] ?? '失败'}',
-      );
-    } catch (error) {
-      server.channel.log('挂载 $entry.key 失败：$error');
-    }
+  try {
+    final Map<String, dynamic> result = await server.channel.request(
+      M.stationRegister,
+      <String, dynamic>{
+        'kind': 'execute',
+        'name': 'local',
+        'description': '本机执行器（file.* / exec.command）',
+        'readme': kStationReadme,
+        'commands': kExecutorCommands,
+        'shared': true,
+      },
+    );
+    server.channel.log(
+      '自建执行站：${result['ok'] == true ? result['station_id'] : result['error']}',
+    );
+  } catch (error) {
+    server.channel.log('自建执行站失败：$error');
   }
 }
 
@@ -130,6 +142,34 @@ Future<int> selfTest() async {
       rejected = true;
     }
     check.that(rejected, '越界路径被拒绝');
+
+    final Map<String, dynamic> made = await executor.execute('fs.mkdir', <String, dynamic>{
+      ...root,
+      'path': 'bin',
+    });
+    check.check(made['created'], true, 'fs.mkdir 创建目录');
+
+    final Map<String, dynamic> bytes = await executor.execute('fs.writeBytes', <String, dynamic>{
+      ...root,
+      'path': 'bin/a.bin',
+      'base64': 'AQID',
+    });
+    check.check(bytes['bytes_written'], 3, 'fs.writeBytes 写入二进制');
+    check.check(
+      File('${temp.path}/bin/a.bin').readAsBytesSync(),
+      <int>[1, 2, 3],
+      'fs.writeBytes 字节内容',
+    );
+
+    final Map<String, dynamic> deleted = await executor.execute('fs.delete', <String, dynamic>{
+      ...root,
+      'path': 'bin/a.bin',
+    });
+    check.check(deleted['deleted'], true, 'fs.delete 删除文件');
+    check.that(
+      !File('${temp.path}/bin/a.bin').existsSync(),
+      '删除后文件不存在',
+    );
 
     final Map<String, dynamic> terminal = await executor.execute('terminal.exec', <String, dynamic>{
       ...root,

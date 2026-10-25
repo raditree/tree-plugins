@@ -1,7 +1,7 @@
 {
   "id": "local_executor",
   "name": "本机执行器",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "本机文件与终端执行器：挂载核心执行站的 fs.* / terminal.exec 命令，在租约根目录内读写与执行；核心不碰文件、不起进程。",
   "runtime": "headless",
   "files": [

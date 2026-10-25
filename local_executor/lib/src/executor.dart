@@ -21,14 +21,28 @@ class LocalExecutor {
   ) async {
     switch (command) {
       case 'fs.read':
+      case 'file.read':
         return _read(arguments);
       case 'fs.write':
+      case 'file.write':
         return _write(arguments);
       case 'fs.list':
+      case 'file.list':
         return _list(arguments);
       case 'fs.grep':
+      case 'file.grep':
         return _grep(arguments);
+      case 'fs.delete':
+      case 'file.delete':
+        return _delete(arguments);
+      case 'fs.mkdir':
+      case 'file.mkdir':
+        return _mkdir(arguments);
+      case 'fs.writeBytes':
+      case 'file.writeBytes':
+        return _writeBytes(arguments);
       case 'terminal.exec':
+      case 'exec.command':
         return _terminal(arguments);
       default:
         throw ExecutorError('本机执行器不支持命令：$command');
@@ -150,6 +164,62 @@ class LocalExecutor {
       'entries': entries,
       'count': entries.length,
       'truncated': entries.length >= maxEntries,
+    };
+  }
+
+  Future<Map<String, dynamic>> _delete(Map<String, dynamic> args) async {
+    final String root = _root(args);
+    final String relative = (args['path'] ?? '').toString();
+    final String path = _resolve(root, relative);
+    final FileSystemEntityType type = FileSystemEntity.typeSync(path);
+    if (type == FileSystemEntityType.notFound) {
+      throw ExecutorError('路径不存在：$relative');
+    }
+    final bool recursive = args['recursive'] == true;
+    if (type == FileSystemEntityType.directory) {
+      final Directory dir = Directory(path);
+      if (!recursive && dir.listSync().isNotEmpty) {
+        throw ExecutorError('目录非空，删除需要 recursive=true：$relative');
+      }
+      dir.deleteSync(recursive: recursive);
+    } else {
+      File(path).deleteSync();
+    }
+    return <String, dynamic>{'path': relative, 'deleted': true};
+  }
+
+  Future<Map<String, dynamic>> _mkdir(Map<String, dynamic> args) async {
+    final String root = _root(args);
+    final String relative = (args['path'] ?? '').toString();
+    final String path = _resolve(root, relative);
+    final Directory dir = Directory(path);
+    if (!dir.existsSync()) {
+      dir.createSync(recursive: args['recursive'] != false);
+    }
+    return <String, dynamic>{'path': relative, 'created': true};
+  }
+
+  Future<Map<String, dynamic>> _writeBytes(Map<String, dynamic> args) async {
+    final String root = _root(args);
+    final String relative = (args['path'] ?? '').toString();
+    final String path = _resolve(root, relative);
+    final String encoded = (args['base64'] ?? args['content_base64'] ?? '')
+        .toString();
+    if (encoded.isEmpty) {
+      throw ExecutorError('fs.writeBytes 需要 base64（要写入的二进制）');
+    }
+    final List<int> bytes;
+    try {
+      bytes = base64Decode(encoded);
+    } on FormatException {
+      throw ExecutorError('fs.writeBytes 的 base64 非法');
+    }
+    final File file = File(path);
+    await file.parent.create(recursive: true);
+    await file.writeAsBytes(bytes, flush: true);
+    return <String, dynamic>{
+      'path': _relative(root, path),
+      'bytes_written': bytes.length,
     };
   }
 
