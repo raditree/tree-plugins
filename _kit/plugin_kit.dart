@@ -31,6 +31,10 @@ abstract final class M {
   static const String toolsCall = 'tools/call';
   static const String ping = 'ping';
   static const String stationRequest = 'station/request';
+
+  /// 核心 → 插件：委派一次 HTTP 请求（片 C）。插件按 `params.path` 自作分发，
+  /// 回 `{status, headers?, body?}`；超过 1 MiB 的响应用 `result_path`。
+  static const String apiDelegate = 'api/delegate';
   static const String stationCancel = 'station/cancel';
   static const String event = 'event';
   static const String shutdown = 'shutdown';

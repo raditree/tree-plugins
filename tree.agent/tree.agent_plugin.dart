@@ -1,20 +1,20 @@
-// tree.agent —— agent 领域插件（批次 G）的 **A1 骨架**。
+// tree.agent —— agent 领域插件（批次 G）。
 //
-// A1 的验收（agent_pluginization.md §6）：空插件能被启停；日志出现在
-// `/api/logs/plugin:tree.agent`。本文件因此只做四件事：
-//   1. hello / ping（骨架统一回答，缺一个就是整条插件不可用）；
-//   2. `tools/list`：空表（tools/list 是可选能力，缺失或为空不得阻断上线）；
-//   3. `system.collect.api.routes` 收集站：如实回空表（A2 起按对照表逐组填）；
-//   4. 上线时写一条 stderr 与一条 log 通知——日志 API 的写入侧就在这两条路上。
+// A1（已完成）：hello / ping / 空 tools-list / 收集站 / 两路日志。
+// A2（进行中）：`api/delegate` 管道 + 第一条只读路由
+// `GET /api/agents/{agentId}/todos`（实现见 `lib/src/delegate.dart`）。
+// 其余 35 条与广播 topic 按 `docs/pluginization/agent_api_contract.md` 逐批搬入。
 //
-// **不做**：36 条委派路由、广播 topic、数据接管——那些是 A2~A5，按
-// `docs/pluginization/agent_api_contract.md` 与 agent_pluginization.md §6 逐批搬入。
+// 本文件仍是"接线层"：骨架统一回答 hello/ping/tools-list，业务全部落在
+// `package:tree_agent_loop` 里；生产与 `--selftest` 共用同一套处理函数。
 //
 // 依赖纪律：本插件不得 import 任何核心包（tree_core / tree_protocol）；
 // 骨架与领域库都在本仓内（`../_kit` 与 `package:tree_agent_loop`）。
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
+import 'package:path/path.dart' as p;
 import 'package:tree_agent_loop/tree_agent_loop.dart';
 
 import '../_kit/plugin_kit.dart';
@@ -38,17 +38,25 @@ PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
 Future<void> _onReady(PluginKitServer server) async {
   // **两路日志都主动写一条**：A1 的验收就是"插件自己的日志能从日志 API 查到"。
   // stderr 进 [stderr] 行，log 通知进 [notify:info] 行（见片 F 的 PluginLogSink）。
-  server.channel.log('已上线：v$kTreeAgentVersion（A1 骨架，委派路由 0 条）');
-  server.channel.logNotify('tree.agent 已上线（v$kTreeAgentVersion，A1 骨架）');
+  server.channel.log(
+    '已上线：v$kTreeAgentVersion（A2，已申报 ${kDeclaredRoutes.length} 条委派路由）',
+  );
+  server.channel.logNotify(
+    'tree.agent 已上线（v$kTreeAgentVersion，已申报 ${kDeclaredRoutes.length} 条路由）',
+  );
 }
 
-/// 骨架不认识的方法（当前只有收集站）。
+/// 骨架不认识的方法：收集站申报 + 委派执行。
 ///
 /// 返回 null = 让骨架回 -32601（不静默）；抛异常由骨架收敛成 -32603。
 Future<Map<String, dynamic>?> handleRequest(
   String method,
   Map<String, dynamic> params,
 ) async {
+  if (method == M.apiDelegate) {
+    // 核心 → 插件：委派一次 HTTP 请求；params 就是信封本体。
+    return handleApiDelegate(asMap(params));
+  }
   if (method == M.stationRequest) {
     final String station = asString(params['station_id']);
     if (station == kApiRoutesStation) {
@@ -77,74 +85,158 @@ Future<void> main(List<String> args) async {
   }
 }
 
-/// 假核心自检（**同码**跑真读循环）：A1 的四条上线要件 + 日志通知。
+/// 假核心自检（**同码**跑真读循环）：A1 上线要件 + A2 第一条委派路由。
 Future<int> selfTest() async {
   final SelfTest check = SelfTest(name: 'tree_agent_plugin');
-  final PluginKitServer server = PluginKitServer(
-    channel: PluginChannel(logTag: 'tree_agent_plugin'),
-    pluginId: kPluginId,
-    displayName: kDisplayName,
-    onReady: _onReady,
-    onRequest: handleRequest,
-    // 自检里不许退出进程：否则后续断言都跑不到。
-    exitOnShutdown: false,
+  final Directory temp = Directory.systemTemp.createTempSync(
+    'tree_agent_selftest_',
   );
-  final FakeCore core = FakeCore(server);
-  unawaited(core.start());
+  try {
+    // 数据根夹具：agent 配置（只验存在性）+ 待办 markdown（含一条裸行）。
+    File(p.join(temp.path, 'agents', 'agt.yaml'))
+      ..createSync(recursive: true)
+      ..writeAsStringSync('id: agt\nname: 夹具\n');
+    File(p.join(temp.path, 'data', 'agt', 'session_default', 'todos.md'))
+      ..createSync(recursive: true)
+      ..writeAsStringSync(
+        '# Tree 会话待办（夹具）\n\n'
+        '- [~] t1 | status=in_progress progress=40 | 写读路径\n'
+        '- [ ] 裸行待办\n',
+      );
 
-  core.ask(0, M.hello, <String, dynamic>{'plugin_id': kPluginId});
-  core.ask(1, M.ping);
-  core.ask(2, M.toolsList);
-  core.ask(3, M.stationRequest, <String, dynamic>{
-    'station_id': kApiRoutesStation,
-    'payload': <String, dynamic>{},
-  });
-  core.ask(4, 'no_such/method');
+    final PluginKitServer server = PluginKitServer(
+      channel: PluginChannel(logTag: 'tree_agent_plugin'),
+      pluginId: kPluginId,
+      displayName: kDisplayName,
+      onReady: _onReady,
+      onRequest: handleRequest,
+      // 自检里不许退出进程：否则后续断言都跑不到。
+      exitOnShutdown: false,
+    );
+    final FakeCore core = FakeCore(server);
+    unawaited(core.start());
 
-  final Map<Object?, Map<String, dynamic>> byId = await core.waitFor(<int>[
-    0,
-    1,
-    2,
-    3,
-    4,
-  ]);
+    Map<String, dynamic> envelope(String path, String agentId) =>
+        <String, dynamic>{
+          'method': 'GET',
+          'path': path,
+          'params': <String, dynamic>{'agentId': agentId},
+          'query': <String, dynamic>{'session_id': 'session_default'},
+          'headers': <String, dynamic>{},
+          'scope': <String, dynamic>{},
+          'workspace_dir': '',
+          'data_dir': temp.path,
+          'agent_id': agentId,
+          'team_id': agentId,
+          'request_id': 'selftest-$agentId-$path',
+        };
 
-  check.that(byId.length == 5, '五条请求都有回包', actual: '${byId.length}');
-  check.check(
-    byId[0]?['result']?['plugin_id'],
-    kPluginId,
-    'hello 自报 plugin_id',
-  );
-  check.check(byId[0]?['result']?['name'], kDisplayName, 'hello 自报展示名');
-  check.check(byId[1]?['result']?['ok'], true, 'ping 回 ok');
-  check.check(
-    byId[2]?['result']?['tools'],
-    <dynamic>[],
-    'A1 工具表为空（tools/list 可选，不阻断上线）',
-  );
-  check.that(
-    byId[3]?['result']?['reply']?['payload']?['routes'] is List &&
-        (byId[3]?['result']?['reply']?['payload']?['routes'] as List).isEmpty,
-    '委派路由申报回空表（如实申报、不是未响应）',
-    actual: '${byId[3]?['result']}',
-  );
-  check.that(byId[4]?['error'] != null, '未知方法回错误（不静默丢弃）');
+    core.ask(0, M.hello, <String, dynamic>{'plugin_id': kPluginId});
+    core.ask(1, M.ping);
+    core.ask(2, M.toolsList);
+    core.ask(3, M.stationRequest, <String, dynamic>{
+      'station_id': kApiRoutesStation,
+      'payload': <String, dynamic>{},
+    });
+    core.ask(4, 'no_such/method');
+    core.ask(5, M.apiDelegate, envelope(todosPattern, 'agt'));
+    core.ask(6, M.apiDelegate, envelope(todosPattern, 'nope'));
+    core.ask(
+      7,
+      M.apiDelegate,
+      envelope('/api/agents/agt/sessions', 'agt'),
+    );
 
-  // 上线通知是异步发的：轮询等它到达（最多 2s）。
-  final DateTime deadline = DateTime.now().add(const Duration(seconds: 2));
-  while (core.outgoing(M.log).isEmpty && DateTime.now().isBefore(deadline)) {
-    await Future<void>.delayed(const Duration(milliseconds: 20));
+    final Map<Object?, Map<String, dynamic>> byId = await core.waitFor(
+      <int>[0, 1, 2, 3, 4, 5, 6, 7],
+    );
+
+    check.that(byId.length == 8, '八条请求都有回包', actual: '${byId.length}');
+    check.check(
+      byId[0]?['result']?['plugin_id'],
+      kPluginId,
+      'hello 自报 plugin_id',
+    );
+    check.check(byId[0]?['result']?['name'], kDisplayName, 'hello 自报展示名');
+    check.check(byId[1]?['result']?['ok'], true, 'ping 回 ok');
+    check.check(
+      byId[2]?['result']?['tools'],
+      <dynamic>[],
+      'A1 工具表为空（tools/list 可选，不阻断上线）',
+    );
+    check.check(
+      byId[3]?['result']?['reply']?['payload']?['routes'],
+      kDeclaredRoutes,
+      '收集站申报与常量表一致（如实申报）',
+    );
+    check.that(byId[4]?['error'] != null, '未知方法回错误（不静默丢弃）');
+
+    // ── A2：GET /api/agents/{agentId}/todos ────────────────────────────
+    final Map<String, dynamic> ok =
+        (byId[5]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+    check.check(ok['status'], 200, 'todos：200');
+    final Map<String, dynamic> okBody =
+        (jsonDecode('${ok['body'] ?? '{}'}') as Map).cast<String, dynamic>();
+    check.check(okBody['session_id'], 'session_default', 'todos：回 session_id');
+    check.check(okBody['todos'], <dynamic>[
+      <String, dynamic>{
+        'id': 't1',
+        'content': '写读路径',
+        'status': 'in_progress',
+        'progress': 40,
+        'updated_at': 0,
+      },
+      <String, dynamic>{
+        'id': 'h1',
+        'content': '裸行待办',
+        'status': 'pending',
+        'progress': 0,
+        'updated_at': 0,
+      },
+    ], 'todos：字段与解析（含裸行 → h1）');
+
+    final Map<String, dynamic> missing =
+        (byId[6]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+    check.check(missing['status'], 404, 'todos：未知 agent ⇒ 404');
+    check.check(
+      jsonDecode('${missing['body'] ?? '{}'}'),
+      <String, dynamic>{'detail': 'agent 不存在'},
+      'todos：404 错误体与核心一致',
+    );
+
+    final Map<String, dynamic> notImplemented =
+        (byId[7]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+    check.check(notImplemented['status'], 501, '未搬路由：501（不是 404）');
+    check.that(
+      jsonDecode('${notImplemented['body'] ?? '{}'}')['detail']
+          .toString()
+          .contains('尚未实现'),
+      '未搬路由：可读原因',
+      actual: '${notImplemented['body']}',
+    );
+
+    // 上线通知是异步发的：轮询等它到达（最多 2s）。
+    final DateTime deadline = DateTime.now().add(const Duration(seconds: 2));
+    while (core.outgoing(M.log).isEmpty && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    final List<Map<String, dynamic>> notifications = core.outgoing(M.log);
+    check.that(
+      notifications.any(
+        (Map<String, dynamic> frame) =>
+            '${frame['params']?['message'] ?? ''}'.contains('tree.agent 已上线'),
+      ),
+      '上线 log 通知已发出（日志 API 写入侧）',
+      actual: '${notifications.length} 条',
+    );
+
+    await core.close();
+    return check.finish(core.logs);
+  } finally {
+    try {
+      temp.deleteSync(recursive: true);
+    } catch (_) {
+      // 清理失败不影响退出码（Windows 上偶发占用）。
+    }
   }
-  final List<Map<String, dynamic>> notifications = core.outgoing(M.log);
-  check.that(
-    notifications.any(
-      (Map<String, dynamic> frame) =>
-          '${frame['params']?['message'] ?? ''}'.contains('tree.agent 已上线'),
-    ),
-    '上线 log 通知已发出（日志 API 写入侧）',
-    actual: '${notifications.length} 条',
-  );
-
-  await core.close();
-  return check.finish(core.logs);
 }

@@ -1,7 +1,9 @@
 # tree.agent（批次 G 的 agent 领域插件）
 
-> 状态：**A1 骨架**（2026-10-25）。空插件可上线、可停用；日志写入
-> `/api/logs/plugin:tree.agent`；委派路由如实申报 0 条。
+> 状态：**A2 进行中**（2026-10-25）。A1 骨架完成；A2 首批：`api/delegate` 管道 +
+> `GET /api/agents/{agentId}/todos`（与核心同数据根**逐字节等价**，见桌面仓
+> `packages/tree_core/tool/verify_agent_equivalence.dart`）。日志写入
+> `/api/logs/plugin:tree.agent`。
 > 迁移契约与验收见桌面仓：
 > - `docs/pluginization/agent_pluginization.md`（迁移计划 / A1~A5）
 > - `docs/pluginization/agent_api_contract.md`（36 条逐条契约 + C-01~C-12 决策）
@@ -14,7 +16,7 @@
 | 阶段 | 内容 | 本仓状态 |
 | --- | --- | --- |
 | A1 | 骨架：stdio 循环、hello/ping、工具表、收集站申报、日志 | **已完成** |
-| A2 | 只读面：agents / models / sessions / todos / subagents / teammates / tools-running | 未开始 |
+| A2 | 只读面：agents / models / sessions / todos / subagents / teammates / tools-running | **进行中**：todos 已搬并等价；其余 7 组未开始 |
 | A3 | 写路径与生成：消息、取消、LLM、工具编排、提问、reset/compact | 未开始 |
 | A4 | 帧迁移：注册广播站，topic 沿用原帧名 | 未开始 |
 | A5 | 交接：核心删除 34 条路由 + 2 条上行 + 领域目录 | 未开始 |
@@ -47,6 +49,16 @@ plugins:
     scope: {}
 ```
 
+## 代码结构
+
+```
+tree.agent_plugin.dart     入口：hello/ping/tools-list、收集站、api/delegate 分发、--selftest
+lib/tree_agent_loop.dart   身份常量 + 已申报路由表 + 导出
+lib/src/paths.dart         数据根布局（与核心 TreePaths 同一串落盘点，含 safeSegment）
+lib/src/todo_store.dart    todos.md 解析（与核心 FileTodoStore 同一正则）
+lib/src/delegate.dart      api/delegate 信封 → 路由分发 → {status, headers, body}
+```
+
 ## A2 起怎么搬
 
 按 `docs/pluginization/agent_api_contract.md` 的 §1 逐组实现，**先只读、后写**；
@@ -54,3 +66,12 @@ plugins:
 不改行为）。数据来自核心的数据根（原地接管，不搬迁），通过核心的文档化出口
 （`workspace/register` 租约、`/api/store/tree.agent`、`/api/logs/plugin:tree.agent`）
 而不是 import 核心包。
+
+每搬一条路由的验收步骤：
+
+1. 在 `kDeclaredRoutes` 加申报（双跑期核心会标 shadowed、继续自己承接）；
+2. 在 `delegate.dart` 加分支（信封里的 `data_dir` 就是数据根，别自行推导）；
+3. 在 `--selftest` 加一条**代码推导**的样例断言；
+4. 在桌面仓 `packages/tree_core/tool/verify_agent_equivalence.dart` 加同一路由的
+   种子 + 请求，跑通「核心 HTTP vs 插件 `api/delegate` 逐字节一致」；
+5. 全绿后才允许核心删除对应实现（G-2，不变量 27）。
