@@ -22,8 +22,11 @@ import '../store/subagent_registry.dart';
 import '../store/subagent_store.dart';
 import '../store/tree_paths.dart';
 import '../store/usage_log.dart';
+import '../team/team_workspace.dart';
+import '../tool/station_tool_runner.dart';
 import '../tool/subagent_tool.dart';
 import '../tool/tool_run_registry.dart';
+import '../workspace/station_command.dart';
 import '../ws/ws_hub.dart';
 
 /// 插件进程内**单个数据根**的运行时：存储 + 设置 + 提问回路 + 会话服务 + 临时员工。
@@ -86,6 +89,16 @@ class AgentRuntime {
             resolveModel: (String modelId) => settings.model(modelId),
             agentOverrides: overridesFor,
             usageLog: usageLog,
+            toolRunner: StationToolRunner(
+              client: (String command, Map<String, dynamic> arguments, Map<String, dynamic> scope) {
+                final StationCommandClient? client = stationClient;
+                if (client == null) {
+                  throw StateError('执行站未接线：station/command 不可用');
+                }
+                return client(command, arguments, scope);
+              },
+              scopeFor: _stationScopeFor,
+            ),
           ),
     );
     subagentService.runner = conversation.runSubagent;
@@ -120,6 +133,9 @@ class AgentRuntime {
   final List<Map<String, dynamic>> frames = <Map<String, dynamic>>[];
 
   Future<void>? _lastTurn;
+
+  /// 核心执行站命令入口（由插件入口在 hello 后注入；null = 未接线）。
+  static StationCommandClient? stationClient;
 
   static final Map<String, AgentRuntime> _byRoot = <String, AgentRuntime>{};
 
@@ -261,6 +277,24 @@ class AgentRuntime {
       'cancelled': cancelled,
       'idle': idle,
       'any_running': cancelled.isNotEmpty,
+    };
+  }
+
+  /// 执行站命令的身份：agent 的真实归属（TOP 自己 / 团队）与工作空间模式。
+  Map<String, dynamic> _stationScopeFor(String agentId, String sessionId) {
+    final CoreAgent? agent = store.agent(agentId);
+    if (agent == null) {
+      throw StateError('agent 不存在：$agentId');
+    }
+    final String team = agent.teamId.trim().isEmpty
+        ? agent.id
+        : agent.teamId.trim();
+    final bool remote = teamSshConfigFor(agent, store.agent) != null;
+    return <String, dynamic>{
+      'agent_id': agentId,
+      'team_id': team,
+      'mode_key': remote ? 'ssh' : 'local',
+      if (sessionId.isNotEmpty) 'session_id': sessionId,
     };
   }
 

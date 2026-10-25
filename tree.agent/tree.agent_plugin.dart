@@ -36,6 +36,9 @@ PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
 );
 
 Future<void> _onReady(PluginKitServer server) async {
+  // 执行站入口：hello 之后插件才能主动向核心下 station/command。
+  AgentRuntime.stationClient = (String command, Map<String, dynamic> arguments, Map<String, dynamic> scope) =>
+      server.channel.command(command, arguments, '', scope);
   // **两路日志都主动写一条**：A1 的验收就是"插件自己的日志能从日志 API 查到"。
   // stderr 进 [stderr] 行，log 通知进 [notify:info] 行（见片 F 的 PluginLogSink）。
   server.channel.log(

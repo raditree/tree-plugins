@@ -78,17 +78,20 @@ export 'src/tool/question_channel.dart';
 export 'src/tool/subagent_tool.dart';
 export 'src/tool/message_tool.dart';
 export 'src/tool/team_tool.dart';
+export 'src/tool/station_tool_runner.dart';
 export 'src/tool/todo_store.dart';
 export 'src/tool/tool_runs_scope.dart';
 export 'src/tool/tool_runner.dart';
 export 'src/util/liveness.dart';
 export 'src/util/tokens.dart';
+export 'src/workspace/station_command.dart';
+export 'src/workspace/station_workspace_io.dart';
 export 'src/workspace/workspace_io.dart';
 export 'src/ws/ws_hub.dart';
 export 'src/yaml_utils.dart';
 
 /// 插件版本（与 `plugin.json` 的 version 同源；发布时两处一起改）。
-const String kTreeAgentVersion = '0.15.0';
+const String kTreeAgentVersion = '0.16.0';
 
 /// 收集站 id：插件经它申报自己承担的 `{method, pattern}` 委派路由。
 const String kApiRoutesStation = 'system.collect.api.routes';

@@ -1,15 +1,10 @@
 # tree.agent（批次 G 的 agent 领域插件）
 
-> 状态：**A2 进行中**（2026-10-25）。A1 骨架完成；A2 已搬：`api/delegate` 管道 +
-> `GET /api/agents`、`GET /api/agents/{id}`、`GET …/teammates`、`GET /api/conversations/{id}`、
-> `GET …/sessions`、`GET …/sessions/{id}`、`GET …/todos`、`GET …/subagents`、
-> `GET /api/models`、`GET …/models-info`
-> （与核心同数据根**逐字节等价**，见桌面仓
-> `packages/tree_core/tool/verify_agent_equivalence.dart`）。日志写入
-> `/api/logs/plugin:tree.agent`。
-> 迁移契约与验收见桌面仓：
-> - `docs/pluginization/agent_pluginization.md`（迁移计划 / A1~A5）
-> - `docs/pluginization/agent_api_contract.md`（36 条逐条契约 + C-01~C-12 决策）
+> 状态：**A2 只读面已完成，A3 进行中**（2026-10-25）。A2 十条只读路由与核心同数据根逐字节等价
+> （`packages/tree_core/tool/verify_agent_equivalence.dart`）；A3 已平移领域代码、接 C-08 写端点与
+> 模型/会话/提问写路由，工具执行改走核心执行站（`StationToolRunner`）。日志写入
+> `/api/logs/plugin:tree.agent`。契约与验收见桌面仓 `docs/pluginization/agent_pluginization.md`
+> 与 `agent_api_contract.md`。
 
 ## 这是什么
 
@@ -19,8 +14,8 @@
 | 阶段 | 内容 | 本仓状态 |
 | --- | --- | --- |
 | A1 | 骨架：stdio 循环、hello/ping、工具表、收集站申报、日志 | **已完成** |
-| A2 | 只读面：agents / models / sessions / todos / subagents / teammates / tools-running | **进行中**：agents（列表/详情/teammates）、conversations（分页 + 提问叠加）、sessions（列表/详情）、todos、subagents、models、models-info 已搬并等价；仅剩 tools-running（依赖 A3 工具层随迁） |
-| A3 | 写路径与生成：消息、取消、LLM、工具编排、提问、reset/compact | 未开始 |
+| A2 | 只读面：agents / models / sessions / todos / subagents / teammates / tools-running | **已完成**：十条只读路由逐字节等价；tools-running 已接 |
+| A3 | 写路径与生成：消息、取消、LLM、工具编排、提问、reset/compact | **进行中**：领域代码已平移、C-08 与写路由已接、工具经执行站执行；剩余其余工具与 reset/compact |
 | A4 | 帧迁移：注册广播站，topic 沿用原帧名 | 未开始 |
 | A5 | 交接：核心删除 34 条路由 + 2 条上行 + 领域目录 | 未开始 |
 
