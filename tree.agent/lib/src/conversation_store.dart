@@ -1,6 +1,8 @@
+import 'agent/question_store.dart';
 import 'paths.dart';
-import 'question_store.dart';
 import 'session_store.dart';
+import 'store/tree_paths.dart';
+import 'tool/question_channel.dart';
 
 /// 会话历史单页上限（与核心 `CoreServer._historyPageMax` 同值）。
 const int kHistoryPageMax = 2000;
@@ -69,7 +71,9 @@ Map<String, dynamic> conversationPage(
     start = (pageSize > 0 && end > pageSize) ? end - pageSize : 0;
   }
 
-  final Map<String, QuestionView> questions = readQuestionViews(paths);
+  final FileQuestionStore questions = FileQuestionStore(
+    TreePaths(paths.root),
+  );
   final List<Map<String, dynamic>> page = <Map<String, dynamic>>[
     for (final Map<String, dynamic> message in ordered.sublist(start, end))
       _withQuestionOverlay(message, questions),
@@ -90,17 +94,16 @@ Map<String, dynamic> conversationPage(
 /// 这样 JSON 字节序也一致。
 Map<String, dynamic> _withQuestionOverlay(
   Map<String, dynamic> message,
-  Map<String, QuestionView> questions,
+  QuestionStore questions,
 ) {
   final Map<String, dynamic> json = Map<String, dynamic>.of(message);
   if ('${json['kind']}' != 'ask_user_question') return json;
-  final QuestionView? record = questions['${json['id']}'];
+  final QuestionRecord? record = questions.byId('${json['id']}');
   if (record == null) return json;
   json['answered'] = !record.isPending;
   json['answer'] = record.answer;
   json['questions'] = <Map<String, dynamic>>[
-    for (final AskedQuestionView question in record.questions)
-      question.toJson(),
+    for (final AskedQuestion question in record.questions) question.toJson(),
   ];
   json['answers'] = record.answers;
   if (record.options.isNotEmpty) json['options'] = record.options;
