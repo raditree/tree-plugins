@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -327,6 +328,38 @@ class LocalExecutor {
       return _startHook(root, command);
     }
     if (command.isEmpty) throw ExecutorError('terminal.exec 需要 command');
+    final int softTimeout =
+        ((args['timeout_seconds'] as num?)?.toInt() ?? 0);
+    if (softTimeout > 0) {
+      final Map<String, dynamic> started = await _startHook(root, command);
+      final String taskId = (started['task_id'] ?? '').toString();
+      final _HookTask task = _hooks[taskId]!;
+      try {
+        final int code = await task.exitCode!.timeout(
+          Duration(seconds: softTimeout),
+        );
+        final String output = await task.readLog();
+        _hooks.remove(taskId);
+        return <String, dynamic>{
+          'text': <String>[
+            '退出码 $code',
+            if (output.isNotEmpty) '--- 输出 ---',
+            if (output.isNotEmpty) output.trimRight(),
+          ].join('\n'),
+          'is_error': code != 0,
+          'exit_code': code,
+        };
+      } on TimeoutException {
+        return <String, dynamic>{
+          'text':
+              '[terminal] 命令超过软超时 ${softTimeout}s，未终止；已转后台。\ntask_id: $taskId\n日志：${task.logRelative}（用 read 查看，或 hook_action=status + task_id 查询）',
+          'is_error': false,
+          'task_id': taskId,
+          'log_relative': task.logRelative,
+          'adopted': true,
+        };
+      }
+    }
     final int timeout = ((args['timeout'] as num?)?.toInt() ?? 0);
     final bool windows = Platform.isWindows;
     final Process process = await Process.start(
@@ -434,6 +467,14 @@ class _HookTask {
       await sink.flush();
       await sink.close();
     } catch (_) {}
+  }
+
+  Future<String> readLog() async {
+    try {
+      return await logFile.readAsString();
+    } catch (_) {
+      return '';
+    }
   }
 
   Future<void> cancel() async {

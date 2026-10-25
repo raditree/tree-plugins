@@ -11,7 +11,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'local_executor';
 const String kDisplayName = '本机执行器';
-const String kVersion = '0.3.0';
+const String kVersion = '0.4.0';
 final LocalExecutor _executor = LocalExecutor();
 
 /// 自建执行站：插件内部定义命令，核心只登记与路由。
@@ -198,6 +198,21 @@ Future<int> selfTest() async {
           '${status['text']}'.contains('已结束'),
       'terminal hook 可查询状态',
     );
+    final Map<String, dynamic> soft = await executor.execute('exec.command', <String, dynamic>{
+      ...root,
+      'command': Platform.isWindows ? 'ping -n 6 127.0.0.1 >nul' : 'sleep 5',
+      'timeout_seconds': 1,
+    });
+    check.that(
+      (soft['task_id'] ?? '').toString().isNotEmpty,
+      '同步命令软超时转后台',
+    );
+    await executor.execute('exec.command', <String, dynamic>{
+      ...root,
+      'hook_action': 'cancel',
+      'task_id': (soft['task_id'] ?? '').toString(),
+    });
+
     final Map<String, dynamic> cancelled = await executor.execute('exec.command', <String, dynamic>{
       ...root,
       'hook_action': 'cancel',
