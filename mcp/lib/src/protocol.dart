@@ -1,3 +1,5 @@
+import 'methods.dart';
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -272,7 +274,7 @@ class McpProtocolClient {
 
   Future<void> _initialize() async {
     final Map<String, dynamic> result = await request(
-      'initialize',
+      McpMethods.initialize,
       <String, dynamic>{
         'protocolVersion': kMcpProtocolVersion,
         'capabilities': <String, dynamic>{
@@ -289,7 +291,7 @@ class McpProtocolClient {
       (result['capabilities'] as Map<dynamic, dynamic>? ?? const <dynamic, dynamic>{})
           .map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
     );
-    notify('notifications/initialized', <String, dynamic>{});
+    notify(McpMethods.initialized, <String, dynamic>{});
     await refreshAll();
   }
 
@@ -297,7 +299,7 @@ class McpProtocolClient {
   Future<void> refreshAll() async {
     if (capabilities.tools) {
       final List<McpToolInfo> next = <McpToolInfo>[];
-      for (final Map<String, dynamic> raw in await _listAll('tools/list', 'tools')) {
+      for (final Map<String, dynamic> raw in await _listAll(McpMethods.toolsList, 'tools')) {
         next.add(McpToolInfo.fromJson(raw));
       }
       tools
@@ -307,7 +309,7 @@ class McpProtocolClient {
     if (capabilities.resources) {
       final List<McpResourceInfo> nextResources = <McpResourceInfo>[];
       for (final Map<String, dynamic> raw
-          in await _listAll('resources/list', 'resources')) {
+          in await _listAll(McpMethods.resourcesList, 'resources')) {
         nextResources.add(McpResourceInfo.fromJson(raw));
       }
       resources
@@ -316,7 +318,7 @@ class McpProtocolClient {
       try {
         final List<McpResourceTemplate> nextTemplates = <McpResourceTemplate>[];
         for (final Map<String, dynamic> raw
-            in await _listAll('resources/templates/list', 'resourceTemplates')) {
+            in await _listAll(McpMethods.resourceTemplatesList, 'resourceTemplates')) {
           nextTemplates.add(McpResourceTemplate.fromJson(raw));
         }
         resourceTemplates
@@ -328,7 +330,7 @@ class McpProtocolClient {
     }
     if (capabilities.prompts) {
       final List<McpPromptInfo> nextPrompts = <McpPromptInfo>[];
-      for (final Map<String, dynamic> raw in await _listAll('prompts/list', 'prompts')) {
+      for (final Map<String, dynamic> raw in await _listAll(McpMethods.promptsList, 'prompts')) {
         nextPrompts.add(McpPromptInfo.fromJson(raw));
       }
       prompts
@@ -442,13 +444,13 @@ class McpProtocolClient {
 
   void _handleNotification(String method) {
     switch (method) {
-      case 'notifications/tools/list_changed':
+      case McpMethods.toolsListChanged:
         unawaited(_refreshTools());
-      case 'notifications/resources/list_changed':
+      case McpMethods.resourcesListChanged:
         unawaited(_refreshResources());
-      case 'notifications/prompts/list_changed':
+      case McpMethods.promptsListChanged:
         unawaited(_refreshPrompts());
-      case 'notifications/message':
+      case McpMethods.logMessage:
         // logging 通知只入队，供上下文/诊断读取。
       default:
         break;
@@ -493,7 +495,7 @@ class McpProtocolClient {
 
   void _handleServerRequest(Object id, String method, Object? _) {
     switch (method) {
-      case 'roots/list':
+      case McpMethods.rootsList:
         _write(<String, dynamic>{
           'jsonrpc': '2.0',
           'id': id,
@@ -503,7 +505,7 @@ class McpProtocolClient {
             ],
           },
         });
-      case 'ping':
+      case McpMethods.ping:
         _write(<String, dynamic>{'jsonrpc': '2.0', 'id': id, 'result': <String, dynamic>{}});
       default:
         _write(<String, dynamic>{
@@ -519,14 +521,14 @@ class McpProtocolClient {
 
   void setRoots(List<McpRoot> next) {
     roots = List<McpRoot>.unmodifiable(next);
-    notify('notifications/roots/list_changed', <String, dynamic>{});
+    notify(McpMethods.rootsListChanged, <String, dynamic>{});
   }
 
   Future<McpCallResult> callTool(
     String name,
     Map<String, dynamic> arguments,
   ) async {
-    final Map<String, dynamic> result = await request('tools/call', <String, dynamic>{
+    final Map<String, dynamic> result = await request(McpMethods.toolsCall, <String, dynamic>{
       'name': name,
       'arguments': arguments,
     });
@@ -552,7 +554,7 @@ class McpProtocolClient {
 
   Future<McpReadResult> readResource(String uri) async {
     final Map<String, dynamic> result = await request(
-      'resources/read',
+      McpMethods.resourcesRead,
       <String, dynamic>{'uri': uri},
     );
     final List<Map<String, dynamic>> contents = <Map<String, dynamic>>[
@@ -567,7 +569,7 @@ class McpProtocolClient {
     String name, [
     Map<String, dynamic> arguments = const <String, dynamic>{},
   ]) async {
-    final Map<String, dynamic> result = await request('prompts/get', <String, dynamic>{
+    final Map<String, dynamic> result = await request(McpMethods.promptsGet, <String, dynamic>{
       'name': name,
       'arguments': arguments,
     });

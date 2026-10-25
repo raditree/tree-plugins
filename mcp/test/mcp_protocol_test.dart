@@ -6,6 +6,14 @@ import 'package:test/test.dart';
 import 'package:tree_mcp/tree_mcp.dart';
 
 void main() {
+  test('协议方法常量：MCP 方法有独立家，不混入插件 RPC 面', () {
+    expect(McpMethods.all, contains(McpMethods.initialize));
+    expect(McpMethods.all, contains(McpMethods.resourcesRead));
+    expect(McpMethods.all, contains(McpMethods.promptsGet));
+    expect(McpMethods.all, contains(McpMethods.rootsList));
+    expect(McpMethods.all.length, 16);
+  });
+
   late McpProtocolClient client;
 
   setUp(() async {

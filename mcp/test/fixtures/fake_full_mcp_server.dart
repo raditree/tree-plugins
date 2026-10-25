@@ -1,3 +1,4 @@
+import 'package:tree_mcp/tree_mcp.dart';
 // ignore_for_file: unused_local_variable, prefer_interpolation_to_compose_strings
 import 'dart:async';
 import 'dart:convert';
@@ -63,7 +64,7 @@ void main() {
       return;
     }
     switch (method) {
-      case 'initialize':
+      case McpMethods.initialize:
         return reply(id, <String, dynamic>{
           'protocolVersion': '2025-06-18',
           'capabilities': <String, dynamic>{
@@ -74,9 +75,9 @@ void main() {
           },
           'serverInfo': <String, dynamic>{'name': 'fake-full-mcp', 'version': '1.0'},
         });
-      case 'ping':
+      case McpMethods.ping:
         return reply(id, <String, dynamic>{});
-      case 'tools/list':
+      case McpMethods.toolsList:
         final String cursor = (message['params'] as Map<dynamic, dynamic>? ??
                 const <dynamic, dynamic>{})
             .map((dynamic k, dynamic v) => MapEntry(k.toString(), v))['cursor']
@@ -101,7 +102,7 @@ void main() {
           ],
           'nextCursor': 'p2',
         });
-      case 'resources/list':
+      case McpMethods.resourcesList:
         return reply(id, <String, dynamic>{
           'resources': <Map<String, dynamic>>[
             <String, dynamic>{
@@ -112,13 +113,13 @@ void main() {
             },
           ],
         });
-      case 'resources/templates/list':
+      case McpMethods.resourceTemplatesList:
         return reply(id, <String, dynamic>{
           'resourceTemplates': <Map<String, dynamic>>[
             <String, dynamic>{'uriTemplate': 'mem://{id}', 'name': 'mem'},
           ],
         });
-      case 'prompts/list':
+      case McpMethods.promptsList:
         return reply(id, <String, dynamic>{
           'prompts': <Map<String, dynamic>>[
             <String, dynamic>{
@@ -130,7 +131,7 @@ void main() {
             },
           ],
         });
-      case 'resources/read':
+      case McpMethods.resourcesRead:
         final String uri = ((message['params'] as Map<dynamic, dynamic>? ??
                     const <dynamic, dynamic>{})['uri'] ?? '')
             .toString();
@@ -143,7 +144,7 @@ void main() {
             },
           ],
         });
-      case 'prompts/get':
+      case McpMethods.promptsGet:
         return reply(id, <String, dynamic>{
           'description': 'prompt-desc',
           'messages': <Map<String, dynamic>>[
@@ -153,7 +154,7 @@ void main() {
             },
           ],
         });
-      case 'tools/call':
+      case McpMethods.toolsCall:
         final Map<String, dynamic> params =
             (message['params'] as Map<dynamic, dynamic>? ?? const <dynamic, dynamic>{})
                 .map((dynamic k, dynamic v) => MapEntry(k.toString(), v));
@@ -170,7 +171,7 @@ void main() {
         }
         if (tool == 'roots') {
           final Map<String, dynamic> result = await ask(
-            'roots/list',
+            McpMethods.rootsList,
             <String, dynamic>{},
           );
           return reply(id, <String, dynamic>{
@@ -186,7 +187,7 @@ void main() {
           if (!tools.contains('added')) tools.add('added');
           write(<String, dynamic>{
             'jsonrpc': '2.0',
-            'method': 'notifications/tools/list_changed',
+            'method': McpMethods.toolsListChanged,
             'params': <String, dynamic>{},
           });
           return reply(id, <String, dynamic>{

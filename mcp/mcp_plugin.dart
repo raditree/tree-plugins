@@ -12,7 +12,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'mcp';
 const String kDisplayName = 'MCP 协议客户端';
-const String kVersion = '0.3.0';
+const String kVersion = '0.3.1';
 const String kCollectStation = 'plugin.tree.agent.collect.tools';
 const String kMetaTool = 'mcp';
 const String kResourcesTool = 'mcp_resources';
