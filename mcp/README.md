@@ -22,6 +22,8 @@
 | `mcp_prompts` | list / get 提示词 |
 | `mcp_context` | inventory / select / build 上下文 |
 
+服务 `initialize` 后 `refreshAll()` 自发现，工具定义由 `mcpToolSpecs()` 生成；
+tree.agent 在**每条新消息前**重收一次收集站，因此新连接的 MCP 工具会在下一轮进入工具表。
 全部经 tree.agent 的工具收集站贡献，执行走 `plugin.toolCall` → 本插件；
 没有 MCP 专用执行站、没有 tree.agent 内硬编码的 MCP 分支。
 

@@ -36,6 +36,22 @@ void main() {
     await client.close();
   });
 
+  test('工具自动暴露：已发现的 MCP 工具进入工具定义', () {
+    final List<Map<String, dynamic>> specs = mcpToolSpecs(
+      <String, McpProtocolClient>{'fake': client},
+    );
+    final Set<String> names = specs
+        .map((Map<String, dynamic> spec) => spec['name'].toString())
+        .toSet();
+    expect(names, contains('mcp'));
+    expect(names, contains('mcp_resources'));
+    expect(names, contains('mcp_prompts'));
+    expect(names, contains('mcp_context'));
+    expect(names, contains('mcp__fake__echo'));
+    expect(names, contains('mcp__fake__roots'));
+    expect(nativeMcpToolName('plugin__mcp__mcp__fake__echo'), 'mcp__fake__echo');
+  });
+
   test('initialize：能力协商 + tools/resources/prompts 自发现（分页拉全）', () {
     expect(client.protocolVersion, '2025-06-18');
     expect(client.serverInfo['name'], 'fake-full-mcp');

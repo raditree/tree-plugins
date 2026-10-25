@@ -12,7 +12,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'mcp';
 const String kDisplayName = 'MCP 协议客户端';
-const String kVersion = '0.3.1';
+const String kVersion = '0.3.2';
 const String kCollectStation = 'plugin.tree.agent.collect.tools';
 const String kMetaTool = 'mcp';
 const String kResourcesTool = 'mcp_resources';
@@ -81,74 +81,7 @@ List<McpServerConfig> _loadConfigs() {
   }
 }
 
-List<Map<String, dynamic>> _toolSpecs() => <Map<String, dynamic>>[
-  <String, dynamic>{
-    'name': kMetaTool,
-    'description': '[MCP] 查看与调用 MCP 工具（help/call）。',
-    'parameters': <String, dynamic>{
-      'type': 'object',
-      'properties': <String, dynamic>{
-        'action': <String, dynamic>{'type': 'string', 'enum': <String>['help', 'call']},
-        'tool_name': <String, dynamic>{'type': 'string'},
-        'arguments': <String, dynamic>{'type': 'object'},
-      },
-      'required': <String>['action'],
-    },
-  },
-  <String, dynamic>{
-    'name': kResourcesTool,
-    'description': '[MCP] 列出/读取资源（list/read），用于上下文注入。',
-    'parameters': <String, dynamic>{
-      'type': 'object',
-      'properties': <String, dynamic>{
-        'action': <String, dynamic>{'type': 'string', 'enum': <String>['list', 'read']},
-        'server': <String, dynamic>{'type': 'string'},
-        'uri': <String, dynamic>{'type': 'string'},
-      },
-      'required': <String>['action'],
-    },
-  },
-  <String, dynamic>{
-    'name': kPromptsTool,
-    'description': '[MCP] 列出/渲染提示词（list/get）。',
-    'parameters': <String, dynamic>{
-      'type': 'object',
-      'properties': <String, dynamic>{
-        'action': <String, dynamic>{'type': 'string', 'enum': <String>['list', 'get']},
-        'server': <String, dynamic>{'type': 'string'},
-        'name': <String, dynamic>{'type': 'string'},
-        'arguments': <String, dynamic>{'type': 'object'},
-      },
-      'required': <String>['action'],
-    },
-  },
-  <String, dynamic>{
-    'name': kContextTool,
-    'description': '[MCP] 上下文管理：inventory / select / build。',
-    'parameters': <String, dynamic>{
-      'type': 'object',
-      'properties': <String, dynamic>{
-        'action': <String, dynamic>{
-          'type': 'string',
-          'enum': <String>['inventory', 'select', 'build'],
-        },
-        'agent_id': <String, dynamic>{'type': 'string'},
-        'resources': <String, dynamic>{'type': 'array'},
-        'prompts': <String, dynamic>{'type': 'array'},
-      },
-      'required': <String>['action'],
-    },
-  },
-  for (final MapEntry<String, McpProtocolClient> entry in _clients.entries)
-    for (final McpToolInfo tool in entry.value.tools)
-      <String, dynamic>{
-        'name': 'mcp__${entry.key}__${tool.name}',
-        'description': '[${entry.key}] ${tool.description}',
-        'parameters': tool.inputSchema.isEmpty
-            ? <String, dynamic>{'type': 'object', 'properties': <String, dynamic>{}}
-            : tool.inputSchema,
-      },
-];
+List<Map<String, dynamic>> _toolSpecs() => mcpToolSpecs(_clients);
 
 Future<Map<String, dynamic>?> handleRequest(
   String method,
@@ -165,16 +98,12 @@ Future<Map<String, dynamic>?> handleRequest(
   return null;
 }
 
-String _nativeName(String name) => name.startsWith('plugin__mcp__')
-    ? name.substring('plugin__mcp__'.length)
-    : name;
-
 Future<Map<String, dynamic>> handleToolCall(
   String name,
   Map<String, dynamic> arguments,
   Map<String, dynamic> scope,
 ) async {
-  final String native = _nativeName(name);
+  final String native = nativeMcpToolName(name);
   try {
     if (native == kMetaTool ||
         native == kResourcesTool ||
@@ -319,7 +248,7 @@ Future<void> main(List<String> args) async {
   if (args.contains('--selftest')) {
     final List<String> errors = <String>[];
     if (_toolSpecs().length != 4) errors.add('无服务时应只有 4 个元/上下文工具');
-    if (_nativeName('plugin__mcp__mcp__files__read') != 'mcp__files__read') {
+    if (nativeMcpToolName('plugin__mcp__mcp__files__read') != 'mcp__files__read') {
       errors.add('命名空间剥离错误');
     }
     if (!_toolSpecs().any((Map<String, dynamic> tool) => tool['name'] == 'mcp')) {
