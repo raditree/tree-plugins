@@ -13,7 +13,10 @@ class ExecutorError implements Exception {
 
 /// 本机执行器：只认 `root`（租约根）与相对路径，**不认 agent/team/mode 身份**。
 class LocalExecutor {
-  const LocalExecutor();
+  LocalExecutor();
+
+  final Map<String, _HookTask> _hooks = <String, _HookTask>{};
+  int _hookSeq = 0;
 
   Future<Map<String, dynamic>> execute(
     String command,
@@ -301,6 +304,28 @@ class LocalExecutor {
   Future<Map<String, dynamic>> _terminal(Map<String, dynamic> args) async {
     final String root = _root(args);
     final String command = (args['command'] ?? '').toString().trim();
+    final String hookAction =
+        (args['hook_action'] ?? '').toString().trim().toLowerCase();
+    if (hookAction.isNotEmpty) {
+      final String taskId = (args['task_id'] ?? '').toString().trim();
+      final _HookTask? task = _hooks[taskId];
+      if (task == null) {
+        throw ExecutorError(
+          '未知 task_id：$taskId（现有：${_hooks.keys.join('、')}）',
+        );
+      }
+      if (hookAction == 'cancel') {
+        if (!task.running) return task.statusPayload();
+        await task.cancel();
+        return task.statusPayload(prefix: '已请求终止');
+      }
+      if (hookAction == 'status') return task.statusPayload();
+      throw ExecutorError('未知 hook_action：$hookAction（可用：status / cancel）');
+    }
+    if (args['hook'] == true) {
+      if (command.isEmpty) throw ExecutorError('command 不能为空');
+      return _startHook(root, command);
+    }
     if (command.isEmpty) throw ExecutorError('terminal.exec 需要 command');
     final int timeout = ((args['timeout'] as num?)?.toInt() ?? 0);
     final bool windows = Platform.isWindows;
@@ -334,6 +359,121 @@ class LocalExecutor {
       'text': text,
       'is_error': code != 0,
       'exit_code': code,
+    };
+  }
+
+  Future<Map<String, dynamic>> _startHook(
+    String root,
+    String command,
+  ) async {
+    final String id =
+        'hook_${++_hookSeq}_${DateTime.now().millisecondsSinceEpoch}';
+    final String relative = '.self/hooks/$id.log';
+    final File logFile = File(p.join(root, relative));
+    await logFile.parent.create(recursive: true);
+    final IOSink sink = logFile.openWrite();
+    final bool windows = Platform.isWindows;
+    final Process process = await Process.start(
+      windows ? 'cmd' : '/bin/sh',
+      windows ? <String>['/c', command] : <String>['-c', command],
+      workingDirectory: root,
+      runInShell: false,
+    );
+    final _HookTask task = _HookTask(
+      id: id,
+      command: command,
+      process: process,
+      logFile: logFile,
+      logRelative: relative,
+      sink: sink,
+      startedAt: DateTime.now(),
+    );
+    _hooks[id] = task;
+    process.stdout.listen(sink.add, onError: (_) {});
+    process.stderr.listen(sink.add, onError: (_) {});
+    task.exitCode = process.exitCode.then((int code) async {
+      task.running = false;
+      task.code = code;
+      await task.closeSink();
+      return code;
+    });
+    return <String, dynamic>{
+      'text':
+          '[terminal hook] 已在后台启动。\ntask_id: $id\n日志：$relative（用 read 查看，或 hook_action=status + task_id 查询）',
+      'is_error': false,
+      'task_id': id,
+      'log_relative': relative,
+    };
+  }
+
+}
+class _HookTask {
+  _HookTask({
+    required this.id,
+    required this.command,
+    required this.process,
+    required this.logFile,
+    required this.logRelative,
+    required this.sink,
+    required this.startedAt,
+  });
+
+  final String id;
+  final String command;
+  final Process process;
+  final File logFile;
+  final String logRelative;
+  final IOSink sink;
+  final DateTime startedAt;
+  bool running = true;
+  int? code;
+  Future<int>? exitCode;
+
+  Future<void> closeSink() async {
+    try {
+      await sink.flush();
+      await sink.close();
+    } catch (_) {}
+  }
+
+  Future<void> cancel() async {
+    if (!running) return;
+    if (Platform.isWindows) {
+      await Process.run('taskkill', <String>[
+        '/PID',
+        process.pid.toString(),
+        '/T',
+        '/F',
+      ]);
+    } else {
+      process.kill(ProcessSignal.sigterm);
+    }
+  }
+
+  Future<Map<String, dynamic>> statusPayload({String prefix = ''}) async {
+    String tail = '';
+    try {
+      if (logFile.existsSync()) {
+        final String all = await logFile.readAsString();
+        tail = all.length > 4000 ? all.substring(all.length - 4000) : all;
+      }
+    } catch (_) {}
+    final String state = running
+        ? '运行中'
+        : '已结束（exit_code=${code?.toString() ?? '未知'}）';
+    return <String, dynamic>{
+      'text': <String>[
+        if (prefix.isNotEmpty) prefix,
+        'task_id: $id',
+        '状态：$state',
+        '命令：$command',
+        '日志：$logRelative',
+        if (tail.isNotEmpty) '--- 日志尾部 ---',
+        if (tail.isNotEmpty) tail.trimRight(),
+      ].join('\n'),
+      'is_error': false,
+      'running': running,
+      if (code != null) 'exit_code': code,
     };
   }
 }

@@ -11,7 +11,8 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'local_executor';
 const String kDisplayName = '本机执行器';
-const String kVersion = '0.2.0';
+const String kVersion = '0.3.0';
+final LocalExecutor _executor = LocalExecutor();
 
 /// 自建执行站：插件内部定义命令，核心只登记与路由。
 const List<String> kExecutorCommands = <String>[
@@ -69,7 +70,7 @@ Future<Map<String, dynamic>?> handleRequest(
   final String command = asString(payload['command']);
   final Map<String, dynamic> arguments = asMap(payload['arguments']);
   try {
-    final Map<String, dynamic> result = await const LocalExecutor().execute(
+    final Map<String, dynamic> result = await _executor.execute(
       command,
       arguments,
     );
@@ -98,7 +99,7 @@ Future<int> selfTest() async {
   final SelfTest check = SelfTest(name: 'local_executor_plugin');
   final Directory temp = Directory.systemTemp.createTempSync('local_exec_');
   try {
-    const LocalExecutor executor = LocalExecutor();
+    final LocalExecutor executor = LocalExecutor();
     final Map<String, dynamic> root = <String, dynamic>{'root': temp.path};
 
     final Map<String, dynamic> written = await executor.execute('fs.write', <String, dynamic>{
@@ -178,6 +179,34 @@ Future<int> selfTest() async {
     check.that(
       '${terminal['text']}'.contains('hi'),
       'terminal.exec 能执行并回输出',
+    );
+
+    final Map<String, dynamic> hook = await executor.execute('exec.command', <String, dynamic>{
+      ...root,
+      'command': Platform.isWindows ? 'ping -n 5 127.0.0.1 >nul' : 'sleep 3',
+      'hook': true,
+    });
+    final String taskId = (hook['task_id'] ?? '').toString();
+    check.that(taskId.isNotEmpty, 'terminal hook 后台启动返回 task_id');
+    final Map<String, dynamic> status = await executor.execute('exec.command', <String, dynamic>{
+      ...root,
+      'hook_action': 'status',
+      'task_id': taskId,
+    });
+    check.that(
+      '${status['text']}'.contains('运行中') ||
+          '${status['text']}'.contains('已结束'),
+      'terminal hook 可查询状态',
+    );
+    final Map<String, dynamic> cancelled = await executor.execute('exec.command', <String, dynamic>{
+      ...root,
+      'hook_action': 'cancel',
+      'task_id': taskId,
+    });
+    check.that(
+      '${cancelled['text']}'.contains('已请求终止') ||
+          '${cancelled['text']}'.contains('已结束'),
+      'terminal hook 可取消',
     );
   } finally {
     try {
