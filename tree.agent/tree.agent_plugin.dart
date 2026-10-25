@@ -671,6 +671,12 @@ Future<int> selfTest() async {
         method: 'DELETE',
       ),
     );
+    core.ask(48, M.apiDelegate, postEnvelope(agentResetPattern, 'agt', <String, dynamic>{'target': 'all'}));
+    core.ask(
+      49,
+      M.apiDelegate,
+      postEnvelope(sshReconnectPattern, 'ghost', <String, dynamic>{}),
+    );
     core.ask(46, M.apiDelegate, envelope(specsPattern, 'agt'));
     core.ask(
       47,
@@ -693,10 +699,10 @@ Future<int> selfTest() async {
     );
 
     final Map<Object?, Map<String, dynamic>> byId = await core.waitFor(
-      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47],
+      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
     );
 
-    check.that(byId.length == 48, '四十八条请求都有回包', actual: '${byId.length}');
+    check.that(byId.length == 50, '五十条请求都有回包', actual: '${byId.length}');
     check.check(
       byId[0]?['result']?['plugin_id'],
       kPluginId,
@@ -1564,6 +1570,9 @@ Future<int> selfTest() async {
       '${postBody(47)['content'] ?? ''}'.isNotEmpty,
       'specs/detail：正文非空',
     );
+
+    check.check(postResult(48)['status'], 400, 'reset：无工作空间时 400');
+    check.check(postResult(49)['status'], 404, 'ssh/reconnect：未知 agent 404');
 
     // 生成是异步的：等它收尾再删临时目录。
     await AgentRuntime.forDataDir(temp.path).waitIdle();

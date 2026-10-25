@@ -131,6 +131,31 @@ void main() {
     expect(commands, containsAll(<String>['file.delete', 'file.writeBytes', 'file.mkdir']));
   });
 
+  test('reconnectSsh：经执行站下发 ssh.reconnect，带 agent 身份', () async {
+    final AgentRuntime runtime = AgentRuntime(
+      paths: paths,
+      engine: ScriptedAgent(chunkDelay: Duration.zero),
+    );
+    final List<Map<String, dynamic>> calls = <Map<String, dynamic>>[];
+    AgentRuntime.stationClient = (
+      String command,
+      Map<String, dynamic> arguments,
+      Map<String, dynamic> scope,
+    ) async {
+      calls.add(<String, dynamic>{
+        'command': command,
+        'arguments': arguments,
+        'scope': scope,
+      });
+      return <String, dynamic>{'ok': true, 'agent_id': 'agt', 'stale': true};
+    };
+    final Map<String, dynamic> result = await runtime.reconnectSsh('agt');
+    expect(result['stale'], isTrue);
+    expect(calls.single['command'], 'ssh.reconnect');
+    expect((calls.single['arguments'] as Map)['agent_id'], 'agt');
+    expect((calls.single['scope'] as Map)['agent_id'], 'agt');
+  });
+
   test('默认引擎是 LlmAgentEngine（生产路径）；未知 agent 返回 null（端点 404）', () async {
     final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
     expect(runtime.conversation.engine, isA<LlmAgentEngine>());

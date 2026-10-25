@@ -341,6 +341,16 @@ class AgentRuntime {
     };
   }
 
+  /// 显式重建目标 agent 的远端 SSH 链路（经核心执行站 ssh.reconnect）。
+  Future<Map<String, dynamic>> reconnectSsh(String agentId) async {
+    final StationCommandClient? client = stationClient;
+    if (client == null) {
+      throw StateError('执行站未接线：ssh.reconnect 不可用');
+    }
+    final Map<String, dynamic> scope = _stationScopeFor(agentId, '');
+    return client('ssh.reconnect', <String, dynamic>{'agent_id': agentId}, scope);
+  }
+
   /// `tool_runs` 工具：作用域 = 本 agent + 直属下级，关闭落到同一登记表。
   Future<ToolOutcome> runToolRuns(ToolInvocation invocation) {
     final ToolRunsScope scope = ToolRunsScope(

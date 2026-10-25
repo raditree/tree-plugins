@@ -7,6 +7,8 @@ import 'agent_store.dart';
 import 'conversation_store.dart';
 import 'model_catalog.dart';
 import 'runtime/agent_runtime.dart';
+import 'workspace/workspace_io.dart';
+import 'settings/prompt_store.dart';
 import 'spec/spec_service.dart';
 import 'session_store.dart';
 import 'settings/domain_settings.dart';
@@ -53,6 +55,9 @@ const String teammateMessagePattern =
 const String teammateLogPattern =
     '/api/agents/{leaderId}/teammate/{memberId}/log'; // 团队读 #3
 const String agentCompactPattern = '/api/agents/{agentId}/compact'; // 维护 #2
+const String agentResetPattern = '/api/agents/{agentId}/reset'; // 维护 #1
+const String sshReconnectPattern =
+    '/api/agents/{agentId}/ssh/reconnect'; // 维护 #3
 const String specsPattern = '/api/agents/{agentId}/specs'; // spec 列表
 const String specDetailPattern = '/api/agents/{agentId}/specs/{specId}'; // spec 详情
 const String toolsRunningPattern = '/api/tools/running'; // 运行监督 #1
@@ -296,6 +301,63 @@ Future<Map<String, dynamic>> _dispatchDelegate(
       'log': read['log'] ?? '',
       'path': read['path'] ?? '',
     });
+  }
+
+  // ── 重置工作空间提示词 / Spec（POST /api/agents/{agentId}/reset）──
+  if (method == 'POST' && _matches(agentResetPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    if (AgentRuntime.forDataDir(paths.root).store.agent(agentId) == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
+    }
+    final String target =
+        (_bodyOf(envelope)['target'] ?? 'all').toString().toLowerCase();
+    if (target != 'system_prompt' && target != 'spec' && target != 'all') {
+      return _jsonReply(400, <String, dynamic>{
+        'detail': 'target 只能是 system_prompt / spec / all',
+      });
+    }
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final WorkspaceIO? io = await runtime.workspaceIoFor(agentId, '');
+    if (io == null) {
+      return _jsonReply(400, <String, dynamic>{
+        'detail': '工作空间不可用（未接线 / SSH 配置不完整），无法重置',
+      });
+    }
+    final Map<String, dynamic> result = <String, dynamic>{'success': true};
+    if (target == 'system_prompt' || target == 'all') {
+      final SystemPromptStore prompts = SystemPromptStore(
+        ioFor: (String agent) => runtime.workspaceIoFor(agent, ''),
+      );
+      final PromptResetResult reset = await prompts.reset(agentId, io);
+      await prompts.refresh(agentId);
+      result['system_prompt'] = reset.toJson();
+    }
+    if (target == 'spec' || target == 'all') {
+      result['spec'] = await runtime.specService.reset(io);
+      await runtime.specService.refreshIndex(agentId, io);
+    }
+    return _jsonReply(200, result);
+  }
+
+  // ── SSH 链路显式重连（POST /api/agents/{agentId}/ssh/reconnect）────
+  if (method == 'POST' && _matches(sshReconnectPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    if (runtime.store.agent(agentId) == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在：$agentId'});
+    }
+    try {
+      final Map<String, dynamic> result = await runtime.reconnectSsh(agentId);
+      return _jsonReply(200, <String, dynamic>{
+        'ok': true,
+        'agent_id': agentId,
+        'stale': result['stale'] ?? false,
+      });
+    } catch (error) {
+      final String message = error.toString();
+      final int status = message.contains('不是 SSH') ? 400 : 500;
+      return _jsonReply(status, <String, dynamic>{'detail': message});
+    }
   }
 
   // ── 手动压缩（POST /api/agents/{agentId}/compact）──────────────────
