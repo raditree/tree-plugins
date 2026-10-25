@@ -93,6 +93,10 @@ class StationToolRunner implements ToolRunner {
             'properties': <String, dynamic>{
               'command': <String, dynamic>{'type': 'string'},
               'timeout': <String, dynamic>{'type': 'number'},
+              'timeout_seconds': <String, dynamic>{
+                'type': 'number',
+                'description': '软超时（秒，缺省 300；0=永不）：到点不杀进程，转后台并返回 task_id',
+              },
               'hook': <String, dynamic>{'type': 'boolean', 'description': 'true = 后台执行并回 task_id'},
               'hook_action': <String, dynamic>{'type': 'string', 'enum': <String>['status', 'cancel']},
               'task_id': <String, dynamic>{'type': 'string'},
@@ -307,8 +311,7 @@ class StationToolRunner implements ToolRunner {
     if (command.isEmpty) return const ToolOutcome('terminal 需要 command', isError: true);
     final Map<String, dynamic> result = await client('exec.command', <String, dynamic>{
       'command': command,
-      if (invocation.arguments['timeout'] != null)
-        'timeout': invocation.arguments['timeout'],
+      'timeout_seconds': invocation.arguments['timeout_seconds'] ?? 300,
       if (invocation.arguments['hook'] != null)
         'hook': invocation.arguments['hook'],
       if (invocation.arguments['hook_action'] != null)
@@ -318,6 +321,9 @@ class StationToolRunner implements ToolRunner {
       if (invocation.arguments['output_file'] != null)
         'output_file': invocation.arguments['output_file'],
     }, scope);
+    if (result['task_id'] != null && hooks != null) {
+      return hooks!.adopt(invocation, result);
+    }
     return ToolOutcome(
       (result['text'] ?? '').toString(),
       isError: result['is_error'] == true,

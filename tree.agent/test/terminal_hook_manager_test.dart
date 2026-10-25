@@ -62,6 +62,39 @@ void main() {
     expect(manager.find('hook_1')!.running, isFalse);
   });
 
+  test('adopt：同步命令软超时接管后进入台账', () async {
+    final TerminalHookManager manager = TerminalHookManager(
+      pollInterval: const Duration(seconds: 30),
+      client: (
+        String command,
+        Map<String, dynamic> arguments,
+        Map<String, dynamic> scope,
+      ) async =>
+          <String, dynamic>{'text': '状态', 'running': true},
+      scopeFor: (String agentId, String sessionId) => <String, dynamic>{
+        'agent_id': agentId,
+      },
+      wake: (String agentId, String sessionId, String notice) async {},
+    );
+    final ToolOutcome adopted = await manager.adopt(
+      const ToolInvocation(
+        id: 't3',
+        name: 'terminal',
+        arguments: <String, dynamic>{'command': 'x'},
+        agentId: 'agt',
+        sessionId: 's',
+      ),
+      <String, dynamic>{
+        'text': '已转后台',
+        'task_id': 'hook_3',
+        'log_relative': '.self/hooks/hook_3.log',
+      },
+    );
+    expect(adopted.content, contains('已转后台'));
+    expect(manager.listVisible('agt', 's').single.id, 'hook_3');
+    await manager.cancel('hook_3');
+  });
+
   test('status/cancel：未知 task_id 给可读错误，已知任务可取消', () async {
     final TerminalHookManager manager = TerminalHookManager(
       pollInterval: const Duration(seconds: 30),

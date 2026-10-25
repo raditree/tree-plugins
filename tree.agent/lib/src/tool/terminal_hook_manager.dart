@@ -101,6 +101,31 @@ class TerminalHookManager {
     return ToolOutcome('$head\ntask_id: $id');
   }
 
+  /// 同步命令被执行器软超时接管：把已有 task_id 纳入台账并开始轮询。
+  Future<ToolOutcome> adopt(
+    ToolInvocation invocation,
+    Map<String, dynamic> result,
+  ) async {
+    final String id = (result['task_id'] ?? '').toString();
+    if (id.isEmpty) {
+      return ToolOutcome((result['text'] ?? '').toString());
+    }
+    final HookRun run = HookRun(
+      id: id,
+      agentId: invocation.agentId,
+      sessionId: invocation.sessionId,
+      command: (invocation.arguments['command'] ?? '').toString(),
+      logRelative: (result['log_relative'] ?? '').toString(),
+      startedAt: DateTime.now(),
+    );
+    _runs[id] = run;
+    unawaited(_watch(run));
+    return ToolOutcome(
+      (result['text'] ?? '').toString() +
+          (run.logRelative.isEmpty ? '' : '\n日志：${run.logRelative}'),
+    );
+  }
+
   Future<ToolOutcome> status(String taskId) async {
     final HookRun? run = _runs[taskId];
     if (run == null) return ToolOutcome('未知 task_id：$taskId', isError: true);
