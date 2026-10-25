@@ -28,6 +28,11 @@ class AgentRecord {
     required this.reviewStatus,
     required this.createdAt,
     required this.updatedAt,
+    required this.reasoningEffort,
+    required this.maxSeqlenOverride,
+    required this.maxOutputTokens,
+    required this.compressThreshold,
+    required this.thinkingOverride,
   });
 
   final String id;
@@ -50,6 +55,13 @@ class AgentRecord {
   final String reviewStatus;
   final int createdAt;
   final int updatedAt;
+
+  // ── 成员级模型参数覆盖（0 / 空串 = 未覆盖）─────────────────────────
+  final String reasoningEffort;
+  final int maxSeqlenOverride;
+  final int maxOutputTokens;
+  final double compressThreshold;
+  final bool? thinkingOverride;
 }
 
 /// 扫描 `agents/*.yaml`。
@@ -173,6 +185,13 @@ AgentRecord? _toRecord(Map<String, dynamic> json, int nowMs) {
     reviewStatus: json['review_status'] as String? ?? '',
     createdAt: _decodeTime(json['created_at']) ?? nowMs,
     updatedAt: _decodeTime(json['updated_at']) ?? nowMs,
+    reasoningEffort: json['reasoning_effort'] as String? ?? '',
+    maxSeqlenOverride:
+        (json['max_seqlen_override'] as num?)?.toInt() ?? 0,
+    maxOutputTokens: (json['max_output_tokens'] as num?)?.toInt() ?? 0,
+    compressThreshold:
+        (json['compress_threshold'] as num?)?.toDouble() ?? 0,
+    thinkingOverride: json['thinking_override'] as bool?,
   );
 }
 
@@ -334,29 +353,32 @@ List<Map<String, dynamic>> _decodeJsonl(String text) {
 /// 与 `TeamService.pendingMemberCountFor` 同口径：TOP（`team_id` 空）⇒ 整队成员；
 /// 成员 ⇒ 自己的后代（BFS）。名册顺序按 `created_at` 升序、同刻按 id（与核心
 /// `TreeStore.members` 一致），计数本身与顺序无关。
-int pendingMemberCountOf(List<AgentRecord> records, AgentRecord self) {
-  final List<AgentRecord> members;
-  if (self.teamId.isEmpty) {
-    members = _membersOf(records, self.id);
-  } else {
-    final Map<String, List<AgentRecord>> children =
-        <String, List<AgentRecord>>{};
-    for (final AgentRecord member in _membersOf(records, self.teamId)) {
-      children.putIfAbsent(member.parentAgentId, () => <AgentRecord>[]).add(
-        member,
-      );
-    }
-    members = <AgentRecord>[];
-    final List<AgentRecord> cursor = <AgentRecord>[self];
-    for (int i = 0; i < cursor.length; i++) {
-      final List<AgentRecord> kids =
-          children[cursor[i].id] ?? const <AgentRecord>[];
-      members.addAll(kids);
-      cursor.addAll(kids);
-    }
+/// 名册：这个 agent **自己的下属**（TOP ⇒ 整队成员；成员 ⇒ 后代 BFS）。
+///
+/// 与核心 `TeamService._rosterOf` 同口径；顺序也一致（成员按 createdAt、同刻按 id；
+/// 后代 BFS 按父先于子）。
+List<AgentRecord> rosterOf(List<AgentRecord> records, AgentRecord self) {
+  if (self.teamId.isEmpty) return _membersOf(records, self.id);
+  final Map<String, List<AgentRecord>> children = <String, List<AgentRecord>>{};
+  for (final AgentRecord member in _membersOf(records, self.teamId)) {
+    children.putIfAbsent(member.parentAgentId, () => <AgentRecord>[]).add(
+      member,
+    );
   }
+  final List<AgentRecord> members = <AgentRecord>[];
+  final List<AgentRecord> cursor = <AgentRecord>[self];
+  for (int i = 0; i < cursor.length; i++) {
+    final List<AgentRecord> kids =
+        children[cursor[i].id] ?? const <AgentRecord>[];
+    members.addAll(kids);
+    cursor.addAll(kids);
+  }
+  return members;
+}
+
+int pendingMemberCountOf(List<AgentRecord> records, AgentRecord self) {
   int pending = 0;
-  for (final AgentRecord member in members) {
+  for (final AgentRecord member in rosterOf(records, self)) {
     if (member.reviewStatus == 'pending_model' ||
         member.reviewStatus == 'pending_review') {
       pending++;
@@ -364,6 +386,18 @@ int pendingMemberCountOf(List<AgentRecord> records, AgentRecord self) {
   }
   return pending;
 }
+
+/// 成员级覆盖（与核心 `memberOverrides` 同口径；只含真正设置过的键）。
+Map<String, Object?> overridesOf(AgentRecord member) => <String, Object?>{
+  if (member.reasoningEffort.trim().isNotEmpty)
+    'reasoning_effort': member.reasoningEffort,
+  if (member.maxSeqlenOverride > 0) 'max_seqlen': member.maxSeqlenOverride,
+  if (member.maxOutputTokens > 0)
+    'max_output_tokens': member.maxOutputTokens,
+  if (member.compressThreshold > 0)
+    'compress_threshold': member.compressThreshold,
+  if (member.thinkingOverride != null) 'thinking': member.thinkingOverride,
+};
 
 List<AgentRecord> _membersOf(List<AgentRecord> records, String teamId) {
   final List<AgentRecord> list = records

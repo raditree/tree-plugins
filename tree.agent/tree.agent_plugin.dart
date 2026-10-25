@@ -127,10 +127,29 @@ Future<int> selfTest() async {
         'parent_agent_id: agt_top\n'
         'level: 1\n'
         'review_status: pending_review\n'
+        'reasoning_effort: low\n'
+        'max_seqlen_override: 16000\n'
+        'thinking_override: false\n'
         'ssh:\n'
         '  host: 10.0.0.5\n'
         'created_at: 2026-10-25T10:00:00.000\n'
         'updated_at: 2026-10-25T10:00:01.000\n',
+      );
+    File(p.join(temp.path, 'agents', 'agt_m2.yaml'))
+      ..createSync(recursive: true)
+      ..writeAsStringSync(
+        'id: agt_m2\n'
+        'name: 执行\n'
+        'team_id: agt_top\n'
+        'parent_agent_id: agt_m\n'
+        'level: 2\n'
+        'role: 执行\n'
+        'duty: 跑测试\n'
+        'model_id: m2\n'
+        'review_status: approved\n'
+        'workspace_id: ws_m2\n'
+        'created_at: 2026-10-25T10:00:04.000\n'
+        'updated_at: 2026-10-25T10:00:04.000\n',
       );
     // 会话夹具：两个会话（旧的先；新会话里有"用户 / agent 文本 / 子 agent / 工具"四种行，
     // 预览只应取最后一条 agent 文本）。
@@ -386,17 +405,20 @@ Future<int> selfTest() async {
         query: <String, String>{'session_id': 'all'},
       ),
     );
+    core.ask(22, M.apiDelegate, envelope(teammatesPattern, 'agt_top'));
+    core.ask(23, M.apiDelegate, envelope(teammatesPattern, 'agt_m'));
+    core.ask(24, M.apiDelegate, envelope(teammatesPattern, 'ghost'));
     core.ask(
-      22,
+      25,
       M.apiDelegate,
       envelope('/api/agents/agt/sessions/ses_x/messages', 'agt'),
     );
 
     final Map<Object?, Map<String, dynamic>> byId = await core.waitFor(
-      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
+      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25],
     );
 
-    check.that(byId.length == 23, '二十三条请求都有回包', actual: '${byId.length}');
+    check.that(byId.length == 26, '二十六条请求都有回包', actual: '${byId.length}');
     check.check(
       byId[0]?['result']?['plugin_id'],
       kPluginId,
@@ -573,13 +595,37 @@ Future<int> selfTest() async {
         (jsonDecode('${listReply['body'] ?? '{}'}') as Map)
             .cast<String, dynamic>();
     check.that(
-      (agentsBody['agents'] as List<dynamic>?)?.length == 3,
-      'agents：三条（扫描 agents/*.yaml）',
+      (agentsBody['agents'] as List<dynamic>?)?.length == 4,
+      'agents：四条（扫描 agents/*.yaml）',
       actual: '${agentsBody['agents']}',
     );
     check.check(
       agentsBody['agents'],
       <dynamic>[
+        <String, dynamic>{
+          'id': 'agt_m2',
+          'name': '执行',
+          'type': 'normal',
+          'system_prompt': '',
+          'model_id': 'm2',
+          'workspace_id': 'ws_m2',
+          'workspace_dir': '',
+          'has_ssh': false,
+          'last_message': '',
+          'last_message_time': null,
+          'unread_count': 0,
+          'avatar_url': null,
+          'pending_member_count': 0,
+          'team_id': 'agt_top',
+          'parent_agent_id': 'agt_m',
+          'level': 2,
+          'role': '执行',
+          'duty': '跑测试',
+          'can_lead_team': true,
+          'review_status': 'approved',
+          'created_at': ms('2026-10-25T10:00:04.000'),
+          'updated_at': ms('2026-10-25T10:00:04.000'),
+        },
         <String, dynamic>{
           'id': 'agt',
           'name': '夹具',
@@ -936,8 +982,139 @@ Future<int> selfTest() async {
     check.check(convAll['total'], 6, 'conversations all：total=6');
     check.check(convAll['session_id'], 'all', 'conversations all：回显 all');
 
+    // ── A2：GET /api/agents/{agentId}/teammates ───────────────────────
+    Map<String, dynamic> matesBody(int index) {
+      final Map<String, dynamic> reply =
+          (byId[index]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+      return (jsonDecode('${reply['body'] ?? '{}'}') as Map)
+          .cast<String, dynamic>();
+    }
+
+    final Map<String, dynamic> topMates = matesBody(22);
+    check.check(
+      topMates['pending_member_count'],
+      1,
+      'teammates：TOP 名册待处理数',
+    );
+    check.check(
+      topMates['self'],
+      <String, dynamic>{
+        'id': 'agt_top',
+        'name': '指挥',
+        'level': 0,
+        'is_member': false,
+        'top_agent_id': '',
+        'top_agent_name': '',
+      },
+      'teammates：TOP 的 self 描述符',
+    );
+    final List<dynamic> topMembers = topMates['members'] as List<dynamic>;
+    check.check(topMembers.length, 2, 'teammates：TOP 整队两名成员');
+    check.check(
+      topMembers[0],
+      <String, dynamic>{
+        'id': 'agt_m',
+        'name': '成员',
+        'role': '',
+        'duty': '',
+        'model_id': '',
+        'level': 1,
+        'can_lead_team': true,
+        'parent_agent_id': 'agt_top',
+        'leader_name': '指挥',
+        'relation': 'direct',
+        'work_status': 'idle',
+        'review_status': 'pending_review',
+        'log_path': '.tree/agt_m/.self/activity.log',
+        'created_at': ms('2026-10-25T10:00:00.000'),
+        'workspace_id': '',
+        'overrides': <String, dynamic>{
+          'reasoning_effort': 'low',
+          'max_seqlen': 16000,
+          'thinking': false,
+        },
+        'effective': <String, dynamic>{
+          'reasoning_effort': 'low',
+          'max_seqlen': 16000,
+          'max_output_tokens': 0,
+          'thinking': false,
+        },
+        'live_status': 'idle',
+      },
+      'teammates：成员视图 + 覆盖项 + 有效参数（无模型）',
+    );
+    check.check(
+      topMembers[1],
+      <String, dynamic>{
+        'id': 'agt_m2',
+        'name': '执行',
+        'role': '执行',
+        'duty': '跑测试',
+        'model_id': 'm2',
+        'level': 2,
+        'can_lead_team': true,
+        'parent_agent_id': 'agt_m',
+        'leader_name': '成员',
+        'relation': 'indirect',
+        'work_status': 'idle',
+        'review_status': 'approved',
+        'log_path': '.tree/agt_m2/.self/activity.log',
+        'created_at': ms('2026-10-25T10:00:04.000'),
+        'workspace_id': 'ws_m2',
+        'overrides': <String, dynamic>{},
+        'effective': <String, dynamic>{
+          'reasoning_effort': '',
+          'max_seqlen': 128000,
+          'max_output_tokens': 0,
+          'thinking': false,
+        },
+        'live_status': 'idle',
+      },
+      'teammates：后代 indirect + 模型默认值（fallback 128000）',
+    );
+
+    final Map<String, dynamic> memberMates = matesBody(23);
+    check.check(
+      memberMates['pending_member_count'],
+      0,
+      'teammates：成员名册只数自己的下属',
+    );
+    check.check(
+      memberMates['self'],
+      <String, dynamic>{
+        'id': 'agt_m',
+        'name': '成员',
+        'level': 1,
+        'is_member': true,
+        'top_agent_id': 'agt_top',
+        'top_agent_name': '指挥',
+      },
+      'teammates：成员的 self 描述符',
+    );
+    check.check(
+      (memberMates['members'] as List<dynamic>).length,
+      1,
+      'teammates：成员只列自己的下级',
+    );
+    check.check(
+      ((memberMates['members'] as List<dynamic>).first as Map?)?['relation'],
+      'direct',
+      'teammates：下级 relation=direct',
+    );
+
+    check.check(
+      matesBody(24),
+      <String, dynamic>{
+        'agent_id': 'ghost',
+        'members': <dynamic>[],
+        'pending_member_count': 0,
+        'self': null,
+      },
+      'teammates：未知 agent ⇒ 200 + self:null（不是 404）',
+    );
+
     final Map<String, dynamic> notImplemented =
-        (byId[22]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+        (byId[25]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
     check.check(notImplemented['status'], 501, '未搬路由：501（不是 404）');
     check.that(
       jsonDecode('${notImplemented['body'] ?? '{}'}')['detail']

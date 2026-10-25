@@ -1,7 +1,7 @@
 # tree.agent（批次 G 的 agent 领域插件）
 
 > 状态：**A2 进行中**（2026-10-25）。A1 骨架完成；A2 已搬：`api/delegate` 管道 +
-> `GET /api/agents`、`GET /api/agents/{id}`、`GET /api/conversations/{id}`、
+> `GET /api/agents`、`GET /api/agents/{id}`、`GET …/teammates`、`GET /api/conversations/{id}`、
 > `GET …/sessions`、`GET …/sessions/{id}`、`GET …/todos`、`GET …/subagents`、
 > `GET /api/models`、`GET …/models-info`
 > （与核心同数据根**逐字节等价**，见桌面仓
@@ -19,7 +19,7 @@
 | 阶段 | 内容 | 本仓状态 |
 | --- | --- | --- |
 | A1 | 骨架：stdio 循环、hello/ping、工具表、收集站申报、日志 | **已完成** |
-| A2 | 只读面：agents / models / sessions / todos / subagents / teammates / tools-running | **进行中**：agents（列表/详情）、conversations（分页 + 提问叠加）、sessions（列表/详情）、todos、subagents、models、models-info 已搬并等价；其余 2 组（teammates / tools-running）未开始，tools-running 依赖 A3 工具层随迁 |
+| A2 | 只读面：agents / models / sessions / todos / subagents / teammates / tools-running | **进行中**：agents（列表/详情/teammates）、conversations（分页 + 提问叠加）、sessions（列表/详情）、todos、subagents、models、models-info 已搬并等价；仅剩 tools-running（依赖 A3 工具层随迁） |
 | A3 | 写路径与生成：消息、取消、LLM、工具编排、提问、reset/compact | 未开始 |
 | A4 | 帧迁移：注册广播站，topic 沿用原帧名 | 未开始 |
 | A5 | 交接：核心删除 34 条路由 + 2 条上行 + 领域目录 | 未开始 |
@@ -65,6 +65,7 @@ lib/src/agent_store.dart   agent 列表/详情：22 键 / 会话预览（32KiB �
 lib/src/session_store.dart 会话列表/详情：session.json + 规范化 CoreMessage.toJson + 非工具消息计数
 lib/src/question_store.dart  questions.json 视图（叠加提问状态/答案/选项）
 lib/src/conversation_store.dart 会话历史分页（limit/before/from/at/all）+ 提问卡片叠加
+lib/src/teammates.dart     团队名册（memberView + relation + overrides/effective）
 lib/src/model_catalog.dart config/models/*.yaml → ModelApi（脱敏/排序/默认值）
 lib/src/yaml_utils.dart    YAML → 纯 Dart Map（UTF-8 容错）
 lib/src/delegate.dart      api/delegate 信封 → 路由分发 → {status, headers, body}

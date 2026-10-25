@@ -5,6 +5,7 @@ import 'agent_store.dart';
 import 'conversation_store.dart';
 import 'model_catalog.dart';
 import 'session_store.dart';
+import 'teammates.dart';
 import 'paths.dart';
 import 'subagent_store.dart';
 import 'todo_store.dart';
@@ -21,6 +22,8 @@ const String sessionDetailPattern =
 const String modelsPattern = '/api/models'; // 模型池 #14
 const String conversationsPattern =
     '/api/conversations/{agentId}'; // 会话历史 #1（会话/历史组）
+const String teammatesPattern =
+    '/api/agents/{agentId}/teammates'; // 团队名册 #10（团队组）
 const String agentModelsInfoPattern =
     '/api/agents/{agentId}/models-info'; // agent 定义 #6
 
@@ -81,6 +84,15 @@ Future<Map<String, dynamic>> _dispatchDelegate(
       );
     }
     return _jsonReply(200, <String, dynamic>{'agents': items});
+  }
+
+  // 团队名册（成员视图 + 关系 + 覆盖项；未知 agent 不 404）。
+  if (method == 'GET' && _matches(teammatesPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    return _jsonReply(
+      200,
+      teammatesPayload(paths, readAgentRecords(paths), agentId),
+    );
   }
 
   // 会话历史（分页 + 提问状态叠加）。
