@@ -8,6 +8,7 @@ import 'package:tree_agent_loop/src/runtime/agent_runtime.dart';
 import 'package:tree_agent_loop/src/store/file_store.dart';
 import 'package:tree_agent_loop/src/store/records.dart';
 import 'package:tree_agent_loop/src/store/tree_paths.dart';
+import 'package:tree_agent_loop/src/workspace/workspace_io.dart';
 
 void main() {
   late Directory temp;
@@ -26,6 +27,8 @@ void main() {
   });
 
   tearDown(() async {
+    AgentRuntime.stationClient = null;
+    AgentRuntime.workspaceRegister = null;
     await AgentRuntime.debugCloseAll();
     try {
       if (temp.existsSync()) temp.deleteSync(recursive: true);
@@ -74,6 +77,49 @@ void main() {
     expect(second['session_created'], isFalse);
     expect(second['session_id'], sessionId);
     await runtime.waitIdle();
+  });
+
+  test('工作空间租约：先 register 再让 fs.* 带 lease_id', () async {
+    final AgentRuntime runtime = AgentRuntime(
+      paths: paths,
+      engine: ScriptedAgent(chunkDelay: Duration.zero),
+    );
+    final List<Map<String, dynamic>> registered = <Map<String, dynamic>>[];
+    final List<Map<String, dynamic>> calls = <Map<String, dynamic>>[];
+    AgentRuntime.workspaceRegister = (String id, String dir) async {
+      registered.add(<String, dynamic>{'id': id, 'dir': dir});
+    };
+    AgentRuntime.stationClient = (
+      String command,
+      Map<String, dynamic> arguments,
+      Map<String, dynamic> scope,
+    ) async {
+      calls.add(<String, dynamic>{
+        'command': command,
+        'arguments': arguments,
+        'scope': scope,
+      });
+      return <String, dynamic>{
+        'content': 'hello',
+        'total_lines': 1,
+        'start_line': 1,
+        'truncated': false,
+      };
+    };
+    final WorkspaceIO? io = await runtime.workspaceIoFor(
+      'agt',
+      'session_default',
+    );
+    expect(io, isNotNull);
+    final content = await io!.readFile('a.txt');
+    expect(content.text, 'hello');
+    expect(registered, hasLength(1));
+    expect(registered.single['dir'], contains(temp.path));
+    expect(calls.single['command'], 'fs.read');
+    final Map<String, dynamic> args =
+        calls.single['arguments'] as Map<String, dynamic>;
+    expect(args['lease_id'], registered.single['id']);
+    expect(args.containsKey('root'), isFalse, reason: 'root 由核心注入，不由 agent 传');
   });
 
   test('默认引擎是 LlmAgentEngine（生产路径）；未知 agent 返回 null（端点 404）', () async {
