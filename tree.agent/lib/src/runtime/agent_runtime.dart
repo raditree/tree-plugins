@@ -35,6 +35,8 @@ import '../tool/team_tool.dart';
 import '../tool/todo_store.dart';
 import '../tool/subagent_tool.dart';
 import '../tool/tool_run_registry.dart';
+import '../tool/tool_runs_scope.dart';
+import '../tool/tool_runs_tool.dart';
 import '../tool/tool_runner.dart';
 import '../workspace/station_command.dart';
 import '../workspace/station_compat_io.dart';
@@ -105,6 +107,7 @@ class AgentRuntime {
             usageLog: usageLog,
             toolRunner: StationToolRunner(
               contributed: () => contributedTools,
+              toolRunsRunner: runToolRuns,
               client: _stationCommand,
               scopeFor: _stationScopeFor,
             ),
@@ -336,6 +339,16 @@ class AgentRuntime {
       'idle': idle,
       'any_running': cancelled.isNotEmpty,
     };
+  }
+
+  /// `tool_runs` 工具：作用域 = 本 agent + 直属下级，关闭落到同一登记表。
+  Future<ToolOutcome> runToolRuns(ToolInvocation invocation) {
+    final ToolRunsScope scope = ToolRunsScope(
+      registry: toolRuns,
+      teamService: teamService,
+      subagents: subagentService,
+    );
+    return ToolRunsTool.run(invocation, scope);
   }
 
   /// 领域工具原语（extra-tools 插件经自建执行站调用）。

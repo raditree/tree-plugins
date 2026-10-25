@@ -12,6 +12,7 @@ class StationToolRunner implements ToolRunner {
     required this.client,
     required this.scopeFor,
     this.contributed,
+    this.toolRunsRunner,
   });
 
   final StationCommandClient client;
@@ -21,6 +22,9 @@ class StationToolRunner implements ToolRunner {
 
   /// 收集站采集到的贡献工具（每次采集后整体替换；空表 = 没有订阅者）。
   final List<ContributedTool> Function()? contributed;
+
+  /// `tool_runs` 的执行回调（未接线时不声明该工具）。
+  final Future<ToolOutcome> Function(ToolInvocation invocation)? toolRunsRunner;
 
   @override
   List<ToolSpec> specsFor({required String agentId, required String sessionId}) =>
@@ -88,6 +92,34 @@ class StationToolRunner implements ToolRunner {
             'required': <String>['command'],
           },
         ),
+        ToolSpec(
+          name: 'edit',
+          description: '在文件中把 old_text 替换为 new_text（默认要求唯一匹配）。',
+          parameters: <String, dynamic>{
+            'type': 'object',
+            'properties': <String, dynamic>{
+              'file_path': <String, dynamic>{'type': 'string', 'description': '工作空间相对路径'},
+              'old_text': <String, dynamic>{'type': 'string', 'description': '要替换的原文'},
+              'new_text': <String, dynamic>{'type': 'string', 'description': '替换后的文本'},
+              'replace_all': <String, dynamic>{'type': 'boolean', 'description': 'true = 替换全部匹配'},
+            },
+            'required': <String>['file_path', 'old_text', 'new_text'],
+          },
+        ),
+        if (toolRunsRunner != null)
+          ToolSpec(
+            name: 'tool_runs',
+            description: '查看/显式关闭本 agent 与其直属下级正在执行的工具调用。',
+            parameters: <String, dynamic>{
+              'type': 'object',
+              'properties': <String, dynamic>{
+                'action': <String, dynamic>{'type': 'string', 'enum': <String>['list', 'close']},
+                'handle': <String, dynamic>{'type': 'string'},
+                'member_id': <String, dynamic>{'type': 'string'},
+              },
+              'required': <String>['action'],
+            },
+          ),
         for (final ContributedTool tool in contributed?.call() ?? const <ContributedTool>[])
           ToolSpec(
             name: tool.coreName,
@@ -109,6 +141,14 @@ class StationToolRunner implements ToolRunner {
           return await _read(invocation, scope);
         case 'write':
           return await _write(invocation, scope);
+        case 'edit':
+          return await _edit(invocation, scope);
+        case 'tool_runs':
+          final Future<ToolOutcome> Function(ToolInvocation)? runner =
+              toolRunsRunner;
+          return runner == null
+              ? const ToolOutcome('tool_runs 未接线', isError: true)
+              : await runner(invocation);
         case 'list':
           return await _list(invocation, scope);
         case 'grep':
@@ -153,6 +193,46 @@ class StationToolRunner implements ToolRunner {
     }, scope);
     final int bytes = (result['bytes_written'] as num?)?.toInt() ?? 0;
     return ToolOutcome('已写入 $path（$bytes 字节）');
+  }
+
+  Future<ToolOutcome> _edit(
+    ToolInvocation invocation,
+    Map<String, dynamic> scope,
+  ) async {
+    final String path =
+        (invocation.arguments['file_path'] ?? '').toString().trim();
+    final String oldText = (invocation.arguments['old_text'] ?? '').toString();
+    final String newText = (invocation.arguments['new_text'] ?? '').toString();
+    final bool replaceAll = invocation.arguments['replace_all'] == true;
+    if (path.isEmpty) return const ToolOutcome('file_path 不能为空', isError: true);
+    if (oldText.isEmpty) return const ToolOutcome('old_text 不能为空', isError: true);
+    final Map<String, dynamic> read = await client('file.read', <String, dynamic>{
+      'path': path,
+    }, scope);
+    final String text = (read['content'] ?? '').toString();
+    final int occurrences = RegExp(RegExp.escape(oldText)).allMatches(text).length;
+    if (occurrences == 0) {
+      return ToolOutcome('未找到 old_text：$path', isError: true);
+    }
+    if (occurrences > 1 && !replaceAll) {
+      return ToolOutcome(
+        'old_text 在 $path 中出现 $occurrences 次，'
+        '请提供更精确的 old_text 或传 replace_all=true',
+        isError: true,
+      );
+    }
+    final String next = replaceAll
+        ? text.replaceAll(oldText, newText)
+        : text.replaceFirst(oldText, newText);
+    final Map<String, dynamic> written = await client(
+      'file.write',
+      <String, dynamic>{'path': path, 'content': next},
+      scope,
+    );
+    return ToolOutcome(
+      '已替换 $occurrences 处：$path'
+      '（文件现为 ${written['bytes_written'] ?? next.length} 字节）',
+    );
   }
 
   Future<ToolOutcome> _list(

@@ -13,7 +13,10 @@ void main() {
   late TestWorkspaceIO io;
   late List<Map<String, dynamic>> calls;
 
-  StationToolRunner runnerFor({String agentId = 'agt'}) {
+  StationToolRunner runnerFor({
+    String agentId = 'agt',
+    Future<ToolOutcome> Function(ToolInvocation invocation)? toolRuns,
+  }) {
     Future<Map<String, dynamic>> client(
       String command,
       Map<String, dynamic> arguments,
@@ -62,6 +65,7 @@ void main() {
     }
     return StationToolRunner(
       client: client,
+      toolRunsRunner: toolRuns,
       scopeFor: (String agentId, String sessionId) => <String, dynamic>{
         'agent_id': agentId,
         'team_id': 'top',
@@ -89,7 +93,82 @@ void main() {
         .specsFor(agentId: 'agt', sessionId: 'session_default')
         .map((ToolSpec spec) => spec.name)
         .toList();
-    expect(names, <String>['read', 'write', 'list', 'grep', 'terminal']);
+    expect(names, <String>['read', 'write', 'list', 'grep', 'terminal', 'edit']);
+  });
+
+  test('edit：唯一匹配替换；重复匹配需 replace_all', () async {
+    final StationToolRunner runner = runnerFor();
+    await io.writeFile('notes/a.md', 'alpha beta alpha');
+    final ToolOutcome unique = await runner.run(
+      const ToolInvocation(
+        id: 'e1',
+        name: 'edit',
+        arguments: <String, dynamic>{
+          'file_path': 'notes/a.md',
+          'old_text': 'beta',
+          'new_text': 'BETA',
+        },
+        agentId: 'agt',
+        sessionId: 'session_default',
+      ),
+    );
+    expect(unique.isError, isFalse, reason: unique.content);
+    expect(File(p.join(temp.path, 'notes', 'a.md')).readAsStringSync(), 'alpha BETA alpha');
+
+    final ToolOutcome ambiguous = await runner.run(
+      const ToolInvocation(
+        id: 'e2',
+        name: 'edit',
+        arguments: <String, dynamic>{
+          'file_path': 'notes/a.md',
+          'old_text': 'alpha',
+          'new_text': 'A',
+        },
+        agentId: 'agt',
+        sessionId: 'session_default',
+      ),
+    );
+    expect(ambiguous.isError, isTrue);
+    expect(ambiguous.content, contains('2 次'));
+
+    final ToolOutcome all = await runner.run(
+      const ToolInvocation(
+        id: 'e3',
+        name: 'edit',
+        arguments: <String, dynamic>{
+          'file_path': 'notes/a.md',
+          'old_text': 'alpha',
+          'new_text': 'A',
+          'replace_all': true,
+        },
+        agentId: 'agt',
+        sessionId: 'session_default',
+      ),
+    );
+    expect(all.isError, isFalse, reason: all.content);
+    expect(File(p.join(temp.path, 'notes', 'a.md')).readAsStringSync(), 'A BETA A');
+  });
+
+  test('tool_runs：接线后进工具表，执行落到回调', () async {
+    final StationToolRunner runner = runnerFor(
+      toolRuns: (ToolInvocation invocation) async =>
+          ToolOutcome('runs: ${invocation.arguments['action']}'),
+    );
+    final List<String> names = runner
+        .specsFor(agentId: 'agt', sessionId: 'session_default')
+        .map((ToolSpec spec) => spec.name)
+        .toList();
+    expect(names, contains('tool_runs'));
+    final ToolOutcome outcome = await runner.run(
+      const ToolInvocation(
+        id: 'r1',
+        name: 'tool_runs',
+        arguments: <String, dynamic>{'action': 'list'},
+        agentId: 'agt',
+        sessionId: 'session_default',
+      ),
+    );
+    expect(outcome.content, 'runs: list');
   });
 
   test('read/write/list：经执行站读写工作空间，scope 带身份', () async {

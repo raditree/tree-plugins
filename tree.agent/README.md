@@ -37,7 +37,7 @@ tree.agent 的收集站采集工具定义，执行时经 `plugin.toolCall` 回�
 
 ## 执行器依赖（L-24）
 
-read / write / list / grep / terminal 不再由核心执行：tree.agent 先登记工作空间租约，
+read / write / edit / list / grep / terminal，以及 tool_runs 不再由核心执行：tree.agent 先登记工作空间租约，
 再把 `workspace_id` 随 `fs.*` / `terminal.exec` 下发；这些命令由 `local_executor`
 自建执行站（`plugin.local_executor.execute.local`，命令 `file.*` / `exec.command`）执行。没装该插件时工具会显式失败（不静默回退核心）。
 
