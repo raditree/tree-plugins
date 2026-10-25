@@ -25,6 +25,10 @@
 全部经 tree.agent 的工具收集站贡献，执行走 `plugin.toolCall` → 本插件；
 没有 MCP 专用执行站、没有 tree.agent 内硬编码的 MCP 分支。
 
+**MCP 插件未启动时，这些工具不会出现在工具表**——没有 core 兜底，也不存在
+`mcp help/call` 的可读错误（只有“工具表里没有它”）。核心仍保留旧的
+`/api/mcp/*` 与 `McpService`（A5 待删），那是另一条路径。
+
 配置：`TREE_MCP_SERVERS`（JSON 数组）：
 ```json
 [{"name":"files","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"]}]
