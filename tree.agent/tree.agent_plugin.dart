@@ -138,12 +138,14 @@ Future<int> selfTest() async {
       ..createSync(recursive: true)
       ..writeAsStringSync(
         '{"session_id":"session_default","agent_id":"agt","title":"默认",'
+        '"created_at":"2026-10-25T10:00:02.000",'
         '"updated_at":"2026-10-25T10:00:10.000"}',
       );
     File(p.join(temp.path, 'data', 'agt', 'ses_old', 'session.json'))
       ..createSync(recursive: true)
       ..writeAsStringSync(
         '{"session_id":"ses_old","agent_id":"agt","title":"旧会话",'
+        '"created_at":"2026-10-25T10:00:03.000",'
         '"updated_at":"2026-10-25T10:00:05.000"}',
       );
     File(p.join(temp.path, 'data', 'agt', 'ses_old', 'messages.jsonl'))
@@ -244,12 +246,15 @@ Future<int> selfTest() async {
     final FakeCore core = FakeCore(server);
     unawaited(core.start());
 
-    Map<String, dynamic> envelope(String path, String agentId) =>
-        <String, dynamic>{
-          'method': 'GET',
-          'path': path,
-          'params': <String, dynamic>{'agentId': agentId},
-          'query': <String, dynamic>{'session_id': 'session_default'},
+    Map<String, dynamic> envelope(
+      String path,
+      String agentId, {
+      Map<String, String> extraParams = const <String, String>{},
+    }) => <String, dynamic>{
+      'method': 'GET',
+      'path': path,
+      'params': <String, dynamic>{'agentId': agentId, ...extraParams},
+      'query': <String, dynamic>{'session_id': 'session_default'},
           'headers': <String, dynamic>{},
           'scope': <String, dynamic>{},
           'workspace_dir': '',
@@ -275,17 +280,45 @@ Future<int> selfTest() async {
     core.ask(10, M.apiDelegate, envelope(agentModelsInfoPattern, 'nope'));
     core.ask(11, M.apiDelegate, envelope(agentsPattern, ''));
     core.ask(12, M.apiDelegate, envelope(agentDetailPattern, 'agt_m'));
+    core.ask(13, M.apiDelegate, envelope(sessionsPattern, 'agt'));
     core.ask(
-      13,
+      14,
       M.apiDelegate,
-      envelope('/api/agents/agt/sessions', 'agt'),
+      envelope(
+        sessionDetailPattern,
+        'agt',
+        extraParams: <String, String>{'sessionId': 'session_default'},
+      ),
+    );
+    core.ask(
+      15,
+      M.apiDelegate,
+      envelope(
+        sessionDetailPattern,
+        'agt',
+        extraParams: <String, String>{'sessionId': 'ses_old'},
+      ),
+    );
+    core.ask(
+      16,
+      M.apiDelegate,
+      envelope(
+        sessionDetailPattern,
+        'agt',
+        extraParams: <String, String>{'sessionId': 'ses_x'},
+      ),
+    );
+    core.ask(
+      17,
+      M.apiDelegate,
+      envelope('/api/agents/agt/sessions/ses_x/messages', 'agt'),
     );
 
     final Map<Object?, Map<String, dynamic>> byId = await core.waitFor(
-      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
     );
 
-    check.that(byId.length == 14, '十四条请求都有回包', actual: '${byId.length}');
+    check.that(byId.length == 18, '十八条请求都有回包', actual: '${byId.length}');
     check.check(
       byId[0]?['result']?['plugin_id'],
       kPluginId,
@@ -573,8 +606,151 @@ Future<int> selfTest() async {
       'agent 详情：SSH 非机密视图（无密钥）',
     );
 
-    final Map<String, dynamic> notImplemented =
+    // ── A2：会话列表 / 会话详情 ───────────────────────────────────────
+    final Map<String, dynamic> sessionsReply =
         (byId[13]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+    check.check(sessionsReply['status'], 200, 'sessions：200');
+    check.check(
+      (jsonDecode('${sessionsReply['body'] ?? '{}'}') as Map)['sessions'],
+      <dynamic>[
+        <String, dynamic>{
+          'session_id': 'session_default',
+          'agent_id': 'agt',
+          'title': '默认',
+          'status': 'active',
+          'selected_spec_ids': <String>[],
+          'message_count': 2,
+          'created_at': ms('2026-10-25T10:00:02.000'),
+          'updated_at': ms('2026-10-25T10:00:10.000'),
+        },
+        <String, dynamic>{
+          'session_id': 'ses_old',
+          'agent_id': 'agt',
+          'title': '旧会话',
+          'status': 'active',
+          'selected_spec_ids': <String>[],
+          'message_count': 1,
+          'created_at': ms('2026-10-25T10:00:03.000'),
+          'updated_at': ms('2026-10-25T10:00:05.000'),
+        },
+      ],
+      'sessions：updated_at 降序 / 非工具消息计数',
+    );
+
+    final Map<String, dynamic> detailSession =
+        (byId[14]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+    check.check(detailSession['status'], 200, '会话详情：200');
+    final Map<String, dynamic> detailSessionBody =
+        (jsonDecode('${detailSession['body'] ?? '{}'}') as Map)
+            .cast<String, dynamic>();
+    check.check(
+      (detailSessionBody['session'] as Map?)?['session_id'],
+      'session_default',
+      '会话详情：session_id',
+    );
+    check.check(
+      (detailSessionBody['messages'] as List<dynamic>?)?.length,
+      4,
+      '会话详情：四条消息',
+    );
+    check.check(
+      (detailSessionBody['messages'] as List<dynamic>?)?[0],
+      <String, dynamic>{
+        'id': 'm1',
+        'agent_id': 'agt',
+        'session_id': 'session_default',
+        'role': 'user',
+        'content': '你好',
+        'timestamp': '2026-10-25T10:00:06.000',
+        'kind': 'text',
+        'tool_name': null,
+        'tool_arguments': null,
+        'tool_result': '',
+        'tool_call_id': null,
+        'usage': null,
+        'attachments': null,
+        'options': <String>[],
+        'answered': false,
+        'is_streaming': false,
+      },
+      '会话详情：用户消息 16 键规范化',
+    );
+    check.check(
+      (detailSessionBody['messages'] as List<dynamic>?)?[1],
+      <String, dynamic>{
+        'id': 'm2',
+        'agent_id': 'agt',
+        'session_id': 'session_default',
+        'role': 'agent',
+        'content': '这是预览',
+        'timestamp': '2026-10-25T10:00:09.000',
+        'kind': 'text',
+        'tool_name': null,
+        'tool_arguments': null,
+        'tool_result': '',
+        'tool_call_id': null,
+        'usage': null,
+        'attachments': null,
+        'options': <String>[],
+        'answered': false,
+        'is_streaming': false,
+      },
+      '会话详情：agent 消息',
+    );
+    check.check(
+      (detailSessionBody['messages'] as List<dynamic>?)?[2],
+      <String, dynamic>{
+        'id': 'm3',
+        'agent_id': 'agt',
+        'session_id': 'session_default',
+        'role': 'agent',
+        'content': '子回复',
+        'timestamp': '2026-10-25T10:00:09.500',
+        'kind': 'text',
+        'tool_name': null,
+        'tool_arguments': null,
+        'tool_result': '',
+        'tool_call_id': null,
+        'usage': null,
+        'attachments': null,
+        'options': <String>[],
+        'answered': false,
+        'subagent_id': 'sub_1',
+        'subagent_name': '',
+        'subagent_parent_id': '',
+        'subagent_level': 0,
+        'is_streaming': false,
+      },
+      '会话详情：临时员工消息带标记键',
+    );
+    check.check(
+      ((detailSessionBody['messages'] as List<dynamic>?)?[3] as Map?)?['kind'],
+      'tool',
+      '会话详情：工具消息 kind',
+    );
+
+    final Map<String, dynamic> oldSession =
+        (byId[15]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+    check.check(oldSession['status'], 200, '会话详情（旧）：200');
+    check.check(
+      ((jsonDecode('${oldSession['body'] ?? '{}'}') as Map)['messages']
+              as List<dynamic>?)
+          ?.length,
+      1,
+      '会话详情（旧）：一条消息',
+    );
+
+    final Map<String, dynamic> missingSession =
+        (byId[16]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+    check.check(missingSession['status'], 404, '会话详情：不存在 ⇒ 404');
+    check.check(
+      jsonDecode('${missingSession['body'] ?? '{}'}'),
+      <String, dynamic>{'detail': '会话不存在'},
+      '会话详情：404 错误体与核心一致',
+    );
+
+    final Map<String, dynamic> notImplemented =
+        (byId[17]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
     check.check(notImplemented['status'], 501, '未搬路由：501（不是 404）');
     check.that(
       jsonDecode('${notImplemented['body'] ?? '{}'}')['detail']

@@ -15,6 +15,8 @@ import 'src/delegate.dart'
         agentModelsInfoPattern,
         agentsPattern,
         modelsPattern,
+        sessionDetailPattern,
+        sessionsPattern,
         subagentsPattern,
         todosPattern;
 
@@ -23,12 +25,13 @@ export 'src/agent_store.dart';
 export 'src/delegate.dart';
 export 'src/model_catalog.dart';
 export 'src/paths.dart';
+export 'src/session_store.dart';
 export 'src/subagent_store.dart';
 export 'src/todo_store.dart';
 export 'src/yaml_utils.dart';
 
 /// 插件版本（与 `plugin.json` 的 version 同源；发布时两处一起改）。
-const String kTreeAgentVersion = '0.4.0';
+const String kTreeAgentVersion = '0.5.0';
 
 /// 收集站 id：插件经它申报自己承担的 `{method, pattern}` 委派路由。
 const String kApiRoutesStation = 'system.collect.api.routes';
@@ -40,6 +43,8 @@ const String kApiRoutesStation = 'system.collect.api.routes';
 const List<Map<String, String>> kDeclaredRoutes = <Map<String, String>>[
   <String, String>{'method': 'GET', 'pattern': agentsPattern},
   <String, String>{'method': 'GET', 'pattern': agentDetailPattern},
+  <String, String>{'method': 'GET', 'pattern': sessionsPattern},
+  <String, String>{'method': 'GET', 'pattern': sessionDetailPattern},
   <String, String>{'method': 'GET', 'pattern': todosPattern},
   <String, String>{'method': 'GET', 'pattern': subagentsPattern},
   <String, String>{'method': 'GET', 'pattern': modelsPattern},

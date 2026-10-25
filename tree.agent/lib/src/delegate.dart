@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'agent_config.dart';
 import 'agent_store.dart';
 import 'model_catalog.dart';
+import 'session_store.dart';
 import 'paths.dart';
 import 'subagent_store.dart';
 import 'todo_store.dart';
@@ -12,6 +13,10 @@ const String todosPattern = '/api/agents/{agentId}/todos'; // agent 定义 #7
 const String subagentsPattern = '/api/agents/{agentId}/subagents'; // 子 agent #8
 const String agentsPattern = '/api/agents'; // agent 列表 #1
 const String agentDetailPattern = '/api/agents/{agentId}'; // agent 详情 #3
+const String sessionsPattern =
+    '/api/agents/{agentId}/sessions'; // 会话列表 #3（会话/历史组）
+const String sessionDetailPattern =
+    '/api/agents/{agentId}/sessions/{sessionId}'; // 会话详情 #5（会话/历史组）
 const String modelsPattern = '/api/models'; // 模型池 #14
 const String agentModelsInfoPattern =
     '/api/agents/{agentId}/models-info'; // agent 定义 #6
@@ -26,6 +31,19 @@ const String agentModelsInfoPattern =
 /// Content-Type 原样写回 HTTP）。未实现的路由回 501 + 可读原因——委派语义里
 /// 404 表示"核心没有这个接口"，而这里是"插件还没搬"。
 Future<Map<String, dynamic>> handleApiDelegate(
+  Map<String, dynamic> envelope,
+) async {
+  try {
+    return await _dispatchDelegate(envelope);
+  } catch (error) {
+    // 与核心 `_dispatch` 的兜底同形：未捕获异常 ⇒ 500 + 可读原因。
+    return _jsonReply(500, <String, dynamic>{
+      'detail': '核心进程内部错误：$error',
+    });
+  }
+}
+
+Future<Map<String, dynamic>> _dispatchDelegate(
   Map<String, dynamic> envelope,
 ) async {
   final String method = _str(envelope['method']).toUpperCase();
@@ -60,6 +78,53 @@ Future<Map<String, dynamic>> handleApiDelegate(
       );
     }
     return _jsonReply(200, <String, dynamic>{'agents': items});
+  }
+
+  // 会话列表（读接口，但会像核心一样兜底默认会话）。
+  if (method == 'GET' && _matches(sessionsPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    if (readAgentRecord(paths, agentId) == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
+    }
+    final List<SessionRecord> sessions = readSessions(paths, agentId);
+    if (!sessions.any((SessionRecord s) => s.sessionId == 'session_default')) {
+      sessions.add(ensureDefaultSession(paths, agentId));
+      sessions.sort(
+        (SessionRecord a, SessionRecord b) =>
+            b.updatedAt.compareTo(a.updatedAt),
+      );
+    }
+    return _jsonReply(200, <String, dynamic>{
+      'agent_id': agentId,
+      'sessions': <Map<String, dynamic>>[
+        for (final SessionRecord session in sessions)
+          sessionApiJson(
+            session,
+            messageCount: messageCountOf(
+              paths,
+              agentId,
+              session.sessionId,
+            ),
+          ),
+      ],
+    });
+  }
+
+  // 会话详情（消息为规范化的 CoreMessage.toJson 形态）。
+  if (method == 'GET' && _matches(sessionDetailPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final String sessionId = _str(params['sessionId']);
+    final SessionRecord? session = findSession(paths, agentId, sessionId);
+    if (session == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': '会话不存在'});
+    }
+    return _jsonReply(200, <String, dynamic>{
+      'session': sessionApiJson(
+        session,
+        messageCount: messageCountOf(paths, agentId, sessionId),
+      ),
+      'messages': readMessages(paths, agentId, sessionId),
+    });
   }
 
   // 单个 agent（含 SSH 非机密视图；不回密钥）。

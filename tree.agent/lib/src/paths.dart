@@ -41,6 +41,10 @@ class AgentDataPaths {
   String subagentsFile(String agentId, String sessionId) =>
       p.join(sessionDir(agentId, sessionId), 'subagents.json');
 
+  /// 会话元数据：`<root>/data/<agent>/<session>/session.json`。
+  String sessionMetaFile(String agentId, String sessionId) =>
+      p.join(sessionDir(agentId, sessionId), 'session.json');
+
   /// 会话消息追加日志：`<root>/data/<agent>/<session>/messages.jsonl`。
   String messagesFile(String agentId, String sessionId) =>
       p.join(sessionDir(agentId, sessionId), 'messages.jsonl');
