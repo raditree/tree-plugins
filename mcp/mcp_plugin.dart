@@ -12,7 +12,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'mcp';
 const String kDisplayName = 'MCP 协议客户端';
-const String kVersion = '0.1.0';
+const String kVersion = '0.2.0';
 const String kCollectStation = 'plugin.tree.agent.collect.tools';
 const String kContextStation = 'plugin.mcp.execute.context';
 const List<String> kContextCommands = <String>[
@@ -21,6 +21,7 @@ const List<String> kContextCommands = <String>[
   'get_prompt',
   'build_context',
   'select_context',
+  'call_tool',
 ];
 
 final Map<String, McpProtocolClient> _clients = <String, McpProtocolClient>{};
@@ -180,6 +181,18 @@ Future<Map<String, dynamic>> _runContext(
       };
     case 'build_context':
       return _context.build((args['agent_id'] ?? '').toString());
+    case 'call_tool':
+      final String server = (args['server'] ?? '').toString();
+      final McpProtocolClient? client = _clients[server];
+      if (client == null) throw McpException('未知 MCP 服务：$server');
+      final McpCallResult result = await client.callTool(
+        (args['tool'] ?? '').toString(),
+        asMap(args['arguments']),
+      );
+      return <String, dynamic>{
+        'text': result.text,
+        'is_error': result.isError,
+      };
     case 'select_context':
       final String agentId = (args['agent_id'] ?? '').toString();
       final List<McpResourceRef> resources = <McpResourceRef>[

@@ -11,6 +11,7 @@
 | 自发现 | `tools/list`、`resources/list`、`resources/templates/list`、`prompts/list`，支持 `nextCursor` 分页 |
 | 变更 | `notifications/tools/list_changed` / `resources/list_changed` / `prompts/list_changed` 自动重拉 |
 | 上下文 | `resources/read`、`prompts/get`、按 agent 的 `select_context` / `build_context` |
+| 兜底调用 | `call_tool` 上下文命令 + tree.agent 的 `mcp` 元工具（help/call） |
 | 反向请求 | `roots/list`、`ping` |
 | 工具 | 把 MCP 工具以 `mcp__<server>__<tool>` 贡献给 tree.agent；`tools/call` 经本插件执行 |
 
