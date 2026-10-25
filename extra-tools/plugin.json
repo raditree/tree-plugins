@@ -1,7 +1,7 @@
 {
   "id": "extra-tools",
   "name": "扩展工具",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "独立插件：向 tree.agent 的工具贡献收集站申报 todo / question / subagent / team / message 五个工具；执行经 tree.agent 自建领域执行站转回其服务。",
   "runtime": "headless",
   "files": [

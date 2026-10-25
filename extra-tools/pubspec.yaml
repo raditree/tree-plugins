@@ -1,10 +1,11 @@
 name: extra_tools
 description: 扩展工具插件（extra-tools）：向 tree.agent 贡献 todo/question/subagent/team/message 工具。
 publish_to: 'none'
-version: 0.1.0
+version: 0.2.0
 
 environment:
   sdk: ^3.13.0
 
 dev_dependencies:
   lints: ^6.0.0
+  test: ^1.25.0
