@@ -1,14 +1,20 @@
 import 'dart:convert';
 
+import 'agent/question_store.dart';
 import 'agent_config.dart';
 import 'agent_store.dart';
 import 'conversation_store.dart';
 import 'model_catalog.dart';
+import 'runtime/agent_runtime.dart';
 import 'session_store.dart';
+import 'settings/domain_settings.dart';
+import 'store/records.dart';
+import 'store/tree_paths.dart';
 import 'teammates.dart';
+import 'tool/todo_store.dart';
+import 'tool/tool_run_registry.dart';
 import 'paths.dart';
 import 'subagent_store.dart';
-import 'todo_store.dart';
 
 /// A2 已搬的只读路由（`G-1 对照表` 的编号见注释）。
 const String todosPattern = '/api/agents/{agentId}/todos'; // agent 定义 #7
@@ -19,6 +25,11 @@ const String sessionsPattern =
     '/api/agents/{agentId}/sessions'; // 会话列表 #3（会话/历史组）
 const String sessionDetailPattern =
     '/api/agents/{agentId}/sessions/{sessionId}'; // 会话详情 #5（会话/历史组）
+const String sessionSpecsPattern =
+    '/api/agents/{agentId}/sessions/{sessionId}/specs'; // 会话已选规范
+const String questionsPattern = '/api/questions'; // 提问列表
+const String questionAnswerPattern =
+    '/api/questions/{qid}/answer'; // 提问作答
 const String modelsPattern = '/api/models'; // 模型池 #14
 const String conversationsPattern =
     '/api/conversations/{agentId}'; // 会话历史 #1（会话/历史组）
@@ -26,6 +37,38 @@ const String teammatesPattern =
     '/api/agents/{agentId}/teammates'; // 团队名册 #10（团队组）
 const String agentModelsInfoPattern =
     '/api/agents/{agentId}/models-info'; // agent 定义 #6
+const String messagesPattern =
+    '/api/agents/{agentId}/messages'; // C-08 新增：发消息
+const String cancelPattern =
+    '/api/agents/{agentId}/cancel'; // C-08 新增：停止
+const String modelPattern = '/api/models/{modelId}'; // 模型池 #16（PATCH/DELETE）
+const String tokenRatePattern =
+    '/api/settings/token-rate'; // token 节奏 #1/#2
+const String toolsRunningPattern = '/api/tools/running'; // 运行监督 #1
+const String toolsRunningClosePattern =
+    '/api/tools/running/{handle}/close'; // 运行监督 #2
+
+/// 从委派信封取 JSON body（小体积内联字符串；缺失/空 = 空表）。
+///
+/// 大体积 `body_path` 目前不用于这两条写端点（核心侧 POST 请求体都很小）。
+Map<String, dynamic> _bodyOf(Map<String, dynamic> envelope) {
+  final Object? raw = envelope['body'];
+  if (raw is Map) {
+    return raw.map(
+      (Object? key, Object? value) => MapEntry(key.toString(), value),
+    );
+  }
+  if (raw is String && raw.trim().isNotEmpty) {
+    final Object? decoded = jsonDecode(raw);
+    if (decoded is Map) {
+      return decoded.map(
+        (Object? key, Object? value) => MapEntry(key.toString(), value),
+      );
+    }
+    throw const FormatException('请求体不是 JSON 对象');
+  }
+  return <String, dynamic>{};
+}
 
 /// 处理一次 `api/delegate`（核心 → 插件）。
 ///
@@ -63,6 +106,277 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     });
   }
   final AgentDataPaths paths = AgentDataPaths(dataDir);
+
+  // ── 会话写接口（创建 / 改名 / 删除 / 已选规范）────────────────────
+  if (method == 'POST' && _matches(sessionsPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    if (runtime.store.agent(agentId) == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
+    }
+    final Map<String, dynamic> body = _bodyOf(envelope);
+    final CoreSession? session = runtime.store.createSession(
+      agentId,
+      title: body['title'] as String? ?? '',
+      sessionId: body['session_id'] as String?,
+    );
+    if (session == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
+    }
+    return _jsonReply(200, <String, dynamic>{
+      'success': true,
+      'session': session.toApiJson(),
+    });
+  }
+  if (method == 'PATCH' && _matches(sessionDetailPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final String sessionId = _str(params['sessionId']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final bool renamed = runtime.store.renameSession(
+      agentId,
+      sessionId,
+      _bodyOf(envelope)['title'] as String? ?? '',
+    );
+    if (!renamed) {
+      return _jsonReply(404, <String, dynamic>{'detail': '会话不存在'});
+    }
+    return _jsonReply(200, <String, dynamic>{'success': true});
+  }
+  if (method == 'DELETE' && _matches(sessionDetailPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final String sessionId = _str(params['sessionId']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    runtime.registry.forgetSession(agentId, sessionId);
+    if (!runtime.store.deleteSession(agentId, sessionId)) {
+      return _jsonReply(404, <String, dynamic>{'detail': '会话不存在'});
+    }
+    return _jsonReply(200, <String, dynamic>{'success': true});
+  }
+  if (method == 'POST' && _matches(sessionSpecsPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final String sessionId = _str(params['sessionId']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    if (runtime.store.session(agentId, sessionId) == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': '会话不存在'});
+    }
+    final List<String> specIds = <String>[
+      for (final Object? item
+          in (_bodyOf(envelope)['spec_ids'] as List<dynamic>? ??
+              const <dynamic>[]))
+        '$item',
+    ];
+    runtime.store.setSelectedSpecs(agentId, sessionId, specIds);
+    return _jsonReply(200, <String, dynamic>{
+      'success': true,
+      'selected_spec_ids': specIds,
+    });
+  }
+
+  // ── 会话清空（DELETE /api/conversations/{agentId}）────────────────
+  if (method == 'DELETE' && _matches(conversationsPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final int deleted = runtime.store.clearMessages(
+      agentId,
+      sessionId: _queryString(query, 'session_id'),
+    );
+    return _jsonReply(200, <String, dynamic>{
+      'success': true,
+      'deleted': deleted,
+    });
+  }
+
+  // ── 提问列表 / 作答 ──────────────────────────────────────────────
+  if (method == 'GET' && _matches(questionsPattern, path)) {
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final List<QuestionRecord> records = runtime.questionStore.list(
+      agentId: _queryString(query, 'agent_id'),
+      sessionId: _queryString(query, 'session_id'),
+    );
+    final String status = _queryString(query, 'status');
+    final List<QuestionRecord> filtered = status.isEmpty
+        ? records
+        : records
+              .where((QuestionRecord r) => r.status == status)
+              .toList();
+    filtered.sort(
+      (QuestionRecord a, QuestionRecord b) =>
+          b.createdAt.compareTo(a.createdAt),
+    );
+    return _jsonReply(200, <String, dynamic>{
+      'questions': <Map<String, dynamic>>[
+        for (final QuestionRecord record in filtered) record.toApiJson(),
+      ],
+      'total': filtered.length,
+    });
+  }
+  if (method == 'POST' && _matches(questionAnswerPattern, path)) {
+    final String qid = _str(params['qid']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final Map<String, dynamic> body = _bodyOf(envelope);
+    final Object? rawAnswers = body['answers'];
+    final List<String> answers = rawAnswers is List
+        ? rawAnswers.map((Object? e) => e?.toString() ?? '').toList()
+        : <String>[(body['answer'] ?? '').toString()];
+    final QuestionRecord? record = runtime.questionStore.byId(qid);
+    if (record == null || !record.isPending) {
+      return _jsonReply(404, <String, dynamic>{
+        'detail': '没有等待回答的问题',
+      });
+    }
+    if (!runtime.questions.answer(qid, answers)) {
+      return _jsonReply(400, <String, dynamic>{
+        'detail': '没有等待回答的问题',
+      });
+    }
+    return _jsonReply(200, <String, dynamic>{
+      'success': true,
+      'qid': qid,
+      'status': record.status,
+      'answers': record.answers,
+    });
+  }
+
+  // ── 模型池写接口（POST / PATCH / DELETE）──────────────────────────
+  if (method == 'POST' && _matches(modelsPattern, path)) {
+    final Map<String, dynamic> body = _bodyOf(envelope);
+    final String? invalid = DomainSettings.validateNewModel(body);
+    if (invalid != null) {
+      return _jsonReply(400, <String, dynamic>{'detail': invalid});
+    }
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final CoreModelConfig? model = runtime.settings.createModel(body);
+    if (model == null) {
+      return _jsonReply(409, <String, dynamic>{
+        'detail': '模型已存在：${body['model_id']}',
+      });
+    }
+    await runtime.settingsSink.flush();
+    return _jsonReply(200, <String, dynamic>{
+      'success': true,
+      'model': model.toApiJson(),
+    });
+  }
+  if (method == 'PATCH' && _matches(modelPattern, path)) {
+    final String modelId = _str(params['modelId']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final CoreModelConfig? model = runtime.settings.updateModel(
+      modelId,
+      _bodyOf(envelope),
+    );
+    if (model == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': '模型不存在'});
+    }
+    await runtime.settingsSink.flush();
+    return _jsonReply(200, <String, dynamic>{
+      'success': true,
+      'model': model.toApiJson(),
+    });
+  }
+  if (method == 'DELETE' && _matches(modelPattern, path)) {
+    final String modelId = _str(params['modelId']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    if (!runtime.settings.deleteModel(modelId)) {
+      return _jsonReply(404, <String, dynamic>{'detail': '模型不存在'});
+    }
+    await runtime.settingsSink.flush();
+    final List<String> bound = <String>[
+      for (final AgentRecord record in readAgentRecords(paths))
+        if (record.modelId == modelId) record.id,
+    ];
+    return _jsonReply(200, <String, dynamic>{
+      'success': true,
+      'bound_agents': bound,
+    });
+  }
+
+  // ── token 节奏（GET/POST /api/settings/token-rate）──────────────────
+  if (method == 'GET' && _matches(tokenRatePattern, path)) {
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    return _jsonReply(200, <String, dynamic>{
+      'token_rate': runtime.settings.tokenAcquisitionRate,
+      'min': DomainSettings.tokenRateMin,
+      'max': DomainSettings.tokenRateMax,
+    });
+  }
+  if (method == 'POST' && _matches(tokenRatePattern, path)) {
+    final Map<String, dynamic> body = _bodyOf(envelope);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final int requested =
+        (body['token_rate'] as num?)?.toInt() ?? DomainSettings.tokenRateMax;
+    final int applied = runtime.settings.setTokenAcquisitionRate(requested);
+    await runtime.settingsSink.flush();
+    return _jsonReply(200, <String, dynamic>{
+      'token_rate': applied,
+      'min': DomainSettings.tokenRateMin,
+      'max': DomainSettings.tokenRateMax,
+    });
+  }
+
+  // 运行中工具：只读快照（数据源是插件进程内的登记表，重启即清空）。
+  if (method == 'GET' && _matches(toolsRunningPattern, path)) {
+    return _jsonReply(
+      200,
+      AgentRuntime.forDataDir(paths.root).toolRuns.snapshot(),
+    );
+  }
+
+  // 运行中工具：显式关闭（与执行站 tool.close 同一个实现）。
+  if (method == 'POST' && _matches(toolsRunningClosePattern, path)) {
+    final String handle = _str(params['handle']);
+    final ToolCloseOutcome outcome = await AgentRuntime.forDataDir(
+      paths.root,
+    ).toolRuns.close(handle);
+    if (!outcome.closed) {
+      return _jsonReply(404, <String, dynamic>{'detail': outcome.note});
+    }
+    return _jsonReply(200, outcome.toJson());
+  }
+
+  // C-08：发消息（写；落库 + 入队生成，不等本轮跑完）。
+  if (method == 'POST' && _matches(messagesPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final Map<String, dynamic> body = _bodyOf(envelope);
+    final String content = _str(body['content']);
+    if (content.isEmpty) {
+      return _jsonReply(400, <String, dynamic>{
+        'detail': 'content 不能为空',
+      });
+    }
+    final Map<String, dynamic>? result = AgentRuntime.forDataDir(paths.root)
+        .sendMessage(
+          agentId: agentId,
+          content: content,
+          sessionId: _str(body['session_id']),
+          attachments: body['attachments'] is List<dynamic>
+              ? body['attachments'] as List<dynamic>
+              : null,
+        );
+    if (result == null) {
+      return _jsonReply(404, <String, dynamic>{
+        'detail': '未知 agent：$agentId',
+      });
+    }
+    return _jsonReply(200, result);
+  }
+
+  // C-08：停止（写；TOP 级联团队树，成员只停自己）。
+  if (method == 'POST' && _matches(cancelPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final Map<String, dynamic> body = _bodyOf(envelope);
+    final Map<String, dynamic>? summary = AgentRuntime.forDataDir(paths.root)
+        .cancel(agentId, sessionId: _str(body['session_id']));
+    if (summary == null) {
+      return _jsonReply(404, <String, dynamic>{
+        'detail': '未知 agent：$agentId',
+      });
+    }
+    return _jsonReply(200, <String, dynamic>{
+      'success': true,
+      'agent_id': agentId,
+      ...summary,
+    });
+  }
 
   // 全局只读：agent 列表（22 键 + 预览 + 待处理成员数，按 updatedAt 降序）。
   if (method == 'GET' && _matches(agentsPattern, path)) {
@@ -203,7 +517,9 @@ Future<Map<String, dynamic>> _dispatchDelegate(
       return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
     }
     if (_matches(todosPattern, path)) {
-      final List<TodoItem> todos = readTodos(paths, agentId, sessionId);
+      final List<TodoItem> todos = FileTodoStore(
+      TreePaths(paths.root),
+    ).read(agentId, sessionId);
       return _jsonReply(200, <String, dynamic>{
         'todos': todos.map((TodoItem todo) => todo.toApiJson()).toList(),
         'session_id': sessionId,

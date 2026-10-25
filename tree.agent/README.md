@@ -66,6 +66,45 @@ lib/src/session_store.dart 会话列表/详情：session.json + 规范化 CoreMe
 lib/src/question_store.dart  questions.json 视图（叠加提问状态/答案/选项）
 lib/src/conversation_store.dart 会话历史分页（limit/before/from/at/all）+ 提问卡片叠加
 lib/src/teammates.dart     团队名册（memberView + relation + overrides/effective）
+lib/src/agent/             平移：question_store（提问记录）、question_broker（等待/作答/取消回路）
+lib/src/tool/              平移：todo_store、question_channel、tool_runner、subagent_tool、
+                           tool_run_registry（运行中工具登记）、hook_ledger、tool_runs_tool
+lib/src/plugin/            平移：agent_events（事件名常量与发布器）
+lib/src/compat/            旧下行帧名最小兼容层（提问卡片；A4 接站内主题后替换）
+lib/src/llm/               平移：llm_types / openai_codec / sse_parser / llm_transport / llm_session /
+                           llm_agent_engine / llm_json_caller / llm_summarizer / vision_files
+lib/src/workspace/workspace_io.dart  引擎用到的窄工作空间契约（执行站接线后补全）
+lib/src/settings/core_settings.dart  插件侧 CoreSettings 门面（领域设置 + frame_rate，夹取口径同核心）
+lib/src/settings/file_settings_sink.dart  模型池 yaml 落盘 + settings.yaml 只更新 token 速率（保留其余键）
+lib/src/agent/attachment_prompt.dart + tool_result_repair.dart  附件提示词 / 工具卡自动修复文案
+lib/src/store/usage_log.dart   会话用量账本（追加 jsonl、坏行容忍、只读尾部）
+lib/src/llm/llm_result_gate.dart  超长工具结果重定向/退化口径
+lib/src/team/team_workspace.dart 团队共享工作目录 + SSH 跟随 TOP
+lib/src/team/team_service.dart  团队域（建队/名册/档案/审核/模型分配/级联）
+lib/src/team/team_model.dart    成员视图/覆盖项/日志路径
+lib/src/team/team_repair.dart   成员配置修复（备份/内存/幂等）
+lib/src/spec/              spec_service（内置/自定义规范、索引、快照、随附文档播种）
+lib/src/team/message_dispatcher.dart  团队消息投递（send/wait_for/broadcast、附件）
+lib/src/tool/message_tool.dart  message 工具声明
+lib/src/util/liveness.dart       心跳活性跟踪/部分结果收口
+lib/src/tool/team_tool.dart     team 工具声明
+lib/src/tool/tool_runs_scope.dart  运行中工具的作用域（上级可见下级）
+lib/src/agent/private_paths.dart  .self 私有目录口径（privateSelfDir / mapPrivatePath / 迁移）
+lib/src/agent/workspace_prompt.dart 工作空间软约束段/基础段/Spec 注入
+lib/src/agent/compaction_service.dart 上下文压缩（切点/手动/自动/预算/中转点）
+lib/src/agent/subagent_service.dart  临时员工编排（召/reuse/阻塞/后台/收尾）
+lib/src/agent/conversation_service.dart 会话服务（脚本引擎可跑：分段落库 + WS 帧 + 取消/排队）
+lib/src/tool/tool_runner.dart + subagent_tool.dart 工具契约与 subagent 工具
+lib/src/ws/ws_hub.dart      A3 阶段最小帧出口（运行期接站内主题；A4 替换）
+lib/src/runtime/agent_runtime.dart  单数据根运行时（store/设置/提问/subagent/conversation；
+                            C-08 端点落地 + 帧记录）
+lib/src/agent/agent_engine.dart + scripted_agent.dart  引擎契约与脚本引擎
+lib/src/util/tokens.dart   字符/token 估算（与核心同口径）
+lib/src/store/             从核心平移的存储层：FileTreeStore / records / TreePaths / YAML /
+                           原子写 / 写队列 / 子 agent 注册表（A3 生成循环复用）
+lib/src/util/              ids / json_time / 容错 UTF-8 解码（含 Windows 代码页）
+lib/src/settings/          ssh_config（纯数据）+ domain_settings（CoreModelConfig /
+                           模型池 / token 速率 / 覆盖与 token_scale 学习）
 lib/src/model_catalog.dart config/models/*.yaml → ModelApi（脱敏/排序/默认值）
 lib/src/yaml_utils.dart    YAML → 纯 Dart Map（UTF-8 容错）
 lib/src/delegate.dart      api/delegate 信封 → 路由分发 → {status, headers, body}

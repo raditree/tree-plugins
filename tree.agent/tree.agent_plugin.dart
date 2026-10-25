@@ -190,6 +190,16 @@ Future<int> selfTest() async {
         '    "status": "answered",\n'
         '    "created_at": 1761360000000,\n'
         '    "answered_at": 1761360001000\n'
+        '  },\n'
+        '  {\n'
+        '    "qid": "q2",\n'
+        '    "agent_id": "agt_m",\n'
+        '    "team_id": "",\n'
+        '    "session_id": "session_default",\n'
+        '    "is_member": false,\n'
+        '    "questions": [{"question": "继续吗", "options": []}],\n'
+        '    "status": "pending",\n'
+        '    "created_at": 1761360002000\n'
         '  }\n'
         ']\n',
       );
@@ -308,6 +318,28 @@ Future<int> selfTest() async {
           'request_id': 'selftest-$agentId-$path',
         };
 
+    Map<String, dynamic> postEnvelope(
+      String path,
+      String agentId,
+      Map<String, dynamic> body, {
+      Map<String, String> extraParams = const <String, String>{},
+      Map<String, String>? query,
+      String method = 'POST',
+    }) => <String, dynamic>{
+      'method': method,
+      'path': path,
+      'params': <String, dynamic>{'agentId': agentId, ...extraParams},
+      'query': <String, dynamic>{...?query},
+      'headers': <String, dynamic>{},
+      'scope': <String, dynamic>{},
+      'workspace_dir': '',
+      'data_dir': temp.path,
+      'agent_id': agentId,
+      'team_id': agentId,
+      'request_id': 'selftest-post-$agentId-$path',
+      'body': jsonEncode(body),
+    };
+
     core.ask(0, M.hello, <String, dynamic>{'plugin_id': kPluginId});
     core.ask(1, M.ping);
     core.ask(2, M.toolsList);
@@ -413,12 +445,162 @@ Future<int> selfTest() async {
       M.apiDelegate,
       envelope('/api/agents/agt/sessions/ses_x/messages', 'agt'),
     );
-
-    final Map<Object?, Map<String, dynamic>> byId = await core.waitFor(
-      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25],
+    core.ask(
+      26,
+      M.apiDelegate,
+      postEnvelope(messagesPattern, 'agt_m', <String, dynamic>{
+        'content': '你好',
+      }),
+    );
+    core.ask(
+      27,
+      M.apiDelegate,
+      postEnvelope(messagesPattern, 'agt', <String, dynamic>{
+        'content': '   ',
+      }),
+    );
+    core.ask(
+      28,
+      M.apiDelegate,
+      postEnvelope(cancelPattern, 'ghost', <String, dynamic>{}),
+    );
+    core.ask(
+      29,
+      M.apiDelegate,
+      postEnvelope(cancelPattern, 'agt', <String, dynamic>{}),
+    );
+    core.ask(30, M.apiDelegate, envelope(toolsRunningPattern, 'agt'));
+    core.ask(
+      32,
+      M.apiDelegate,
+      postEnvelope(modelsPattern, 'agt', <String, dynamic>{
+        'model_id': 'm3',
+        'base_url': 'https://m3.example.com/v1',
+        'api_key': 'sk-3',
+      }),
+    );
+    core.ask(
+      33,
+      M.apiDelegate,
+      postEnvelope(modelsPattern, 'agt', <String, dynamic>{
+        'model_id': 'm3',
+        'base_url': 'https://m3.example.com/v1',
+        'api_key': 'sk-3',
+      }),
+    );
+    core.ask(
+      34,
+      M.apiDelegate,
+      postEnvelope(
+        modelPattern,
+        'agt',
+        <String, dynamic>{'name': '模型三'},
+        extraParams: <String, String>{'modelId': 'm3'},
+        method: 'PATCH',
+      ),
+    );
+    core.ask(
+      35,
+      M.apiDelegate,
+      postEnvelope(
+        modelPattern,
+        'agt',
+        <String, dynamic>{},
+        extraParams: <String, String>{'modelId': 'm3'},
+        method: 'DELETE',
+      ),
+    );
+    core.ask(36, M.apiDelegate, envelope(tokenRatePattern, 'agt'));
+    core.ask(
+      37,
+      M.apiDelegate,
+      postEnvelope(tokenRatePattern, 'agt', <String, dynamic>{
+        'token_rate': 200,
+      }),
+    );
+    core.ask(38, M.apiDelegate, envelope(tokenRatePattern, 'agt'));
+    core.ask(
+      39,
+      M.apiDelegate,
+      postEnvelope(sessionsPattern, 'agt', <String, dynamic>{
+        'session_id': 'ses_new',
+        'title': '新会话',
+      }),
+    );
+    core.ask(
+      40,
+      M.apiDelegate,
+      postEnvelope(
+        sessionDetailPattern,
+        'agt',
+        <String, dynamic>{'title': '改名'},
+        extraParams: <String, String>{'sessionId': 'ses_new'},
+        method: 'PATCH',
+      ),
+    );
+    core.ask(
+      41,
+      M.apiDelegate,
+      postEnvelope(
+        sessionSpecsPattern,
+        'agt',
+        <String, dynamic>{
+          'spec_ids': <String>['general-task'],
+        },
+        extraParams: <String, String>{'sessionId': 'ses_new'},
+      ),
+    );
+    core.ask(
+      42,
+      M.apiDelegate,
+      postEnvelope(
+        sessionDetailPattern,
+        'agt',
+        <String, dynamic>{},
+        extraParams: <String, String>{'sessionId': 'ses_new'},
+        method: 'DELETE',
+      ),
+    );
+    core.ask(43, M.apiDelegate, envelope(questionsPattern, 'agt'));
+    core.ask(
+      44,
+      M.apiDelegate,
+      postEnvelope(
+        questionAnswerPattern,
+        'agt',
+        <String, dynamic>{
+          'answers': <String>['继续'],
+        },
+        extraParams: <String, String>{'qid': 'q2'},
+      ),
+    );
+    core.ask(
+      45,
+      M.apiDelegate,
+      postEnvelope(
+        conversationsPattern,
+        'agt',
+        <String, dynamic>{},
+        query: <String, String>{'session_id': 'ses_old'},
+        method: 'DELETE',
+      ),
+    );
+    core.ask(
+      31,
+      M.apiDelegate,
+      postEnvelope(
+        toolsRunningClosePattern,
+        'agt',
+        <String, dynamic>{},
+        extraParams: <String, String>{'handle': 'toolrun_missing'},
+      ),
     );
 
-    check.that(byId.length == 26, '二十六条请求都有回包', actual: '${byId.length}');
+    final Map<Object?, Map<String, dynamic>> byId = await core.waitFor(
+      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45],
+    );
+
+    check.that(byId.length == 46, '四十六条请求都有回包', actual: '${byId.length}');
     check.check(
       byId[0]?['result']?['plugin_id'],
       kPluginId,
@@ -1123,6 +1305,159 @@ Future<int> selfTest() async {
       '未搬路由：可读原因',
       actual: '${notImplemented['body']}',
     );
+
+    // ── C-08：POST messages / cancel ─────────────────────────────────
+    Map<String, dynamic> postResult(int index) =>
+        (byId[index]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+
+    Map<String, dynamic> postBody(int index) {
+      final String raw = '${postResult(index)['body'] ?? '{}'}';
+      return (jsonDecode(raw) as Map).cast<String, dynamic>();
+    }
+
+    final Map<String, dynamic> messagesReply = postResult(26);
+    check.check(messagesReply['status'], 200, 'messages：200');
+    final Map<String, dynamic> messagesBody = postBody(26);
+    check.check(messagesBody['success'], true, 'messages：success');
+    check.check(messagesBody['agent_id'], 'agt_m', 'messages：回 agent_id');
+    check.that(
+      '${messagesBody['session_id'] ?? ''}'.isNotEmpty,
+      'messages：未指定会话 ⇒ 新建并回 session_id',
+    );
+    check.check(
+      messagesBody['session_created'],
+      true,
+      'messages：新建会话标记',
+    );
+
+    check.check(postResult(27)['status'], 400, 'messages：空内容 400');
+    check.check(
+      postBody(27),
+      <String, dynamic>{'detail': 'content 不能为空'},
+      'messages：400 错误体',
+    );
+
+    check.check(postResult(28)['status'], 404, 'cancel：未知 agent 404');
+    check.check(
+      postBody(28),
+      <String, dynamic>{'detail': '未知 agent：ghost'},
+      'cancel：404 错误体',
+    );
+
+    final Map<String, dynamic> cancelReply = postResult(29);
+    check.check(cancelReply['status'], 200, 'cancel：200');
+    final Map<String, dynamic> cancelBody = postBody(29);
+    check.check(cancelBody['success'], true, 'cancel：success');
+    check.check(cancelBody['agent_id'], 'agt', 'cancel：回 agent_id');
+    check.check(cancelBody['cascade'], true, 'cancel：TOP 级联');
+    check.check(cancelBody['cascade_ids'], <dynamic>['agt'], 'cancel：级联 id');
+    check.that(
+      <dynamic>[
+        ...(cancelBody['cancelled'] as List<dynamic>? ?? <dynamic>[]),
+        ...(cancelBody['idle'] as List<dynamic>? ?? <dynamic>[]),
+      ].contains('agt'),
+      'cancel：agt 落在 cancelled 或 idle（覆盖在途/空闲两种时序）',
+    );
+
+    // 运行监督：空快照 + 失效句柄的 404 都可读。
+    final Map<String, dynamic> runningReply = postResult(30);
+    check.check(runningReply['status'], 200, 'tools/running：200');
+    check.check(
+      jsonDecode('${runningReply['body'] ?? '{}'}'),
+      <String, dynamic>{'runs': <dynamic>[]},
+      'tools/running：空快照形状',
+    );
+    check.check(postResult(31)['status'], 404, 'tools/running close：404');
+    check.that(
+      jsonDecode('${postResult(31)['body'] ?? '{}'}')['detail']
+          .toString()
+          .contains('句柄已失效'),
+      'tools/running close：可读原因',
+    );
+
+    // ── 模型池写接口 + token 节奏 ───────────────────────────────────
+    check.check(postResult(32)['status'], 200, 'models：创建 200');
+    final Map<String, dynamic> created = postBody(32);
+    check.check(created['success'], true, 'models：创建 success');
+    check.check(
+      (created['model'] as Map?)?['model_id'],
+      'm3',
+      'models：创建回 model_id',
+    );
+    check.check(
+      ((created['model'] as Map?) ?? {}).containsKey('api_key'),
+      false,
+      'models：创建不回密钥',
+    );
+    check.check(postResult(33)['status'], 409, 'models：重名 409');
+    check.check(
+      postBody(33),
+      <String, dynamic>{'detail': '模型已存在：m3'},
+      'models：重名错误体',
+    );
+    check.check(postResult(34)['status'], 200, 'models：PATCH 200');
+    check.check(
+      (postBody(34)['model'] as Map?)?['name'],
+      '模型三',
+      'models：PATCH 改名生效',
+    );
+    check.check(postResult(35)['status'], 200, 'models：DELETE 200');
+    check.check(
+      postBody(35)['bound_agents'],
+      <dynamic>[],
+      'models：DELETE 回绑定 agent 列表',
+    );
+    check.check(postBody(36)['token_rate'], 1000, 'token-rate：默认 1000');
+    check.check(postResult(37)['status'], 200, 'token-rate：POST 200');
+    check.check(postBody(37)['token_rate'], 200, 'token-rate：夹取后 200');
+    check.check(postBody(38)['token_rate'], 200, 'token-rate：写后读一致');
+
+    // ── 会话写接口 / 提问 / 会话清空 ─────────────────────────────────
+    check.check(postResult(39)['status'], 200, 'sessions：创建 200');
+    final Map<String, dynamic> createdSession = postBody(39);
+    check.check(
+      (createdSession['session'] as Map?)?['session_id'],
+      'ses_new',
+      'sessions：创建回 session_id',
+    );
+    check.check(
+      (createdSession['session'] as Map?)?['message_count'],
+      0,
+      'sessions：新会话 message_count=0',
+    );
+    check.check(postResult(40)['status'], 200, 'sessions：PATCH 200');
+    check.check(postBody(40)['success'], true, 'sessions：PATCH success');
+    check.check(
+      postBody(41)['selected_spec_ids'],
+      <dynamic>['general-task'],
+      'sessions/specs：回显已选规范',
+    );
+    check.check(postResult(42)['status'], 200, 'sessions：DELETE 200');
+
+    final Map<String, dynamic> questionList = postBody(43);
+    check.check(questionList['total'], 2, 'questions：两条（含已作答）');
+    check.check(
+      (questionList['questions'] as List<dynamic>).first['qid'],
+      'q2',
+      'questions：最新在前',
+    );
+    check.that(
+      postResult(44)['status'] == 200,
+      'questions：作答 200',
+      actual: jsonEncode(postBody(44)),
+    );
+    check.check(postBody(44)['status'], 'answered', 'questions：状态变 answered');
+    check.check(
+      postBody(44)['answers'],
+      <dynamic>['继续'],
+      'questions：回显逐题答案',
+    );
+    check.check(postResult(45)['status'], 200, 'conversations：清空 200');
+    check.check(postBody(45)['deleted'], 1, 'conversations：删除消息数');
+
+    // 生成是异步的：等它收尾再删临时目录。
+    await AgentRuntime.forDataDir(temp.path).waitIdle();
+    await AgentRuntime.debugCloseAll();
 
     // 上线通知是异步发的：轮询等它到达（最多 2s）。
     final DateTime deadline = DateTime.now().add(const Duration(seconds: 2));
