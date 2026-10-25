@@ -105,7 +105,7 @@ gh release create v1.0.4 build/plugins/plugin-index.json build/plugins/tree_mini
 | `name` | ✅ | 展示名（面板与详情页读它） |
 | `version` | ✅ | 三段数字 `x.y.z`（装机端比大小只用它判断"有没有更新"） |
 | `description` | | 一句话说明 |
-| `runtime` | | `binary`（缺省，随包可执行文件）/ `python`（脚本，需要解释器） |
+| `runtime` | | **`headless`**（无界面，核心经 stdio 拉起）/ **`ui`**（有界面，自己连核心 WS）；历史值 `binary` / `python` 仍接受并按 `headless` 处理，新清单请写 `headless` / `ui` |
 | `files` | ✅ | 要放进装机端 `plugins/` 的文件名（相对本目录，至少一个） |
 | `command` | ✅ | 装完后用来拉起它的那个文件名（必须在 `files` 里） |
 | `args` | | 启动参数数组（字符串） |
