@@ -2,10 +2,12 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'paths.dart';
+import 'subagent_store.dart';
 import 'todo_store.dart';
 
-/// A2 的第一条只读路由（`G-1 对照表` agent 定义 #7）。
+/// A2 已搬的两条只读路由（`G-1 对照表` agent 定义 #7 / 子 agent #8）。
 const String todosPattern = '/api/agents/{agentId}/todos';
+const String subagentsPattern = '/api/agents/{agentId}/subagents';
 
 /// 处理一次 `api/delegate`（核心 → 插件）。
 ///
@@ -31,19 +33,31 @@ Future<Map<String, dynamic>> handleApiDelegate(
   }
   final AgentDataPaths paths = AgentDataPaths(dataDir);
 
-  if (method == 'GET' && _matches(todosPattern, path)) {
+  if (method == 'GET' &&
+      (_matches(todosPattern, path) || _matches(subagentsPattern, path))) {
     final String agentId = _str(params['agentId']);
-    final String sessionId = _str(query['session_id']).isEmpty
-        ? 'session_default'
-        : _str(query['session_id']);
+    final String sessionId = _sessionOf(query);
     try {
       if (!File(paths.agentFile(agentId)).existsSync()) {
         return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
       }
-      final List<TodoItem> todos = readTodos(paths, agentId, sessionId);
+      if (_matches(todosPattern, path)) {
+        final List<TodoItem> todos = readTodos(paths, agentId, sessionId);
+        return _jsonReply(200, <String, dynamic>{
+          'todos': todos.map((TodoItem todo) => todo.toApiJson()).toList(),
+          'session_id': sessionId,
+        });
+      }
+      final List<Map<String, dynamic>> roster = readSubagentRoster(
+        paths,
+        agentId,
+        sessionId,
+      );
       return _jsonReply(200, <String, dynamic>{
-        'todos': todos.map((TodoItem todo) => todo.toApiJson()).toList(),
+        'agent_id': agentId,
         'session_id': sessionId,
+        'total': roster.length,
+        'subagents': roster,
       });
     } on ArgumentError {
       // 非法 id（含路径分隔符等）：按"agent 不存在"fail-closed，不回显路径规则。
@@ -82,6 +96,12 @@ Map<String, dynamic> _jsonReply(int status, Map<String, dynamic> body) =>
       },
       'body': jsonEncode(body),
     };
+
+/// 会话 id：缺省/空 ⇒ `session_default`（与核心 `TreeStore.defaultSessionId` 同值）。
+String _sessionOf(Map<String, dynamic> query) {
+  final String raw = _str(query['session_id']);
+  return raw.isEmpty ? 'session_default' : raw;
+}
 
 String _str(Object? value) => (value ?? '').toString().trim();
 

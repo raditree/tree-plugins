@@ -103,6 +103,45 @@ Future<int> selfTest() async {
         '- [~] t1 | status=in_progress progress=40 | 写读路径\n'
         '- [ ] 裸行待办\n',
       );
+    File(
+      p.join(temp.path, 'data', 'agt', 'session_default', 'subagents.json'),
+    )
+      ..createSync(recursive: true)
+      ..writeAsStringSync(
+        const JsonEncoder.withIndent('  ').convert(<String, dynamic>{
+          'version': 1,
+          'agent_id': 'agt',
+          'session_id': 'session_default',
+          'subagents': <Map<String, dynamic>>[
+            <String, dynamic>{
+              'id': 'sub_1',
+              'name': '临时员工',
+              'owner_agent_id': 'agt',
+              'session_id': 'session_default',
+              'parent_id': 'agt',
+              'level': 1,
+              'scope': '整理日志',
+              'run_count': 2,
+              'agent': <String, dynamic>{},
+              'created_at': '2026-10-25T10:00:00.000',
+              'updated_at': '2026-10-25T10:05:00.000',
+            },
+            <String, dynamic>{
+              'id': 'sub_2',
+              'name': '下级',
+              'owner_agent_id': 'agt',
+              'session_id': 'session_default',
+              'parent_id': 'sub_1',
+              'level': 2,
+              'scope': '',
+              'run_count': 0,
+              'agent': <String, dynamic>{},
+              'created_at': 1761360000000,
+              'updated_at': 1761360100000,
+            },
+          ],
+        }),
+      );
 
     final PluginKitServer server = PluginKitServer(
       channel: PluginChannel(logTag: 'tree_agent_plugin'),
@@ -141,17 +180,18 @@ Future<int> selfTest() async {
     core.ask(4, 'no_such/method');
     core.ask(5, M.apiDelegate, envelope(todosPattern, 'agt'));
     core.ask(6, M.apiDelegate, envelope(todosPattern, 'nope'));
+    core.ask(7, M.apiDelegate, envelope(subagentsPattern, 'agt'));
     core.ask(
-      7,
+      8,
       M.apiDelegate,
       envelope('/api/agents/agt/sessions', 'agt'),
     );
 
     final Map<Object?, Map<String, dynamic>> byId = await core.waitFor(
-      <int>[0, 1, 2, 3, 4, 5, 6, 7],
+      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8],
     );
 
-    check.that(byId.length == 8, '八条请求都有回包', actual: '${byId.length}');
+    check.that(byId.length == 9, '九条请求都有回包', actual: '${byId.length}');
     check.check(
       byId[0]?['result']?['plugin_id'],
       kPluginId,
@@ -204,8 +244,52 @@ Future<int> selfTest() async {
       'todos：404 错误体与核心一致',
     );
 
-    final Map<String, dynamic> notImplemented =
+    // ── A2：GET /api/agents/{agentId}/subagents ────────────────────────
+    final Map<String, dynamic> rosterReply =
         (byId[7]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+    check.check(rosterReply['status'], 200, 'subagents：200');
+    final Map<String, dynamic> rosterBody =
+        (jsonDecode('${rosterReply['body'] ?? '{}'}') as Map)
+            .cast<String, dynamic>();
+    check.check(rosterBody['agent_id'], 'agt', 'subagents：回 agent_id');
+    check.check(rosterBody['total'], 2, 'subagents：total = 名册条数');
+    check.check(
+      rosterBody['subagents'],
+      <dynamic>[
+        <String, dynamic>{
+          'id': 'sub_1',
+          'name': '临时员工',
+          'owner_agent_id': 'agt',
+          'session_id': 'session_default',
+          'parent_id': 'agt',
+          'level': 1,
+          'scope': '整理日志',
+          'run_count': 2,
+          'created_at': '2026-10-25T10:00:00.000',
+          'updated_at': '2026-10-25T10:05:00.000',
+        },
+        <String, dynamic>{
+          'id': 'sub_2',
+          'name': '下级',
+          'owner_agent_id': 'agt',
+          'session_id': 'session_default',
+          'parent_id': 'sub_1',
+          'level': 2,
+          'scope': '',
+          'run_count': 0,
+          'created_at': DateTime.fromMillisecondsSinceEpoch(
+            1761360000000,
+          ).toIso8601String(),
+          'updated_at': DateTime.fromMillisecondsSinceEpoch(
+            1761360100000,
+          ).toIso8601String(),
+        },
+      ],
+      'subagents：名册视图字段与时间口径（ISO / 毫秒都读）',
+    );
+
+    final Map<String, dynamic> notImplemented =
+        (byId[8]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
     check.check(notImplemented['status'], 501, '未搬路由：501（不是 404）');
     check.that(
       jsonDecode('${notImplemented['body'] ?? '{}'}')['detail']

@@ -1,8 +1,8 @@
 # tree.agent（批次 G 的 agent 领域插件）
 
-> 状态：**A2 进行中**（2026-10-25）。A1 骨架完成；A2 首批：`api/delegate` 管道 +
-> `GET /api/agents/{agentId}/todos`（与核心同数据根**逐字节等价**，见桌面仓
-> `packages/tree_core/tool/verify_agent_equivalence.dart`）。日志写入
+> 状态：**A2 进行中**（2026-10-25）。A1 骨架完成；A2 已搬：`api/delegate` 管道 +
+> `GET /api/agents/{agentId}/todos`、`GET …/subagents`（与核心同数据根**逐字节等价**，
+> 见桌面仓 `packages/tree_core/tool/verify_agent_equivalence.dart`）。日志写入
 > `/api/logs/plugin:tree.agent`。
 > 迁移契约与验收见桌面仓：
 > - `docs/pluginization/agent_pluginization.md`（迁移计划 / A1~A5）
@@ -16,7 +16,7 @@
 | 阶段 | 内容 | 本仓状态 |
 | --- | --- | --- |
 | A1 | 骨架：stdio 循环、hello/ping、工具表、收集站申报、日志 | **已完成** |
-| A2 | 只读面：agents / models / sessions / todos / subagents / teammates / tools-running | **进行中**：todos 已搬并等价；其余 7 组未开始 |
+| A2 | 只读面：agents / models / sessions / todos / subagents / teammates / tools-running | **进行中**：todos / subagents 已搬并等价；其余 6 组未开始 |
 | A3 | 写路径与生成：消息、取消、LLM、工具编排、提问、reset/compact | 未开始 |
 | A4 | 帧迁移：注册广播站，topic 沿用原帧名 | 未开始 |
 | A5 | 交接：核心删除 34 条路由 + 2 条上行 + 领域目录 | 未开始 |
@@ -56,6 +56,7 @@ tree.agent_plugin.dart     入口：hello/ping/tools-list、收集站、api/dele
 lib/tree_agent_loop.dart   身份常量 + 已申报路由表 + 导出
 lib/src/paths.dart         数据根布局（与核心 TreePaths 同一串落盘点，含 safeSegment）
 lib/src/todo_store.dart    todos.md 解析（与核心 FileTodoStore 同一正则）
+lib/src/subagent_store.dart subagents.json 名册解析（与 CoreSubagent.toRosterJson 同口径）
 lib/src/delegate.dart      api/delegate 信封 → 路由分发 → {status, headers, body}
 ```
 
