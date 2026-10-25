@@ -1,0 +1,15 @@
+name: tree_agent_loop
+description: tree.agent 插件的领域库（批次 G）：从 tree_core 平移 agent/llm/team/tool 的共享包；不得反向依赖核心包。
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.13.0
+
+# A1 骨架只依赖 dart: SDK。A2 起按 agent_pluginization.md §10.1 逐项加入
+# pub.dev 依赖（yaml / path 等），**不允许**出现 tree_core / tree_protocol。
+dependencies: {}
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.0
