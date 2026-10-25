@@ -1,9 +1,7 @@
 import 'agent_store.dart';
 import 'model_catalog.dart';
 import 'paths.dart';
-
-/// 模型没配 max_seqlen 时的兜底上下文长度（与核心 `CoreSettings.fallbackMaxSeqlen` 同值）。
-const int kFallbackMaxSeqlen = 128000;
+import 'settings/domain_settings.dart';
 
 /// `GET /api/agents/{agentId}/teammates` 的响应体（与核心 `TeamService.teammatesPayload` 同口径）。
 ///

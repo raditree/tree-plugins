@@ -1,0 +1,258 @@
+import 'dart:io';
+
+import 'package:path/path.dart' as p;
+
+/// `~/.tree` 数据根的路径解析与布局定义。
+///
+/// 布局（M2 起，全部是**人类可直接阅读与手改**的文本文件）：
+/// ```
+/// <root>/
+/// ├── config/
+/// │   ├── settings.yaml          # 全局设置（token 帧率/推送帧率/消息切入/数据收集…）
+/// │   └── models/<model_id>.yaml # 每个模型一个文件（含明文 api_key）
+/// ├── agents/<agent_id>.yaml     # 每个顶部 agent 一个文件（含 system_prompt）
+/// ├── logs/core.log               # 核心进程日志（stderr 的落盘副本，按大小轮转）
+/// └── data/<agent_id>/<session_id>/
+///     ├── session.json           # 会话元数据（原子快照：写临时文件再改名）
+///     ├── messages.jsonl         # 消息追加日志（一行一条，崩溃最多丢最后一行）
+///     └── usage.jsonl            # 逐调用用量账本（一行一次 LLM 调用；遥测，非对话）
+/// ```
+///
+/// 为什么不是"每会话一个大 JSON"：单个会话实测已达 2433 条消息 / 2.9 MB，
+/// 全量重写会让每次追加都变成 O(n) 写放大并放大崩溃损坏面；jsonl 追加天然
+/// 只影响一行，配合 session.json 的原子快照即可保证元数据不会半写。
+///
+/// 根目录解析顺序：显式 override（CLI `--data-dir`）→ `TREE_HOME` 环境变量
+/// → 各平台规范位置（Windows `%APPDATA%\Tree`；macOS
+/// `~/Library/Application Support/Tree`；Linux `$XDG_DATA_HOME/tree` 或
+/// `~/.local/share/tree`）→ `~/.tree` 兜底。
+class TreePaths {
+  TreePaths(this.root);
+
+  /// 数据根目录（绝对路径）。
+  final String root;
+
+  /// 解析数据根目录（[environment] 仅测试注入用）。
+  static TreePaths resolve({
+    String? override,
+    Map<String, String>? environment,
+  }) {
+    final Map<String, String> env = environment ?? Platform.environment;
+    final String explicit = (override ?? '').trim();
+    if (explicit.isNotEmpty) return TreePaths(p.absolute(explicit));
+    final String treeHome = (env['TREE_HOME'] ?? '').trim();
+    if (treeHome.isNotEmpty) return TreePaths(p.absolute(treeHome));
+    return TreePaths(_platformDefault(env));
+  }
+
+  static String _platformDefault(Map<String, String> env) {
+    if (Platform.isWindows) {
+      final String appData = (env['APPDATA'] ?? '').trim();
+      if (appData.isNotEmpty) return p.join(appData, 'Tree');
+      final String profile = (env['USERPROFILE'] ?? '').trim();
+      if (profile.isNotEmpty) return p.join(profile, '.tree');
+      return p.join(Directory.systemTemp.path, 'Tree');
+    }
+    final String home = (env['HOME'] ?? '').trim();
+    if (Platform.isMacOS) {
+      return home.isEmpty
+          ? p.join(Directory.systemTemp.path, 'Tree')
+          : p.join(home, 'Library', 'Application Support', 'Tree');
+    }
+    final String xdg = (env['XDG_DATA_HOME'] ?? '').trim();
+    if (xdg.isNotEmpty) return p.join(xdg, 'tree');
+    return home.isEmpty
+        ? p.join(Directory.systemTemp.path, 'tree')
+        : p.join(home, '.local', 'share', 'tree');
+  }
+
+  /// 配置目录。
+  String get configDir => p.join(root, 'config');
+
+  /// 模型配置目录。
+  String get modelsDir => p.join(configDir, 'models');
+
+  /// agent 配置目录。
+  String get agentsDir => p.join(root, 'agents');
+
+  /// 会话数据目录（每个 agent 一个子目录）。
+  String get sessionsDataDir => p.join(root, 'data');
+
+  /// 全局设置文件。
+  String get settingsFile => p.join(configDir, 'settings.yaml');
+
+  /// MCP 服务配置（可直接手改的 yaml）。
+  String get mcpConfigFile => p.join(configDir, 'mcp.yaml');
+
+  /// 插件配置（可直接手改的 yaml）。
+  String get pluginsConfigFile => p.join(configDir, 'plugins.yaml');
+
+  /// 插件**发布仓库**的下载缓存（`<root>/plugins_release`）。
+  ///
+  /// 为什么放在数据根而不是可执行文件同级：这里存的是**半成品**（发布索引
+  /// `plugin-index.json` 与按 `<id>/<version>/` 分层的资产），而 `plugins/`（exe 同级）是
+  /// **已就位、会被拉起**的那一份。混在一起会让“下载了一半”的东西出现在插件查找
+  /// 路径里（面板上就多一条起不来的插件），而重装/换版时也不好判断该删哪一份。
+  /// 删掉这个目录没有破坏性：下一次刷新会重新拉。
+  String get pluginsReleaseDir => p.join(root, 'plugins_release');
+
+  /// 图像附件的 `file_id` 缓存（`if_vision` 用）。
+  ///
+  /// 为什么放在配置目录而不是工作空间：它是**模型服务侧**的状态（同一张图在
+  /// 同一端点只传一次），跟"图片存在哪个工作空间"无关；键里已经带了工作空间
+  /// 身份（见 `llm/vision_files.dart` 的 `visionCacheKey`），所以不同 agent、
+  /// 不同 SSH 主机不会互相串味。删掉它只意味着下次重新上传。
+  String get visionFilesFile => p.join(configDir, 'vision_files.json');
+
+  /// 核心进程日志目录（`<root>/logs`）。
+  ///
+  /// 为什么核心要落盘：发布版没有调试器时，stderr 只有"父进程转发 + 开发者看得到"，
+  /// 用户报"压缩没生效 / 插件没接管"时无迹可查。日志出口见
+  /// `CoreLogSink`（`lib/src/util/core_log_sink.dart`）：**stderr 与这个目录双写**。
+  String get logsDir => p.join(root, 'logs');
+
+  /// 核心日志的**当前**那一份（`<root>/logs/core.log`）。
+  ///
+  /// 轮转后的历史份额见 [coreLogFileAt]（`core.1.log` 最新，编号越大越旧）。
+  String get coreLogFile => p.join(logsDir, 'core.log');
+
+  /// **后台（hook）任务台账目录**（`<root>/hooks`）。
+  ///
+  /// 落在这里的是一行一条的 `<task_id>.json`（原子写）：远端后台命令跨**核心/应用
+  /// 重启**接续的凭据——重启后按它重新挂上"等它结束"，并把完成提示投递回原会话。
+  /// 为什么放数据根而不是工作空间：工作空间可能在远端，而"远端此刻可达吗"恰恰是
+  /// 重启时最不确定的事；数据根永远读得到。
+  String get hooksDir => p.join(root, 'hooks');
+
+  /// 轮转后的历史日志份（[index] 从 1 开始；越大越旧）。
+  String coreLogFileAt(int index) => p.join(logsDir, 'core.$index.log');
+
+  /// 插件运行日志目录（`<root>/logs/plugins`）。
+  ///
+  /// 日志 API 的 `plugin:<id>` 源在磁盘上的落点；清空时按与核心同一口径轮转成
+  /// `<id>.1.log`。文件名只取 [safeSegment] 后的插件 id（配置里的 id 天然满足）。
+  String get pluginLogsDir => p.join(logsDir, 'plugins');
+
+  /// 某个插件**当前**那一份日志（`<root>/logs/plugins/<id>.log`）。
+  String pluginLogFile(String pluginId) =>
+      p.join(pluginLogsDir, '${safeSegment(pluginId)}.log');
+
+  /// 某个插件轮转后的历史日志份（[index] 从 1 开始；越大越旧）。
+  String pluginLogFileAt(String pluginId, int index) =>
+      p.join(pluginLogsDir, '${safeSegment(pluginId)}.$index.log');
+
+  /// 插件**命名空间存储**根目录（`<root>/store`）。
+  ///
+  /// 布局：`<root>/store/<ns>/k_<base64url(key)>`，每个键一个文件、内容原样字节。
+  /// `ns` 与 key 的安全校验见 `store/plugin_store.dart`（这里不做文件名编码）。
+  String get storeDir => p.join(root, 'store');
+
+  /// 全部提问的原子快照（跨会话，右侧「问题回复」页用）。
+  ///
+  /// 为什么不像消息那样按会话拆文件：提问是**跨会话**查询的队列（`GET /api/questions`），
+  /// 且单条很小；集中一个文件才能一次原子覆盖、不必扫描目录。会话内的提问卡片
+  /// 另有消息日志承载（`kind = ask_user_question`）。
+  String get questionsFile => p.join(sessionsDataDir, 'questions.json');
+
+  /// 单个模型配置文件。
+  String modelFile(String modelId) =>
+      p.join(modelsDir, '${safeSegment(modelId)}.yaml');
+
+  /// 单个 agent 配置文件。
+  String agentFile(String agentId) =>
+      p.join(agentsDir, '${safeSegment(agentId)}.yaml');
+
+  /// 某 agent 的会话数据目录。
+  String agentDataDir(String agentId) =>
+      p.join(sessionsDataDir, safeSegment(agentId));
+
+  /// 某会话的目录。
+  String sessionDir(String agentId, String sessionId) =>
+      p.join(agentDataDir(agentId), safeSegment(sessionId));
+
+  /// 会话元数据（原子快照）。
+  String sessionMetaFile(String agentId, String sessionId) =>
+      p.join(sessionDir(agentId, sessionId), 'session.json');
+
+  /// 会话消息追加日志。
+  String messagesFile(String agentId, String sessionId) =>
+      p.join(sessionDir(agentId, sessionId), 'messages.jsonl');
+
+  /// 某会话的**逐调用用量账本**（`data/<agent_id>/<session_id>/usage.jsonl`）。
+  ///
+  /// 一行一次 LLM 调用（对话跳 / 内置压缩 / `llm.call` / 插件接管跳），
+  /// 字段表见 `UsageCall.toJson()`。为什么与消息分开一个文件：用量是**遥测**不是
+  /// 对话——混进 `messages.jsonl` 会改变既有行形状的兼容面，而单独一份既能让
+  /// 插件面板独立读，也能让"删会话"（递归删目录）天然把它收干净。
+  String usageFile(String agentId, String sessionId) =>
+      p.join(sessionDir(agentId, sessionId), 'usage.jsonl');
+
+  /// **临时员工（subagent）名册**：`data/<agentId>/<sessionId>/subagents.json`。
+  ///
+  /// 为什么与会话数据同目录（而不是某种全局名册）：临时员工**只活在它被召来的
+  /// 那个会话里**——放在会话目录下，"删会话"这一条既有路径（递归删目录）就天然
+  /// 把它收干净了，不需要任何跨会话的清理钩子，也不会残留到任何全局位置。
+  String subagentsFile(String agentId, String sessionId) =>
+      p.join(sessionDir(agentId, sessionId), 'subagents.json');
+
+  /// agent 的**默认工作空间目录**（`<root>/workspaces/<agent_id>`）。
+  ///
+  /// 仅当 agent 配置里 `workspace_dir` 为空时使用；用户可以在
+  /// `agents/<id>.yaml` 里直接改成自己的项目目录。
+  String defaultWorkspaceDir(String agentId) =>
+      p.join(root, 'workspaces', safeSegment(agentId));
+
+  /// 创建全部必需目录（幂等）。
+  Future<void> ensureLayout() async {
+    for (final String dir in <String>[
+      root,
+      configDir,
+      modelsDir,
+      agentsDir,
+      sessionsDataDir,
+      logsDir,
+      hooksDir,
+      storeDir,
+    ]) {
+      await Directory(dir).create(recursive: true);
+    }
+  }
+
+  /// [ensureLayout] 的同步版本（测试与"启动即建骨架"的同步路径用）。
+  void ensureLayoutSync() {
+    for (final String dir in <String>[
+      root,
+      configDir,
+      modelsDir,
+      agentsDir,
+      sessionsDataDir,
+      logsDir,
+      hooksDir,
+      storeDir,
+    ]) {
+      Directory(dir).createSync(recursive: true);
+    }
+  }
+
+  /// 校验单个路径分段是否安全（防路径穿越）。
+  ///
+  /// 只允许 `[A-Za-z0-9_.-]`，并拒绝 `.` / `..` 与空串。核心自己生成的 id
+  /// 天然满足；来自 HTTP/WS 的 id 必须先过这里，否则 `../` 能写出数据根之外。
+  static String safeSegment(String raw) {
+    final String value = raw.trim();
+    if (value.isEmpty) {
+      throw ArgumentError.value(raw, 'segment', '路径分段不能为空');
+    }
+    if (value == '.' || value == '..') {
+      throw ArgumentError.value(raw, 'segment', '路径分段不能是 . 或 ..');
+    }
+    if (!RegExp(r'^[A-Za-z0-9_.-]+$').hasMatch(value)) {
+      throw ArgumentError.value(
+        raw,
+        'segment',
+        '路径分段只允许 [A-Za-z0-9_.-]（防路径穿越）',
+      );
+    }
+    return value;
+  }
+}
