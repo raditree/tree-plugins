@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'agent_config.dart';
+import 'agent_store.dart';
 import 'model_catalog.dart';
 import 'paths.dart';
 import 'subagent_store.dart';
@@ -9,6 +10,7 @@ import 'todo_store.dart';
 /// A2 已搬的只读路由（`G-1 对照表` 的编号见注释）。
 const String todosPattern = '/api/agents/{agentId}/todos'; // agent 定义 #7
 const String subagentsPattern = '/api/agents/{agentId}/subagents'; // 子 agent #8
+const String agentsPattern = '/api/agents'; // agent 列表 #1
 const String modelsPattern = '/api/models'; // 模型池 #14
 const String agentModelsInfoPattern =
     '/api/agents/{agentId}/models-info'; // agent 定义 #6
@@ -36,6 +38,28 @@ Future<Map<String, dynamic>> handleApiDelegate(
     });
   }
   final AgentDataPaths paths = AgentDataPaths(dataDir);
+
+  // 全局只读：agent 列表（22 键 + 预览 + 待处理成员数，按 updatedAt 降序）。
+  if (method == 'GET' && _matches(agentsPattern, path)) {
+    final List<AgentRecord> records = readAgentRecords(paths)
+      ..sort(
+        (AgentRecord a, AgentRecord b) =>
+            b.updatedAt.compareTo(a.updatedAt),
+      );
+    final List<Map<String, dynamic>> items = <Map<String, dynamic>>[];
+    for (final AgentRecord record in records) {
+      final TextPreview? preview = lastTextPreview(paths, record.id);
+      items.add(
+        agentApiJson(
+          record,
+          lastMessage: preview?.content ?? '',
+          lastMessageTime: preview?.timestamp,
+          pendingMemberCount: pendingMemberCountOf(records, record),
+        ),
+      );
+    }
+    return _jsonReply(200, <String, dynamic>{'agents': items});
+  }
 
   // 全局只读：模型池（不需要 agent）。
   if (method == 'GET' && _matches(modelsPattern, path)) {

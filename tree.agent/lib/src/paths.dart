@@ -41,6 +41,10 @@ class AgentDataPaths {
   String subagentsFile(String agentId, String sessionId) =>
       p.join(sessionDir(agentId, sessionId), 'subagents.json');
 
+  /// 会话消息追加日志：`<root>/data/<agent>/<session>/messages.jsonl`。
+  String messagesFile(String agentId, String sessionId) =>
+      p.join(sessionDir(agentId, sessionId), 'messages.jsonl');
+
   /// 校验单个路径分段（防路径穿越）。与核心 `TreePaths.safeSegment` 同一口径：
   /// 只允许 `[A-Za-z0-9_.-]`，拒绝空串 / `.` / `..`。
   static String safeSegment(String raw) {

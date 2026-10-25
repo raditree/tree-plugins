@@ -104,7 +104,64 @@ Future<int> selfTest() async {
         'max_seqlen_override: 32000\n'
         'max_output_tokens: 8192\n'
         'compress_threshold: 0.8\n'
-        'thinking_override: true\n',
+        'thinking_override: true\n'
+        'created_at: 2026-10-25T10:00:03.000\n'
+        'updated_at: 2026-10-25T10:00:03.000\n',
+      );
+    File(p.join(temp.path, 'agents', 'agt_top.yaml'))
+      ..createSync(recursive: true)
+      ..writeAsStringSync(
+        'id: agt_top\n'
+        'name: 指挥\n'
+        'model_id: m1\n'
+        'system_prompt: 你是指挥\n'
+        'created_at: 2026-10-25T10:00:01.000\n'
+        'updated_at: 2026-10-25T10:00:02.000\n',
+      );
+    File(p.join(temp.path, 'agents', 'agt_m.yaml'))
+      ..createSync(recursive: true)
+      ..writeAsStringSync(
+        'id: agt_m\n'
+        'name: 成员\n'
+        'team_id: agt_top\n'
+        'parent_agent_id: agt_top\n'
+        'level: 1\n'
+        'review_status: pending_review\n'
+        'ssh:\n'
+        '  host: 10.0.0.5\n'
+        'created_at: 2026-10-25T10:00:00.000\n'
+        'updated_at: 2026-10-25T10:00:01.000\n',
+      );
+    // 会话夹具：两个会话（旧的先；新会话里有"用户 / agent 文本 / 子 agent / 工具"四种行，
+    // 预览只应取最后一条 agent 文本）。
+    File(p.join(temp.path, 'data', 'agt', 'session_default', 'session.json'))
+      ..createSync(recursive: true)
+      ..writeAsStringSync(
+        '{"session_id":"session_default","agent_id":"agt","title":"默认",'
+        '"updated_at":"2026-10-25T10:00:10.000"}',
+      );
+    File(p.join(temp.path, 'data', 'agt', 'ses_old', 'session.json'))
+      ..createSync(recursive: true)
+      ..writeAsStringSync(
+        '{"session_id":"ses_old","agent_id":"agt","title":"旧会话",'
+        '"updated_at":"2026-10-25T10:00:05.000"}',
+      );
+    File(p.join(temp.path, 'data', 'agt', 'ses_old', 'messages.jsonl'))
+      .writeAsStringSync(
+        '{"id":"m0","agent_id":"agt","session_id":"ses_old","role":"agent",'
+        '"content":"旧的预览","kind":"text","timestamp":"2026-10-25T10:00:04.000"}\n',
+      );
+    File(p.join(temp.path, 'data', 'agt', 'session_default', 'messages.jsonl'))
+      .writeAsStringSync(
+        '{"id":"m1","agent_id":"agt","session_id":"session_default","role":"user",'
+        '"content":"你好","kind":"text","timestamp":"2026-10-25T10:00:06.000"}\n'
+        '{"id":"m2","agent_id":"agt","session_id":"session_default","role":"agent",'
+        '"content":"这是预览","kind":"text","timestamp":"2026-10-25T10:00:09.000"}\n'
+        '{"id":"m3","agent_id":"agt","session_id":"session_default","role":"agent",'
+        '"content":"子回复","kind":"text","subagent_id":"sub_1",'
+        '"timestamp":"2026-10-25T10:00:09.500"}\n'
+        '{"id":"m4","agent_id":"agt","session_id":"session_default","role":"agent",'
+        '"content":"工具卡片","kind":"tool","timestamp":"2026-10-25T10:00:09.900"}\n',
       );
     File(p.join(temp.path, 'config', 'models', 'm1.yaml'))
       ..createSync(recursive: true)
@@ -216,17 +273,18 @@ Future<int> selfTest() async {
     core.ask(8, M.apiDelegate, envelope(modelsPattern, 'agt'));
     core.ask(9, M.apiDelegate, envelope(agentModelsInfoPattern, 'agt'));
     core.ask(10, M.apiDelegate, envelope(agentModelsInfoPattern, 'nope'));
+    core.ask(11, M.apiDelegate, envelope(agentsPattern, ''));
     core.ask(
-      11,
+      12,
       M.apiDelegate,
       envelope('/api/agents/agt/sessions', 'agt'),
     );
 
     final Map<Object?, Map<String, dynamic>> byId = await core.waitFor(
-      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
     );
 
-    check.that(byId.length == 12, '十二条请求都有回包', actual: '${byId.length}');
+    check.that(byId.length == 13, '十三条请求都有回包', actual: '${byId.length}');
     check.check(
       byId[0]?['result']?['plugin_id'],
       kPluginId,
@@ -394,8 +452,100 @@ Future<int> selfTest() async {
       'models-info：404 错误体与核心一致',
     );
 
-    final Map<String, dynamic> notImplemented =
+    // ── A2：GET /api/agents（列表：22 键 + 预览 + 待处理成员数 + 排序）──
+    final Map<String, dynamic> listReply =
         (byId[11]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+    check.check(listReply['status'], 200, 'agents：200');
+    int ms(String iso) => DateTime.parse(iso).millisecondsSinceEpoch;
+    final Map<String, dynamic> agentsBody =
+        (jsonDecode('${listReply['body'] ?? '{}'}') as Map)
+            .cast<String, dynamic>();
+    check.that(
+      (agentsBody['agents'] as List<dynamic>?)?.length == 3,
+      'agents：三条（扫描 agents/*.yaml）',
+      actual: '${agentsBody['agents']}',
+    );
+    check.check(
+      agentsBody['agents'],
+      <dynamic>[
+        <String, dynamic>{
+          'id': 'agt',
+          'name': '夹具',
+          'type': 'normal',
+          'system_prompt': '你是夹具',
+          'model_id': 'm1',
+          'workspace_id': '',
+          'workspace_dir': '',
+          'has_ssh': false,
+          'last_message': '这是预览',
+          'last_message_time': ms('2026-10-25T10:00:09.000'),
+          'unread_count': 0,
+          'avatar_url': null,
+          'pending_member_count': 0,
+          'team_id': '',
+          'parent_agent_id': '',
+          'level': 0,
+          'role': '',
+          'duty': '',
+          'can_lead_team': true,
+          'review_status': '',
+          'created_at': ms('2026-10-25T10:00:03.000'),
+          'updated_at': ms('2026-10-25T10:00:03.000'),
+        },
+        <String, dynamic>{
+          'id': 'agt_top',
+          'name': '指挥',
+          'type': 'normal',
+          'system_prompt': '你是指挥',
+          'model_id': 'm1',
+          'workspace_id': '',
+          'workspace_dir': '',
+          'has_ssh': false,
+          'last_message': '',
+          'last_message_time': null,
+          'unread_count': 0,
+          'avatar_url': null,
+          'pending_member_count': 1,
+          'team_id': '',
+          'parent_agent_id': '',
+          'level': 0,
+          'role': '',
+          'duty': '',
+          'can_lead_team': true,
+          'review_status': '',
+          'created_at': ms('2026-10-25T10:00:01.000'),
+          'updated_at': ms('2026-10-25T10:00:02.000'),
+        },
+        <String, dynamic>{
+          'id': 'agt_m',
+          'name': '成员',
+          'type': 'normal',
+          'system_prompt': '',
+          'model_id': '',
+          'workspace_id': '',
+          'workspace_dir': '',
+          'has_ssh': true,
+          'last_message': '',
+          'last_message_time': null,
+          'unread_count': 0,
+          'avatar_url': null,
+          'pending_member_count': 0,
+          'team_id': 'agt_top',
+          'parent_agent_id': 'agt_top',
+          'level': 1,
+          'role': '',
+          'duty': '',
+          'can_lead_team': true,
+          'review_status': 'pending_review',
+          'created_at': ms('2026-10-25T10:00:00.000'),
+          'updated_at': ms('2026-10-25T10:00:01.000'),
+        },
+      ],
+      'agents：22 键 / 预览 / 待处理成员数 / updatedAt 降序',
+    );
+
+    final Map<String, dynamic> notImplemented =
+        (byId[12]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
     check.check(notImplemented['status'], 501, '未搬路由：501（不是 404）');
     check.that(
       jsonDecode('${notImplemented['body'] ?? '{}'}')['detail']

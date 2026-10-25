@@ -12,11 +12,13 @@ library;
 import 'src/delegate.dart'
     show
         agentModelsInfoPattern,
+        agentsPattern,
         modelsPattern,
         subagentsPattern,
         todosPattern;
 
 export 'src/agent_config.dart';
+export 'src/agent_store.dart';
 export 'src/delegate.dart';
 export 'src/model_catalog.dart';
 export 'src/paths.dart';
@@ -25,7 +27,7 @@ export 'src/todo_store.dart';
 export 'src/yaml_utils.dart';
 
 /// 插件版本（与 `plugin.json` 的 version 同源；发布时两处一起改）。
-const String kTreeAgentVersion = '0.3.0';
+const String kTreeAgentVersion = '0.4.0';
 
 /// 收集站 id：插件经它申报自己承担的 `{method, pattern}` 委派路由。
 const String kApiRoutesStation = 'system.collect.api.routes';
@@ -35,6 +37,7 @@ const String kApiRoutesStation = 'system.collect.api.routes';
 /// A2 起按 `agent_api_contract.md` §1 逐组追加；双跑期核心仍实现同键时，
 /// 核心会把它标注为 shadowed 并继续由核心承接（查表顺序），交接删除后自动生效。
 const List<Map<String, String>> kDeclaredRoutes = <Map<String, String>>[
+  <String, String>{'method': 'GET', 'pattern': agentsPattern},
   <String, String>{'method': 'GET', 'pattern': todosPattern},
   <String, String>{'method': 'GET', 'pattern': subagentsPattern},
   <String, String>{'method': 'GET', 'pattern': modelsPattern},
