@@ -37,6 +37,12 @@ tree.agent 的收集站采集工具定义，执行时经 `plugin.toolCall` 回�
 
 ## 执行器依赖（L-24）
 
+> **local_executor 是 tree.agent 的必需依赖**（`requires.plugins: local_executor >=0.4.0`）。
+> 执行器缺失/被卸载时 tree.agent 不应启动；已运行时卸载执行器，核心会先要求确认，
+> 确认后**停用 tree.agent**，不会回退到核心内置执行器。
+
+
+
 read / write / edit / list / grep / terminal，以及 tool_runs 不再由核心执行：tree.agent 先登记工作空间租约，
 再把 `workspace_id` 随 `fs.*` / `terminal.exec` 下发；这些命令由 `local_executor`
 自建执行站（`plugin.local_executor.execute.local`，命令 `file.*` / `exec.command`）执行。没装该插件时工具会显式失败（不静默回退核心）。

@@ -11,5 +11,13 @@
   "args": [],
   "suspension": "keep",
   "granularity": "team",
-  "scope": {}
+  "scope": {},
+  "requires": {
+    "plugins": [
+      {
+        "id": "local_executor",
+        "version": ">=0.4.0"
+      }
+    ]
+  }
 }
