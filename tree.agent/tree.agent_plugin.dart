@@ -153,10 +153,34 @@ Future<int> selfTest() async {
         '{"id":"m0","agent_id":"agt","session_id":"ses_old","role":"agent",'
         '"content":"旧的预览","kind":"text","timestamp":"2026-10-25T10:00:04.000"}\n',
       );
+    File(p.join(temp.path, 'data', 'questions.json'))
+      ..createSync(recursive: true)
+      ..writeAsStringSync(
+        '[\n'
+        '  {\n'
+        '    "qid": "q1",\n'
+        '    "agent_id": "agt",\n'
+        '    "team_id": "",\n'
+        '    "session_id": "session_default",\n'
+        '    "is_member": false,\n'
+        '    "questions": [{"question": "选哪个", "options": ["A", "B"]}],\n'
+        '    "answers": ["B"],\n'
+        '    "question": "选哪个",\n'
+        '    "options": ["A", "B"],\n'
+        '    "answer": "B",\n'
+        '    "status": "answered",\n'
+        '    "created_at": 1761360000000,\n'
+        '    "answered_at": 1761360001000\n'
+        '  }\n'
+        ']\n',
+      );
     File(p.join(temp.path, 'data', 'agt', 'session_default', 'messages.jsonl'))
       .writeAsStringSync(
         '{"id":"m1","agent_id":"agt","session_id":"session_default","role":"user",'
         '"content":"你好","kind":"text","timestamp":"2026-10-25T10:00:06.000"}\n'
+        '{"id":"q1","agent_id":"agt","session_id":"session_default","role":"agent",'
+        '"content":"选哪个","kind":"ask_user_question",'
+        '"timestamp":"2026-10-25T10:00:07.000"}\n'
         '{"id":"m2","agent_id":"agt","session_id":"session_default","role":"agent",'
         '"content":"这是预览","kind":"text","timestamp":"2026-10-25T10:00:09.000"}\n'
         '{"id":"m3","agent_id":"agt","session_id":"session_default","role":"agent",'
@@ -250,11 +274,12 @@ Future<int> selfTest() async {
       String path,
       String agentId, {
       Map<String, String> extraParams = const <String, String>{},
+      Map<String, String>? query,
     }) => <String, dynamic>{
       'method': 'GET',
       'path': path,
       'params': <String, dynamic>{'agentId': agentId, ...extraParams},
-      'query': <String, dynamic>{'session_id': 'session_default'},
+      'query': <String, dynamic>{...?query, if (query == null) 'session_id': 'session_default'},
           'headers': <String, dynamic>{},
           'scope': <String, dynamic>{},
           'workspace_dir': '',
@@ -311,14 +336,67 @@ Future<int> selfTest() async {
     core.ask(
       17,
       M.apiDelegate,
+      envelope(
+        conversationsPattern,
+        'agt',
+        query: <String, String>{'session_id': 'session_default'},
+      ),
+    );
+    core.ask(
+      18,
+      M.apiDelegate,
+      envelope(
+        conversationsPattern,
+        'agt',
+        query: <String, String>{'session_id': 'session_default', 'limit': '2'},
+      ),
+    );
+    core.ask(
+      19,
+      M.apiDelegate,
+      envelope(
+        conversationsPattern,
+        'agt',
+        query: <String, String>{
+          'session_id': 'session_default',
+          'limit': '2',
+          'from': '1',
+        },
+      ),
+    );
+    core.ask(
+      20,
+      M.apiDelegate,
+      envelope(
+        conversationsPattern,
+        'agt',
+        query: <String, String>{
+          'session_id': 'session_default',
+          'limit': '2',
+          'at': 'm3',
+        },
+      ),
+    );
+    core.ask(
+      21,
+      M.apiDelegate,
+      envelope(
+        conversationsPattern,
+        'agt',
+        query: <String, String>{'session_id': 'all'},
+      ),
+    );
+    core.ask(
+      22,
+      M.apiDelegate,
       envelope('/api/agents/agt/sessions/ses_x/messages', 'agt'),
     );
 
     final Map<Object?, Map<String, dynamic>> byId = await core.waitFor(
-      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
     );
 
-    check.that(byId.length == 18, '十八条请求都有回包', actual: '${byId.length}');
+    check.that(byId.length == 23, '二十三条请求都有回包', actual: '${byId.length}');
     check.check(
       byId[0]?['result']?['plugin_id'],
       kPluginId,
@@ -619,7 +697,7 @@ Future<int> selfTest() async {
           'title': '默认',
           'status': 'active',
           'selected_spec_ids': <String>[],
-          'message_count': 2,
+          'message_count': 3,
           'created_at': ms('2026-10-25T10:00:02.000'),
           'updated_at': ms('2026-10-25T10:00:10.000'),
         },
@@ -650,8 +728,8 @@ Future<int> selfTest() async {
     );
     check.check(
       (detailSessionBody['messages'] as List<dynamic>?)?.length,
-      4,
-      '会话详情：四条消息',
+      5,
+      '会话详情：五条消息',
     );
     check.check(
       (detailSessionBody['messages'] as List<dynamic>?)?[0],
@@ -678,6 +756,28 @@ Future<int> selfTest() async {
     check.check(
       (detailSessionBody['messages'] as List<dynamic>?)?[1],
       <String, dynamic>{
+        'id': 'q1',
+        'agent_id': 'agt',
+        'session_id': 'session_default',
+        'role': 'agent',
+        'content': '选哪个',
+        'timestamp': '2026-10-25T10:00:07.000',
+        'kind': 'ask_user_question',
+        'tool_name': null,
+        'tool_arguments': null,
+        'tool_result': '',
+        'tool_call_id': null,
+        'usage': null,
+        'attachments': null,
+        'options': <String>[],
+        'answered': false,
+        'is_streaming': false,
+      },
+      '会话详情：提问卡片（详情不叠加记录状态）',
+    );
+    check.check(
+      (detailSessionBody['messages'] as List<dynamic>?)?[2],
+      <String, dynamic>{
         'id': 'm2',
         'agent_id': 'agt',
         'session_id': 'session_default',
@@ -698,7 +798,7 @@ Future<int> selfTest() async {
       '会话详情：agent 消息',
     );
     check.check(
-      (detailSessionBody['messages'] as List<dynamic>?)?[2],
+      (detailSessionBody['messages'] as List<dynamic>?)?[3],
       <String, dynamic>{
         'id': 'm3',
         'agent_id': 'agt',
@@ -724,7 +824,7 @@ Future<int> selfTest() async {
       '会话详情：临时员工消息带标记键',
     );
     check.check(
-      ((detailSessionBody['messages'] as List<dynamic>?)?[3] as Map?)?['kind'],
+      ((detailSessionBody['messages'] as List<dynamic>?)?[4] as Map?)?['kind'],
       'tool',
       '会话详情：工具消息 kind',
     );
@@ -749,8 +849,95 @@ Future<int> selfTest() async {
       '会话详情：404 错误体与核心一致',
     );
 
+    // ── A2：GET /api/conversations（分页 + 提问状态叠加）──────────────
+    Map<String, dynamic> convBody(int index) {
+      final Map<String, dynamic> reply =
+          (byId[index]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+      return (jsonDecode('${reply['body'] ?? '{}'}') as Map)
+          .cast<String, dynamic>();
+    }
+
+    List<String> idsOf(Map<String, dynamic> body) => <String>[
+      for (final Object? item in body['messages'] as List<dynamic>)
+        '${(item as Map<dynamic, dynamic>)['id']}',
+    ];
+
+    final Map<String, dynamic> convDefault = convBody(17);
+    check.check(convDefault['total'], 5, 'conversations：total = 全部消息数');
+    check.check(convDefault['offset'], 0, 'conversations：offset = 0');
+    check.check(convDefault['has_more'], false, 'conversations：has_more=false');
+    check.check(
+      idsOf(convDefault),
+      <String>['m1', 'q1', 'm2', 'm3', 'm4'],
+      'conversations：按 timestamp 升序',
+    );
+    check.check(
+      (convDefault['messages'] as List<dynamic>)[1],
+      <String, dynamic>{
+        'id': 'q1',
+        'agent_id': 'agt',
+        'session_id': 'session_default',
+        'role': 'agent',
+        'content': '选哪个',
+        'timestamp': '2026-10-25T10:00:07.000',
+        'kind': 'ask_user_question',
+        'tool_name': null,
+        'tool_arguments': null,
+        'tool_result': '',
+        'tool_call_id': null,
+        'usage': null,
+        'attachments': null,
+        'options': <String>['A', 'B'],
+        'answered': true,
+        'is_streaming': false,
+        'answer': 'B',
+        'questions': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'question': '选哪个',
+            'options': <String>['A', 'B'],
+          },
+        ],
+        'answers': <String>['B'],
+      },
+      'conversations：提问卡片叠加记录状态/答案/选项',
+    );
+
+    final Map<String, dynamic> convLimit = convBody(18);
+    check.check(
+      idsOf(convLimit),
+      <String>['m3', 'm4'],
+      'conversations limit=2：末尾一页',
+    );
+    check.check(convLimit['offset'], 3, 'conversations limit=2：offset=3');
+    check.check(convLimit['has_more'], true, 'conversations limit=2：has_more');
+
+    final Map<String, dynamic> convFrom = convBody(19);
+    check.check(
+      idsOf(convFrom),
+      <String>['q1', 'm2'],
+      'conversations from=1&limit=2：按下标取页',
+    );
+    check.check(convFrom['offset'], 1, 'conversations from：offset=1');
+
+    final Map<String, dynamic> convAt = convBody(20);
+    check.check(
+      idsOf(convAt),
+      <String>['m2', 'm3'],
+      'conversations at=m3&limit=2：以目标为中心',
+    );
+    check.check(convAt['offset'], 2, 'conversations at：offset=2');
+
+    final Map<String, dynamic> convAll = convBody(21);
+    check.check(
+      idsOf(convAll),
+      <String>['m0', 'm1', 'q1', 'm2', 'm3', 'm4'],
+      'conversations session_id=all：跨会话合并后按时间升序',
+    );
+    check.check(convAll['total'], 6, 'conversations all：total=6');
+    check.check(convAll['session_id'], 'all', 'conversations all：回显 all');
+
     final Map<String, dynamic> notImplemented =
-        (byId[17]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+        (byId[22]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
     check.check(notImplemented['status'], 501, '未搬路由：501（不是 404）');
     check.that(
       jsonDecode('${notImplemented['body'] ?? '{}'}')['detail']

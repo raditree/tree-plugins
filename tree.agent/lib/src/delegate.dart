@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'agent_config.dart';
 import 'agent_store.dart';
+import 'conversation_store.dart';
 import 'model_catalog.dart';
 import 'session_store.dart';
 import 'paths.dart';
@@ -18,6 +19,8 @@ const String sessionsPattern =
 const String sessionDetailPattern =
     '/api/agents/{agentId}/sessions/{sessionId}'; // 会话详情 #5（会话/历史组）
 const String modelsPattern = '/api/models'; // 模型池 #14
+const String conversationsPattern =
+    '/api/conversations/{agentId}'; // 会话历史 #1（会话/历史组）
 const String agentModelsInfoPattern =
     '/api/agents/{agentId}/models-info'; // agent 定义 #6
 
@@ -78,6 +81,27 @@ Future<Map<String, dynamic>> _dispatchDelegate(
       );
     }
     return _jsonReply(200, <String, dynamic>{'agents': items});
+  }
+
+  // 会话历史（分页 + 提问状态叠加）。
+  if (method == 'GET' && _matches(conversationsPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    if (readAgentRecord(paths, agentId) == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
+    }
+    final String rawSession = _queryString(query, 'session_id');
+    return _jsonReply(
+      200,
+      conversationPage(
+        paths,
+        agentId,
+        sessionId: rawSession.isEmpty ? 'session_default' : rawSession,
+        limit: int.tryParse(_queryString(query, 'limit')) ?? 0,
+        before: _queryString(query, 'before').trim(),
+        from: int.tryParse(_queryString(query, 'from')),
+        at: _queryString(query, 'at').trim(),
+      ),
+    );
   }
 
   // 会话列表（读接口，但会像核心一样兜底默认会话）。
@@ -234,6 +258,13 @@ Map<String, dynamic> _jsonReply(int status, Map<String, dynamic> body) =>
 String _sessionOf(Map<String, dynamic> query) {
   final String raw = _str(query['session_id']);
   return raw.isEmpty ? 'session_default' : raw;
+}
+
+/// 枚举查询参数取**第一个值**（重复键在信封里是数组；核心取 queryParameters 的首值）。
+String _queryString(Map<String, dynamic> query, String key) {
+  final Object? raw = query[key];
+  if (raw is List) return raw.isEmpty ? '' : _str(raw.first);
+  return _str(raw);
 }
 
 String _str(Object? value) => (value ?? '').toString().trim();

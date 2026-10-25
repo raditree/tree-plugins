@@ -45,6 +45,9 @@ class AgentDataPaths {
   String sessionMetaFile(String agentId, String sessionId) =>
       p.join(sessionDir(agentId, sessionId), 'session.json');
 
+  /// 跨会话提问快照：`<root>/data/questions.json`（JSON 数组）。
+  String get questionsFile => p.join(sessionsDataDir, 'questions.json');
+
   /// 会话消息追加日志：`<root>/data/<agent>/<session>/messages.jsonl`。
   String messagesFile(String agentId, String sessionId) =>
       p.join(sessionDir(agentId, sessionId), 'messages.jsonl');
