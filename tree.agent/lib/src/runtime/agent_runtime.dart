@@ -16,17 +16,23 @@ import '../llm/llm_summarizer.dart';
 import '../paths.dart';
 import '../settings/core_settings.dart';
 import '../settings/file_settings_sink.dart';
+import '../spec/spec_service.dart';
 import '../store/file_store.dart';
 import '../store/records.dart';
 import '../store/subagent_registry.dart';
 import '../store/subagent_store.dart';
 import '../store/tree_paths.dart';
 import '../store/usage_log.dart';
+import '../team/message_dispatcher.dart';
+import '../team/team_service.dart';
 import '../team/team_workspace.dart';
 import '../tool/station_tool_runner.dart';
 import '../tool/subagent_tool.dart';
 import '../tool/tool_run_registry.dart';
 import '../workspace/station_command.dart';
+import '../workspace/station_compat_io.dart';
+import '../workspace/station_workspace_io.dart';
+import '../workspace/workspace_io.dart';
 import '../ws/ws_hub.dart';
 
 /// 插件进程内**单个数据根**的运行时：存储 + 设置 + 提问回路 + 会话服务 + 临时员工。
@@ -101,6 +107,36 @@ class AgentRuntime {
             ),
           ),
     );
+    teamService = TeamService(
+      store: store,
+      settings: settings,
+      isWorking: conversation.isRunning,
+      toolRuns: toolRuns,
+      defaultWorkspaceDir: TreePaths(paths.root).defaultWorkspaceDir,
+    );
+    messageDispatcher = TeamMessageDispatcher(
+      store: store,
+      teams: teamService,
+      deliver:
+          ({
+            required String agentId,
+            required String sessionId,
+            required String content,
+            String senderId = '',
+            String senderName = '',
+          }) => conversation.deliver(
+            agentId: agentId,
+            sessionId: sessionId,
+            content: content,
+            senderId: senderId,
+            senderName: senderName,
+          ),
+      workspaceDirOf: _workspaceDirOf,
+      ioFor: (String agentId) => workspaceIoFor(agentId, ''),
+    );
+    specService = SpecService(store: store)
+      ..ioFor = (String agentId) => workspaceIoFor(agentId, '');
+
     subagentService.runner = conversation.runSubagent;
     subagentService.onFinished = (String owner, String session, String notice, SubagentTag tag) {
       unawaited(
@@ -122,6 +158,9 @@ class AgentRuntime {
   late final WsHub hub;
   late final FileQuestionStore questionStore;
   late final QuestionBroker questions;
+  late final TeamService teamService;
+  late final TeamMessageDispatcher messageDispatcher;
+  late final SpecService specService;
   late final SubagentService subagentService;
   late final CompactionService compaction;
   late final ConversationService conversation;
@@ -278,6 +317,37 @@ class AgentRuntime {
       'idle': idle,
       'any_running': cancelled.isNotEmpty,
     };
+  }
+
+  /// 工作空间根目录（本机绝对路径；SSH 团队返回空串）。
+  String _workspaceDirOf(String agentId) {
+    final CoreAgent? agent = store.agent(agentId);
+    if (agent == null) return TreePaths(paths.root).defaultWorkspaceDir(agentId);
+    if (teamSshConfigFor(agent, store.agent) != null) return '';
+    final TeamWorkspace shared = teamWorkspaceFor(agent, store.agent);
+    return shared.configuredDir.isNotEmpty
+        ? shared.configuredDir
+        : TreePaths(paths.root).defaultWorkspaceDir(shared.owner.id);
+  }
+
+  /// 某个 agent 的工作空间 IO（经核心执行站；未接线时返回 null）。
+  Future<WorkspaceIO?> workspaceIoFor(String agentId, String sessionId) async {
+    final CoreAgent? agent = store.agent(agentId);
+    if (agent == null) return null;
+    final StationCommandClient? client = stationClient;
+    if (client == null) return null;
+    final Map<String, dynamic> scope = _stationScopeFor(agentId, sessionId);
+    final String root = _workspaceDirOf(agentId);
+    return StationCompatIo(
+      StationWorkspaceIo(
+        client: client,
+        agentId: agentId,
+        teamId: (scope['team_id'] ?? '').toString(),
+        modeKey: (scope['mode_key'] ?? '').toString(),
+        sessionId: sessionId,
+        root: root,
+      ),
+    );
   }
 
   /// 执行站命令的身份：agent 的真实归属（TOP 自己 / 团队）与工作空间模式。

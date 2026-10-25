@@ -1,11 +1,13 @@
 import 'dart:convert';
 
+import 'agent/compaction_service.dart';
 import 'agent/question_store.dart';
 import 'agent_config.dart';
 import 'agent_store.dart';
 import 'conversation_store.dart';
 import 'model_catalog.dart';
 import 'runtime/agent_runtime.dart';
+import 'spec/spec_service.dart';
 import 'session_store.dart';
 import 'settings/domain_settings.dart';
 import 'store/records.dart';
@@ -44,6 +46,15 @@ const String cancelPattern =
 const String modelPattern = '/api/models/{modelId}'; // 模型池 #16（PATCH/DELETE）
 const String tokenRatePattern =
     '/api/settings/token-rate'; // token 节奏 #1/#2
+const String teammatePattern =
+    '/api/agents/{leaderId}/teammate/{memberId}'; // 团队写 #1
+const String teammateMessagePattern =
+    '/api/agents/{leaderId}/teammate/{memberId}/message'; // 团队写 #2
+const String teammateLogPattern =
+    '/api/agents/{leaderId}/teammate/{memberId}/log'; // 团队读 #3
+const String agentCompactPattern = '/api/agents/{agentId}/compact'; // 维护 #2
+const String specsPattern = '/api/agents/{agentId}/specs'; // spec 列表
+const String specDetailPattern = '/api/agents/{agentId}/specs/{specId}'; // spec 详情
 const String toolsRunningPattern = '/api/tools/running'; // 运行监督 #1
 const String toolsRunningClosePattern =
     '/api/tools/running/{handle}/close'; // 运行监督 #2
@@ -234,6 +245,119 @@ Future<Map<String, dynamic>> _dispatchDelegate(
       'qid': qid,
       'status': record.status,
       'answers': record.answers,
+    });
+  }
+
+  // ── 团队写接口（成员模型分配 / 直接发消息 / 活动日志）──────────────
+  if (method == 'PATCH' && _matches(teammatePattern, path)) {
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final Map<String, dynamic> result = runtime.teamService.assignModel(
+      topId: _str(params['leaderId']),
+      memberId: _str(params['memberId']),
+      body: _bodyOf(envelope),
+    );
+    final Object? error = result['error'];
+    if (error != null) {
+      final String message = error.toString();
+      return _jsonReply(
+        message.startsWith('成员不存在') ? 404 : 400,
+        <String, dynamic>{'detail': message},
+      );
+    }
+    return _jsonReply(200, result);
+  }
+  if (method == 'POST' && _matches(teammateMessagePattern, path)) {
+    final String content = (_bodyOf(envelope)['content'] ?? '').toString();
+    if (content.trim().isEmpty) {
+      return _jsonReply(200, <String, dynamic>{
+        'success': false,
+        'error': '缺少 content',
+      });
+    }
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final String sessionId =
+        (_bodyOf(envelope)['session_id'] ?? '').toString().trim();
+    final Map<String, dynamic> result = await runtime.messageDispatcher
+        .sendFromUser(
+          targetId: _str(params['memberId']),
+          content: content,
+          sessionId: sessionId.isEmpty ? 'session_default' : sessionId,
+        );
+    return _jsonReply(200, result);
+  }
+  if (method == 'GET' && _matches(teammateLogPattern, path)) {
+    final int lines =
+        int.tryParse(_queryString(query, 'lines')) ?? 60;
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final Map<String, dynamic> read = await runtime.messageDispatcher
+        .readActivityLog(_str(params['memberId']), lines: lines);
+    return _jsonReply(200, <String, dynamic>{
+      'success': read['success'] ?? true,
+      'log': read['log'] ?? '',
+      'path': read['path'] ?? '',
+    });
+  }
+
+  // ── 手动压缩（POST /api/agents/{agentId}/compact）──────────────────
+  if (method == 'POST' && _matches(agentCompactPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final String sessionId = (_bodyOf(envelope)['session_id'] ?? '').toString();
+    if (runtime.conversation.isRunning(agentId)) {
+      return _jsonReply(200, <String, dynamic>{
+        'success': true,
+        'compressed': false,
+        'reason': 'agent_working',
+        'context_size': 0,
+      });
+    }
+    final CompactionResult result = await runtime.compaction.compact(
+      agentId,
+      sessionId,
+    );
+    if (result.error.isNotEmpty) {
+      return _jsonReply(
+        result.status,
+        <String, dynamic>{'detail': result.error},
+      );
+    }
+    return _jsonReply(200, result.toJson());
+  }
+
+  // ── Spec 列表 / 详情（经执行站读工作空间）─────────────────────────
+  if (method == 'GET' && _matches(specsPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final String sessionId = _queryString(query, 'session_id').isEmpty
+        ? 'session_default'
+        : _queryString(query, 'session_id');
+    final CoreSession? session = runtime.store.session(agentId, sessionId);
+    final List<SpecDocument> documents = await runtime.specService.index(
+      agentId,
+      await runtime.workspaceIoFor(agentId, sessionId),
+    );
+    return _jsonReply(200, <String, dynamic>{
+      'specs': <Map<String, dynamic>>[
+        for (final SpecDocument document in documents) document.toMetaJson(),
+      ],
+      'selected_spec_ids': session?.selectedSpecIds ?? <String>[],
+    });
+  }
+  if (method == 'GET' && _matches(specDetailPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final String specId = _str(params['specId']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final SpecDocument? document = await runtime.specService.detail(
+      agentId,
+      await runtime.workspaceIoFor(agentId, ''),
+      specId,
+    );
+    if (document == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'Spec 不存在: $specId'});
+    }
+    return _jsonReply(200, <String, dynamic>{
+      'meta': document.toMetaJson(),
+      'content': document.raw,
     });
   }
 

@@ -25,6 +25,9 @@ const String kPluginId = 'tree.agent';
 /// 面板展示名。
 const String kDisplayName = 'Tree Agent 循环';
 
+/// 自检跑的是假核心（不处理 station/command），必须关掉执行站入口。
+bool _enableStationClient = true;
+
 /// 建一个服务实例。自检与生产**共用**这个形状，只有退出策略不同。
 PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
   channel: PluginChannel.stdio(kPluginId),
@@ -37,8 +40,10 @@ PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
 
 Future<void> _onReady(PluginKitServer server) async {
   // 执行站入口：hello 之后插件才能主动向核心下 station/command。
-  AgentRuntime.stationClient = (String command, Map<String, dynamic> arguments, Map<String, dynamic> scope) =>
-      server.channel.command(command, arguments, '', scope);
+  if (_enableStationClient) {
+    AgentRuntime.stationClient = (String command, Map<String, dynamic> arguments, Map<String, dynamic> scope) =>
+        server.channel.command(command, arguments, '', scope);
+  }
   // **两路日志都主动写一条**：A1 的验收就是"插件自己的日志能从日志 API 查到"。
   // stderr 进 [stderr] 行，log 通知进 [notify:info] 行（见片 F 的 PluginLogSink）。
   server.channel.log(
@@ -90,6 +95,7 @@ Future<void> main(List<String> args) async {
 
 /// 假核心自检（**同码**跑真读循环）：A1 上线要件 + A2 第一条委派路由。
 Future<int> selfTest() async {
+  _enableStationClient = false;
   final SelfTest check = SelfTest(name: 'tree_agent_plugin');
   final Directory temp = Directory.systemTemp.createTempSync(
     'tree_agent_selftest_',
@@ -588,6 +594,16 @@ Future<int> selfTest() async {
         method: 'DELETE',
       ),
     );
+    core.ask(46, M.apiDelegate, envelope(specsPattern, 'agt'));
+    core.ask(
+      47,
+      M.apiDelegate,
+      envelope(
+        specDetailPattern,
+        'agt',
+        extraParams: <String, String>{'specId': 'general-task'},
+      ),
+    );
     core.ask(
       31,
       M.apiDelegate,
@@ -600,10 +616,10 @@ Future<int> selfTest() async {
     );
 
     final Map<Object?, Map<String, dynamic>> byId = await core.waitFor(
-      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45],
+      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47],
     );
 
-    check.that(byId.length == 46, '四十六条请求都有回包', actual: '${byId.length}');
+    check.that(byId.length == 48, '四十八条请求都有回包', actual: '${byId.length}');
     check.check(
       byId[0]?['result']?['plugin_id'],
       kPluginId,
@@ -1457,6 +1473,20 @@ Future<int> selfTest() async {
     );
     check.check(postResult(45)['status'], 200, 'conversations：清空 200');
     check.check(postBody(45)['deleted'], 1, 'conversations：删除消息数');
+
+    // ── Spec 列表 / 详情（无执行站时只回内置规范）──────────────────
+    check.check(postResult(46)['status'], 200, 'specs：200');
+    final Map<String, dynamic> specsBody = postBody(46);
+    check.that(
+      (specsBody['specs'] as List<dynamic>? ?? <dynamic>[]).isNotEmpty,
+      'specs：内置规范非空',
+      actual: '${(specsBody['specs'] as List<dynamic>? ?? <dynamic>[]).length}',
+    );
+    check.check(postResult(47)['status'], 200, 'specs/detail：200');
+    check.that(
+      '${postBody(47)['content'] ?? ''}'.isNotEmpty,
+      'specs/detail：正文非空',
+    );
 
     // 生成是异步的：等它收尾再删临时目录。
     await AgentRuntime.forDataDir(temp.path).waitIdle();

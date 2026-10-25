@@ -11,6 +11,7 @@ library;
 
 import 'src/delegate.dart'
     show
+        agentCompactPattern,
         agentDetailPattern,
         agentModelsInfoPattern,
         agentsPattern,
@@ -24,7 +25,12 @@ import 'src/delegate.dart'
         sessionDetailPattern,
         sessionSpecsPattern,
         sessionsPattern,
+        specDetailPattern,
+        specsPattern,
         subagentsPattern,
+        teammateLogPattern,
+        teammateMessagePattern,
+        teammatePattern,
         teammatesPattern,
         todosPattern,
         tokenRatePattern,
@@ -91,7 +97,7 @@ export 'src/ws/ws_hub.dart';
 export 'src/yaml_utils.dart';
 
 /// 插件版本（与 `plugin.json` 的 version 同源；发布时两处一起改）。
-const String kTreeAgentVersion = '0.16.0';
+const String kTreeAgentVersion = '0.17.0';
 
 /// 收集站 id：插件经它申报自己承担的 `{method, pattern}` 委派路由。
 const String kApiRoutesStation = 'system.collect.api.routes';
@@ -131,6 +137,13 @@ const List<Map<String, String>> kDeclaredRoutes = <Map<String, String>>[
   <String, String>{'method': 'DELETE', 'pattern': conversationsPattern},
   <String, String>{'method': 'GET', 'pattern': questionsPattern},
   <String, String>{'method': 'POST', 'pattern': questionAnswerPattern},
+  // 团队写 / 维护 / spec（A3 写路径）。
+  <String, String>{'method': 'PATCH', 'pattern': teammatePattern},
+  <String, String>{'method': 'POST', 'pattern': teammateMessagePattern},
+  <String, String>{'method': 'GET', 'pattern': teammateLogPattern},
+  <String, String>{'method': 'POST', 'pattern': agentCompactPattern},
+  <String, String>{'method': 'GET', 'pattern': specsPattern},
+  <String, String>{'method': 'GET', 'pattern': specDetailPattern},
 ];
 
 /// 一条委派路由声明的形状（`{method, pattern}`）。
