@@ -17,6 +17,7 @@ import '../paths.dart';
 import '../settings/core_settings.dart';
 import '../settings/file_settings_sink.dart';
 import '../spec/spec_service.dart';
+import '../station/tool_contributions.dart';
 import '../store/file_store.dart';
 import '../store/records.dart';
 import '../store/subagent_registry.dart';
@@ -96,6 +97,7 @@ class AgentRuntime {
             agentOverrides: overridesFor,
             usageLog: usageLog,
             toolRunner: StationToolRunner(
+              contributed: () => contributedTools,
               client: (String command, Map<String, dynamic> arguments, Map<String, dynamic> scope) {
                 final StationCommandClient? client = stationClient;
                 if (client == null) {
@@ -176,6 +178,13 @@ class AgentRuntime {
   /// 核心执行站命令入口（由插件入口在 hello 后注入；null = 未接线）。
   static StationCommandClient? stationClient;
 
+  /// 本插件 id 与收集站触发入口（入口在 hello 后注入）。
+  static String pluginId = 'tree.agent';
+  static StationTriggerClient? stationTrigger;
+
+  /// 其它插件贡献的工具（最近一次采集结果）。
+  final List<ContributedTool> contributedTools = <ContributedTool>[];
+
   static final Map<String, AgentRuntime> _byRoot = <String, AgentRuntime>{};
 
   /// 取（或创建）某个数据根的运行时。
@@ -236,12 +245,13 @@ class AgentRuntime {
   ///
   /// 返回 C-08 的成功体；agent 不存在返回 null（端点回 404）。
   /// **不等待本轮生成**——端点立刻回 200，帧通过 [frames] / 站内主题推送。
-  Map<String, dynamic>? sendMessage({
+  Future<Map<String, dynamic>?> sendMessage({
     required String agentId,
     required String content,
     String sessionId = '',
     List<dynamic>? attachments,
-  }) {
+  }) async {
+    await refreshContributedTools();
     final CoreAgent? agent = store.agent(agentId);
     if (agent == null) return null;
     final (:CoreSession session, :bool created) = resolveSession(
@@ -328,6 +338,25 @@ class AgentRuntime {
     return shared.configuredDir.isNotEmpty
         ? shared.configuredDir
         : TreePaths(paths.root).defaultWorkspaceDir(shared.owner.id);
+  }
+
+  /// 触发工具贡献收集站并刷新缓存（无订阅者 / 未接线 ⇒ 空表，不阻断发消息）。
+  Future<void> refreshContributedTools() async {
+    final StationTriggerClient? trigger = stationTrigger;
+    if (trigger == null) return;
+    try {
+      final Map<String, dynamic> response = await trigger(
+        toolCollectStationId(pluginId),
+        <String, dynamic>{'action': 'list'},
+        <String, dynamic>{'purpose': 'agent.tools'},
+        <String, dynamic>{'mode_key': 'local'},
+      );
+      contributedTools
+        ..clear()
+        ..addAll(parseContributedTools(response));
+    } catch (_) {
+      // 收集失败不阻断发送：工具表退回内置五项。
+    }
   }
 
   /// 某个 agent 的工作空间 IO（经核心执行站；未接线时返回 null）。

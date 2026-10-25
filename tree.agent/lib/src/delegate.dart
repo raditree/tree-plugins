@@ -467,7 +467,7 @@ Future<Map<String, dynamic>> _dispatchDelegate(
         'detail': 'content 不能为空',
       });
     }
-    final Map<String, dynamic>? result = AgentRuntime.forDataDir(paths.root)
+    final Map<String, dynamic>? result = await AgentRuntime.forDataDir(paths.root)
         .sendMessage(
           agentId: agentId,
           content: content,

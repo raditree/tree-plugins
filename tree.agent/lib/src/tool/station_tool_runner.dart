@@ -1,4 +1,5 @@
 import 'tool_runner.dart';
+import '../station/tool_contributions.dart';
 import '../workspace/station_command.dart';
 
 /// 通过核心执行站执行的**内置工具子集**（read / write / list / grep / terminal）。
@@ -7,16 +8,23 @@ import '../workspace/station_command.dart';
 /// `terminal.exec`，身份（agent/team/mode/session）由 [scopeFor] 解析后随命令下发。
 /// 这是 A3 工具编排的落点；L-24 把执行站迁到 local_executor 后，这里零改动。
 class StationToolRunner implements ToolRunner {
-  StationToolRunner({required this.client, required this.scopeFor});
+  StationToolRunner({
+    required this.client,
+    required this.scopeFor,
+    this.contributed,
+  });
 
   final StationCommandClient client;
 
   /// 目标 agent 的真实归属（`agent_id` / `team_id` / `mode_key` / `session_id`）。
   final Map<String, dynamic> Function(String agentId, String sessionId) scopeFor;
 
+  /// 收集站采集到的贡献工具（每次采集后整体替换；空表 = 没有订阅者）。
+  final List<ContributedTool> Function()? contributed;
+
   @override
   List<ToolSpec> specsFor({required String agentId, required String sessionId}) =>
-      const <ToolSpec>[
+      <ToolSpec>[
         ToolSpec(
           name: 'read',
           description: '读取工作空间内的文件（相对路径；可指定起始行与行数）。',
@@ -80,6 +88,12 @@ class StationToolRunner implements ToolRunner {
             'required': <String>['command'],
           },
         ),
+        for (final ContributedTool tool in contributed?.call() ?? const <ContributedTool>[])
+          ToolSpec(
+            name: tool.coreName,
+            description: '[来自插件 ${tool.pluginId}] ${tool.description}',
+            parameters: tool.parameters,
+          ),
       ];
 
   @override
@@ -102,7 +116,7 @@ class StationToolRunner implements ToolRunner {
         case 'terminal':
           return await _terminal(invocation, scope);
         default:
-          return ToolOutcome('未知工具：${invocation.name}', isError: true);
+          return await _contributedTool(invocation, scope);
       }
     } catch (error) {
       return ToolOutcome('工具执行失败：$error', isError: true);
@@ -192,6 +206,36 @@ class StationToolRunner implements ToolRunner {
     }, scope);
     return ToolOutcome(
       (result['text'] ?? '').toString(),
+      isError: result['is_error'] == true,
+    );
+  }
+
+  Future<ToolOutcome> _contributedTool(
+    ToolInvocation invocation,
+    Map<String, dynamic> scope,
+  ) async {
+    final List<ContributedTool> tools =
+        contributed?.call() ?? const <ContributedTool>[];
+    ContributedTool? match;
+    for (final ContributedTool tool in tools) {
+      if (tool.coreName == invocation.name) {
+        match = tool;
+        break;
+      }
+    }
+    if (match == null) {
+      return ToolOutcome('未知工具：${invocation.name}', isError: true);
+    }
+    final Map<String, dynamic> result = await client(
+      'tool.call',
+      <String, dynamic>{
+        'tool': invocation.name,
+        'arguments': invocation.arguments,
+      },
+      scope,
+    );
+    return ToolOutcome(
+      (result['result'] ?? '').toString(),
       isError: result['is_error'] == true,
     );
   }

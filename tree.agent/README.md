@@ -121,3 +121,19 @@ lib/src/delegate.dart      api/delegate 信封 → 路由分发 → {status, hea
 4. 在桌面仓 `packages/tree_core/tool/verify_agent_equivalence.dart` 加同一路由的
    种子 + 请求，跑通「核心 HTTP vs 插件 `api/delegate` 逐字节一致」；
 5. 全绿后才允许核心删除对应实现（G-2，不变量 27）。
+
+
+## 工具贡献收集站（自建）
+
+本插件向核心注册一个**收集站** `plugin.tree.agent.collect.tools`（`shared: true`），
+其它插件可以订阅它，把自己的工具加进 agent 的工具表：
+
+1. 订阅：`station/subscribe`，`station_id = plugin.tree.agent.collect.tools`，scope 留空（通配）；
+2. 收到 `station/request`（`payload = {action: "list"}`）时按 schema 回：
+   `{ok: true, payload: {tools: [{name, description, parameters}]}}`
+   （`parameters` 是 JSON Schema 对象）；
+3. agent 把工具名改写为 `plugin__<你的插件id>__<name>`，执行时经核心执行站
+   `tool.call` 转到你的 `tools/call`。
+
+站点 schema：`{kind: object, fields: [{name: tools, type: array, required: true}]}`；
+采集失败不阻断 agent 发消息，工具表退回内置五项。

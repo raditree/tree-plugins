@@ -34,10 +34,10 @@ void main() {
 
   test('sendMessage：新会话 + 落库 + 脚本回复 + 帧序列；第二次复用会话', () async {
     final AgentRuntime runtime = AgentRuntime(paths: paths, engine: ScriptedAgent(chunkDelay: Duration.zero));
-    final Map<String, dynamic> first = runtime.sendMessage(
+    final Map<String, dynamic> first = (await runtime.sendMessage(
       agentId: 'agt',
       content: '你好',
-    )!;
+    ))!;
     expect(first['success'], isTrue);
     expect(first['agent_id'], 'agt');
     expect(first['session_created'], isTrue);
@@ -66,21 +66,21 @@ void main() {
         .toList();
     expect(types, containsAll(<String>['msg_start', 'msg_chunk', 'msg_end', 'agent_status']));
 
-    final Map<String, dynamic> second = runtime.sendMessage(
+    final Map<String, dynamic> second = (await runtime.sendMessage(
       agentId: 'agt',
       content: '再来',
       sessionId: sessionId,
-    )!;
+    ))!;
     expect(second['session_created'], isFalse);
     expect(second['session_id'], sessionId);
     await runtime.waitIdle();
   });
 
-  test('默认引擎是 LlmAgentEngine（生产路径）；未知 agent 返回 null（端点 404）', () {
+  test('默认引擎是 LlmAgentEngine（生产路径）；未知 agent 返回 null（端点 404）', () async {
     final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
     expect(runtime.conversation.engine, isA<LlmAgentEngine>());
     expect(
-      runtime.sendMessage(agentId: 'ghost', content: '你好'),
+      await runtime.sendMessage(agentId: 'ghost', content: '你好'),
       isNull,
     );
   });
