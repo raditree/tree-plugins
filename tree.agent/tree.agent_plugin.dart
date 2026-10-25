@@ -58,6 +58,23 @@ Future<void> _onReady(PluginKitServer server) async {
           'scope': scope,
         });
     try {
+      final Map<String, dynamic> toolStation = await server.channel.request(
+        M.stationRegister,
+        <String, dynamic>{
+          'kind': 'execute',
+          'name': kAgentToolsStationName,
+          'description': 'tree.agent 领域工具原语',
+          'readme': kAgentToolsReadme,
+          'commands': kAgentToolCommands,
+        },
+      );
+      server.channel.log(
+        '领域工具执行站：${toolStation['ok'] == true ? toolStation['station_id'] : toolStation['error']}',
+      );
+    } catch (error) {
+      server.channel.log('领域工具执行站注册失败：$error');
+    }
+    try {
       final Map<String, dynamic> registered = await server.channel.request(
         M.stationRegister,
         <String, dynamic>{
@@ -99,6 +116,34 @@ Future<Map<String, dynamic>?> handleRequest(
   }
   if (method == M.stationRequest) {
     final String station = asString(params['station_id']);
+    if (station == agentToolsStationId(kPluginId)) {
+      final Map<String, dynamic> meta = asMap(params['meta']);
+      final String dataDir = asString(meta['data_dir']);
+      if (dataDir.isEmpty) {
+        return <String, dynamic>{
+          'reply': <String, dynamic>{'error': '缺少 data_dir（核心未在站请求里带数据根）'},
+        };
+      }
+      final Map<String, dynamic> payload = asMap(params['payload']);
+      final String command = asString(payload['command']);
+      final Map<String, dynamic> args = asMap(payload['arguments']);
+      final Map<String, dynamic> scope = asMap(params['scope']);
+      try {
+        final Map<String, dynamic> result =
+            await AgentRuntime.forDataDir(dataDir).handleAgentToolCommand(
+              command,
+              args,
+              scope,
+            );
+        return <String, dynamic>{
+          'reply': <String, dynamic>{'payload': result},
+        };
+      } catch (error) {
+        return <String, dynamic>{
+          'reply': <String, dynamic>{'error': error.toString()},
+        };
+      }
+    }
     if (station == kApiRoutesStation) {
       // 收集站口径：`{reply: {payload: {routes: [...]}}}`（核心只读 reply.payload）。
       return <String, dynamic>{

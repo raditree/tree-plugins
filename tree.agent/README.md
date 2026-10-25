@@ -28,6 +28,13 @@
   领域代码进 `lib/src/`，包名 `tree_agent_loop`。
 - `tools/list` 是可选能力：缺失或为空**不阻断上线**。
 
+## 扩展工具（extra-tools）
+
+todo / question / subagent / team / message 五个工具由独立插件 `extra-tools` 贡献：
+tree.agent 的收集站采集工具定义，执行时经 `plugin.toolCall` 回到 extra-tools，
+再由其调用 tree.agent 自建领域执行站（`todo.*` / `question.ask` / `subagent.run` /
+`team.run` / `message.run`）。tree.agent 只提供领域原语，不包工具定义。
+
 ## 执行器依赖（L-24）
 
 read / write / list / grep / terminal 不再由核心执行：tree.agent 先登记工作空间租约，

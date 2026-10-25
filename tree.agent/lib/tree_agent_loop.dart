@@ -67,6 +67,7 @@ export 'src/llm/sse_parser.dart';
 export 'src/llm/vision_files.dart';
 export 'src/session_store.dart';
 export 'src/spec/builtin_spec_assets.dart';
+export 'src/station/agent_tools.dart';
 export 'src/station/tool_contributions.dart';
 export 'src/spec/builtin_specs.dart';
 export 'src/spec/spec_service.dart';
@@ -98,7 +99,7 @@ export 'src/ws/ws_hub.dart';
 export 'src/yaml_utils.dart';
 
 /// 插件版本（与 `plugin.json` 的 version 同源；发布时两处一起改）。
-const String kTreeAgentVersion = '0.20.0';
+const String kTreeAgentVersion = '0.21.0';
 
 /// 收集站 id：插件经它申报自己承担的 `{method, pattern}` 委派路由。
 const String kApiRoutesStation = 'system.collect.api.routes';

@@ -28,9 +28,14 @@ import '../store/usage_log.dart';
 import '../team/message_dispatcher.dart';
 import '../team/team_service.dart';
 import '../team/team_workspace.dart';
+import '../tool/message_tool.dart';
+import '../tool/question_channel.dart';
 import '../tool/station_tool_runner.dart';
+import '../tool/team_tool.dart';
+import '../tool/todo_store.dart';
 import '../tool/subagent_tool.dart';
 import '../tool/tool_run_registry.dart';
+import '../tool/tool_runner.dart';
 import '../workspace/station_command.dart';
 import '../workspace/station_compat_io.dart';
 import '../workspace/station_workspace_io.dart';
@@ -58,6 +63,7 @@ class AgentRuntime {
         if (frames.length > 2000) frames.removeAt(0);
       },
     );
+    todoStore = FileTodoStore(TreePaths(paths.root));
     questionStore = FileQuestionStore(TreePaths(paths.root));
     questions = QuestionBroker(
       questions: questionStore,
@@ -153,6 +159,7 @@ class AgentRuntime {
   late final FileDomainSettingsSink settingsSink;
   late final SubagentRegistry registry;
   late final WsHub hub;
+  late final FileTodoStore todoStore;
   late final FileQuestionStore questionStore;
   late final QuestionBroker questions;
   late final TeamService teamService;
@@ -330,6 +337,123 @@ class AgentRuntime {
       'any_running': cancelled.isNotEmpty,
     };
   }
+
+  /// 领域工具原语（extra-tools 插件经自建执行站调用）。
+  Future<Map<String, dynamic>> handleAgentToolCommand(
+    String command,
+    Map<String, dynamic> arguments,
+    Map<String, dynamic> scope,
+  ) async {
+    final String agentId = (scope['agent_id'] ?? '').toString();
+    if (agentId.isEmpty || store.agent(agentId) == null) {
+      return <String, dynamic>{'text': 'agent 不存在：$agentId', 'is_error': true};
+    }
+    final String rawSession = (scope['session_id'] ?? '').toString();
+    final String sessionId = rawSession.isEmpty ? 'session_default' : rawSession;
+    final ToolInvocation invocation = ToolInvocation(
+      id: 'extra-tools-$command',
+      name: command.split('.').first,
+      arguments: arguments,
+      agentId: agentId,
+      sessionId: sessionId,
+    );
+    switch (command) {
+      case 'todo.get':
+        return _todoReply(todoStore.read(agentId, sessionId));
+      case 'todo.set':
+      case 'todo.update':
+        final List<TodoItem> current = todoStore.read(agentId, sessionId);
+        final List<Map<String, dynamic>> raw = <Map<String, dynamic>>[
+          for (final Object? item in (arguments['todos'] as List<dynamic>? ?? const <dynamic>[]))
+            if (item is Map)
+              item.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
+        ];
+        if (raw.isEmpty) {
+          return const <String, dynamic>{'text': 'todos 不能为空', 'is_error': true};
+        }
+        final Map<String, TodoItem> byId = <String, TodoItem>{
+          for (final TodoItem item in current) item.id: item,
+        };
+        for (int i = 0; i < raw.length; i++) {
+          final Map<String, dynamic> item = raw[i];
+          final String content = (item['content'] ?? '').toString().trim();
+          if (content.isEmpty) {
+            return <String, dynamic>{'text': '第 ${i + 1} 项缺少 content', 'is_error': true};
+          }
+          final String id = (item['id'] ?? 't${i + 1}').toString();
+          byId[id] = TodoItem(
+            id: id,
+            content: content,
+            status: (item['status'] ?? 'pending').toString(),
+            progress: (item['progress'] as num?)?.toInt() ?? 0,
+            updatedAt: DateTime.now().millisecondsSinceEpoch,
+          );
+        }
+        final List<TodoItem> next = command == 'todo.update'
+            ? <TodoItem>[for (final TodoItem item in current) byId[item.id] ?? item]
+            : byId.values.toList();
+        todoStore.write(agentId, sessionId, next);
+        return _todoReply(next);
+      case 'todo.clear':
+        todoStore.write(agentId, sessionId, <TodoItem>[]);
+        return const <String, dynamic>{'text': '已清空待办。', 'todos': <Map<String, dynamic>>[], 'is_error': false};
+      case 'question.ask':
+        final List<AskedQuestion> asked = <AskedQuestion>[];
+        final Object? rawQuestions = arguments['questions'];
+        if (rawQuestions is List) {
+          for (final Object? raw in rawQuestions) {
+            if (raw is Map) {
+              asked.add(AskedQuestion.fromJson(
+                raw.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
+              ));
+            }
+          }
+        }
+        if (asked.isEmpty) {
+          final String question = (arguments['question'] ?? '').toString().trim();
+          if (question.isEmpty) {
+            return const <String, dynamic>{'text': 'question.ask 需要 question', 'is_error': true};
+          }
+          asked.add(AskedQuestion.single(question));
+        }
+        final QuestionOutcome outcome = await questions.ask(
+          AskQuestionRequest(
+            agentId: agentId,
+            sessionId: sessionId,
+            questions: asked,
+            isCancelled: () => false,
+          ),
+        );
+        return <String, dynamic>{
+          'text': outcome.cancelled ? '提问已取消（未作答）' : formatAnswerLines(asked, outcome.answers),
+          'answers': outcome.answers,
+          'cancelled': outcome.cancelled,
+          'is_error': false,
+        };
+      case 'subagent.run':
+        final ToolOutcome r = await SubagentTool.run(invocation, subagentService);
+        return <String, dynamic>{'text': r.content, 'is_error': r.isError};
+      case 'team.run':
+        final ToolOutcome r = await TeamTool.run(invocation, teamService);
+        return <String, dynamic>{'text': r.content, 'is_error': r.isError};
+      case 'message.run':
+        final ToolOutcome r = await MessageTool.run(invocation, messageDispatcher);
+        return <String, dynamic>{'text': r.content, 'is_error': r.isError};
+      default:
+        return <String, dynamic>{'text': '未知领域工具命令：$command', 'is_error': true};
+    }
+  }
+
+  Map<String, dynamic> _todoReply(List<TodoItem> todos) => <String, dynamic>{
+    'text': todos.isEmpty
+        ? '（暂无待办）'
+        : <String>[
+            for (final TodoItem item in todos)
+              '${item.id} [${item.status}] ${item.progress}% ${item.content}',
+          ].join('\n'),
+    'todos': <Map<String, dynamic>>[for (final TodoItem item in todos) item.toApiJson()],
+    'is_error': false,
+  };
 
   /// 执行站命令的统一出口：fs.* / terminal.exec 自动带工作空间租约。
   Future<Map<String, dynamic>> _stationCommand(
