@@ -29,6 +29,7 @@ import 'src/delegate.dart'
         sessionsPattern,
         specDetailPattern,
         specsPattern,
+        subagentTranscriptPattern,
         subagentsPattern,
         teammateLogPattern,
         teammateMessagePattern,
@@ -121,6 +122,11 @@ const List<Map<String, String>> kDeclaredRoutes = <Map<String, String>>[
   <String, String>{'method': 'GET', 'pattern': subagentsPattern},
   <String, String>{'method': 'GET', 'pattern': modelsPattern},
   <String, String>{'method': 'GET', 'pattern': agentModelsInfoPattern},
+  // agent 写接口 / 临时员工 transcript（契约 §1.1 #2/#4/#5/#9）。
+  <String, String>{'method': 'POST', 'pattern': agentsPattern},
+  <String, String>{'method': 'PATCH', 'pattern': agentDetailPattern},
+  <String, String>{'method': 'DELETE', 'pattern': agentDetailPattern},
+  <String, String>{'method': 'GET', 'pattern': subagentTranscriptPattern},
   // C-08 新增（核心未实现，无 HTTP 对照；行为由插件自检覆盖）。
   <String, String>{'method': 'POST', 'pattern': messagesPattern},
   <String, String>{'method': 'POST', 'pattern': cancelPattern},

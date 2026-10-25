@@ -258,6 +258,31 @@ Future<int> selfTest() async {
         '{"id":"m0","agent_id":"agt","session_id":"ses_old","role":"agent",'
         '"content":"旧的预览","kind":"text","timestamp":"2026-10-25T10:00:04.000"}\n',
       );
+    // 另一个会话的临时员工名册（没有消息）：跨会话 transcript 的"属于会话"夹具。
+    File(p.join(temp.path, 'data', 'agt', 'ses_subagent', 'subagents.json'))
+      ..createSync(recursive: true)
+      ..writeAsStringSync(
+        const JsonEncoder.withIndent('  ').convert(<String, dynamic>{
+          'version': 1,
+          'agent_id': 'agt',
+          'session_id': 'ses_subagent',
+          'subagents': <Map<String, dynamic>>[
+            <String, dynamic>{
+              'id': 'sub_9',
+              'name': '旧员工',
+              'owner_agent_id': 'agt',
+              'session_id': 'ses_subagent',
+              'parent_id': 'agt',
+              'level': 1,
+              'scope': '',
+              'run_count': 0,
+              'agent': <String, dynamic>{},
+              'created_at': '2026-10-25T10:00:00.000',
+              'updated_at': '2026-10-25T10:00:05.000',
+            },
+          ],
+        }),
+      );
     File(p.join(temp.path, 'data', 'questions.json'))
       ..createSync(recursive: true)
       ..writeAsStringSync(
@@ -697,12 +722,85 @@ Future<int> selfTest() async {
         extraParams: <String, String>{'handle': 'toolrun_missing'},
       ),
     );
-
-    final Map<Object?, Map<String, dynamic>> byId = await core.waitFor(
-      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
+    // ── agent 写路由 / transcript（G-1 §1.1 #2/#4/#5/#9）───────────────
+    core.ask(
+      50,
+      M.apiDelegate,
+      postEnvelope(agentsPattern, '', <String, dynamic>{'model_id': 'm1'}),
+    );
+    core.ask(
+      51,
+      M.apiDelegate,
+      postEnvelope(agentsPattern, '', <String, dynamic>{
+        'name': '新助手',
+        'model_id': 'nope',
+      }),
+    );
+    core.ask(
+      52,
+      M.apiDelegate,
+      postEnvelope(agentsPattern, '', <String, dynamic>{
+        'name': '新助手',
+        'model_id': 'm1',
+        'system_prompt': '你是新助手',
+      }),
+    );
+    core.ask(
+      53,
+      M.apiDelegate,
+      envelope(
+        '/api/agents/agt/subagents/sub_1/transcript',
+        'agt',
+        extraParams: <String, String>{'subagentId': 'sub_1'},
+        query: <String, String>{'session_id': 'session_default'},
+      ),
+    );
+    core.ask(
+      54,
+      M.apiDelegate,
+      envelope(
+        '/api/agents/agt/subagents/sub_999/transcript',
+        'agt',
+        extraParams: <String, String>{'subagentId': 'sub_999'},
+        query: <String, String>{'session_id': 'session_default'},
+      ),
+    );
+    core.ask(
+      55,
+      M.apiDelegate,
+      envelope(
+        '/api/agents/agt/subagents/sub_9/transcript',
+        'agt',
+        extraParams: <String, String>{'subagentId': 'sub_9'},
+        query: <String, String>{'session_id': 'ses_subagent'},
+      ),
+    );
+    core.ask(
+      56,
+      M.apiDelegate,
+      envelope(
+        '/api/agents/agt/subagents/sub_9/transcript',
+        'agt',
+        extraParams: <String, String>{'subagentId': 'sub_9'},
+        query: <String, String>{'session_id': 'session_default'},
+      ),
+    );
+    core.ask(
+      57,
+      M.apiDelegate,
+      postEnvelope(
+        '/api/agents/ghost',
+        'ghost',
+        <String, dynamic>{},
+        method: 'DELETE',
+      ),
     );
 
-    check.that(byId.length == 50, '五十条请求都有回包', actual: '${byId.length}');
+    final Map<Object?, Map<String, dynamic>> byId = await core.waitFor(
+      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57],
+    );
+
+    check.that(byId.length == 58, '五十八条请求都有回包', actual: '${byId.length}');
     check.check(
       byId[0]?['result']?['plugin_id'],
       kPluginId,
@@ -1573,6 +1671,197 @@ Future<int> selfTest() async {
 
     check.check(postResult(48)['status'], 400, 'reset：无工作空间时 400');
     check.check(postResult(49)['status'], 404, 'ssh/reconnect：未知 agent 404');
+
+    // ── G-1：agent 写路由 / transcript（§1.1 #2/#4/#5/#9）─────────────
+    check.check(postResult(50)['status'], 400, 'agents：POST 缺 name ⇒ 400');
+    check.check(
+      postBody(50),
+      <String, dynamic>{'detail': 'name 不能为空'},
+      'agents：POST name 错误体',
+    );
+    check.check(postResult(51)['status'], 400, 'agents：POST 未知模型 ⇒ 400');
+    check.check(
+      postBody(51),
+      <String, dynamic>{'detail': '模型不存在：nope'},
+      'agents：POST 模型错误体',
+    );
+    check.check(postResult(52)['status'], 200, 'agents：POST 创建 200');
+    final Map<String, dynamic> createdAgent =
+        (postBody(52)['agent'] as Map).cast<String, dynamic>();
+    final String createdId = '${createdAgent['id'] ?? ''}';
+    check.that(
+      createdId.startsWith('agt_'),
+      'agents：创建回 agent id',
+      actual: createdId,
+    );
+    check.check(createdAgent['name'], '新助手', 'agents：创建回 name');
+    check.check(createdAgent['model_id'], 'm1', 'agents：创建回 model_id');
+    check.check(createdAgent['system_prompt'], '你是新助手', 'agents：创建回提示词');
+    check.check(createdAgent['team_id'], '', 'agents：创建不接受 team_id');
+    check.check(createdAgent['parent_agent_id'], '', 'agents：创建不接受 parent');
+    check.check(createdAgent['level'], 0, 'agents：创建 level=0');
+    check.that(
+      File(
+        p.join(temp.path, 'data', createdId, 'session_default', 'session.json'),
+      ).existsSync(),
+      'agents：创建时建默认会话',
+    );
+
+    check.check(postResult(53)['status'], 200, 'transcript：200');
+    final Map<String, dynamic> transcript = postBody(53);
+    check.check(transcript['agent_id'], 'agt', 'transcript：回 agent_id');
+    check.check(transcript['subagent_id'], 'sub_1', 'transcript：回 subagent_id');
+    check.check(transcript['total'], 1, 'transcript：只含该临时员工的消息');
+    check.check(
+      ((transcript['messages'] as List<dynamic>).single as Map)['id'],
+      'm3',
+      'transcript：按 subagent_id 过滤',
+    );
+    check.check(postResult(54)['status'], 404, 'transcript：未知临时员工 404');
+    check.check(
+      postBody(54),
+      <String, dynamic>{'detail': '临时员工不存在：sub_999'},
+      'transcript：未知临时员工错误体',
+    );
+    check.check(postResult(55)['status'], 200, 'transcript（另一会话）：200');
+    final Map<String, dynamic> otherTranscript = postBody(55);
+    check.check(otherTranscript['total'], 0, 'transcript（另一会话）：没有消息');
+    check.check(
+      otherTranscript['session_id'],
+      'ses_subagent',
+      'transcript（另一会话）：回显请求的 session_id',
+    );
+    check.check(postResult(56)['status'], 404, 'transcript：跨会话 404');
+    check.check(
+      postBody(56),
+      <String, dynamic>{
+        'detail':
+            '临时员工「旧员工」属于会话 ses_subagent，'
+            '不在这个会话（session_default）里——跨会话不保留是硬不变量。',
+      },
+      'transcript：跨会话错误体',
+    );
+    check.check(postResult(57)['status'], 404, 'agents：DELETE 未知 id ⇒ 404');
+
+    // 第二批：动态 agent id 的 PATCH / GET / DELETE 全链路。
+    // 插件读循环对每个请求另起异步任务（与生产一致），所以这里逐条发、逐条等：
+    // 写后读必须等前一条回包，否则会读到写队列尚未落盘的状态。
+    Future<Map<String, dynamic>> delegateSeq(
+      int id,
+      Map<String, dynamic> request,
+    ) async {
+      core.ask(id, M.apiDelegate, request);
+      final Map<Object?, Map<String, dynamic>> replies = await core.waitFor(
+        <int>[id],
+      );
+      return (replies[id]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+    }
+
+    Map<String, dynamic> replyBody(Map<String, dynamic> reply) {
+      final String raw = '${reply['body'] ?? '{}'}';
+      return (jsonDecode(raw) as Map).cast<String, dynamic>();
+    }
+
+    final String createdWorkspace = p.join(temp.path, '工作区');
+    final Map<String, dynamic> patchReply = await delegateSeq(
+      58,
+      postEnvelope(
+        '/api/agents/$createdId',
+        createdId,
+        <String, dynamic>{
+          'name': '改名应被忽略',
+          'team_id': 'agt_top',
+          'system_prompt': '改过的提示词',
+          'workspace_dir': createdWorkspace,
+          'ssh': <String, dynamic>{
+            'host': '10.0.0.9',
+            'username': 'dev',
+            'password': 'secret',
+          },
+          'max_seqlen': 32000,
+          'thinking': true,
+        },
+        method: 'PATCH',
+      ),
+    );
+    check.check(patchReply['status'], 200, 'agents：PATCH 200');
+    final Map<String, dynamic> patched =
+        (replyBody(patchReply)['agent'] as Map).cast<String, dynamic>();
+    check.check(patched['name'], '新助手', 'agents：PATCH 不改 name');
+    check.check(patched['team_id'], '', 'agents：PATCH 不改 team_id');
+    check.check(patched['system_prompt'], '改过的提示词', 'agents：PATCH 改提示词');
+    check.check(
+      patched['workspace_dir'],
+      createdWorkspace,
+      'agents：PATCH 改工作目录',
+    );
+    final Map<String, dynamic> ssh =
+        (replyBody(patchReply)['ssh'] as Map).cast<String, dynamic>();
+    check.check(ssh['host'], '10.0.0.9', 'agents：PATCH 回 SSH 非机密视图');
+    check.check(ssh['auth'], 'password', 'agents：PATCH SSH auth 口径');
+    check.check(ssh.containsKey('password'), false, 'agents：PATCH 不回 SSH 密码');
+
+    final Map<String, dynamic> invalidReply = await delegateSeq(
+      59,
+      postEnvelope(
+        '/api/agents/$createdId',
+        createdId,
+        <String, dynamic>{'compress_threshold': 2},
+        method: 'PATCH',
+      ),
+    );
+    check.check(invalidReply['status'], 400, 'agents：PATCH 非法压缩阈值 400');
+    check.check(
+      replyBody(invalidReply),
+      <String, dynamic>{
+        'detail': 'compress_threshold 必须在 0.1~0.95 之间，或 null 清除该项覆盖',
+      },
+      'agents：PATCH 压缩阈值错误体',
+    );
+
+    final Map<String, dynamic> agentDetailReply = await delegateSeq(
+      60,
+      envelope('/api/agents/$createdId', createdId),
+    );
+    check.check(agentDetailReply['status'], 200, 'agents：GET 详情 200');
+    check.check(
+      (replyBody(agentDetailReply)['agent'] as Map)['system_prompt'],
+      '改过的提示词',
+      'agents：GET 详情读到 PATCH 后值',
+    );
+
+    final Map<String, dynamic> deleteReply = await delegateSeq(
+      61,
+      postEnvelope(
+        '/api/agents/$createdId',
+        createdId,
+        <String, dynamic>{},
+        method: 'DELETE',
+      ),
+    );
+    check.check(deleteReply['status'], 200, 'agents：DELETE 200');
+    check.check(
+      replyBody(deleteReply)['removed'],
+      <dynamic>[createdId],
+      'agents：DELETE removed 含自身',
+    );
+    check.check(replyBody(deleteReply)['cascade'], false, 'agents：DELETE cascade=false');
+
+    final Map<String, dynamic> goneReply = await delegateSeq(
+      62,
+      envelope('/api/agents/$createdId', createdId),
+    );
+    check.check(goneReply['status'], 404, 'agents：删除后 GET ⇒ 404');
+    final Map<String, dynamic> againReply = await delegateSeq(
+      63,
+      postEnvelope(
+        '/api/agents/$createdId',
+        createdId,
+        <String, dynamic>{},
+        method: 'DELETE',
+      ),
+    );
+    check.check(againReply['status'], 404, 'agents：再次 DELETE ⇒ 404');
 
     // 生成是异步的：等它收尾再删临时目录。
     await AgentRuntime.forDataDir(temp.path).waitIdle();

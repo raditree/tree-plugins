@@ -1,7 +1,10 @@
 import 'dart:convert';
 
+import 'package:path/path.dart' as p;
+
 import 'agent/compaction_service.dart';
 import 'agent/question_store.dart';
+import 'compat/protocol_types.dart';
 import 'agent_config.dart';
 import 'agent_store.dart';
 import 'conversation_store.dart';
@@ -12,17 +15,22 @@ import 'settings/prompt_store.dart';
 import 'spec/spec_service.dart';
 import 'session_store.dart';
 import 'settings/domain_settings.dart';
+import 'settings/ssh_config.dart';
 import 'store/records.dart';
 import 'store/tree_paths.dart';
 import 'teammates.dart';
+import 'tool/question_channel.dart';
 import 'tool/todo_store.dart';
 import 'tool/tool_run_registry.dart';
 import 'paths.dart';
 import 'subagent_store.dart';
+import 'team/team_repair.dart';
 
 /// A2 已搬的只读路由（`G-1 对照表` 的编号见注释）。
 const String todosPattern = '/api/agents/{agentId}/todos'; // agent 定义 #7
 const String subagentsPattern = '/api/agents/{agentId}/subagents'; // 子 agent #8
+const String subagentTranscriptPattern =
+    '/api/agents/{agentId}/subagents/{subagentId}/transcript'; // 子 agent #9
 const String agentsPattern = '/api/agents'; // agent 列表 #1
 const String agentDetailPattern = '/api/agents/{agentId}'; // agent 详情 #3
 const String sessionsPattern =
@@ -96,10 +104,11 @@ Map<String, dynamic> _bodyOf(Map<String, dynamic> envelope) {
 /// Content-Type 原样写回 HTTP）。未实现的路由回 501 + 可读原因——委派语义里
 /// 404 表示"核心没有这个接口"，而这里是"插件还没搬"。
 Future<Map<String, dynamic>> handleApiDelegate(
-  Map<String, dynamic> envelope,
-) async {
+  Map<String, dynamic> envelope, {
+  AgentRuntime Function(String dataDir)? runtimeFor,
+}) async {
   try {
-    return await _dispatchDelegate(envelope);
+    return await _dispatchDelegate(envelope, runtimeFor);
   } catch (error) {
     // 与核心 `_dispatch` 的兜底同形：未捕获异常 ⇒ 500 + 可读原因。
     return _jsonReply(500, <String, dynamic>{
@@ -110,6 +119,7 @@ Future<Map<String, dynamic>> handleApiDelegate(
 
 Future<Map<String, dynamic>> _dispatchDelegate(
   Map<String, dynamic> envelope,
+  AgentRuntime Function(String dataDir)? runtimeFor,
 ) async {
   final String method = _str(envelope['method']).toUpperCase();
   final String path = _str(envelope['path']);
@@ -586,6 +596,299 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     return _jsonReply(200, <String, dynamic>{'agents': items});
   }
 
+  // 创建 agent（契约 §1.1 #2）：必填 name / model_id；团队字段不可在此指定。
+  if (method == 'POST' && _matches(agentsPattern, path)) {
+    final Map<String, dynamic> body = _bodyOf(envelope);
+    final String name = (body['name'] as String? ?? '').trim();
+    if (name.isEmpty) {
+      return _jsonReply(400, <String, dynamic>{'detail': 'name 不能为空'});
+    }
+    final String modelId = (body['model_id'] as String? ?? '').trim();
+    if (modelId.isEmpty) {
+      return _jsonReply(400, <String, dynamic>{'detail': 'model_id 不能为空'});
+    }
+    final AgentRuntime runtime = _runtimeFor(paths, runtimeFor);
+    if (runtime.settings.model(modelId) == null) {
+      return _jsonReply(400, <String, dynamic>{'detail': '模型不存在：$modelId'});
+    }
+    final CoreAgent agent = runtime.store.createAgent(
+      name: name,
+      systemPrompt: body['system_prompt'] as String? ?? '',
+      modelId: modelId,
+      teamMemberCount: (body['team_member_count'] as num?)?.toInt() ?? 0,
+      maxLevel: TeamLimits.level(body['max_level']),
+      maxMembersPerLevel: TeamLimits.members(body['max_members_per_level']),
+    );
+    // 默认会话由 createAgent 落盘；先排水，保证紧接着的读接口看得见（写路由）。
+    await runtime.store.flush();
+    return _jsonReply(200, <String, dynamic>{
+      'success': true,
+      'agent': agent.toApiJson(),
+    });
+  }
+
+  // 更新 agent（契约 §1.1 #4）：name / team_id / parent_agent_id / level /
+  // review_status / role 是禁区；空 body 也会 bump updated_at 并重写 yaml。
+  if (method == 'PATCH' && _matches(agentDetailPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final Map<String, dynamic> body = _bodyOf(envelope);
+    final String modelId = (body['model_id'] as String? ?? '').trim();
+    final AgentRuntime runtime = _runtimeFor(paths, runtimeFor);
+    if (modelId.isNotEmpty && runtime.settings.model(modelId) == null) {
+      return _jsonReply(400, <String, dynamic>{'detail': '模型不存在：$modelId'});
+    }
+    final CoreAgent? agent = runtime.store.updateAgent(
+      agentId,
+      systemPrompt: body.containsKey('system_prompt')
+          ? (body['system_prompt'] as String? ?? '')
+          : null,
+      modelId: modelId.isEmpty ? null : modelId,
+    );
+    if (agent == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
+    }
+
+    bool touched = false;
+    bool workspaceDirChanged = false;
+    if (body.containsKey('workspace_dir')) {
+      final String dir = (body['workspace_dir'] as String? ?? '').trim();
+      if (dir.isNotEmpty && !p.isAbsolute(dir)) {
+        return _jsonReply(400, <String, dynamic>{
+          'detail': 'workspace_dir 必须是绝对路径或空串（空 = 用默认工作空间）',
+        });
+      }
+      agent.workspaceDir = dir;
+      touched = true;
+      workspaceDirChanged = true;
+    }
+    if (body.containsKey('ssh')) {
+      final Object? raw = body['ssh'];
+      if (raw == null) {
+        agent.sshConfig = null;
+        touched = true;
+      } else if (raw is Map) {
+        final Map<String, dynamic> sshBody = raw.map(
+          (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+        );
+        final SshConfig? parsed = SshConfig.parse(sshBody);
+        if (parsed == null) {
+          return _jsonReply(400, <String, dynamic>{'detail': 'ssh.host 不能为空'});
+        }
+        // 密码/口令按 PATCH 语义：键缺失 = 保留原值，显式空串 = 清空。
+        final SshConfig? existing = agent.sshConfig;
+        final String password = sshBody.containsKey('password')
+            ? parsed.password
+            : (existing?.password ?? '');
+        final String passphrase = sshBody.containsKey('key_passphrase')
+            ? parsed.keyPassphrase
+            : (existing?.keyPassphrase ?? '');
+        if (password.isEmpty && parsed.keyPath.isEmpty) {
+          return _jsonReply(400, <String, dynamic>{
+            'detail': 'SSH 需要 password 或 key_path 之一',
+          });
+        }
+        agent.sshConfig = SshConfig(
+          host: parsed.host,
+          port: parsed.port,
+          username: parsed.username,
+          password: password,
+          keyPath: parsed.keyPath,
+          keyPassphrase: passphrase,
+          root: parsed.root,
+        );
+        touched = true;
+      } else {
+        return _jsonReply(400, <String, dynamic>{
+          'detail': 'ssh 必须是对象或 null',
+        });
+      }
+    }
+    if (body['clear_model_overrides'] == true) {
+      agent.reasoningEffort = '';
+      agent.maxSeqlenOverride = 0;
+      agent.maxOutputTokens = 0;
+      agent.compressThreshold = 0;
+      agent.thinkingOverride = null;
+      touched = true;
+    } else {
+      if (body.containsKey('reasoning_effort')) {
+        agent.reasoningEffort = (body['reasoning_effort'] as String? ?? '')
+            .trim();
+        touched = true;
+      }
+      if (body.containsKey('max_seqlen')) {
+        final Object? raw = body['max_seqlen'];
+        if (raw == null) {
+          agent.maxSeqlenOverride = 0;
+        } else {
+          final int? parsed = raw is num ? raw.toInt() : int.tryParse('$raw');
+          if (parsed == null || parsed <= 0) {
+            return _jsonReply(400, <String, dynamic>{
+              'detail': 'max_seqlen 必须为正整数，或 null 清除该项覆盖',
+            });
+          }
+          agent.maxSeqlenOverride = parsed;
+        }
+        touched = true;
+      }
+      if (body.containsKey('max_output_tokens')) {
+        final Object? raw = body['max_output_tokens'];
+        if (raw == null) {
+          agent.maxOutputTokens = 0;
+        } else {
+          final int? parsed = raw is num ? raw.toInt() : int.tryParse('$raw');
+          if (parsed == null || parsed <= 0) {
+            return _jsonReply(400, <String, dynamic>{
+              'detail': 'max_output_tokens 必须为正整数，或 null 清除该项覆盖',
+            });
+          }
+          agent.maxOutputTokens = parsed;
+        }
+        touched = true;
+      }
+      if (body.containsKey('compress_threshold')) {
+        final Object? raw = body['compress_threshold'];
+        if (raw == null) {
+          agent.compressThreshold = 0;
+        } else {
+          final double? parsed = raw is num
+              ? raw.toDouble()
+              : double.tryParse('$raw');
+          if (parsed == null || parsed < 0.1 || parsed > 0.95) {
+            return _jsonReply(400, <String, dynamic>{
+              'detail':
+                  'compress_threshold 必须在 0.1~0.95 之间，或 null 清除该项覆盖',
+            });
+          }
+          agent.compressThreshold = parsed;
+        }
+        touched = true;
+      }
+      if (body.containsKey('thinking')) {
+        final Object? raw = body['thinking'];
+        if (raw == null) {
+          agent.thinkingOverride = null;
+        } else if (raw is bool) {
+          agent.thinkingOverride = raw;
+        } else {
+          return _jsonReply(400, <String, dynamic>{
+            'detail': 'thinking 必须是 true / false，或 null 清除该项覆盖',
+          });
+        }
+        touched = true;
+      }
+    }
+    if (touched) {
+      agent.updatedAt = DateTime.now().millisecondsSinceEpoch;
+      runtime.store.putAgent(agent);
+    }
+    // 目录改动 = 团队共享目录变了：与核心一样把生效目录镜像给成员。
+    if (workspaceDirChanged) {
+      await syncWorkspaceMirrors(
+        runtime.store,
+        defaultDirFor: (String id) =>
+            TreePaths(paths.root).defaultWorkspaceDir(id),
+      );
+    }
+    await runtime.store.flush();
+    final SshConfig? ssh = agent.sshConfig;
+    return _jsonReply(200, <String, dynamic>{
+      'success': true,
+      'agent': agent.toApiJson(),
+      if (ssh != null) 'ssh': _sshApiView(ssh),
+    });
+  }
+
+  // 删除 agent（契约 §1.1 #5）：两道闸门（有下级未级联 / 正在运行）都不改东西。
+  if (method == 'DELETE' && _matches(agentDetailPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final AgentRuntime runtime = _runtimeFor(paths, runtimeFor);
+    if (runtime.store.agent(agentId) == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
+    }
+    // 与核心逐字比较（不 trim）：只有 '1' / 'true' 生效。
+    final String cascadeRaw = _firstQueryValue(query, 'cascade');
+    final bool cascade = cascadeRaw == '1' || cascadeRaw == 'true';
+    final List<CoreAgent> descendants = runtime.teamService.descendants(
+      agentId,
+    );
+    if (descendants.isNotEmpty && !cascade) {
+      final String message =
+          '该 agent 还有 ${descendants.length} 个下级成员，未指定 cascade';
+      return _jsonReply(409, <String, dynamic>{
+        'detail': message,
+        'error': message,
+        'cascade_required': <Map<String, dynamic>>[
+          for (final CoreAgent member in descendants)
+            <String, dynamic>{
+              'member_id': member.id,
+              'name': member.name,
+              'level': member.level,
+              'parent_agent_id': member.parentAgentId,
+            },
+        ],
+        'hint':
+            '直接删除会让这些下级变成孤儿（找不到上级，广播与级联停止都够不着）；'
+            '确认后带 ?cascade=1 连同下级一并删除，或先用 team 工具逐个移除下级',
+      });
+    }
+    final List<String> ids = <String>[
+      agentId,
+      if (cascade) ...descendants.map((CoreAgent member) => member.id),
+    ];
+    // 记下每条的团队归属：删完就取不到了，而计数回填要用。
+    final Map<String, String> teamOf = <String, String>{};
+    for (final String id in ids) {
+      final CoreAgent? agent = runtime.store.agent(id);
+      if (agent == null) continue;
+      teamOf[id] = _teamOfFor(agent);
+    }
+    List<String> running() =>
+        ids.where(runtime.conversation.isRunning).toList(growable: false);
+    if (running().isNotEmpty) {
+      return _jsonReply(409, _busyBody(running()));
+    }
+    // 停：作废排队任务（旧代次出队即丢）+ 收尾在途提问。
+    for (final String id in ids) {
+      _stopOne(runtime, id);
+    }
+    // 竞态兜底：恰好在闸门之后接单的排队任务会被这次代次推进作废，但"已过代次
+    // 检查、即将登记 token"的窗口仍在；再确认一次（不等待）。
+    final List<String> started = running();
+    if (started.isNotEmpty) {
+      return _jsonReply(409, _busyBody(started));
+    }
+    await runtime.store.flush();
+    int questionsRemoved = 0;
+    for (final String id in ids) {
+      runtime.questions.cancelForAgent(id);
+      questionsRemoved += runtime.questionStore.removeForAgent(id);
+      await runtime.questionStore.flush();
+    }
+    // 叶→根删（父先于子的逆序），避免留下"父没了子还在"的中间态。
+    final List<String> removed = <String>[];
+    for (final String id in ids.reversed) {
+      runtime.registry.forgetAgent(id);
+      if (runtime.store.deleteAgent(id)) removed.add(id);
+    }
+    await runtime.store.flush();
+    // 回填存活 TOP 的成员数（与 team 工具"按实际成员数"同一口径）。
+    final Set<String> touchedTopIds = <String>{
+      for (final String teamId in teamOf.values)
+        if (!ids.contains(teamId)) teamId,
+    };
+    for (final String topId in touchedTopIds) {
+      runtime.teamService.syncMemberCount(topId);
+    }
+    await runtime.store.flush();
+    return _jsonReply(200, <String, dynamic>{
+      'success': true,
+      'removed': removed,
+      'cascade': cascade,
+      if (questionsRemoved > 0) 'questions_removed': questionsRemoved,
+    });
+  }
+
   // 团队名册（成员视图 + 关系 + 覆盖项；未知 agent 不 404）。
   if (method == 'GET' && _matches(teammatesPattern, path)) {
     final String agentId = _str(params['agentId']);
@@ -736,6 +1039,51 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     });
   }
 
+  // 临时员工 transcript（契约 §1.1 #9）：只读父会话里带 subagent_id 标记的那一段。
+  // 先按请求的会话装载名册，再核对记录自己的 (ownerAgentId, sessionId)——
+  // 跨会话不保留是硬不变量，对不上回可读 404。
+  if (method == 'GET' && _matches(subagentTranscriptPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final String subagentId = _str(params['subagentId']);
+    if (readAgentRecord(paths, agentId) == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
+    }
+    final AgentRuntime runtime = _runtimeFor(paths, runtimeFor);
+    final String sessionId = _sessionOf(query);
+    runtime.registry.ensureSession(agentId, sessionId);
+    final CoreSubagent? record = runtime.registry.handle(subagentId);
+    if (record == null) {
+      return _jsonReply(404, <String, dynamic>{
+        'detail': '临时员工不存在：$subagentId',
+      });
+    }
+    if (record.ownerAgentId != agentId || record.sessionId != sessionId) {
+      return _jsonReply(404, <String, dynamic>{
+        'detail':
+            '临时员工「${record.name}」属于会话 ${record.sessionId}，'
+            '不在这个会话（$sessionId）里——跨会话不保留是硬不变量。',
+      });
+    }
+    final List<Map<String, dynamic>> messages = <Map<String, dynamic>>[
+      for (final Map<String, dynamic> message
+          in readMessages(paths, record.ownerAgentId, sessionId))
+        if ('${message['subagent_id'] ?? ''}' == subagentId &&
+            '${message['kind']}' != 'subagent_report')
+          _withQuestionOverlay(runtime.questionStore, message),
+    ];
+    messages.sort(
+      (Map<String, dynamic> a, Map<String, dynamic> b) =>
+          _messageMs(a).compareTo(_messageMs(b)),
+    );
+    return _jsonReply(200, <String, dynamic>{
+      'agent_id': agentId,
+      'subagent_id': subagentId,
+      'session_id': sessionId,
+      'total': messages.length,
+      'messages': messages,
+    });
+  }
+
   return _jsonReply(501, <String, dynamic>{
     'detail': 'tree.agent 尚未实现该路由：$method $path',
   });
@@ -774,6 +1122,13 @@ String _sessionOf(Map<String, dynamic> query) {
   return raw.isEmpty ? 'session_default' : raw;
 }
 
+/// 查询参数原样取第一个值（不 trim；重复键在信封里是数组）。
+String _firstQueryValue(Map<String, dynamic> query, String key) {
+  final Object? raw = query[key];
+  if (raw is List) return raw.isEmpty ? '' : '${raw.first ?? ''}';
+  return '${raw ?? ''}';
+}
+
 /// 枚举查询参数取**第一个值**（重复键在信封里是数组；核心取 queryParameters 的首值）。
 String _queryString(Map<String, dynamic> query, String key) {
   final Object? raw = query[key];
@@ -788,3 +1143,65 @@ Map<String, dynamic> _map(Object? value) => value is Map
         (Object? key, Object? item) => MapEntry(key.toString(), item),
       )
     : <String, dynamic>{};
+
+/// 运行时解析：默认走进程内按数据根缓存；[runtimeFor] 只给测试注入替身。
+AgentRuntime _runtimeFor(
+  AgentDataPaths paths,
+  AgentRuntime Function(String dataDir)? runtimeFor,
+) => (runtimeFor ?? AgentRuntime.forDataDir)(paths.root);
+
+/// agent 的团队归属：成员取 `team_id`，顶层 agent 就是它自己。
+String _teamOfFor(CoreAgent agent) => agent.teamId.isEmpty ? agent.id : agent.teamId;
+
+/// 停**单个** agent（不展开团队树）：与核心 `_stopAgentTree(cascade: false)` 同口径。
+void _stopOne(AgentRuntime runtime, String id) {
+  final bool running = runtime.conversation.cancelAgent(id);
+  if (running) return;
+  // 没有在途任务也补一条 idle：否则前端/成员窗口的「工作中」标识会一直亮着。
+  runtime.hub.broadcast(<String, dynamic>{
+    'type': WsOutboundType.agentStatus,
+    'data': <String, dynamic>{
+      'agent_id': id,
+      'status': 'idle',
+      'own_running': false,
+    },
+  });
+}
+
+/// "正在运行，不能删"的 409 响应体（与核心 `_busyBody` 逐字一致）。
+Map<String, dynamic> _busyBody(List<String> running) => <String, dynamic>{
+  'detail': 'agent 正在运行，不能删除',
+  'error': 'agent 正在运行，不能删除',
+  'running': running,
+  'hint':
+      '请先停止该 agent（成员可在标题栏按「停止」）并等它变为空闲后再删除；'
+      '正在执行的工具无法被抢占（本地执行活着就永不超时），所以这里不会替你等待。',
+};
+
+/// SSH 的前端形态：在 `redacted()` 基础上补 `key_path`（绝不含密码/口令）。
+Map<String, dynamic> _sshApiView(SshConfig config) => <String, dynamic>{
+  ...config.redacted(),
+  if (config.keyPath.isNotEmpty) 'key_path': config.keyPath,
+};
+
+/// 提问卡片的历史形态：用提问记录（真源）覆盖只追加消息里的旧状态。
+Map<String, dynamic> _withQuestionOverlay(
+  QuestionStore questions,
+  Map<String, dynamic> message,
+) {
+  final Map<String, dynamic> json = Map<String, dynamic>.of(message);
+  if ('${json['kind']}' != 'ask_user_question') return json;
+  final QuestionRecord? record = questions.byId('${json['id']}');
+  if (record == null) return json;
+  json['answered'] = !record.isPending;
+  json['answer'] = record.answer;
+  json['questions'] = <Map<String, dynamic>>[
+    for (final AskedQuestion question in record.questions) question.toJson(),
+  ];
+  json['answers'] = record.answers;
+  if (record.options.isNotEmpty) json['options'] = record.options;
+  return json;
+}
+
+int _messageMs(Map<String, dynamic> message) =>
+    DateTime.tryParse('${message['timestamp']}')?.millisecondsSinceEpoch ?? 0;
