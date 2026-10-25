@@ -8,6 +8,7 @@ import 'package:tree_agent_loop/src/runtime/agent_runtime.dart';
 import 'package:tree_agent_loop/src/store/file_store.dart';
 import 'package:tree_agent_loop/src/store/records.dart';
 import 'package:tree_agent_loop/src/store/tree_paths.dart';
+import 'package:tree_agent_loop/src/tool/tool_runner.dart';
 import 'package:tree_agent_loop/src/workspace/workspace_io.dart';
 
 void main() {
@@ -154,6 +155,59 @@ void main() {
     expect(calls.single['command'], 'ssh.reconnect');
     expect((calls.single['arguments'] as Map)['agent_id'], 'agt');
     expect((calls.single['scope'] as Map)['agent_id'], 'agt');
+  });
+
+  test('mcp 元工具：help 汇总 inventory，call 转到 call_tool', () async {
+    final AgentRuntime runtime = AgentRuntime(
+      paths: paths,
+      engine: ScriptedAgent(chunkDelay: Duration.zero),
+    );
+    final List<Map<String, dynamic>> calls = <Map<String, dynamic>>[];
+    AgentRuntime.stationClient = (
+      String command,
+      Map<String, dynamic> arguments,
+      Map<String, dynamic> scope,
+    ) async {
+      calls.add(<String, dynamic>{'command': command, 'arguments': arguments});
+      if (command == 'inventory') {
+        return <String, dynamic>{
+          'servers': <Map<String, dynamic>>[
+            <String, dynamic>{
+              'server': 'fake',
+              'tools': <Map<String, dynamic>>[
+                <String, dynamic>{'name': 'echo', 'description': '回显'},
+              ],
+            },
+          ],
+        };
+      }
+      return <String, dynamic>{'text': 'MCP 结果', 'is_error': false};
+    };
+    final ToolOutcome help = await runtime.runMcpTool(
+      const ToolInvocation(
+        id: 'h1',
+        name: 'mcp',
+        arguments: <String, dynamic>{'action': 'help'},
+        agentId: 'agt',
+        sessionId: 'session_default',
+      ),
+    );
+    expect(help.content, contains('mcp__fake__echo'));
+    final ToolOutcome call = await runtime.runMcpTool(
+      const ToolInvocation(
+        id: 'h2',
+        name: 'mcp',
+        arguments: <String, dynamic>{
+          'action': 'call',
+          'tool_name': 'mcp__fake__echo',
+          'arguments': <String, dynamic>{'text': 'x'},
+        },
+        agentId: 'agt',
+        sessionId: 'session_default',
+      ),
+    );
+    expect(call.content, 'MCP 结果');
+    expect(calls.last['command'], 'call_tool');
   });
 
   test('默认引擎是 LlmAgentEngine（生产路径）；未知 agent 返回 null（端点 404）', () async {

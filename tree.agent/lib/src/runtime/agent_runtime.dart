@@ -108,6 +108,7 @@ class AgentRuntime {
             toolRunner: StationToolRunner(
               contributed: () => contributedTools,
               toolRunsRunner: runToolRuns,
+              mcpRunner: runMcpTool,
               client: _stationCommand,
               scopeFor: _stationScopeFor,
             ),
@@ -349,6 +350,83 @@ class AgentRuntime {
     }
     final Map<String, dynamic> scope = _stationScopeFor(agentId, '');
     return client('ssh.reconnect', <String, dynamic>{'agent_id': agentId}, scope);
+  }
+
+  /// `mcp` 元工具：help 汇总 MCP 插件自发现的工具；call 兜底调用。
+  Future<ToolOutcome> runMcpTool(ToolInvocation invocation) async {
+    final StationCommandClient? client = stationClient;
+    if (client == null) {
+      return const ToolOutcome('MCP 插件未接线（执行站不可用）', isError: true);
+    }
+    final Map<String, dynamic> scope = _stationScopeFor(
+      invocation.agentId,
+      invocation.sessionId,
+    );
+    final String action =
+        (invocation.arguments['action'] ?? '').toString().trim();
+    try {
+      if (action == 'help') {
+        final Map<String, dynamic> inventory = await client(
+          'inventory',
+          <String, dynamic>{},
+          scope,
+        );
+        final List<String> lines = <String>['可用 MCP 工具列表:'];
+        final List<dynamic> servers =
+            inventory['servers'] as List<dynamic>? ?? <dynamic>[];
+        for (final Object? rawServer in servers) {
+          if (rawServer is! Map) continue;
+          final String server = (rawServer['server'] ?? '').toString();
+          final List<dynamic> tools =
+              rawServer['tools'] as List<dynamic>? ?? <dynamic>[];
+          for (final Object? rawTool in tools) {
+            if (rawTool is! Map) continue;
+            final String tool = (rawTool['name'] ?? '').toString();
+            final String description = (rawTool['description'] ?? '').toString();
+            lines.add(
+              '- mcp__${server}__$tool${description.isEmpty ? '' : ': $description'}',
+            );
+          }
+        }
+        if (lines.length == 1) {
+          lines.add('当前没有可用的 MCP 工具（检查 MCP 服务配置）。');
+        }
+        return ToolOutcome(lines.join('\n'));
+      }
+      if (action == 'call') {
+        final String toolName =
+            (invocation.arguments['tool_name'] ?? '').toString().trim();
+        final List<String> parts = toolName.split('__');
+        if (parts.length != 3 || parts[0] != 'mcp') {
+          return ToolOutcome(
+            'tool_name 必须是 mcp__<服务>__<工具>：$toolName',
+            isError: true,
+          );
+        }
+        final Object? rawArgs = invocation.arguments['arguments'];
+        final Map<String, dynamic> args = rawArgs is Map
+            ? rawArgs.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
+            : <String, dynamic>{};
+        final Map<String, dynamic> result = await client(
+          'call_tool',
+          <String, dynamic>{
+            'server': parts[1],
+            'tool': parts[2],
+            'arguments': args,
+          },
+          scope,
+        );
+        return ToolOutcome(
+          (result['text'] ?? '').toString().isEmpty
+              ? '（MCP 工具没有返回内容）'
+              : (result['text'] ?? '').toString(),
+          isError: result['is_error'] == true,
+        );
+      }
+      return const ToolOutcome("未知的 action，支持 'help' 或 'call'", isError: true);
+    } catch (error) {
+      return ToolOutcome('MCP 调用失败：$error', isError: true);
+    }
   }
 
   /// `tool_runs` 工具：作用域 = 本 agent + 直属下级，关闭落到同一登记表。
