@@ -1,7 +1,7 @@
 {
   "id": "tree.agent",
   "name": "Tree Agent 循环",
-  "version": "0.24.0",
+  "version": "0.25.0",
   "description": "agent 领域插件（批次 G）：A1 阶段只有 stdio 骨架、心跳与日志；36 条委派路由、广播 topic 与数据接管按 docs/pluginization/agent_api_contract.md 逐批搬入。依赖纪律：不得 import tree_core / tree_protocol。",
   "runtime": "headless",
   "files": [

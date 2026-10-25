@@ -32,6 +32,7 @@ import '../tool/message_tool.dart';
 import '../tool/question_channel.dart';
 import '../tool/station_tool_runner.dart';
 import '../tool/team_tool.dart';
+import '../tool/terminal_hook_manager.dart';
 import '../tool/todo_store.dart';
 import '../tool/subagent_tool.dart';
 import '../tool/tool_run_registry.dart';
@@ -93,6 +94,16 @@ class AgentRuntime {
         agentOverrides: overridesFor,
       ),
     )..usageLog = usageLog;
+    terminalHooks = TerminalHookManager(
+      client: _stationCommand,
+      scopeFor: _stationScopeFor,
+      wake: (String agentId, String sessionId, String notice) =>
+          conversation.wake(
+            agentId: agentId,
+            sessionId: sessionId,
+            notice: notice,
+          ),
+    );
     conversation = ConversationService(
       store: store,
       hub: hub,
@@ -109,6 +120,7 @@ class AgentRuntime {
               contributed: () => contributedTools,
               toolRunsRunner: runToolRuns,
               mcpRunner: runMcpTool,
+              hooks: terminalHooks,
               client: _stationCommand,
               scopeFor: _stationScopeFor,
             ),
@@ -166,6 +178,7 @@ class AgentRuntime {
   late final FileTodoStore todoStore;
   late final FileQuestionStore questionStore;
   late final QuestionBroker questions;
+  late final TerminalHookManager terminalHooks;
   late final TeamService teamService;
   late final TeamMessageDispatcher messageDispatcher;
   late final SpecService specService;
@@ -430,13 +443,33 @@ class AgentRuntime {
   }
 
   /// `tool_runs` 工具：作用域 = 本 agent + 直属下级，关闭落到同一登记表。
-  Future<ToolOutcome> runToolRuns(ToolInvocation invocation) {
+  Future<ToolOutcome> runToolRuns(ToolInvocation invocation) async {
+    final String action =
+        (invocation.arguments['action'] ?? '').toString().trim().toLowerCase();
+    if (action == 'close') {
+      final String handle =
+          (invocation.arguments['handle'] ?? '').toString().trim();
+      if (handle.isNotEmpty && terminalHooks.find(handle) != null) {
+        return terminalHooks.cancel(handle);
+      }
+    }
     final ToolRunsScope scope = ToolRunsScope(
       registry: toolRuns,
       teamService: teamService,
       subagents: subagentService,
     );
-    return ToolRunsTool.run(invocation, scope);
+    final ToolOutcome base = await ToolRunsTool.run(invocation, scope);
+    if (action != 'list') return base;
+    final List<HookRun> hooks = terminalHooks.listVisible(
+      invocation.agentId,
+      invocation.sessionId,
+    );
+    if (hooks.isEmpty) return base;
+    final String extra = <String>[
+      '后台终端任务（terminal hook）：',
+      for (final HookRun run in hooks) '- ${run.describe()}',
+    ].join('\n');
+    return ToolOutcome('${base.content}\n\n$extra', isError: base.isError);
   }
 
   /// 领域工具原语（extra-tools 插件经自建执行站调用）。

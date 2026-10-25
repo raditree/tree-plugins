@@ -1,3 +1,4 @@
+import 'terminal_hook_manager.dart';
 import 'tool_runner.dart';
 import '../station/tool_contributions.dart';
 import '../workspace/station_command.dart';
@@ -14,6 +15,7 @@ class StationToolRunner implements ToolRunner {
     this.contributed,
     this.toolRunsRunner,
     this.mcpRunner,
+    this.hooks,
   });
 
   final StationCommandClient client;
@@ -29,6 +31,9 @@ class StationToolRunner implements ToolRunner {
 
   /// `mcp` 元工具（help/call）的执行回调。
   final Future<ToolOutcome> Function(ToolInvocation invocation)? mcpRunner;
+
+  /// terminal hook 管理器（start/status/cancel + 完成唤醒）。
+  final TerminalHookManager? hooks;
 
   @override
   List<ToolSpec> specsFor({required String agentId, required String sessionId}) =>
@@ -307,6 +312,23 @@ class StationToolRunner implements ToolRunner {
   ) async {
     final String command =
         (invocation.arguments['command'] ?? '').toString().trim();
+    final String hookAction =
+        (invocation.arguments['hook_action'] ?? '').toString().trim();
+    final TerminalHookManager? manager = hooks;
+    if (manager != null &&
+        (hookAction.isNotEmpty || invocation.arguments['hook'] == true)) {
+      if (hookAction.isNotEmpty) {
+        final String taskId =
+            (invocation.arguments['task_id'] ?? '').toString().trim();
+        if (taskId.isEmpty) {
+          return ToolOutcome('hook_action=$hookAction 需要 task_id', isError: true);
+        }
+        return hookAction == 'cancel'
+            ? manager.cancel(taskId)
+            : manager.status(taskId);
+      }
+      return manager.start(invocation);
+    }
     if (command.isEmpty) return const ToolOutcome('terminal 需要 command', isError: true);
     final Map<String, dynamic> result = await client('exec.command', <String, dynamic>{
       'command': command,
