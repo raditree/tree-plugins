@@ -53,10 +53,19 @@ void main() {
         ),
       ],
       client: (String command, Map<String, dynamic> arguments, Map<String, dynamic> scope) async {
-        calls.add(<String, dynamic>{'command': command, 'arguments': arguments});
+        calls.add(<String, dynamic>{
+          'command': command,
+          'arguments': arguments,
+          'scope': scope,
+        });
         return <String, dynamic>{'result': '来自插件的答案', 'is_error': false};
       },
-      scopeFor: (String agentId, String sessionId) => <String, dynamic>{'agent_id': agentId},
+      scopeFor: (String agentId, String sessionId) => <String, dynamic>{
+        'agent_id': agentId,
+        'team_id': 'top',
+        'mode_key': 'local',
+        'session_id': sessionId,
+      },
     );
     final List<String> names = runner
         .specsFor(agentId: 'agt', sessionId: 's')
@@ -74,7 +83,21 @@ void main() {
     );
     expect(outcome.content, '来自插件的答案');
     expect(outcome.isError, isFalse);
-    expect(calls.single['command'], 'tool.call');
-    expect((calls.single['arguments'] as Map)['tool'], 'plugin__tree.sample__query');
+    expect(calls.single['command'], 'plugin.toolCall');
+    final Map<String, dynamic> callArgs =
+        calls.single['arguments'] as Map<String, dynamic>;
+    expect(callArgs['plugin_id'], 'tree.sample');
+    expect(callArgs['tool'], 'query');
+    expect(
+      callArgs['scope'],
+      <String, dynamic>{
+        'agent_id': 'agt',
+        'team_id': 'top',
+        'mode_key': 'local',
+        'session_id': 's',
+      },
+      reason: '领域身份放 payload；核心不解析这些字段',
+    );
+    expect(calls.single['scope'], isEmpty, reason: '顶层 scope 留空');
   });
 }

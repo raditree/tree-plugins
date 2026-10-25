@@ -226,13 +226,17 @@ class StationToolRunner implements ToolRunner {
     if (match == null) {
       return ToolOutcome('未知工具：${invocation.name}', isError: true);
     }
+    // 核心只负责把调用转给贡献插件，**不解析**身份字段：scope 放 payload，
+    // 顶层 scope 留空（mode 由核心按平台路由兜底，与领域身份无关）。
     final Map<String, dynamic> result = await client(
-      'tool.call',
+      'plugin.toolCall',
       <String, dynamic>{
-        'tool': invocation.name,
+        'plugin_id': match.pluginId,
+        'tool': match.name,
         'arguments': invocation.arguments,
+        'scope': scope,
       },
-      scope,
+      <String, dynamic>{},
     );
     return ToolOutcome(
       (result['result'] ?? '').toString(),

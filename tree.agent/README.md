@@ -132,8 +132,9 @@ lib/src/delegate.dart      api/delegate 信封 → 路由分发 → {status, hea
 2. 收到 `station/request`（`payload = {action: "list"}`）时按 schema 回：
    `{ok: true, payload: {tools: [{name, description, parameters}]}}`
    （`parameters` 是 JSON Schema 对象）；
-3. agent 把工具名改写为 `plugin__<你的插件id>__<name>`，执行时经核心执行站
-   `tool.call` 转到你的 `tools/call`。
+3. agent 把工具名改写为 `plugin__<你的插件id>__<name>`，执行时经核心执行站的
+   `plugin.toolCall` 转到你的 `tools/call`。**领域身份放 `arguments.scope`，
+   顶层 scope 留空**：核心只认 `plugin_id` / `tool`，不解析 agent/team/mode/session。
 
 站点 schema：`{kind: object, fields: [{name: tools, type: array, required: true}]}`；
 采集失败不阻断 agent 发消息，工具表退回内置五项。
