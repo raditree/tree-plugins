@@ -1,46 +1,21 @@
-import 'methods.dart';
-
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'config.dart';
+import 'methods.dart';
+
 /// MCP 协议版本（客户端声明；服务端可回自己支持的版本）。
 const String kMcpProtocolVersion = '2025-06-18';
+
+/// 建连握手窗口：进程起得来但一直不回 `initialize` 时不无限等待。
+const Duration kMcpHandshakeTimeout = Duration(seconds: 20);
 
 class McpException implements Exception {
   McpException(this.message);
   final String message;
   @override
   String toString() => message;
-}
-
-/// 一个 MCP 服务配置（stdio 传输）。
-class McpServerConfig {
-  const McpServerConfig({
-    required this.name,
-    required this.command,
-    this.args = const <String>[],
-    this.env = const <String, String>{},
-  });
-
-  final String name;
-  final String command;
-  final List<String> args;
-  final Map<String, String> env;
-
-  factory McpServerConfig.fromJson(Map<String, dynamic> json) => McpServerConfig(
-    name: (json['name'] ?? '').toString(),
-    command: (json['command'] ?? '').toString(),
-    args: <String>[
-      for (final Object? arg in (json['args'] as List<dynamic>? ?? const <dynamic>[]))
-        arg.toString(),
-    ],
-    env: <String, String>{
-      for (final MapEntry<dynamic, dynamic> entry
-          in (json['env'] as Map<dynamic, dynamic>? ?? const <dynamic, dynamic>{}).entries)
-        entry.key.toString(): entry.value.toString(),
-    },
-  );
 }
 
 /// 服务端 initialize 声明的能力。
@@ -265,7 +240,14 @@ class McpProtocolClient {
       throw McpException('启动 MCP 服务 ${config.name} 失败：$error');
     }
     final McpProtocolClient client = McpProtocolClient._(config, process);
-    await client._initialize();
+    try {
+      // 进程起得来却一直不回 initialize 时，不能让一次注册 / 列表把委派队列
+      // 永远挂住：握手有界（20s），超时即关进程并回可读错误。
+      await client._initialize().timeout(kMcpHandshakeTimeout);
+    } catch (error) {
+      await client.close();
+      rethrow;
+    }
     return client;
   }
 

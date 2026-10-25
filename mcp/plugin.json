@@ -1,8 +1,8 @@
 {
   "id": "mcp",
   "name": "MCP 协议客户端",
-  "version": "0.3.2",
-  "description": "完整 MCP 客户端插件：initialize 能力协商、tools/resources/prompts 自发现、list_changed、resources/read、prompts/get、roots/list 与上下文管理；工具经 tree.agent 收集站贡献。",
+  "version": "0.4.0",
+  "description": "完整 MCP 客户端插件：initialize 能力协商、tools/resources/prompts 自发现、list_changed、resources/read、prompts/get、roots/list 与上下文管理；工具经 tree.agent 收集站贡献；承接 /api/mcp/services 三条 REST 委派路由，配置落 <数据根>/config/mcp.yaml。",
   "runtime": "headless",
   "files": [
     "tree_mcp.exe"

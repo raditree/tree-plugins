@@ -1,13 +1,14 @@
 name: tree_mcp
-description: MCP 协议客户端插件（stdio JSON-RPC）：能力协商、工具/资源/提示词自发现、上下文管理。
+description: MCP 协议客户端插件（stdio JSON-RPC）：能力协商、工具/资源/提示词自发现、上下文管理；承接 /api/mcp/services 三条 REST 委派路由与 config/mcp.yaml 配置。
 publish_to: 'none'
-version: 0.3.2
+version: 0.4.0
 
 environment:
   sdk: ^3.13.0
 
 dependencies:
   path: ^1.9.0
+  yaml: ^3.1.4
 
 dev_dependencies:
   lints: ^6.0.0

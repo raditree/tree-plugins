@@ -79,6 +79,10 @@ List<Map<String, dynamic>> mcpToolSpecs(
       },
 ];
 
+/// MCP 工具的命名空间名（与核心旧实现同口径：`mcp__<服务>__<工具>`）。
+String mcpNamespacedToolName(String service, String tool) =>
+    'mcp__${service}__$tool';
+
 /// 把核心传回的命名空间工具名还原成 MCP 原生名。
 String nativeMcpToolName(String name) => name.startsWith('plugin__mcp__')
     ? name.substring('plugin__mcp__'.length)
