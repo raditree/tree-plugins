@@ -17,7 +17,7 @@
 | 阶段 | 内容 | 本仓状态 |
 | --- | --- | --- |
 | A1 | 骨架：stdio 循环、hello/ping、工具表、收集站申报、日志 | **已完成** |
-| A2 | 只读面：agents / models / sessions / todos / subagents / teammates / tools-running | **进行中**：agents（列表/详情）、todos、subagents、models、models-info 已搬并等价；其余 3 组未开始 |
+| A2 | 只读面：agents / models / sessions / todos / subagents / teammates / tools-running | **进行中**：agents（列表/详情）、todos、subagents、models、models-info 已搬并等价；其余 4 组（sessions / conversations / teammates / tools-running）未开始，tools-running 依赖 A3 工具层随迁 |
 | A3 | 写路径与生成：消息、取消、LLM、工具编排、提问、reset/compact | 未开始 |
 | A4 | 帧迁移：注册广播站，topic 沿用原帧名 | 未开始 |
 | A5 | 交接：核心删除 34 条路由 + 2 条上行 + 领域目录 | 未开始 |
