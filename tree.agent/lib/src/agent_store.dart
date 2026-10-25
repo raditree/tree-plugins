@@ -18,6 +18,7 @@ class AgentRecord {
     required this.workspaceId,
     required this.workspaceDir,
     required this.hasSsh,
+    required this.sshView,
     required this.teamId,
     required this.parentAgentId,
     required this.level,
@@ -36,6 +37,10 @@ class AgentRecord {
   final String workspaceId;
   final String workspaceDir;
   final bool hasSsh;
+
+  /// SSH 配置的前端形态（`SshConfig.redacted()` + `key_path`）；无配置 = null。
+  final Map<String, dynamic>? sshView;
+
   final String teamId;
   final String parentAgentId;
   final int level;
@@ -74,13 +79,82 @@ List<AgentRecord> readAgentRecords(AgentDataPaths paths) {
   return byId.values.toList();
 }
 
+/// 读单个 agent（按文件路径，不看文件名与 id 是否一致；与 `store.agent(id)` 同口径）。
+///
+/// 文件不存在 / 解析失败 / 字段类型不符 ⇒ null（端点按"agent 不存在"处理）。
+AgentRecord? readAgentRecord(AgentDataPaths paths, String agentId) {
+  final Map<String, dynamic>? json;
+  try {
+    json = readYamlMap(File(paths.agentFile(agentId)));
+  } on ArgumentError {
+    return null; // 非法 id：fail-closed
+  }
+  if (json == null) return null;
+  try {
+    return _toRecord(json, DateTime.now().millisecondsSinceEpoch);
+  } catch (_) {
+    return null;
+  }
+}
+
+/// `SshConfig.redacted()` + `key_path` 的同一形态；`host` 为空 ⇒ null（与 `parse` 一致）。
+Map<String, dynamic>? _sshViewOf(Object? raw) {
+  if (raw is! Map) return null;
+  final Map<String, dynamic> map = raw.map(
+    (Object? key, Object? value) => MapEntry(key.toString(), value),
+  );
+  final String host = (map['host'] ?? '').toString().trim();
+  if (host.isEmpty) return null;
+  final String username = (map['username'] ?? map['user'] ?? '')
+      .toString()
+      .trim();
+  final String password = (map['password'] ?? '').toString();
+  final String keyPath =
+      (map['key_path'] ??
+              map['keyPath'] ??
+              map['private_key_path'] ??
+              map['privateKeyPath'] ??
+              '')
+          .toString()
+          .trim();
+  final String root =
+      (map['root'] ??
+              map['remote_root'] ??
+              map['remoteRoot'] ??
+              map['dir'] ??
+              map['remote_base_dir'] ??
+              '')
+          .toString()
+          .trim();
+  final Object? loginShellRaw = map['login_shell'] ?? map['loginShell'];
+  final Object? loginShell = loginShellRaw == null
+      ? null
+      : (loginShellRaw is bool
+            ? (loginShellRaw ? null : '')
+            : loginShellRaw.toString().trim());
+  return <String, dynamic>{
+    'host': host,
+    'port': _sshPort(map['port']),
+    'username': username,
+    'auth': password.isNotEmpty
+        ? 'password'
+        : (keyPath.isNotEmpty ? 'key' : 'none'),
+    if (root.isNotEmpty) 'root': root,
+    'login_shell': ?loginShell,
+    if (keyPath.isNotEmpty) 'key_path': keyPath,
+  };
+}
+
+int _sshPort(Object? raw) {
+  if (raw is num) return raw.toInt();
+  if (raw is String) return int.tryParse(raw.trim()) ?? 22;
+  return 22;
+}
+
 AgentRecord? _toRecord(Map<String, dynamic> json, int nowMs) {
   final String id = json['id'] as String? ?? '';
   if (id.isEmpty) return null; // 核心会生成新 id；本视图无法复刻随机值，跳过（正常文件都带 id）
-  final Object? rawSsh = json['ssh'];
-  final bool hasSsh =
-      rawSsh is Map &&
-      (rawSsh['host'] ?? '').toString().trim().isNotEmpty;
+  final Map<String, dynamic>? sshView = _sshViewOf(json['ssh']);
   return AgentRecord(
     id: id,
     name: json['name'] as String? ?? '',
@@ -88,7 +162,8 @@ AgentRecord? _toRecord(Map<String, dynamic> json, int nowMs) {
     modelId: json['model_id'] as String? ?? '',
     workspaceId: json['workspace_id'] as String? ?? '',
     workspaceDir: json['workspace_dir'] as String? ?? '',
-    hasSsh: hasSsh,
+    hasSsh: sshView != null,
+    sshView: sshView,
     teamId: json['team_id'] as String? ?? '',
     parentAgentId: json['parent_agent_id'] as String? ?? '',
     level: (json['level'] as num?)?.toInt() ?? 0,

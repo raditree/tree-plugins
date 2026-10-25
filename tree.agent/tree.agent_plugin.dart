@@ -274,17 +274,18 @@ Future<int> selfTest() async {
     core.ask(9, M.apiDelegate, envelope(agentModelsInfoPattern, 'agt'));
     core.ask(10, M.apiDelegate, envelope(agentModelsInfoPattern, 'nope'));
     core.ask(11, M.apiDelegate, envelope(agentsPattern, ''));
+    core.ask(12, M.apiDelegate, envelope(agentDetailPattern, 'agt_m'));
     core.ask(
-      12,
+      13,
       M.apiDelegate,
       envelope('/api/agents/agt/sessions', 'agt'),
     );
 
     final Map<Object?, Map<String, dynamic>> byId = await core.waitFor(
-      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
     );
 
-    check.that(byId.length == 13, '十三条请求都有回包', actual: '${byId.length}');
+    check.that(byId.length == 14, '十四条请求都有回包', actual: '${byId.length}');
     check.check(
       byId[0]?['result']?['plugin_id'],
       kPluginId,
@@ -544,8 +545,36 @@ Future<int> selfTest() async {
       'agents：22 键 / 预览 / 待处理成员数 / updatedAt 降序',
     );
 
-    final Map<String, dynamic> notImplemented =
+    // ── A2：GET /api/agents/{agentId}（详情 + SSH 非机密视图）──────────
+    final Map<String, dynamic> detailReply =
         (byId[12]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+    check.check(detailReply['status'], 200, 'agent 详情：200');
+    final Map<String, dynamic> detailBody =
+        (jsonDecode('${detailReply['body'] ?? '{}'}') as Map)
+            .cast<String, dynamic>();
+    check.check(
+      (detailBody['agent'] as Map?)?['id'],
+      'agt_m',
+      'agent 详情：id',
+    );
+    check.check(
+      (detailBody['agent'] as Map?)?['last_message'],
+      '',
+      'agent 详情：不取预览（与核心 toApiJson() 默认一致）',
+    );
+    check.check(
+      detailBody['ssh'],
+      <String, dynamic>{
+        'host': '10.0.0.5',
+        'port': 22,
+        'username': '',
+        'auth': 'none',
+      },
+      'agent 详情：SSH 非机密视图（无密钥）',
+    );
+
+    final Map<String, dynamic> notImplemented =
+        (byId[13]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
     check.check(notImplemented['status'], 501, '未搬路由：501（不是 404）');
     check.that(
       jsonDecode('${notImplemented['body'] ?? '{}'}')['detail']

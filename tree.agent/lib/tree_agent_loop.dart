@@ -11,6 +11,7 @@ library;
 
 import 'src/delegate.dart'
     show
+        agentDetailPattern,
         agentModelsInfoPattern,
         agentsPattern,
         modelsPattern,
@@ -38,6 +39,7 @@ const String kApiRoutesStation = 'system.collect.api.routes';
 /// 核心会把它标注为 shadowed 并继续由核心承接（查表顺序），交接删除后自动生效。
 const List<Map<String, String>> kDeclaredRoutes = <Map<String, String>>[
   <String, String>{'method': 'GET', 'pattern': agentsPattern},
+  <String, String>{'method': 'GET', 'pattern': agentDetailPattern},
   <String, String>{'method': 'GET', 'pattern': todosPattern},
   <String, String>{'method': 'GET', 'pattern': subagentsPattern},
   <String, String>{'method': 'GET', 'pattern': modelsPattern},

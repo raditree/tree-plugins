@@ -11,6 +11,7 @@ import 'todo_store.dart';
 const String todosPattern = '/api/agents/{agentId}/todos'; // agent 定义 #7
 const String subagentsPattern = '/api/agents/{agentId}/subagents'; // 子 agent #8
 const String agentsPattern = '/api/agents'; // agent 列表 #1
+const String agentDetailPattern = '/api/agents/{agentId}'; // agent 详情 #3
 const String modelsPattern = '/api/models'; // 模型池 #14
 const String agentModelsInfoPattern =
     '/api/agents/{agentId}/models-info'; // agent 定义 #6
@@ -59,6 +60,24 @@ Future<Map<String, dynamic>> handleApiDelegate(
       );
     }
     return _jsonReply(200, <String, dynamic>{'agents': items});
+  }
+
+  // 单个 agent（含 SSH 非机密视图；不回密钥）。
+  if (method == 'GET' && _matches(agentDetailPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final AgentRecord? record = readAgentRecord(paths, agentId);
+    if (record == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
+    }
+    return _jsonReply(200, <String, dynamic>{
+      'agent': agentApiJson(
+        record,
+        lastMessage: '',
+        lastMessageTime: null,
+        pendingMemberCount: 0,
+      ),
+      if (record.sshView != null) 'ssh': record.sshView!,
+    });
   }
 
   // 全局只读：模型池（不需要 agent）。
