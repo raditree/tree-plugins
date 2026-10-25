@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
@@ -98,13 +99,7 @@ class AgentRuntime {
             usageLog: usageLog,
             toolRunner: StationToolRunner(
               contributed: () => contributedTools,
-              client: (String command, Map<String, dynamic> arguments, Map<String, dynamic> scope) {
-                final StationCommandClient? client = stationClient;
-                if (client == null) {
-                  throw StateError('执行站未接线：station/command 不可用');
-                }
-                return client(command, arguments, scope);
-              },
+              client: _stationCommand,
               scopeFor: _stationScopeFor,
             ),
           ),
@@ -182,8 +177,15 @@ class AgentRuntime {
   static String pluginId = 'tree.agent';
   static StationTriggerClient? stationTrigger;
 
+  /// 工作空间租约登记（通知；由入口在 hello 后注入）。
+  static Future<void> Function(String workspaceId, String dir)? workspaceRegister;
+
   /// 其它插件贡献的工具（最近一次采集结果）。
   final List<ContributedTool> contributedTools = <ContributedTool>[];
+
+  /// 工作空间根 → 租约 id / 已登记集合（同一根只登记一次）。
+  final Map<String, String> _workspaceIds = <String, String>{};
+  final Set<String> _registeredWorkspaces = <String>{};
 
   static final Map<String, AgentRuntime> _byRoot = <String, AgentRuntime>{};
 
@@ -329,6 +331,38 @@ class AgentRuntime {
     };
   }
 
+  /// 执行站命令的统一出口：fs.* / terminal.exec 自动带工作空间租约。
+  Future<Map<String, dynamic>> _stationCommand(
+    String command,
+    Map<String, dynamic> arguments,
+    Map<String, dynamic> scope,
+  ) async {
+    final StationCommandClient? client = stationClient;
+    if (client == null) {
+      throw StateError('执行站未接线：station/command 不可用');
+    }
+    Map<String, dynamic> outgoing = arguments;
+    if (command.startsWith('fs.') || command == 'terminal.exec') {
+      final String agentId = (scope['agent_id'] ?? '').toString();
+      final String root = agentId.isEmpty ? '' : _workspaceDirOf(agentId);
+      if (root.isNotEmpty) {
+        final String workspaceId = _workspaceIds.putIfAbsent(
+          root,
+          () =>
+              'ws_${base64Url.encode(utf8.encode(root)).replaceAll('=', '')}',
+        );
+        final Future<void> Function(String, String)? register =
+            workspaceRegister;
+        if (register != null && !_registeredWorkspaces.contains(root)) {
+          await register(workspaceId, root);
+          _registeredWorkspaces.add(root);
+        }
+        outgoing = <String, dynamic>{...arguments, 'lease_id': workspaceId};
+      }
+    }
+    return client(command, outgoing, scope);
+  }
+
   /// 工作空间根目录（本机绝对路径；SSH 团队返回空串）。
   String _workspaceDirOf(String agentId) {
     final CoreAgent? agent = store.agent(agentId);
@@ -363,13 +397,12 @@ class AgentRuntime {
   Future<WorkspaceIO?> workspaceIoFor(String agentId, String sessionId) async {
     final CoreAgent? agent = store.agent(agentId);
     if (agent == null) return null;
-    final StationCommandClient? client = stationClient;
-    if (client == null) return null;
+    if (stationClient == null) return null;
     final Map<String, dynamic> scope = _stationScopeFor(agentId, sessionId);
     final String root = _workspaceDirOf(agentId);
     return StationCompatIo(
       StationWorkspaceIo(
-        client: client,
+        client: _stationCommand,
         agentId: agentId,
         teamId: (scope['team_id'] ?? '').toString(),
         modeKey: (scope['mode_key'] ?? '').toString(),

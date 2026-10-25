@@ -52,6 +52,7 @@ abstract final class M {
 
   // ── 插件 → 核心（上行通知，不等应答）─────────────────────────────
   static const String stationStream = 'station/stream';
+  static const String workspaceRegister = 'workspace/register';
   static const String log = 'log';
 }
 

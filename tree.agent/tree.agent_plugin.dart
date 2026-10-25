@@ -42,6 +42,12 @@ Future<void> _onReady(PluginKitServer server) async {
   // 执行站入口：hello 之后插件才能主动向核心下 station/command。
   if (_enableStationClient) {
     AgentRuntime.pluginId = kPluginId;
+    AgentRuntime.workspaceRegister = (String workspaceId, String dir) async {
+      server.channel.notify(M.workspaceRegister, <String, dynamic>{
+        'workspace_id': workspaceId,
+        'dir': dir,
+      });
+    };
     AgentRuntime.stationClient = (String command, Map<String, dynamic> arguments, Map<String, dynamic> scope) =>
         server.channel.command(command, arguments, '', scope);
     AgentRuntime.stationTrigger = (String stationId, Object? payload, Map<String, dynamic> meta, Map<String, dynamic> scope) =>
