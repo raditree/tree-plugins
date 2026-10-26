@@ -34,7 +34,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| [bin/tree_self_updater.dart](bin/tree_self_updater.dart) | 入口：`--selftest`（进程内假核心走一遍，输出走 stderr，退出码 0 = 全绿）；正常形态把 stdin 交给 `SelfUpdaterLoop` |
+| bin/tree_self_updater.dart | 入口：`--selftest`（进程内假核心走一遍，输出走 stderr，退出码 0 = 全绿）；正常形态把 stdin 交给 `SelfUpdaterLoop` |
 | [lib/src/self_updater_loop.dart](lib/src/self_updater_loop.dart) | 协议面与全部可计数证据（`toolCalls` / `commands` / `dumpCount` / `resumed` / `inheritedToolCalls`）；读循环**从不 await 业务**，`ping` 永远立即回 |
 | [lib/src/tool_surface.dart](lib/src/tool_surface.dart) | 唯一一个 tool 的形状：`actions`（action ⇒ 命令的**唯一映射表**）、`refusedActions`（不得出现的两个）、`parameters`（`enum` 由 `actions.keys` 推导） |
 | [lib/src/plugin_methods.dart](lib/src/plugin_methods.dart) | 自带的协议方法名常量 + 本插件身份（`pluginId` 必须与核心 `BuiltinPluginSpec(id: 'self_updater')` **同串**） |
@@ -52,7 +52,7 @@
 4. **身份只转述、不发明**：`station/command` 的归属参数只能来自 `tools/call` 的 `scope`；
    缺它时本插件如实说"本次调用没有可证明的归属身份"，而不是补一个看起来能过的值。
 5. **零核心依赖**：只依赖 `package:tree_tunnel_protocol`（帧编解码 / RPC 常量）。方法名自带
-   一张表，漂移由 [tree_protocol 的门禁](../tree_protocol/test/plugin_rpc_method_gate_test.dart)
+   一张表，漂移由 tree_protocol 的门禁
    把本包 `lib/`、`bin/` 列入扫描面来钉 —— **不**为了共用常量而引入核心包依赖。
 
 ## 构建与随包分发
@@ -64,7 +64,7 @@ dart run bin/tree_self_updater.dart --selftest   # 开发态自检（cwd = 本�
 
 `tool/package_windows.dart` 会把产物拷进发行包的 `plugins/` 目录（缺失只打印不算失败，
 与其他插件二进制同口径）；核心侧的解析顺序见
-[builtin_plugins.dart](../tree_core/lib/src/plugin/builtin_plugins.dart)：可执行文件同级
+builtin_plugins.dart：可执行文件同级
 `plugins/` → 仓根 `build/plugins/` → cwd 的 `plugins/` 与 `build/plugins/`
 （2026-10-17：仓里的 `examples/plugins/` 已删，那两条回退跟着收掉）。
 
