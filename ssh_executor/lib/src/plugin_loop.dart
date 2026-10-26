@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart';
 
@@ -6,6 +7,7 @@ import 'agent_binary.dart';
 import 'bootstrap.dart';
 import 'exec_station.dart';
 import 'ssh_dialer.dart';
+import 'terminal_sessions.dart';
 import 'tunnel.dart';
 import 'tunnel_manager.dart';
 import 'ui_panel.dart';
@@ -40,6 +42,15 @@ abstract final class PluginMethods {
 
   /// 核心**上行**给插件的通知 method（面板动作、工具事件等都在 `params['event']` 上）。
   static const String event = 'event';
+
+  /// 插件 → 核心：向自建广播站发布一条消息（`{station_id, topic, payload, scope}`）。
+  static const String stationTrigger = 'station/trigger';
+
+  /// 插件 → 核心：REST 委派的落地方法（`local_executor` 同形）。
+  static const String apiDelegate = 'api/delegate';
+
+  /// 核心收集插件申报的委派路由（`station/request` 的 `station_id`）。
+  static const String collectApiRoutes = 'system.collect.api.routes';
 }
 
 /// 插件主循环（L1：核心 ⇄ 插件）。
@@ -94,6 +105,16 @@ class PluginLoop {
           _manager.request(connId, method, params),
       log: log,
     );
+    // L-26：SSH 终端（REST 管会话 + 广播站推输出）。租约解析复用执行站的台账：
+    // UI 拿不到密码，只能复用 tree.agent 已经建立的那条连接。
+    _terminals = SshTerminalSessions(
+      requestAgent: (String connId, String method, Map<String, dynamic> params) =>
+          _manager.request(connId, method, params),
+      leaseOfId: _executeStation.targetOfLease,
+      leaseOfHost: _executeStation.targetOfHost,
+      publish: _publishTerminal,
+      log: log,
+    );
   }
 
   final void Function(Map<String, dynamic> message) send;
@@ -105,6 +126,15 @@ class PluginLoop {
   /// SSH 工作空间执行站（tree.agent 的 SSH 模式把 `file.*` / `exec.command`
   /// 改写成 `ssh.*` 后下发到这里；见 `exec_station.dart`）。
   late final SshWorkspaceExecutor _executeStation;
+
+  /// SSH 终端会话表（REST 管会话 + 广播站推输出）。
+  late final SshTerminalSessions _terminals;
+
+  /// 终端输出站 id（`station/register` 回包写入；空 = 未注册）。
+  String _terminalStationId = '';
+
+  /// 终端会话数（诊断 / 测试）。
+  int get terminalCount => _terminals.count;
 
   final Set<Future<void>> _inFlight = <Future<void>>{};
   Completer<int>? _done;
@@ -172,7 +202,8 @@ class PluginLoop {
   Future<void> shutdown() async {
     if (_shuttingDown) return;
     _shuttingDown = true;
-    log?.call('收到 shutdown：收掉全部隧道后退出');
+    log?.call('收到 shutdown：收掉全部终端会话与隧道后退出');
+    await _terminals.closeAll();
     await _manager.closeAll();
     _finish(0, 'shutdown');
   }
@@ -247,6 +278,10 @@ class PluginLoop {
           if (_executeStationId == null) {
             unawaited(_registerExecuteStation());
           }
+          // L-26：终端输出广播站（REST 建会话，输出从这条站推给 UI）。
+          if (_terminalStationId.isEmpty) {
+            unawaited(_registerTerminalStation());
+          }
           return;
         case PluginMethods.ping:
           _reply(id, <String, dynamic>{'ok': true});
@@ -258,6 +293,9 @@ class PluginLoop {
         case PluginMethods.shutdown:
           _reply(id, <String, dynamic>{'ok': true});
           await shutdown();
+          return;
+        case PluginMethods.apiDelegate:
+          _reply(id, await _handleDelegate(params));
           return;
         case TunnelMethods.ensure:
           // ── `tunnel.*`（兼容层）：只服务「只报 capability、不订点位」的旧核心 ──
@@ -292,6 +330,16 @@ class PluginLoop {
           _panel.refresh(force: true);
           return;
         case StationMethods.request:
+          // 核心收集委派路由申报（与工具贡献同一套收集站）。
+          if ((params['station_id'] ?? '').toString() ==
+              PluginMethods.collectApiRoutes) {
+            _reply(id, <String, dynamic>{
+              'reply': <String, dynamic>{
+                'payload': <String, dynamic>{'routes': kSshTerminalRoutes},
+              },
+            });
+            return;
+          }
           final Map<String, dynamic> payload = _payloadOf(params);
           // ① 自建**执行站**的投递：核心 `_forwardStationCommand` 的 payload 形状是
           // `{command, arguments}`（与中转站的 `{action, ...}` 区分）。只有本插件
@@ -493,6 +541,135 @@ class PluginLoop {
     }
   }
 
+  /// 申报终端输出广播站（`kind: broadcast`，UI 按需订阅）。
+  Future<void> _registerTerminalStation() async {
+    try {
+      final Map<String, dynamic> response = await _requestCore(
+        PluginMethods.stationRegister,
+        <String, dynamic>{
+          'kind': 'broadcast',
+          'name': kSshTerminalStationName,
+          'description': 'SSH 终端输出（terminal_output / terminal_exit）',
+          'readme': kSshTerminalReadme,
+          'shared': true,
+        },
+      );
+      final Map<String, dynamic> result = _resultOf(response);
+      if (result['ok'] == true) {
+        _terminalStationId = (result['station_id'] ?? '').toString().trim();
+      }
+      log?.call(
+        _terminalStationId.isNotEmpty
+            ? '已注册 SSH 终端输出站（$_terminalStationId）'
+            : '注册 SSH 终端输出站未成功：${result['error'] ?? '核心未回 ok'}',
+      );
+    } catch (error) {
+      log?.call('注册 SSH 终端输出站异常（终端仍可用，但没有实时输出）：$error');
+    }
+  }
+
+  /// 把一条终端帧投到自建广播站（站没注册上就丢弃并留痕）。
+  Future<void> _publishTerminal(
+    String topic,
+    Map<String, dynamic> payload,
+  ) async {
+    if (_terminalStationId.isEmpty) {
+      log?.call('终端输出站未注册，丢弃一帧：$topic');
+      return;
+    }
+    try {
+      await _requestCore(PluginMethods.stationTrigger, <String, dynamic>{
+        'station_id': _terminalStationId,
+        'topic': topic,
+        'payload': payload,
+        'meta': <String, dynamic>{'plugin_id': kPluginId},
+        // SSH 终端固定 ssh；UI 订阅是通配，不因此丢帧。
+        'scope': <String, dynamic>{'mode_key': 'ssh'},
+      });
+    } catch (error) {
+      log?.call('终端输出投递失败（$topic）：$error');
+    }
+  }
+
+  /// `api/delegate`：终端会话的 REST 面（核心只转发，不解释终端语义）。
+  Future<Map<String, dynamic>> _handleDelegate(
+    Map<String, dynamic> envelope,
+  ) async {
+    final String method = (envelope['method'] ?? '').toString().toUpperCase();
+    final String path = (envelope['path'] ?? '').toString();
+    final Map<String, dynamic> body = _bodyOf(envelope);
+    try {
+      if (method == 'POST' && path == kSshSessionsPattern) {
+        final String requested = (body['session_id'] ?? '').toString().trim();
+        final String id = requested.isEmpty
+            ? 'term_${DateTime.now().microsecondsSinceEpoch}'
+            : requested;
+        return _json(200, await _terminals.open(sessionId: id, body: body));
+      }
+      final RegExpMatch? match = RegExp(
+        r'^/api/terminal/ssh/sessions/([^/]+)(/input|/cancel|/resize)?$',
+      ).firstMatch(path);
+      if (match == null) {
+        return _json(404, <String, dynamic>{'detail': '未知终端路由：$path'});
+      }
+      final String id = Uri.decodeComponent(match.group(1)!);
+      final String action = match.group(2) ?? '';
+      if (method == 'DELETE' && action.isEmpty) {
+        await _terminals.close(id);
+        return _json(200, <String, dynamic>{'ok': true, 'session_id': id});
+      }
+      if (method != 'POST') {
+        return _json(405, <String, dynamic>{'detail': '方法不允许：$method $path'});
+      }
+      switch (action) {
+        case '/input':
+          final String text = (body['text'] ?? '').toString();
+          final List<int> bytes = text.isNotEmpty
+              ? utf8.encode(text)
+              : base64Decode((body['bytes'] ?? '').toString());
+          await _terminals.input(id, bytes);
+          return _json(200, <String, dynamic>{'ok': true});
+        case '/cancel':
+          await _terminals.cancel(id);
+          return _json(200, <String, dynamic>{'ok': true});
+        case '/resize':
+          await _terminals.resize(
+            id,
+            (body['columns'] as num?)?.toInt() ?? 80,
+            (body['rows'] as num?)?.toInt() ?? 24,
+          );
+          return _json(200, <String, dynamic>{'ok': true});
+        default:
+          return _json(404, <String, dynamic>{'detail': '未知终端动作：$path'});
+      }
+    } on SshTerminalError catch (error) {
+      return _json(error.status, <String, dynamic>{'detail': error.message});
+    } catch (error) {
+      return _json(500, <String, dynamic>{'detail': '终端会话失败：$error'});
+    }
+  }
+
+  static Map<String, dynamic> _bodyOf(Map<String, dynamic> envelope) {
+    final Object? raw = envelope['body'];
+    if (raw is Map) {
+      return raw.map((dynamic k, dynamic v) => MapEntry('$k', v));
+    }
+    if (raw is String && raw.trim().isNotEmpty) {
+      final Object? decoded = jsonDecode(raw);
+      if (decoded is Map) {
+        return decoded.map((dynamic k, dynamic v) => MapEntry('$k', v));
+      }
+    }
+    return <String, dynamic>{};
+  }
+
+  static Map<String, dynamic> _json(int status, Map<String, dynamic> body) =>
+      <String, dynamic>{
+        'status': status,
+        'headers': <String, dynamic>{'content-type': 'application/json'},
+        'body': jsonEncode(body),
+      };
+
   static Map<String, dynamic> _resultOf(Map<String, dynamic> frame) {
     final Object? result = frame['result'];
     if (result is Map) {
@@ -510,6 +687,13 @@ class PluginLoop {
   }
 
   void _sendEvent(Map<String, dynamic> event) {
+    // L-26：本插件开的终端会话，输出走**广播站**（核心不再有终端数据面）；
+    // 不是我们开的 shell（旧核心时代的会话）仍按原路发 `tunnel/event`。
+    final String shellId = (event['shell_id'] ?? '').toString();
+    if (_terminals.ownsShell(shellId)) {
+      _terminals.handleEvent(event);
+      return;
+    }
     // 及时性补充（权威面是 tunnel.state）：丢了不致命，所以这里只发不成对。
     send(rpcNotification(TunnelMethods.event, event));
     // 面板只关心**状态跃迁**（PTY 的 shell.data / shell.exit 与面板无关，别刷它）。
