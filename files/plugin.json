@@ -1,0 +1,14 @@
+{
+  "id": "files",
+  "name": "文件与工作空间",
+  "version": "0.1.0",
+  "description": "文件面板 REST 领域插件：经 api/delegate 承接原核心 13 条 /api/files/* 路由（列表/内容/写文本/PDF 信息/分片上传/同步到本地/下载/打包/新建/重命名/删除）；本机工作空间直接读写，SSH 工作空间经 ssh_executor 执行站；不 import 核心包。",
+  "runtime": "headless",
+  "files": [
+    "tree_files.exe"
+  ],
+  "command": "tree_files.exe",
+  "args": [],
+  "granularity": "team",
+  "scope": {}
+}
