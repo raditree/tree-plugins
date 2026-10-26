@@ -16,6 +16,8 @@ class FakeAgent {
   final List<({String connId, String method, Map<String, dynamic> params})>
   calls = <({String connId, String method, Map<String, dynamic> params})>[];
   String root = '/home/u/ws';
+  final Map<String, Map<String, dynamic>> procs = <String, Map<String, dynamic>>{};
+  int _seq = 0;
 
   Future<Map<String, dynamic>> ensure(Map<String, dynamic> config) async {
     ensureCalls.add(config);
@@ -69,9 +71,32 @@ class FakeAgent {
       case AgentMethods.fsWrite:
         final String path = params['path'].toString();
         final List<int> bytes = base64Decode(params['data'].toString());
-        files[path] = bytes;
+        // `mode: append` = 分块写的后续块（与目标机 tree_agent 同语义）。
+        final bool append = params['mode'] == 'append';
+        files[path] = append
+            ? <int>[...?files[path], ...bytes]
+            : bytes;
         _ensureParents(path);
-        return _ok(<String, dynamic>{'size': bytes.length});
+        return _ok(<String, dynamic>{'size': files[path]!.length});
+      case AgentMethods.fsRename:
+        final String from = params['from'].toString();
+        final String to = params['to'].toString();
+        if (!files.containsKey(from) && !_isDir(from)) {
+          return _fail('源路径不存在：$from', TunnelErrorCodes.notFound);
+        }
+        if (files.containsKey(to) || _isDir(to)) {
+          return _fail('目标已存在：$to', TunnelErrorCodes.alreadyExists);
+        }
+        final List<int>? data = files.remove(from);
+        if (data != null) {
+          files[to] = data;
+          _ensureParents(to);
+        } else {
+          dirs.add(to);
+          dirs.remove(from);
+          _ensureParents(to);
+        }
+        return _ok(<String, dynamic>{});
       case AgentMethods.fsListEntries:
         final String path = params['path'].toString();
         if (!_isDir(path)) {
@@ -94,6 +119,7 @@ class FakeAgent {
                 'size': names[name] == 'file'
                     ? files[_join(path, name)]!.length
                     : 0,
+                if (names[name] == 'file') 'mtime_ms': 1700000000000,
               },
           ],
         });
@@ -121,6 +147,32 @@ class FakeAgent {
           'stderr': base64Encode(utf8.encode('warn\n')),
           'truncated': false,
         });
+      case AgentMethods.execSpawn:
+        final String id = 'job-${++_seq}';
+        final String logPath = params['log_path'].toString();
+        procs[id] = <String, dynamic>{
+          'id': id,
+          'state': 'running',
+          'log_path': logPath,
+          'command': params['command'],
+        };
+        return _ok(<String, dynamic>{
+          'id': id,
+          'pid': 100 + _seq,
+          'pgid': 100 + _seq,
+          'log_path': logPath,
+          'started_at_ms': 1,
+        });
+      case AgentMethods.execQuery:
+        final Map<String, dynamic>? proc = procs[params['id'].toString()];
+        if (proc == null) {
+          return _fail('没有这条后台任务', TunnelErrorCodes.notFound);
+        }
+        return _ok(<String, dynamic>{'proc': proc});
+      case AgentMethods.execKill:
+        final Map<String, dynamic>? proc = procs[params['id'].toString()];
+        if (proc != null) proc['state'] = 'exited';
+        return _ok(<String, dynamic>{'killed': proc != null});
       default:
         return _fail('假 agent 不认识：$method');
     }
@@ -213,7 +265,7 @@ void main() {
         'ssh_lease_id': leaseId,
       });
 
-  test('命令表：9 条、全部 ssh. 命名空间（不占用 local_executor 的 file.*）', () {
+  test('命令表：10 条、全部 ssh. 命名空间（不占用 local_executor 的 file.*）', () {
     expect(kSshWorkspaceCommands, <String>[
       'ssh.lease.register',
       'ssh.file.read',
@@ -223,6 +275,7 @@ void main() {
       'ssh.file.delete',
       'ssh.file.mkdir',
       'ssh.file.writeBytes',
+      'ssh.file.rename',
       'ssh.exec.command',
     ]);
     expect(kSshWorkspaceCommands.contains('file.read'), isFalse);
@@ -289,6 +342,115 @@ void main() {
     );
     expect(result['base64'], '//4=');
     expect(result['content'], '');
+  });
+
+  test('file.read{raw}：分块通道（offset/length/eof）不受文本上限约束', () async {
+    agent.files['/home/u/ws/big.bin'] = List<int>.generate(100, (int i) => i);
+    await register();
+    final Map<String, dynamic> first = await executor.execute(
+      'ssh.file.read',
+      <String, dynamic>{
+        'ssh_lease_id': 'lease-1',
+        'path': 'big.bin',
+        'raw': true,
+        'offset': 0,
+        'length': 40,
+      },
+    );
+    expect(base64Decode(first['base64'] as String), hasLength(40));
+    expect(first['offset'], 0);
+    expect(first['size'], 100);
+    expect(first['eof'], isFalse, reason: '只读了前 40 字节');
+    expect(first.containsKey('content'), isFalse, reason: 'raw 通道不做行处理');
+
+    final Map<String, dynamic> tail = await executor.execute(
+      'ssh.file.read',
+      <String, dynamic>{
+        'ssh_lease_id': 'lease-1',
+        'path': 'big.bin',
+        'raw': true,
+        'offset': 80,
+        'length': 40,
+      },
+    );
+    expect(base64Decode(tail['base64'] as String), hasLength(20));
+    expect(tail['eof'], isTrue, reason: '越过尾部时 eof=true，调用方据此收口');
+  });
+
+  test('file.writeBytes{append}：首块截断重建、后续块追加', () async {
+    await register();
+    await executor.execute('ssh.file.writeBytes', <String, dynamic>{
+      'ssh_lease_id': 'lease-1',
+      'path': 'up.bin',
+      'base64': base64Encode(<int>[1, 2, 3]),
+    });
+    await executor.execute('ssh.file.writeBytes', <String, dynamic>{
+      'ssh_lease_id': 'lease-1',
+      'path': 'up.bin',
+      'base64': base64Encode(<int>[4, 5]),
+      'append': true,
+    });
+    expect(agent.files['/home/u/ws/up.bin'], <int>[1, 2, 3, 4, 5]);
+  });
+
+  test('file.list：entries 保持字符串表，details 带 size/mtime', () async {
+    agent.putFile('/home/u/ws/notes/a.txt', 'hello');
+    agent.dirs.add('/home/u/ws/notes/sub');
+    await register();
+    final Map<String, dynamic> listed = await executor.execute(
+      'ssh.file.list',
+      <String, dynamic>{
+        'ssh_lease_id': 'lease-1',
+        'path': 'notes',
+        'max_depth': 0,
+      },
+    );
+    expect(listed['entries'], contains('notes/a.txt'));
+    expect(listed['entries'], contains('notes/sub/'));
+    final List<dynamic> details = listed['details'] as List<dynamic>;
+    final Map<String, dynamic> fileDetail = details
+        .cast<Map<String, dynamic>>()
+        .firstWhere((Map<String, dynamic> item) => item['name'] == 'notes/a.txt');
+    expect(fileDetail['type'], 'file');
+    expect(fileDetail['size'], 5);
+    expect(fileDetail['mtime_ms'], 1700000000000);
+  });
+
+  test('file.rename：走目标机 fs.rename（原子；目标已存在即拒）', () async {
+    agent.putFile('/home/u/ws/a.txt', 'one');
+    await register();
+    final Map<String, dynamic> renamed = await executor.execute(
+      'ssh.file.rename',
+      <String, dynamic>{
+        'ssh_lease_id': 'lease-1',
+        'from': 'a.txt',
+        'to': 'b.txt',
+      },
+    );
+    expect(renamed['from'], 'a.txt');
+    expect(renamed['to'], 'b.txt');
+    expect(agent.files.containsKey('/home/u/ws/a.txt'), isFalse);
+    expect(utf8.decode(agent.files['/home/u/ws/b.txt']!), 'one');
+    expect(
+      agent.calls.any(
+        (({String connId, String method, Map<String, dynamic> params}) call) =>
+            call.method == AgentMethods.fsRename,
+      ),
+      isTrue,
+      reason: '不允许再用 ssh.exec.command 拼 mv',
+    );
+
+    agent.putFile('/home/u/ws/a.txt', 'one');
+    agent.putFile('/home/u/ws/c.txt', 'two');
+    await expectLater(
+      executor.execute('ssh.file.rename', <String, dynamic>{
+        'ssh_lease_id': 'lease-1',
+        'from': 'a.txt',
+        'to': 'c.txt',
+      }),
+      throwsA(isA<SshStationError>()),
+      reason: '目标已存在必须拒绝（fs.rename 绝不覆盖）',
+    );
   });
 
   test('越界路径（.. / 绝对路径）一律拒绝', () async {
@@ -417,7 +579,7 @@ void main() {
     expect(agent.dirs.contains('/home/u/ws/new/sub'), isTrue);
   });
 
-  test('exec.command：前台输出映射 local_executor 契约；后台 hook 显式未支持', () async {
+  test('exec.command：前台映射；hook 走远端 exec.spawn/query/kill', () async {
     await register();
     final Map<String, dynamic> result = await executor.execute(
       'ssh.exec.command',
@@ -435,34 +597,56 @@ void main() {
         .params;
     expect(execParams['timeout_ms'], 5000);
 
-    await expectLater(
-      executor.execute('ssh.exec.command', <String, dynamic>{
+    final Map<String, dynamic> started = await executor.execute(
+      'ssh.exec.command',
+      <String, dynamic>{
         'ssh_lease_id': 'lease-1',
-        'command': 'sleep 1',
+        'command': 'sleep 100',
         'hook': true,
-      }),
-      throwsA(
-        isA<SshStationError>().having(
-          (SshStationError error) => error.message,
-          'message',
-          contains('暂不支持后台 hook'),
-        ),
-      ),
+      },
     );
-    await expectLater(
-      executor.execute('ssh.exec.command', <String, dynamic>{
+    final String taskId = started['task_id'].toString();
+    expect(taskId, isNotEmpty);
+    expect(started['running'], isTrue);
+    expect(started['log_relative'], startsWith('.self/ssh_hooks/'));
+    final Map<String, dynamic> spawnParams = agent.calls
+        .lastWhere((call) => call.method == AgentMethods.execSpawn)
+        .params;
+    expect(spawnParams['log_path'], startsWith('/home/u/ws/.self/ssh_hooks/'));
+    expect(spawnParams['cwd'], '/home/u/ws');
+
+    final Map<String, dynamic> running = await executor.execute(
+      'ssh.exec.command',
+      <String, dynamic>{
         'ssh_lease_id': 'lease-1',
         'hook_action': 'status',
-        'task_id': 't1',
-      }),
-      throwsA(
-        isA<SshStationError>().having(
-          (SshStationError error) => error.message,
-          'message',
-          contains('暂不支持 hook_action'),
-        ),
-      ),
+        'task_id': taskId,
+      },
     );
+    expect(running['running'], isTrue);
+
+    agent.procs[taskId]!['state'] = 'exited';
+    agent.procs[taskId]!['exit_code'] = 0;
+    final Map<String, dynamic> done = await executor.execute(
+      'ssh.exec.command',
+      <String, dynamic>{
+        'ssh_lease_id': 'lease-1',
+        'hook_action': 'status',
+        'task_id': taskId,
+      },
+    );
+    expect(done['running'], isFalse);
+    expect(done['exit_code'], 0);
+
+    final Map<String, dynamic> cancelled = await executor.execute(
+      'ssh.exec.command',
+      <String, dynamic>{
+        'ssh_lease_id': 'lease-1',
+        'hook_action': 'cancel',
+        'task_id': taskId,
+      },
+    );
+    expect(cancelled['cancelled'], isTrue);
   });
 
   test('L2 失败透传为可读错误（含 error_kind 时附加分类）', () async {

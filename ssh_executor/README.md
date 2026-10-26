@@ -180,13 +180,19 @@ tree.agent 的 agent / 工具在 SSH 工作空间上跑时，**不能**再落到
 
 - **站点 id**：`plugin.ssh_executor.execute.ssh_workspace`（`kind: execute`、`shared: true`、
   `allowed_plugins: ['tree.agent']`）；`hello` 之后异步申报，不阻塞读循环。
-- **命令表（9 条）**：
+- **命令表（10 条）**：
   - `ssh.lease.register`：`{ssh: {...}, ssh_lease_id?}` → 建/复用隧道并返回
     `{lease_id, conn_id, root, host, agent}`（`root` 是 `agent.hello.root` 的远端绝对根）；
-  - `ssh.file.read` / `write` / `list` / `grep` / `delete` / `mkdir` / `writeBytes`：
+  - `ssh.file.read` / `write` / `list` / `grep` / `delete` / `mkdir` / `writeBytes` / `rename`：
     参数与返回**逐条对齐** `local_executor` 的 `file.*`（路径一律是**工作空间内相对路径**，
     插件拼上远端根并做越界校验，再翻译成 `fs.*`；`file.read` 的分块拉取 / 行切片 /
     512 KiB 截断 / 二进制 base64 与 `local_executor` 同口径）；
+    - `read{raw:true, offset, length}`：**分块下载通道**，二进制原样回 `{base64, offset, size, eof}`，
+      不受文本模式 8 MiB 上限约束（files 插件的大文件下载 / PDF 头尾定读走这条）；
+    - `writeBytes{append:true}`：分块写的后续块（首块截断重建）；
+    - `list` 额外回 `details:[{name,type,size,mtime_ms}]`（与 `entries` 同序；`entries` 仍是纯字符串表，
+      且**一律是工作空间根相对路径**，与 `local_executor.file.list` 同形）；
+    - `rename`：目标机 `fs.rename`（原子、目标存在即拒），不再 shell 拼 `mv`；
   - `ssh.exec.command`：前台命令 → `exec.run`，回 `{text, is_error, exit_code}`
     （对齐 `terminal.exec`）。
 - **租约**：tree.agent 首次用某个 SSH 工作空间时发一次 `ssh.lease.register`，**凭据只在
@@ -204,8 +210,8 @@ tree.agent 的 agent / 工具在 SSH 工作空间上跑时，**不能**再落到
 1. `exec.command` 的**后台 hook**（`hook: true` / `hook_action: status|cancel`）：agent 侧
    `exec.spawn` / `exec.list` / `exec.query` / `exec.kill` 已具备，但 tree.agent 的 hook
    台账语义（软超时接管、`task_id` 生命周期）还没接 —— 本切片显式报“暂不支持后台 hook”。
-2. `ssh.file.read` 单次最多 8 MiB（执行站命令没有分块数据面）；更大文件应改用
-   `ssh.exec.command`（head / tail）。
+2. ~~`ssh.file.read` 单次最多 8 MiB~~ **已解**（2026-10-25）：`read{raw,offset,length}` 分块通道 +
+   `writeBytes{append}` 分块写；文本模式仍有 8 MiB / 512 KiB 上限（那是预览口径，不是数据面）。
 3. 隧道 `tunnel_not_ready`（重连中）时**等待重发**还没做：当前如实失败。核心内置路会等
    隧道回来再发；执行站命令目前没有等待链（需要插件内等待/重试，且必须保证写命令不重放）。
 4. 凭据在 `ssh.lease.register` 的 arguments 里经核心转发一次（核心不落日志）；后续可改成

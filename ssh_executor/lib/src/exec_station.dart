@@ -29,6 +29,7 @@ const List<String> kSshWorkspaceCommands = <String>[
   'ssh.file.delete',
   'ssh.file.mkdir',
   'ssh.file.writeBytes',
+  'ssh.file.rename',
   'ssh.exec.command',
 ];
 
@@ -81,8 +82,25 @@ class _SshLease {
 /// （其它失败可能是 `file.write` 写了一半之类的业务错误，**绝不重试**）。
 const String kSshLeaseUnknownCode = 'ssh_lease_unknown';
 
-/// `ssh.file.read` 单次最多读的原文（8 MiB）：租约命令没有分块数据面，
-/// 超过这个量级应改用 `ssh.exec.command`（head/tail）——真实大文件读取是后续 TODO。
+/// 一条租约的**非机密**视图：会话型功能（终端）只需要连接与远端根。
+class SshLeaseTarget {
+  const SshLeaseTarget({
+    required this.leaseId,
+    required this.connId,
+    required this.root,
+    required this.host,
+  });
+
+  final String leaseId;
+  final String connId;
+  final String root;
+  final String host;
+}
+
+/// `ssh.file.read` **文本模式**单次最多读的原文（8 MiB）。
+///
+/// 大文件走 `raw: true` 分块通道（`offset` + `length`，按 `eof` 收口）——
+/// 那条路不受这个上限约束，也不再需要 `head/tail` 兜底。
 const int _kMaxReadBytes = 8 * 1024 * 1024;
 
 /// `ssh.file.read` 返回文本的上限（与 `local_executor` 的 512 KiB 同口径）。
@@ -118,6 +136,41 @@ class SshWorkspaceExecutor {
   /// 已登记的租约数（诊断 / 测试）。
   int get leaseCount => _leases.length;
 
+  /// 按租约 id 取连接与远端根（终端等会话型功能用；找不到 = null）。
+  SshLeaseTarget? targetOfLease(String leaseId) {
+    final _SshLease? lease = _leases[leaseId.trim()];
+    return lease == null ? null : _targetOf(lease);
+  }
+
+  /// 按 host（可选 username）找**最近登记**的一条租约。
+  ///
+  /// UI 打开 SSH 终端时拿不到密码（API 不回显），只能复用 tree.agent 已建立的连接：
+  /// 这里按用户能看到的 `host`/`username` 找回那条租约。
+  SshLeaseTarget? targetOfHost(String host, String username) {
+    final String wantedHost = host.trim();
+    if (wantedHost.isEmpty) return null;
+    final String wantedUser = username.trim();
+    SshLeaseTarget? found;
+    for (final _SshLease lease in _leases.values) {
+      if ((lease.ssh['host'] ?? '').toString().trim() != wantedHost) continue;
+      if (wantedUser.isNotEmpty) {
+        final String user = (lease.ssh['username'] ?? lease.ssh['user'] ?? '')
+            .toString()
+            .trim();
+        if (user != wantedUser) continue;
+      }
+      found = _targetOf(lease);
+    }
+    return found;
+  }
+
+  static SshLeaseTarget _targetOf(_SshLease lease) => SshLeaseTarget(
+    leaseId: lease.leaseId,
+    connId: lease.connId,
+    root: lease.root,
+    host: (lease.ssh['host'] ?? '').toString(),
+  );
+
   /// 执行一条命令；失败抛 [SshStationError]（调用方转成 `reply.error`）。
   Future<Map<String, dynamic>> execute(
     String command,
@@ -140,6 +193,8 @@ class SshWorkspaceExecutor {
         return _mkdir(await _leaseOf(arguments), arguments);
       case 'ssh.file.writeBytes':
         return _writeBytes(await _leaseOf(arguments), arguments);
+      case 'ssh.file.rename':
+        return _rename(await _leaseOf(arguments), arguments);
       case 'ssh.exec.command':
         return _terminal(await _leaseOf(arguments), arguments);
       default:
@@ -265,6 +320,26 @@ class SshWorkspaceExecutor {
     final String type = (stat['type'] ?? '').toString();
     if (type == 'missing') throw SshStationError('文件不存在：$relative');
     if (type == 'dir') throw SshStationError('目标是目录，不能读取：$relative');
+    // **分块下载通道**（`raw: true`）：二进制原样回 base64，不做行处理、不受
+    // 8 MiB 的文本读取上限约束——调用方按 `offset` 递进、按 `eof` 收口。
+    if (arguments['raw'] == true) {
+      final int startOffset =
+          ((arguments['offset'] as num?)?.toInt() ?? 0).clamp(0, 1 << 62);
+      final int? length = (arguments['length'] as num?)?.toInt();
+      final _ReadResult chunk = await _readAll(
+        lease,
+        path,
+        startOffset: startOffset,
+        maxBytes: length != null && length > 0 ? length : null,
+      );
+      return <String, dynamic>{
+        'path': _relativePath(lease, path),
+        'base64': base64Encode(chunk.bytes),
+        'offset': startOffset,
+        'size': (stat['size'] as num?)?.toInt() ?? 0,
+        'eof': chunk.eof,
+      };
+    }
     final _ReadResult read = await _readAll(lease, path);
     String text;
     String? encoded;
@@ -299,12 +374,19 @@ class SshWorkspaceExecutor {
     };
   }
 
-  Future<_ReadResult> _readAll(_SshLease lease, String path) async {
+  Future<_ReadResult> _readAll(
+    _SshLease lease,
+    String path, {
+    int startOffset = 0,
+    int? maxBytes,
+  }) async {
     final List<int> bytes = <int>[];
-    int offset = 0;
+    int offset = startOffset;
     bool capped = false;
+    bool eof = false;
+    final int cap = maxBytes ?? _kMaxReadBytes;
     while (true) {
-      final int remaining = _kMaxReadBytes - bytes.length;
+      final int remaining = cap - bytes.length;
       if (remaining <= 0) {
         capped = true;
         break;
@@ -321,13 +403,16 @@ class SshWorkspaceExecutor {
       final List<int> chunk = data.isEmpty ? const <int>[] : base64Decode(data);
       bytes.addAll(chunk);
       offset += chunk.length;
-      if (result['eof'] == true) break;
+      eof = result['eof'] == true;
+      if (eof) break;
       if (chunk.isEmpty) {
         // 没数据、也没 eof：不猜，按“已读到当前尾部”收口（agent 的契约不应出现）。
+        // 分块下载靠 `eof` 判断是否还有后续 ⇒ 这里保守地标记为已到尾部。
+        eof = true;
         break;
       }
     }
-    return _ReadResult(bytes: bytes, truncatedByCap: capped);
+    return _ReadResult(bytes: bytes, truncatedByCap: capped, eof: eof);
   }
 
   // ───────────────────────── file.write / writeBytes ─────────────────────────
@@ -377,19 +462,47 @@ class SshWorkspaceExecutor {
       throw SshStationError('ssh.file.writeBytes 的 base64 非法');
     }
     await _ensureParent(lease, path);
+    // `append: true` = 分块写的后续块（第一块用默认 write 截断重建）。
+    final bool append = arguments['append'] == true;
     final Map<String, dynamic> result = await _call(
       lease,
       AgentMethods.fsWrite,
       <String, dynamic>{
         'path': path,
         'data': base64Encode(bytes),
-        'mode': 'write',
+        'mode': append ? 'append' : 'write',
         'flush': true,
       },
     );
     return <String, dynamic>{
       'path': _relativePath(lease, path),
       'bytes_written': (result['size'] as num?)?.toInt() ?? bytes.length,
+      'appended': append,
+    };
+  }
+
+  // ───────────────────────── file.rename ─────────────────────────
+
+  /// 原子重命名（目标机 `fs.rename`：源不存在 / 目标已存在都显式报错，绝不覆盖）。
+  Future<Map<String, dynamic>> _rename(
+    _SshLease lease,
+    Map<String, dynamic> arguments,
+  ) async {
+    final String from = (arguments['from'] ?? arguments['path'] ?? '').toString();
+    final String to = (arguments['to'] ?? arguments['new_path'] ?? '').toString();
+    if (from.trim().isEmpty || to.trim().isEmpty) {
+      throw SshStationError('ssh.file.rename 需要 from 与 to');
+    }
+    final String source = _absPath(lease, from);
+    final String target = _absPath(lease, to);
+    await _call(lease, AgentMethods.fsRename, <String, dynamic>{
+      'from': source,
+      'to': target,
+    });
+    return <String, dynamic>{
+      'path': _relativePath(lease, target),
+      'from': _relativePath(lease, source),
+      'to': _relativePath(lease, target),
     };
   }
 
@@ -424,28 +537,53 @@ class SshWorkspaceExecutor {
     final String type = (stat['type'] ?? '').toString();
     if (type == 'missing') throw SshStationError('路径不存在：$relative');
     final List<String> entries = <String>[];
+    final List<Map<String, dynamic>> details = <Map<String, dynamic>>[];
     if (type != 'dir') {
-      entries.add(_relativePath(lease, base));
+      final String rel = _relativePath(lease, base);
+      entries.add(rel);
+      details.add(<String, dynamic>{
+        'name': rel,
+        'type': 'file',
+        'size': (stat['size'] as num?)?.toInt() ?? 0,
+        if (stat['mtime_ms'] != null) 'mtime_ms': stat['mtime_ms'],
+      });
     } else {
-      await _walkEntries(lease, base, '', 0, maxDepth, maxEntries, entries);
+      await _walkEntries(
+        lease,
+        base,
+        0,
+        maxDepth,
+        maxEntries,
+        entries,
+        details,
+      );
     }
     return <String, dynamic>{
       'path': relative,
       'root': lease.root,
       'entries': entries,
+      // 与 `entries` 同序的元信息（文件面板要 size / mtime；`entries` 保持纯字符串
+      // 是为了兼容既有调用方：tree.agent 的 WorkspaceIO 只吃字符串表）。
+      'details': details,
       'count': entries.length,
       'truncated': entries.length >= maxEntries,
     };
   }
 
+  /// 递归列目录。
+  ///
+  /// **条目一律是「工作空间根相对」路径**（`.self/spec/a.md`），与
+  /// `local_executor` 的 `file.list` 完全同形——调用方（tree.agent 的
+  /// `WorkspaceIO`、files 插件）拿到的字符串可以直接回喂 `readFile`/`deleteFile`；
+  /// 回「请求目录相对」的裸名会让同一操作在本地与 SSH 下前缀不同（L-01 差异 3 的根因）。
   Future<void> _walkEntries(
     _SshLease lease,
     String dir,
-    String prefix,
     int depth,
     int maxDepth,
     int maxEntries,
     List<String> entries,
+    List<Map<String, dynamic>> details,
   ) async {
     if (entries.length >= maxEntries) return;
     final Map<String, dynamic> result = await _call(
@@ -468,23 +606,31 @@ class SshWorkspaceExecutor {
       if (entries.length >= maxEntries) return;
       final String name = (child['name'] ?? '').toString();
       if (name.isEmpty || name == '.' || name == '..') continue;
-      final String relative = prefix.isEmpty ? name : '$prefix/$name';
+      final String relative = _relativePath(lease, _posixJoin(dir, name));
       final String childType = (child['type'] ?? '').toString();
+      final Map<String, dynamic> detail = <String, dynamic>{
+        'name': relative,
+        'type': childType,
+        if (childType != 'dir') 'size': (child['size'] as num?)?.toInt() ?? 0,
+        if (child['mtime_ms'] != null) 'mtime_ms': child['mtime_ms'],
+      };
       if (childType == 'dir') {
         entries.add('$relative/');
+        details.add(detail);
         if (depth < maxDepth) {
           await _walkEntries(
             lease,
             _posixJoin(dir, name),
-            relative,
             depth + 1,
             maxDepth,
             maxEntries,
             entries,
+            details,
           );
         }
       } else if (childType == 'file') {
         entries.add(relative);
+        details.add(detail);
       }
       // 链接与其它类型不列（与 local_executor 的 walk（只认 Directory / File）同口径）。
     }
@@ -679,24 +825,82 @@ class SshWorkspaceExecutor {
     _SshLease lease,
     Map<String, dynamic> arguments,
   ) async {
+    final String command = (arguments['command'] ?? '').toString().trim();
     final String hookAction = (arguments['hook_action'] ?? '')
         .toString()
         .trim()
         .toLowerCase();
-    if (hookAction.isNotEmpty) {
-      throw SshStationError(
-        'SSH 工作空间执行站暂不支持 hook_action（$hookAction）：'
-        '后台任务台账属后续切片（TODO：接 agent 的 exec.list / exec.query / exec.kill）',
+    final String taskId = (arguments['task_id'] ?? '').toString().trim();
+
+    if (hookAction == 'status') {
+      if (taskId.isEmpty) {
+        throw SshStationError('hook_action=status 需要 task_id');
+      }
+      final Map<String, dynamic> reply = await _call(
+        lease,
+        AgentMethods.execQuery,
+        <String, dynamic>{'id': taskId},
       );
+      final Map<String, dynamic> proc = _asMap(reply['proc']);
+      final String state = (proc['state'] ?? '').toString();
+      final bool running = state == 'running';
+      final int? exitCode = (proc['exit_code'] as num?)?.toInt();
+      final String logPath = (proc['log_path'] ?? '').toString();
+      final String logRelative = _relativeToRoot(lease, logPath);
+      return <String, dynamic>{
+        'text': running
+            ? '任务 $taskId 仍在运行（日志：$logRelative）'
+            : '任务 $taskId 已结束（state=$state${exitCode == null ? '' : '，exit_code=$exitCode'}）',
+        'running': running,
+        'exit_code': ?exitCode,
+        if (logRelative.isNotEmpty) 'log_relative': logRelative,
+      };
     }
-    if (arguments['hook'] == true) {
-      throw SshStationError(
-        'SSH 工作空间执行站暂不支持后台 hook：'
-        '后续切片接 agent 的 exec.spawn / exec.list / exec.query / exec.kill',
+
+    if (hookAction == 'cancel') {
+      if (taskId.isEmpty) {
+        throw SshStationError('hook_action=cancel 需要 task_id');
+      }
+      final Map<String, dynamic> reply = await _call(
+        lease,
+        AgentMethods.execKill,
+        <String, dynamic>{'id': taskId},
       );
+      final bool killed = reply['killed'] == true;
+      return <String, dynamic>{
+        'text': killed ? '任务 $taskId 已取消' : '任务 $taskId 未被取消（可能已结束）',
+        'running': false,
+        'cancelled': killed,
+      };
     }
-    final String command = (arguments['command'] ?? '').toString().trim();
+
     if (command.isEmpty) throw SshStationError('ssh.exec.command 需要 command');
+
+    if (arguments['hook'] == true) {
+      final String stamp = DateTime.now().microsecondsSinceEpoch.toString();
+      final String logRelative = '.self/ssh_hooks/$stamp.log';
+      final String logPath = _join(lease.root, logRelative);
+      final Map<String, dynamic> reply = await _call(
+        lease,
+        AgentMethods.execSpawn,
+        <String, dynamic>{
+          'command': command,
+          'log_path': logPath,
+          'cwd': lease.root,
+        },
+      );
+      final String id = (reply['id'] ?? '').toString();
+      if (id.isEmpty) {
+        throw SshStationError('远端后台任务未返回 id');
+      }
+      return <String, dynamic>{
+        'text': '[terminal hook] 已在远端后台启动：$command',
+        'task_id': id,
+        'log_relative': logRelative,
+        'running': true,
+      };
+    }
+
     final int timeoutSeconds =
         (arguments['timeout_seconds'] as num?)?.toInt() ?? 0;
     final int timeout = (arguments['timeout'] as num?)?.toInt() ?? 0;
@@ -724,6 +928,18 @@ class SshWorkspaceExecutor {
       if (result['timed_out'] == true) 'timed_out': true,
     };
   }
+
+  String _relativeToRoot(_SshLease lease, String path) {
+    if (path.isEmpty) return '';
+    if (path == lease.root) return '.';
+    if (path.startsWith('${lease.root}/')) {
+      return path.substring(lease.root.length + 1);
+    }
+    return path;
+  }
+
+  String _join(String root, String relative) =>
+      root.endsWith('/') ? '$root$relative' : '$root/$relative';
 
   // ───────────────────────── 基础设施 ─────────────────────────
 
@@ -810,8 +1026,15 @@ class SshWorkspaceExecutor {
 }
 
 class _ReadResult {
-  const _ReadResult({required this.bytes, required this.truncatedByCap});
+  const _ReadResult({
+    required this.bytes,
+    required this.truncatedByCap,
+    this.eof = false,
+  });
 
   final List<int> bytes;
   final bool truncatedByCap;
+
+  /// 是否读到了文件尾（分块下载靠它收口，不能靠"这次没读满"猜）。
+  final bool eof;
 }
