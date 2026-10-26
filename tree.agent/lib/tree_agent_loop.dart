@@ -12,6 +12,7 @@ library;
 import 'src/delegate.dart'
     show
         agentCompactPattern,
+        agentActivatePattern,
         agentResetPattern,
         sshReconnectPattern,
         agentDetailPattern,
@@ -70,6 +71,7 @@ export 'src/llm/sse_parser.dart';
 export 'src/llm/vision_files.dart';
 export 'src/session_store.dart';
 export 'src/spec/builtin_spec_assets.dart';
+export 'src/station/agent_executor.dart';
 export 'src/station/agent_tools.dart';
 export 'src/station/tool_contributions.dart';
 export 'src/spec/builtin_specs.dart';
@@ -106,6 +108,24 @@ const String kTreeAgentVersion = '0.27.0';
 
 /// 收集站 id：插件经它申报自己承担的 `{method, pattern}` 委派路由。
 const String kApiRoutesStation = 'system.collect.api.routes';
+
+/// **A4 事件广播站**：自建站名（核心拼成 `plugin.tree.agent.broadcast.events`）。
+///
+/// 领域帧（`msg_chunk` / `tool_start` / `agent_status` / …）不再由核心发出，
+/// 而是由本插件以 `station/trigger` 发布到这个站点；UI 订阅同名站点收包。
+/// id 拼接规则在核心侧固定（`plugin.<plugin_id>.broadcast.<name>`），两侧
+/// 都不得自选 id。
+const String kAgentEventsStationName = 'events';
+
+/// A4 事件广播站的完整 id（UI 侧同串常量；改名前先改协议文档）。
+const String kAgentEventsStationId = 'plugin.tree.agent.broadcast.events';
+
+/// 事件站 readme（`station/register` 必填：说清"发什么、什么时候发、谁该订"）。
+const String kAgentEventsReadme =
+    'agent 领域事件广播站：每轮生成期间按原帧名发布 msg_chunk / msg_end / '
+    'tool_start / tool_end / agent_status / agent_done / agent_error / question。'
+    'topic = tree.agent.<session_id>.<帧类型>，payload 就是原来的 WS 帧；'
+    'UI 订阅本站在 data 态按 topic 分发，closed 表示插件下线、reset 表示 seq 归零。';
 
 /// 已申报的委派路由（**如实申报**：核心据此知道哪些键归本插件）。
 ///
@@ -154,6 +174,8 @@ const List<Map<String, String>> kDeclaredRoutes = <Map<String, String>>[
   <String, String>{'method': 'POST', 'pattern': agentCompactPattern},
   <String, String>{'method': 'POST', 'pattern': agentResetPattern},
   <String, String>{'method': 'POST', 'pattern': sshReconnectPattern},
+  // 执行器激活（非 G-1：UI 开终端前真建连；与自建站 `agent_executor` 同一实现）。
+  <String, String>{'method': 'POST', 'pattern': agentActivatePattern},
   <String, String>{'method': 'GET', 'pattern': specsPattern},
   <String, String>{'method': 'GET', 'pattern': specDetailPattern},
 ];

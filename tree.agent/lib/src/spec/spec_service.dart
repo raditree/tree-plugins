@@ -210,7 +210,11 @@ class SpecService {
     final int index = await _nextBackupIndex(io);
     final List<String> backedUp = <String>[];
     final List<String> removed = <String>[];
-    for (final String file in files) {
+    for (final String listed in files) {
+      // 列目录的回包风格**按后端而异**：本机回工作空间相对路径，SSH/私有工作空间
+      // 可能回请求目录相对的文件名或带前缀的路径。回包是契约面（见
+      // agent_api_contract §9「reset」），必须与后端无关 ⇒ 一律归一到 `specDir/<名>`。
+      final String file = _specRelativeOf(listed);
       String text;
       try {
         text = (await io.readFile(file)).text;
@@ -236,6 +240,22 @@ class SpecService {
         for (final String id in kBuiltinSpecIds) '$specDir/$id.md',
       ],
     };
+  }
+
+  /// 把 [WorkspaceIO.listFiles] 的任一种回包风格归一成 `specDir/<文件名>`。
+  ///
+  /// 三种风格都要能认：
+  /// - 工作空间相对：`.self/spec/a.md`（本机执行器）；
+  /// - 请求目录相对：`a.md`（部分远端 find/list 实现）；
+  /// - 带私有前缀：`agents/<id>/.self/spec/a.md`（团队/私有工作空间）。
+  static String _specRelativeOf(String listed) {
+    final String normalized = listed.replaceAll('\\', '/');
+    final int marker = normalized.lastIndexOf('/$specDir/');
+    if (marker >= 0) return normalized.substring(marker + 1);
+    if (normalized.startsWith('$specDir/')) return normalized;
+    final int slash = normalized.lastIndexOf('/');
+    final String name = slash >= 0 ? normalized.substring(slash + 1) : normalized;
+    return '$specDir/$name';
   }
 
   /// 工具入口（Q9：只有 select / create / update 三个动作）。

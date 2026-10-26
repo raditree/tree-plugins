@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
@@ -66,17 +67,29 @@ const String agentCompactPattern = '/api/agents/{agentId}/compact'; // 维护 #2
 const String agentResetPattern = '/api/agents/{agentId}/reset'; // 维护 #1
 const String sshReconnectPattern =
     '/api/agents/{agentId}/ssh/reconnect'; // 维护 #3
+const String agentActivatePattern =
+    '/api/agents/{agentId}/activate'; // 执行器激活（非 G-1：终端开前真建连）
 const String specsPattern = '/api/agents/{agentId}/specs'; // spec 列表
 const String specDetailPattern = '/api/agents/{agentId}/specs/{specId}'; // spec 详情
 const String toolsRunningPattern = '/api/tools/running'; // 运行监督 #1
 const String toolsRunningClosePattern =
     '/api/tools/running/{handle}/close'; // 运行监督 #2
 
-/// 从委派信封取 JSON body（小体积内联字符串；缺失/空 = 空表）。
-///
-/// 大体积 `body_path` 目前不用于这两条写端点（核心侧 POST 请求体都很小）。
+/// 从委派信封取 JSON body：内联 `body`，或核心因 chunked/大体积落盘的
+/// `body_path`（同机路径，核心已校验）——两者都支持，否则 chunked 写路由
+/// 会被当成空 body。
 Map<String, dynamic> _bodyOf(Map<String, dynamic> envelope) {
-  final Object? raw = envelope['body'];
+  Object? raw = envelope['body'];
+  if ((raw == null || (raw is String && raw.trim().isEmpty))) {
+    final String bodyPath = (envelope['body_path'] ?? '').toString().trim();
+    if (bodyPath.isNotEmpty) {
+      try {
+        raw = File(bodyPath).readAsStringSync();
+      } catch (error) {
+        throw FormatException('读取 body_path 失败：$error');
+      }
+    }
+  }
   if (raw is Map) {
     return raw.map(
       (Object? key, Object? value) => MapEntry(key.toString(), value),
@@ -353,8 +366,14 @@ Future<Map<String, dynamic>> _dispatchDelegate(
   if (method == 'POST' && _matches(sshReconnectPattern, path)) {
     final String agentId = _str(params['agentId']);
     final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
-    if (runtime.store.agent(agentId) == null) {
+    final CoreAgent? agent = runtime.store.agent(agentId);
+    if (agent == null) {
       return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在：$agentId'});
+    }
+    if (agent.sshConfig == null) {
+      return _jsonReply(400, <String, dynamic>{
+        'detail': '该 agent 未使用 SSH（本地工作空间），没有可重连的远端链路',
+      });
     }
     try {
       final Map<String, dynamic> result = await runtime.reconnectSsh(agentId);
@@ -368,6 +387,29 @@ Future<Map<String, dynamic>> _dispatchDelegate(
       final int status = message.contains('不是 SSH') ? 400 : 500;
       return _jsonReply(status, <String, dynamic>{'detail': message});
     }
+  }
+
+  // ── 激活 agent 执行器（POST /api/agents/{agentId}/activate）──────────
+  //
+  // 与自建执行站 `agent_executor` 的 `executor.activate` 同一实现：
+  // local 只检查设备与工作空间；ssh 真建连并登记租约。UI 在开终端前调用它，
+  // 免得 SSH 终端因为"还没有租约"而失败。
+  if (method == 'POST' && _matches(agentActivatePattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    if (runtime.store.agent(agentId) == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在：$agentId'});
+    }
+    final Map<String, dynamic> result =
+        await runtime.activateAgentExecutor(agentId);
+    if (result['ok'] != true) {
+      // 502：失败发生在下游执行器（SSH 连不上 / 工作空间不可写），不是请求本身不合法。
+      return _jsonReply(502, <String, dynamic>{
+        'detail': result['error'] ?? '执行器激活失败',
+        if (result['mode'] != null) 'mode': result['mode'],
+      });
+    }
+    return _jsonReply(200, result);
   }
 
   // ── 手动压缩（POST /api/agents/{agentId}/compact）──────────────────

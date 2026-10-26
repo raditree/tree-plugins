@@ -8,14 +8,18 @@ import 'dart:async';
 /// 执行站的 `tool.call`（核心再转到该插件的 `tools/call`）。
 const String kToolCollectName = 'tools';
 
-/// 触发收集站（核心 `station/trigger`；回包含 `result.items`）。
+/// 触发站点（核心 `station/trigger`；收集站回包含 `result.items`）。
+///
+/// [topic] 只对**广播站**有意义（A4 事件站按 `<plugin>.<session>.<kind>` 分流）；
+/// 收集站/中转站不传（核心会按"缺 topic"报可读错误，不会静默丢）。
 typedef StationTriggerClient =
     Future<Map<String, dynamic>> Function(
       String stationId,
       Object? payload,
       Map<String, dynamic> meta,
-      Map<String, dynamic> scope,
-    );
+      Map<String, dynamic> scope, {
+      String? topic,
+    });
 
 /// 本插件自建收集站 id（plugin.tree.agent.collect.tools）。
 String toolCollectStationId(String pluginId) =>

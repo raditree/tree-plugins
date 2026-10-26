@@ -1005,4 +1005,35 @@ void main() {
       expect(after.compactedSummary, contains('总结正文'));
     });
   });
+
+  // L-01 已知差异 2 的回归：插件 REST 回包必须与核心旧实现同形——
+  // `relay_skip_reason` 只在「插件在场却没接管」时出现，其它情况连键都不出现。
+  group('REST 回包形状（与核心旧实现逐键一致）', () {
+    test('relay_skip_reason：没接管时出现，正常压缩时不出现', () {
+      const CompactionResult skipped = CompactionResult(
+        compressed: true,
+        contextSize: 5,
+        summarizedMessages: 8,
+        source: compactionSourceBuiltin,
+        sessionId: 'session_default',
+        relaySkipReason: '压缩插件没有回包',
+      );
+      final Map<String, dynamic> json = skipped.toJson();
+      expect(json['success'], isTrue);
+      expect(json['relay_skip_reason'], '压缩插件没有回包');
+
+      const CompactionResult normal = CompactionResult(
+        compressed: true,
+        contextSize: 5,
+        summarizedMessages: 8,
+        source: compactionSourceBuiltin,
+        sessionId: 'session_default',
+      );
+      expect(
+        normal.toJson().containsKey('relay_skip_reason'),
+        isFalse,
+        reason: '空原因时不能出现该键（老前端零感知）',
+      );
+    });
+  });
 }

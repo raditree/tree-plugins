@@ -50,9 +50,16 @@ Future<void> _onReady(PluginKitServer server) async {
     };
     AgentRuntime.stationClient = (String command, Map<String, dynamic> arguments, Map<String, dynamic> scope) =>
         server.channel.command(command, arguments, '', scope);
-    AgentRuntime.stationTrigger = (String stationId, Object? payload, Map<String, dynamic> meta, Map<String, dynamic> scope) =>
-        server.channel.request(M.stationTrigger, <String, dynamic>{
+    AgentRuntime.stationTrigger =
+        (
+          String stationId,
+          Object? payload,
+          Map<String, dynamic> meta,
+          Map<String, dynamic> scope, {
+          String? topic,
+        }) => server.channel.request(M.stationTrigger, <String, dynamic>{
           'station_id': stationId,
+          if (topic != null && topic.isNotEmpty) 'topic': topic,
           'payload': payload,
           'meta': meta,
           'scope': scope,
@@ -64,8 +71,8 @@ Future<void> _onReady(PluginKitServer server) async {
           'kind': 'execute',
           'name': kAgentToolsStationName,
           'description': 'tree.agent 领域工具原语',
-          'readme': kAgentToolsReadme,
-          'commands': kAgentToolCommands,
+          'readme': AgentRuntime.agentToolsReadme,
+          'commands': AgentRuntime.agentToolCommands,
         },
       );
       server.channel.log(
@@ -91,6 +98,49 @@ Future<void> _onReady(PluginKitServer server) async {
       );
     } catch (error) {
       server.channel.log('工具贡献收集站注册失败（不影响内置工具）：$error');
+    }
+    // 执行器激活站：local 检查设备与工作空间；ssh 真建连并登记租约。
+    try {
+      final Map<String, dynamic> executor = await server.channel.request(
+        M.stationRegister,
+        <String, dynamic>{
+          'kind': 'execute',
+          'name': kAgentExecutorStationName,
+          'description': 'tree.agent 执行器激活（local 检查 / ssh 真建连）',
+          'readme': kAgentExecutorReadme,
+          'commands': kAgentExecutorCommands,
+          'shared': true,
+        },
+      );
+      server.channel.log(
+        '执行器激活站：${executor['ok'] == true ? executor['station_id'] : executor['error']}',
+      );
+    } catch (error) {
+      server.channel.log('执行器激活站注册失败：$error');
+    }
+    // **A4 事件广播站**：领域帧不再由核心发出，统一从这里出去。
+    // 注册失败不影响 REST/工具：宁可少推帧，也不能让插件起不来。
+    try {
+      final Map<String, dynamic> events = await server.channel.request(
+        M.stationRegister,
+        <String, dynamic>{
+          'kind': 'broadcast',
+          'name': kAgentEventsStationName,
+          'description': 'tree.agent 领域事件（流式增量 / 工具 / 状态 / 提问）',
+          'readme': kAgentEventsReadme,
+          'shared': true,
+        },
+      );
+      final String stationId = (events['station_id'] ?? '').toString();
+      AgentRuntime.eventsStationId = stationId.isEmpty
+          ? kAgentEventsStationId
+          : stationId;
+      server.channel.log(
+        '事件广播站：${AgentRuntime.eventsStationId}'
+        '${events['ok'] == true ? '' : '（失败：${events['error']}）'}',
+      );
+    } catch (error) {
+      server.channel.log('事件广播站注册失败（前端将收不到流式帧）：$error');
     }
   }
   // **两路日志都主动写一条**：A1 的验收就是"插件自己的日志能从日志 API 查到"。
@@ -143,6 +193,25 @@ Future<Map<String, dynamic>?> handleRequest(
           'reply': <String, dynamic>{'error': error.toString()},
         };
       }
+    }
+    if (station == agentExecutorStationId(kPluginId)) {
+      final Map<String, dynamic> meta = asMap(params['meta']);
+      final String dataDir = asString(meta['data_dir']);
+      if (dataDir.isEmpty) {
+        return <String, dynamic>{
+          'reply': <String, dynamic>{'error': '缺少 data_dir（核心未在站请求里带数据根）'},
+        };
+      }
+      final Map<String, dynamic> payload = asMap(params['payload']);
+      final Map<String, dynamic> result = await AgentRuntime.forDataDir(dataDir)
+          .handleAgentExecutorCommand(
+            asString(payload['command']),
+            asMap(payload['arguments']),
+            asMap(params['scope']),
+          );
+      return <String, dynamic>{
+        'reply': <String, dynamic>{'payload': result},
+      };
     }
     if (station == kApiRoutesStation) {
       // 收集站口径：`{reply: {payload: {routes: [...]}}}`（核心只读 reply.payload）。
@@ -1862,6 +1931,214 @@ Future<int> selfTest() async {
       ),
     );
     check.check(againReply['status'], 404, 'agents：再次 DELETE ⇒ 404');
+
+    // ── S1：spec 工具（agent_tools 的 spec.* + 工作空间 IO）────────────
+    check.that(
+      AgentRuntime.agentToolCommands.toSet().containsAll(<String>[
+        'spec.list',
+        'spec.read',
+        'spec.select',
+        'spec.reset',
+      ]),
+      'agent_tools：申报 spec.* 命令',
+      actual: '${AgentRuntime.agentToolCommands}',
+    );
+    final Directory specWorkspace = Directory(
+      p.join(temp.path, 'workspaces', 'agt'),
+    )..createSync(recursive: true);
+    // 假执行站：把 file.* 落到临时工作空间（自检不开真执行站）。
+    Future<Map<String, dynamic>> specStation(
+      String command,
+      Map<String, dynamic> arguments,
+      Map<String, dynamic> scope,
+    ) async {
+      String abs(String relative) =>
+          p.join(specWorkspace.path, p.normalize(relative));
+      switch (command) {
+        case 'file.read':
+          final String text = await File(
+            abs(arguments['path'].toString()),
+          ).readAsString();
+          return <String, dynamic>{
+            'content': text,
+            'total_lines': text.split('\n').length,
+            'start_line': 1,
+            'truncated': false,
+          };
+        case 'file.write':
+          final File file = File(abs(arguments['path'].toString()));
+          await file.parent.create(recursive: true);
+          await file.writeAsString(arguments['content'].toString());
+          return <String, dynamic>{
+            'bytes_written': arguments['content'].toString().length,
+          };
+        case 'file.list':
+          // 与 local_executor 同口径：entries 是**工作空间根为基准的相对路径**
+          // （`.self/spec/x.md`），不是裸文件名（SpecService.reset 依赖这一点）。
+          final String rel = arguments['path'].toString();
+          final Directory dir = Directory(abs(rel));
+          return <String, dynamic>{
+            'entries': <dynamic>[
+              if (dir.existsSync())
+                for (final FileSystemEntity entity in dir.listSync())
+                  entity is Directory
+                      ? '${p.join(rel, p.basename(entity.path))}/'
+                      : p.join(rel, p.basename(entity.path)),
+            ],
+          };
+        case 'file.delete':
+          final File file = File(abs(arguments['path'].toString()));
+          final bool deleted = file.existsSync();
+          if (deleted) await file.delete();
+          return <String, dynamic>{'deleted': deleted};
+        case 'file.mkdir':
+          await Directory(
+            abs(arguments['path'].toString()),
+          ).create(recursive: true);
+          return <String, dynamic>{'ok': true};
+        default:
+          return <String, dynamic>{'error': '自检假站不处理 $command'};
+      }
+    }
+
+    AgentRuntime.stationClient = specStation;
+    try {
+      final AgentRuntime runtime = AgentRuntime.forDataDir(temp.path);
+      Future<Map<String, dynamic>> specCall(
+        String command, [
+        Map<String, dynamic> arguments = const <String, dynamic>{},
+      ]) async {
+        final Map<String, dynamic> reply = await runtime.handleAgentToolCommand(
+          command,
+          arguments,
+          <String, dynamic>{
+            'agent_id': 'agt',
+            'session_id': 'session_default',
+          },
+        );
+        final Object? decoded = jsonDecode('${reply['text'] ?? '{}'}');
+        return <String, dynamic>{
+          'is_error': reply['is_error'] == true,
+          'body': decoded is Map
+              ? decoded.map(
+                  (Object? key, Object? value) =>
+                      MapEntry(key.toString(), value),
+                )
+              : <String, dynamic>{},
+        };
+      }
+
+      final Map<String, dynamic> specList = await specCall('spec.list');
+      check.check(specList['is_error'], false, 'spec.list：不报错');
+      final Map<String, dynamic> specListBody =
+          (specList['body'] as Map).cast<String, dynamic>();
+      check.that(
+        ((specListBody['count'] as num?)?.toInt() ?? 0) >=
+            kBuiltinSpecIds.length,
+        'spec.list：内置规范进入清单',
+        actual: '${specListBody['count']}',
+      );
+      check.that(
+        (specListBody['specs'] as List<dynamic>).any(
+          (Object? item) => (item as Map)['spec_id'] == 'general-task',
+        ),
+        'spec.list：general-task 可见（spec_id 键）',
+      );
+      check.check(
+        specListBody['selected_spec_ids'],
+        <dynamic>[],
+        'spec.list：初始未选择',
+      );
+
+      final Map<String, dynamic> specRead = await specCall(
+        'spec.read',
+        <String, dynamic>{'spec_id': 'general-task'},
+      );
+      check.check(specRead['is_error'], false, 'spec.read：已知 id 成功');
+      check.that(
+        '${(specRead['body'] as Map)['content'] ?? ''}'.contains('## '),
+        'spec.read：返回规范全文',
+      );
+      final Map<String, dynamic> specMissing = await specCall(
+        'spec.read',
+        <String, dynamic>{'spec_id': 'ghost'},
+      );
+      check.check(specMissing['is_error'], true, 'spec.read：越界 spec_id 报错');
+      check.that(
+        '${(specMissing['body'] as Map)['error'] ?? ''}'.contains(
+          'Spec 不存在: ghost',
+        ),
+        'spec.read：越界错误可读',
+        actual: '${(specMissing['body'] as Map)['error']}',
+      );
+
+      final File customSpec = File(
+        p.join(specWorkspace.path, '.self', 'spec', 'my-custom.md'),
+      );
+      await customSpec.parent.create(recursive: true);
+      await customSpec.writeAsString(
+        '---\nid: my-custom\ntitle: 自检自定义规范\n---\n\n正文\n',
+      );
+      final Map<String, dynamic> specReset = await specCall('spec.reset');
+      check.check(specReset['is_error'], false, 'spec.reset：不报错');
+      final Map<String, dynamic> specResetBody =
+          (specReset['body'] as Map).cast<String, dynamic>();
+      check.check(specResetBody['action'], 'reset', 'spec.reset：回动作');
+      check.that(
+        (specResetBody['backed_up'] as List<dynamic>? ?? <dynamic>[]).any(
+          (Object? item) => '$item'.contains('my-custom.md'),
+        ),
+        'spec.reset：自定义规范进备份',
+        actual: '${specResetBody['backed_up']}',
+      );
+      check.that(
+        !customSpec.existsSync(),
+        'spec.reset：自定义规范已移走',
+      );
+      check.that(
+        File('${customSpec.path}.bak.1').existsSync(),
+        'spec.reset：备份文件可找回',
+      );
+      check.that(
+        (specResetBody['restored'] as List<dynamic>? ?? <dynamic>[]).contains(
+          '.self/spec/general-task.md',
+        ),
+        'spec.reset：重建内置规范',
+      );
+      check.that(
+        File(
+          p.join(
+            specWorkspace.path,
+            '.self',
+            'spec',
+            'general-task.md',
+          ),
+        ).existsSync(),
+        'spec.reset：内置文件已落盘',
+      );
+
+      // 可选动作 select：挂 hook 并回全文，随后 list 能读到会话级选择。
+      final Map<String, dynamic> specSelect = await specCall(
+        'spec.select',
+        <String, dynamic>{
+          'spec_ids': <String>['general-task'],
+        },
+      );
+      check.check(specSelect['is_error'], false, 'spec.select：可选动作成功');
+      check.check(
+        (specSelect['body'] as Map)['count'],
+        1,
+        'spec.select：回所选条数',
+      );
+      final Map<String, dynamic> specListAfter = await specCall('spec.list');
+      check.check(
+        (specListAfter['body'] as Map)['selected_spec_ids'],
+        <dynamic>['general-task'],
+        'spec.list：读到本会话已选',
+      );
+    } finally {
+      AgentRuntime.stationClient = null;
+    }
 
     // 生成是异步的：等它收尾再删临时目录。
     await AgentRuntime.forDataDir(temp.path).waitIdle();

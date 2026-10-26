@@ -19,6 +19,8 @@ import '../settings/core_settings.dart';
 import '../settings/file_settings_sink.dart';
 import '../settings/ssh_config.dart';
 import '../spec/spec_service.dart';
+import '../station/agent_executor.dart';
+import '../station/agent_tools.dart';
 import '../station/tool_contributions.dart';
 import '../store/file_store.dart';
 import '../store/records.dart';
@@ -31,6 +33,7 @@ import '../team/team_service.dart';
 import '../team/team_workspace.dart';
 import '../tool/message_tool.dart';
 import '../tool/question_channel.dart';
+import '../tool/spec_tool.dart';
 import '../tool/station_tool_runner.dart';
 import '../tool/team_tool.dart';
 import '../tool/terminal_hook_manager.dart';
@@ -97,8 +100,10 @@ class AgentRuntime {
     registry = SubagentRegistry(persistence: store);
     hub = WsHub(
       onBroadcast: (Map<String, dynamic> frame) {
+        // 本地留痕（测试 / 排障），并**同时**走 A4 的事件站出口。
         frames.add(frame);
         if (frames.length > 2000) frames.removeAt(0);
+        publishAgentEvent(frame);
       },
     );
     todoStore = FileTodoStore(TreePaths(paths.root));
@@ -154,6 +159,7 @@ class AgentRuntime {
             toolRunner: StationToolRunner(
               contributed: () => contributedTools,
               toolRunsRunner: runToolRuns,
+              specRunner: _runSpecTool,
               hooks: terminalHooks,
               client: _stationCommand,
               scopeFor: _stationScopeFor,
@@ -231,9 +237,61 @@ class AgentRuntime {
   /// 核心执行站命令入口（由插件入口在 hello 后注入；null = 未接线）。
   static StationCommandClient? stationClient;
 
+  /// 本插件自建 `agent_tools` 执行站对外申报的命令。
+  ///
+  /// 领域原语来自 [kAgentToolCommands]；spec.* 是 S1 新增的规范域命令
+  /// （见 [SpecTool.stationCommands]）。执行站注册（入口）必须用这一份，
+  /// 否则 extra-tools 之类经站调用的插件会被核心按“未知命令”拒绝。
+  static List<String> get agentToolCommands => <String>[
+    ...kAgentToolCommands,
+    ...SpecTool.stationCommands,
+  ];
+
+  /// `agent_tools` 站 readme（在既有领域原语说明后补 spec.* 一句）。
+  static String get agentToolsReadme =>
+      '$kAgentToolsReadme spec.*：工作空间规范 list / read / select / create / update / reset。';
+
   /// 本插件 id 与收集站触发入口（入口在 hello 后注入）。
   static String pluginId = 'tree.agent';
   static StationTriggerClient? stationTrigger;
+
+  /// **A4 事件站 id**：入口在 hello 后注册自建广播站时写入；空 = 未接线。
+  static String eventsStationId = '';
+
+  /// 把一帧领域事件发布到自建广播站（`station/trigger`）。
+  ///
+  /// topic 口径与协议包 `StationTopic` 一致：`<plugin_id>.<session_id>.<kind>`。
+  /// **payload 原样是旧 WS 帧**——UI 侧只需换收口，不改渲染字段。
+  ///
+  /// 空 session_id 用 `_` 兜底（topic 三段都不能为空，否则订阅匹配不到）。
+  /// `scope.mode_key` 决定"这条消息属于哪种工作面"：帧自身带 `mode_key` 就用它，
+  /// 否则按 local（UI 订阅是通配，不因此丢帧）。
+  static void publishAgentEvent(Map<String, dynamic> frame) {
+    final StationTriggerClient? trigger = stationTrigger;
+    final String stationId = eventsStationId;
+    if (trigger == null || stationId.isEmpty) return;
+    final String sessionId =
+        (frame['session_id'] ?? frame['sessionId'] ?? '_').toString().trim();
+    final String kind = (frame['type'] ?? 'event').toString().trim();
+    if (kind.isEmpty) return;
+    final String mode =
+        (frame['mode_key'] ?? frame['mode'] ?? 'local').toString().trim();
+    final Map<String, dynamic> scope = <String, dynamic>{
+      'mode_key': mode == 'ssh' ? 'ssh' : 'local',
+    };
+    final String topic = '$pluginId.$sessionId.$kind';
+    // 单向：投递结果不回灌业务（与核心 announce 同口径）；失败只留日志。
+    unawaited(
+      trigger(
+            stationId,
+            frame,
+            <String, dynamic>{'plugin_id': pluginId},
+            scope,
+            topic: topic,
+          )
+          .catchError((Object error) => <String, dynamic>{'ok': false}),
+    );
+  }
 
   /// 工作空间租约登记（通知；由入口在 hello 后注入）。
   static Future<void> Function(String workspaceId, String dir)? workspaceRegister;
@@ -436,6 +494,15 @@ class AgentRuntime {
     return ToolOutcome('${base.content}\n\n$extra', isError: base.isError);
   }
 
+  /// `spec` 工具的执行入口：解析工作空间后交给 [SpecTool]（工具层共用）。
+  Future<ToolOutcome> _runSpecTool(ToolInvocation invocation) async {
+    final WorkspaceIO? io = await workspaceIoFor(
+      invocation.agentId,
+      invocation.sessionId,
+    );
+    return SpecTool.run(invocation, specService, io);
+  }
+
   /// 领域工具原语（extra-tools 插件经自建执行站调用）。
   Future<Map<String, dynamic>> handleAgentToolCommand(
     String command,
@@ -537,6 +604,29 @@ class AgentRuntime {
       case 'message.run':
         final ToolOutcome r = await MessageTool.run(invocation, messageDispatcher);
         return <String, dynamic>{'text': r.content, 'is_error': r.isError};
+      case 'spec.list':
+      case 'spec.read':
+      case 'spec.select':
+      case 'spec.create':
+      case 'spec.update':
+      case 'spec.reset':
+        final WorkspaceIO? io = await workspaceIoFor(agentId, sessionId);
+        if (io == null) {
+          return const <String, dynamic>{
+            'text': '工作空间不可用（未接线 / SSH 配置不完整），无法执行 spec 工具',
+            'is_error': true,
+          };
+        }
+        final Map<String, dynamic> result = await SpecTool.runAction(
+          service: specService,
+          io: io,
+          invocation: invocation,
+          action: command.split('.').last,
+        );
+        return <String, dynamic>{
+          'text': const JsonEncoder.withIndent('  ').convert(result),
+          'is_error': result.containsKey('error'),
+        };
       default:
         return <String, dynamic>{'text': '未知领域工具命令：$command', 'is_error': true};
     }
@@ -551,6 +641,107 @@ class AgentRuntime {
           ].join('\n'),
     'todos': <Map<String, dynamic>>[for (final TodoItem item in todos) item.toApiJson()],
     'is_error': false,
+  };
+
+  /// 「激活指定 agent 执行器」执行站入口（命令见 `station/agent_executor.dart`）。
+  ///
+  /// 回包**不抛异常**：成败都在 `ok` 上，调用方（其它插件 / UI 的 REST 层）
+  /// 只看一种形状，不必按平台分叉。
+  Future<Map<String, dynamic>> handleAgentExecutorCommand(
+    String command,
+    Map<String, dynamic> arguments,
+    Map<String, dynamic> scope,
+  ) {
+    final String agentId =
+        (arguments['agent_id'] ?? scope['agent_id'] ?? '').toString();
+    if (command != kActivateExecutorCommand) {
+      return Future<Map<String, dynamic>>.value(
+        _activationFailure(agentId, '执行站不支持命令：$command'),
+      );
+    }
+    return activateAgentExecutor(agentId);
+  }
+
+  /// 激活某个 agent 的执行器（local 检查 / ssh 真建连）。
+  ///
+  /// - **local**：确保工作空间存在且可写，回报设备基本信息。这是"检查"，不建连接；
+  /// - **ssh**：经 `ssh.lease.register` 建到目标机的连接并登记远端租约，回报
+  ///   `ssh_lease_id` / `conn_id` / `root`；同一 agent + 同一份 SSH 配置走缓存
+  ///   （重复激活不会重复建连）。
+  Future<Map<String, dynamic>> activateAgentExecutor(String agentId) async {
+    final String id = agentId.trim();
+    if (id.isEmpty) return _activationFailure('', '缺少 agent_id');
+    final CoreAgent? agent = store.agent(id);
+    if (agent == null) return _activationFailure(id, 'agent 不存在：$id');
+    final Map<String, dynamic> device = _deviceInfo();
+    final SshConfig? ssh = teamSshConfigFor(agent, store.agent);
+    if (ssh == null) {
+      final String root = _workspaceDirOf(id);
+      if (root.isEmpty) {
+        return _activationFailure(id, '本机工作空间未解析出目录（agent=$id）');
+      }
+      try {
+        final Directory dir = Directory(root);
+        if (!dir.existsSync()) dir.createSync(recursive: true);
+        // 写一个探针文件再删掉：只看 exists 会把"只读目录"误判成可用。
+        final File probe = File(
+          p.join(
+            dir.path,
+            '.tree_probe_${pid}_${DateTime.now().microsecondsSinceEpoch}',
+          ),
+        );
+        probe.writeAsStringSync('ok', flush: true);
+        probe.deleteSync();
+      } catch (error) {
+        return _activationFailure(id, '本机工作空间不可写：$root（$error）');
+      }
+      return <String, dynamic>{
+        'ok': true,
+        'mode': 'local',
+        'executor': 'local_executor',
+        'agent_id': id,
+        'workspace': root,
+        'device': device,
+        'text': '本机执行器就绪：${device['os']} / ${device['hostname']} / $root',
+      };
+    }
+    try {
+      final _SshWorkspaceLease lease = await _sshLeaseFor(id, ssh);
+      return <String, dynamic>{
+        'ok': true,
+        'mode': 'ssh',
+        'executor': 'ssh_executor',
+        'agent_id': id,
+        'root': lease.root,
+        'ssh_lease_id': lease.leaseId,
+        'conn_id': lease.connId,
+        'host': ssh.host,
+        'device': device,
+        'text': 'SSH 执行器已激活：${ssh.username}@${ssh.host} → ${lease.root}',
+      };
+    } catch (error) {
+      return _activationFailure(id, 'SSH 执行器激活失败：$error');
+    }
+  }
+
+  Map<String, dynamic> _activationFailure(String agentId, String message) =>
+      <String, dynamic>{
+        'ok': false,
+        'agent_id': agentId,
+        'error': message,
+        'text': message,
+      };
+
+  /// 设备基本信息（本机激活一并回报，方便调用方统一展示）。
+  ///
+  /// 刻意只放**事实**：不给远端设备做任何推断（ssh 激活时这里仍是本机信息，
+  /// 远端的真实情况由 `agent.hello` 负责）。
+  Map<String, dynamic> _deviceInfo() => <String, dynamic>{
+    'os': Platform.operatingSystem,
+    'os_version': Platform.operatingSystemVersion,
+    'hostname': Platform.localHostname,
+    'processors': Platform.numberOfProcessors,
+    'dart': Platform.version.split(' ').first,
   };
 
   /// 执行站命令的统一出口：**本机命令自动带工作空间租约；SSH 命令改走 ssh.* 站**。

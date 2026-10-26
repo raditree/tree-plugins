@@ -1,3 +1,4 @@
+import 'spec_tool.dart';
 import 'terminal_hook_manager.dart';
 import 'tool_runner.dart';
 import '../station/tool_contributions.dart';
@@ -14,6 +15,7 @@ class StationToolRunner implements ToolRunner {
     required this.scopeFor,
     this.contributed,
     this.toolRunsRunner,
+    this.specRunner,
     this.hooks,
   });
 
@@ -27,6 +29,12 @@ class StationToolRunner implements ToolRunner {
 
   /// `tool_runs` 的执行回调（未接线时不声明该工具）。
   final Future<ToolOutcome> Function(ToolInvocation invocation)? toolRunsRunner;
+
+  /// `spec` 的执行回调（未接线时不声明该工具）。
+  ///
+  /// 真正的工作空间解析在运行时里（要按 agent 走本机 / SSH 执行站）；工具层只
+  /// 负责声明与把调用转过去。
+  final Future<ToolOutcome> Function(ToolInvocation invocation)? specRunner;
 
   /// terminal hook 管理器（start/status/cancel + 完成唤醒）。
   final TerminalHookManager? hooks;
@@ -119,6 +127,7 @@ class StationToolRunner implements ToolRunner {
             'required': <String>['file_path', 'old_text', 'new_text'],
           },
         ),
+        if (specRunner != null) SpecTool.spec(),
         if (toolRunsRunner != null)
           ToolSpec(
             name: 'tool_runs',
@@ -161,6 +170,12 @@ class StationToolRunner implements ToolRunner {
               toolRunsRunner;
           return runner == null
               ? const ToolOutcome('tool_runs 未接线', isError: true)
+              : await runner(invocation);
+        case SpecTool.name:
+          final Future<ToolOutcome> Function(ToolInvocation)? runner =
+              specRunner;
+          return runner == null
+              ? const ToolOutcome('spec 工具未接线', isError: true)
               : await runner(invocation);
         case 'list':
           return await _list(invocation, scope);

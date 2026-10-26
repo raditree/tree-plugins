@@ -14,7 +14,7 @@
 | --- | --- | --- |
 | A1 | 骨架：stdio 循环、hello/ping、工具表、收集站申报、日志 | **已完成** |
 | A2 | 只读面：agents / models / sessions / todos / subagents / teammates / tools-running | **已完成**：十条只读路由逐字节等价；tools-running 已接 |
-| A3 | 写路径与生成：消息、取消、LLM、工具编排、提问、reset/compact、G-1 剩余 4 条 | **已完成**：38 条申报；reset/compact/ssh 重连/团队写路由/4 条 G-1 路由已接；测试 347、自检 167 |
+| A3 | 写路径与生成：消息、取消、LLM、工具编排、提问、reset/compact、G-1 剩余 4 条 | **已完成**：38 条申报；reset/compact/ssh 重连/团队写路由/4 条 G-1 路由已接；测试 356、自检 186 |
 | A4 | 帧迁移：注册广播站，topic 沿用原帧名 | 未开始 |
 | A5 | 交接：核心删除 34 条路由 + 2 条上行 + 领域目录 | 未开始 |
 
@@ -33,6 +33,37 @@ todo / question / subagent / team / message 五个工具由独立插件 `extra-t
 tree.agent 的收集站采集工具定义，执行时经 `plugin.toolCall` 回到 extra-tools，
 再由其调用 tree.agent 自建领域执行站（`todo.*` / `question.ask` / `subagent.run` /
 `team.run` / `message.run`）。tree.agent 只提供领域原语，不包工具定义。
+
+## Spec 工具（S1，原生）
+
+`spec` 工具在 tree.agent **原生**声明与执行（不经 extra-tools）：`StationToolRunner`
+把它加进模型工具表，执行时按 agent 解析工作空间（本机 / SSH 同一执行站路径）后交给
+`SpecService` + `WorkspaceIO`。动作：
+
+| action | 作用 | 读/写 |
+| --- | --- | --- |
+| `list` | 列出工作空间全部规范 + 本会话已选 id | 读（首次会播种内置副本） |
+| `read` | 按 `spec_id` 取规范原文（不挂 hook） | 读 |
+| `select` | 选择/取消（空数组）并直接回全文、挂会话 hook | 写会话选择 |
+| `create` / `update` | 沉淀/维护自定义规范（内置不可改） | 写工作空间 |
+| `reset` | 备份 `.self/spec/*` 后重建内置规范（破坏性） | 写工作空间 |
+
+同一套动作也暴露为自建 `agent_tools` 执行站命令 `spec.list` / `spec.read` /
+`spec.select` / `spec.create` / `spec.update` / `spec.reset`（命令参数与工具参数同形），
+供 extra-tools 等插件经站调用；站点 readme 与命令表在注册时由
+`AgentRuntime.agentToolsReadme` / `agentToolCommands` 统一提供。
+
+## 执行器激活站（`agent_executor`）
+
+命令 `executor.activate {agent_id}`：
+
+- **local**：检查工作空间存在且可写（写探针再删）+ 回报设备基本信息，不建连接；
+- **ssh**：**真激活**——经 `ssh.lease.register` 建到目标机的连接并登记远端租约，
+  回 `ssh_lease_id` / `conn_id` / `root`（同一 agent + 同一份配置走缓存）。
+
+回包统一为 `{ok, mode, executor, agent_id, device, text, ...}`。同一实现也暴露为 REST
+`POST /api/agents/{agentId}/activate`（失败 502 + `detail`），UI 在开终端前调用它——
+UI 不碰 SSH 凭据。站点 readme / 命令表见 `lib/src/station/agent_executor.dart`。
 
 ## 执行器依赖（L-24）
 
@@ -86,7 +117,8 @@ lib/src/conversation_store.dart 会话历史分页（limit/before/from/at/all）
 lib/src/teammates.dart     团队名册（memberView + relation + overrides/effective）
 lib/src/agent/             平移：question_store（提问记录）、question_broker（等待/作答/取消回路）
 lib/src/tool/              平移：todo_store、question_channel、tool_runner、subagent_tool、
-                           tool_run_registry（运行中工具登记）、hook_ledger、tool_runs_tool
+                           tool_run_registry（运行中工具登记）、hook_ledger、tool_runs_tool；
+                           spec_tool（S1 原生 spec 工具：list/read/select/create/update/reset）
 lib/src/plugin/            平移：agent_events（事件名常量与发布器）
 lib/src/compat/            旧下行帧名最小兼容层（提问卡片；A4 接站内主题后替换）
 lib/src/llm/               平移：llm_types / openai_codec / sse_parser / llm_transport / llm_session /
