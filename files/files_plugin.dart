@@ -34,8 +34,24 @@ PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
 Future<void> _onReady(PluginKitServer server) async {
   _service = FilesService(log: server.channel.log);
   // SSH 工作空间经执行站命令（ssh.lease.register / ssh.file.*）。
-  _service.stationCommand = (String command, Map<String, dynamic> arguments) =>
-      server.channel.command(command, arguments);
+  // 骨架异常 → 领域库自有异常（`lib/` 不能 import 包外的 `../_kit`，契约 §4.3 环 8）。
+  _service.stationCommand = (
+    String command,
+    Map<String, dynamic> arguments,
+  ) async {
+    try {
+      return await server.channel.command(command, arguments);
+    } on CmdFailureException catch (error) {
+      throw StationCommandFailure(
+        error.message,
+        code: (error.code.isEmpty ? 'unknown' : error.code),
+        payload: <String, dynamic>{
+          for (final MapEntry<String, Object?> entry in error.payload.entries)
+            entry.key: entry.value,
+        },
+      );
+    }
+  };
   server.channel.log(
     '已上线：v$kVersion（文件面板；已申报 ${kDeclaredRoutes.length} 条委派路由）',
   );

@@ -16,6 +16,29 @@ typedef StationCommandCaller = Future<Map<String, dynamic>> Function(
   Map<String, dynamic> arguments,
 );
 
+/// 执行站命令失败（**插件侧**的异常形状：可读原因 + 稳定错误码 + 失败载荷）。
+///
+/// 本仓 `lib/` 不能 import 包外的 `../_kit`（分析器拒绝跨包相对 import），
+/// 所以入口 `files_plugin.dart`（它 import 了 kit）把骨架的
+/// `CmdFailureException` 翻译成这个类型，领域库只认这里。
+///
+/// 错误码逐字对齐 `tree_protocol` 的 `ExecStationErrorCodes`（契约 §4.2）；
+/// **只有 `lease_unknown` 表示"确定未执行、可安全重发"**。
+class StationCommandFailure implements Exception {
+  const StationCommandFailure(
+    this.message, {
+    this.code = 'unknown',
+    this.payload = const <String, dynamic>{},
+  });
+
+  final String message;
+  final String code;
+  final Map<String, dynamic> payload;
+
+  @override
+  String toString() => message;
+}
+
 /// 一条 SSH 工作空间租约（插件进程内缓存；插件/执行站重启后失效）。
 class SshLease {
   const SshLease({
@@ -115,7 +138,10 @@ class RemoteFiles {
         'ssh_lease_id': current.leaseId,
       });
     } catch (error) {
-      if (!'$error'.contains('ssh_lease_unknown')) rethrow;
+      // 判据必须是结构化错误码，不是消息文本（契约 §4.1）。
+      if (error is! StationCommandFailure || error.code != 'lease_unknown') {
+        rethrow;
+      }
       leases.remove(target.leaseKey);
       final SshLease renewed = await lease();
       return call(name, <String, dynamic>{

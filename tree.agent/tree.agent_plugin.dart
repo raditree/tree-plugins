@@ -42,8 +42,21 @@ Future<void> _onReady(PluginKitServer server) async {
   // 执行站入口：hello 之后插件才能主动向核心下 station/command。
   if (_enableStationClient) {
     AgentRuntime.pluginId = kPluginId;
-    AgentRuntime.stationClient = (String command, Map<String, dynamic> arguments, Map<String, dynamic> scope) =>
-        server.channel.command(command, arguments, '', scope);
+    // 骨架异常 → 领域库自有异常（`lib/` 不能 import 包外的 `../_kit`，契约 §4.3 环 8）。
+    AgentRuntime.stationClient = (String command, Map<String, dynamic> arguments, Map<String, dynamic> scope) async {
+      try {
+        return await server.channel.command(command, arguments, '', scope);
+      } on CmdFailureException catch (error) {
+        throw StationCommandFailure(
+          error.message,
+          code: (error.code.isEmpty ? 'unknown' : error.code),
+          payload: <String, dynamic>{
+            for (final MapEntry<String, Object?> entry in error.payload.entries)
+              entry.key: entry.value,
+          },
+        );
+      }
+    };
     AgentRuntime.stationTrigger =
         (
           String stationId,
@@ -165,7 +178,10 @@ Future<Map<String, dynamic>?> handleRequest(
       final String dataDir = asString(meta['data_dir']);
       if (dataDir.isEmpty) {
         return <String, dynamic>{
-          'reply': <String, dynamic>{'error': '缺少 data_dir（核心未在站请求里带数据根）'},
+          'reply': <String, dynamic>{
+            'error': '缺少 data_dir（核心未在站请求里带数据根）',
+            'code': 'invalid_arguments',
+          },
         };
       }
       final Map<String, dynamic> payload = asMap(params['payload']);
@@ -185,16 +201,30 @@ Future<Map<String, dynamic>?> handleRequest(
         // 工具级失败（未知命令等）仍走 `{text, is_error}` 的 payload，不是站级失败。
         final String stationError = asString(result['error']);
         if (stationError.isNotEmpty) {
+          final String stamp = asString(result['code']);
           return <String, dynamic>{
-            'reply': <String, dynamic>{'error': stationError, 'payload': result},
+            'reply': <String, dynamic>{
+              'error': stationError,
+              'payload': result,
+              'code': stamp.isEmpty ? 'unknown' : stamp,
+            },
           };
         }
         return <String, dynamic>{
           'reply': <String, dynamic>{'payload': result},
         };
+      } on StationCommandFailure catch (error) {
+        // 站级失败同样把载荷带回去（`llm.call` 已付费正文不能丢）。
+        return <String, dynamic>{
+          'reply': <String, dynamic>{
+            'error': error.message,
+            'payload': error.payload,
+            'code': error.code,
+          },
+        };
       } catch (error) {
         return <String, dynamic>{
-          'reply': <String, dynamic>{'error': error.toString()},
+          'reply': <String, dynamic>{'error': error.toString(), 'code': 'unknown'},
         };
       }
     }
@@ -203,19 +233,36 @@ Future<Map<String, dynamic>?> handleRequest(
       final String dataDir = asString(meta['data_dir']);
       if (dataDir.isEmpty) {
         return <String, dynamic>{
-          'reply': <String, dynamic>{'error': '缺少 data_dir（核心未在站请求里带数据根）'},
+          'reply': <String, dynamic>{
+            'error': '缺少 data_dir（核心未在站请求里带数据根）',
+            'code': 'invalid_arguments',
+          },
         };
       }
       final Map<String, dynamic> payload = asMap(params['payload']);
-      final Map<String, dynamic> result = await AgentRuntime.forDataDir(dataDir)
-          .handleAgentExecutorCommand(
-            asString(payload['command']),
-            asMap(payload['arguments']),
-            asMap(params['scope']),
-          );
-      return <String, dynamic>{
-        'reply': <String, dynamic>{'payload': result},
-      };
+      try {
+        final Map<String, dynamic> result = await AgentRuntime.forDataDir(dataDir)
+            .handleAgentExecutorCommand(
+              asString(payload['command']),
+              asMap(payload['arguments']),
+              asMap(params['scope']),
+            );
+        return <String, dynamic>{
+          'reply': <String, dynamic>{'payload': result},
+        };
+      } on StationCommandFailure catch (error) {
+        return <String, dynamic>{
+          'reply': <String, dynamic>{
+            'error': error.message,
+            'payload': error.payload,
+            'code': error.code,
+          },
+        };
+      } catch (error) {
+        return <String, dynamic>{
+          'reply': <String, dynamic>{'error': error.toString(), 'code': 'unknown'},
+        };
+      }
     }
     if (station == kApiRoutesStation) {
       // 收集站口径：`{reply: {payload: {routes: [...]}}}`（核心只读 reply.payload）。

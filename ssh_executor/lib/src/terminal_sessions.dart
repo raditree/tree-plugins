@@ -257,8 +257,7 @@ class SshTerminalSessions {
       if (found == null) {
         throw SshTerminalError(
           409,
-          '$kSshLeaseUnknownCode: 租约 $leaseId 未登记（插件进程可能重启过），'
-          '请先在该工作区执行一次操作再开终端',
+          '租约 $leaseId 未登记（插件进程可能重启过），请先在该工作区执行一次操作再开终端',
         );
       }
       return found;

@@ -129,7 +129,7 @@ Future<Map<String, dynamic>?> handleRequest(
     };
   } catch (error) {
     return <String, dynamic>{
-      'reply': <String, dynamic>{'error': error.toString()},
+      'reply': <String, dynamic>{'error': error.toString(), 'code': 'unknown'},
     };
   }
 }
@@ -283,8 +283,8 @@ Future<int> selfTest() async {
       <String, dynamic>{'local_lease_id': 'selftest', ...args},
       sourcePluginId: owner,
     );
-    // 失败路径：返回原因原文（自检按**码前缀**断言，不靠"抛没抛"猜）。
-    Future<String> why(
+    // 失败路径：返回异常本体（自检按 `error.code` 断言，不靠"抛没抛"猜）。
+    Future<ExecutorError?> why(
       String command, [
       Map<String, dynamic> args = const <String, dynamic>{},
       String as = owner,
@@ -295,9 +295,9 @@ Future<int> selfTest() async {
           <String, dynamic>{'local_lease_id': 'selftest', ...args},
           sourcePluginId: as,
         );
-        return '';
+        return null;
       } on ExecutorError catch (error) {
-        return error.message;
+        return error;
       }
     }
 
@@ -349,10 +349,12 @@ Future<int> selfTest() async {
 
     check.that(
       (await why('local.file.write', <String, dynamic>{
-        'path': '../outside.txt',
-        'content': 'x',
-      }))
-          .contains('越出工作空间根目录'),
+            'path': '../outside.txt',
+            'content': 'x',
+          }))
+          ?.message
+          .contains('越出工作空间根目录') ??
+          false,
       '越界路径被拒绝',
     );
     // 注入 root 的**可证伪**测试：`notes/a.txt` 在租约根里有、在 systemTemp 里
@@ -377,7 +379,8 @@ Future<int> selfTest() async {
             <String, dynamic>{'path': 'notes/a.txt'},
             intruder,
           ))
-              .contains(kLeaseDeniedCode),
+              ?.code ==
+          kLeaseDeniedCode,
       '别人的租约直接被拒（lease_denied）',
     );
     check.that(
@@ -386,7 +389,8 @@ Future<int> selfTest() async {
             <String, dynamic>{'dir': temp.path, 'local_lease_id': 'selftest'},
             intruder,
           ))
-              .contains(kLeaseDeniedCode),
+              ?.code ==
+          kLeaseDeniedCode,
       '顶不掉别人登记的租约（lease_denied）',
     );
     var unknownSeen = false;
@@ -397,15 +401,17 @@ Future<int> selfTest() async {
         sourcePluginId: owner,
       );
     } on ExecutorError catch (error) {
-      unknownSeen = error.message.contains(kLocalLeaseUnknownCode);
+      unknownSeen = error.code == kLeaseUnknownCode;
     }
-    check.that(unknownSeen, '未登记的租约回 local_lease_unknown 前缀');
+    check.that(unknownSeen, '未登记的租约回 lease_unknown 码');
     check.that(
       (await why('local.file.read', <String, dynamic>{
-        'local_lease_id': '',
-        'path': 'notes/a.txt',
-      }))
-          .contains('local_lease_id'),
+            'local_lease_id': '',
+            'path': 'notes/a.txt',
+          }))
+          ?.message
+          .contains('local_lease_id') ??
+          false,
       '没带租约句柄显式失败（不回落当前目录）',
     );
 
@@ -467,18 +473,20 @@ Future<int> selfTest() async {
     );
     check.that(
       (await why('local.file.rename', <String, dynamic>{
-        'from': 'notes/a.txt',
-        'to': 'bin/b.bin',
-      }))
-          .contains('不覆盖'),
+            'from': 'notes/a.txt',
+            'to': 'bin/b.bin',
+          }))
+              ?.code ==
+          LocalCodes.targetExists,
       'rename 不覆盖已存在的目标',
     );
     check.that(
       (await why('local.file.rename', <String, dynamic>{
-        'from': 'notes/missing.txt',
-        'to': 'bin/c.bin',
-      }))
-          .contains('文件不存在'),
+            'from': 'notes/missing.txt',
+            'to': 'bin/c.bin',
+          }))
+              ?.code ==
+          LocalCodes.fileNotFound,
       'rename 源不存在显式报错',
     );
 

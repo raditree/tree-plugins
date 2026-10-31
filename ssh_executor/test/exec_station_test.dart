@@ -297,7 +297,7 @@ void main() {
     expect(executor.leaseCount, 1);
   });
 
-  test('未登记租约 ⇒ ssh_lease_unknown（调用方据此重登记；不做静默回退）', () async {
+  test('未登记租约 ⇒ lease_unknown 码（调用方据此重登记；不做静默回退）', () async {
     await expectLater(
       executor.execute('ssh.file.read', <String, dynamic>{
         'ssh_lease_id': 'gone',
@@ -305,9 +305,9 @@ void main() {
       }),
       throwsA(
         isA<SshStationError>().having(
-          (SshStationError error) => error.message,
-          'message',
-          contains(kSshLeaseUnknownCode),
+          (SshStationError error) => error.code,
+          'code',
+          kSshLeaseUnknownCode,
         ),
       ),
     );
@@ -340,18 +340,22 @@ void main() {
       ),
       throwsA(
         isA<SshStationError>().having(
+          (SshStationError error) => error.code,
+          'code',
+          kLeaseDeniedCode,
+        ).having(
           (SshStationError error) => error.message,
           'message',
-          allOf(contains(kLeaseDeniedCode), contains('tree.agent')),
+          contains('tree.agent'),
         ),
       ),
     );
     // 顶不掉：重登记同一条句柄也只认原登记方。
     await expectLater(registerAs('demo_intruder'), throwsA(
       isA<SshStationError>().having(
-        (SshStationError error) => error.message,
-        'message',
-        contains(kLeaseDeniedCode),
+        (SshStationError error) => error.code,
+        'code',
+        kLeaseDeniedCode,
       ),
     ));
     expect(executor.leaseCount, 1);
@@ -368,11 +372,13 @@ void main() {
         sourcePluginId: 'demo_intruder',
       ),
       throwsA(
-        isA<SshStationError>().having(
-          (SshStationError error) => error.message,
-          'message',
-          allOf(contains(kLeaseDeniedCode), isNot(contains(kSshLeaseUnknownCode))),
-        ),
+        isA<SshStationError>()
+            .having((SshStationError error) => error.code, 'code', kLeaseDeniedCode)
+            .having(
+              (SshStationError error) => error.code,
+              'code 不是租约失效',
+              isNot(kSshLeaseUnknownCode),
+            ),
       ),
     );
   });

@@ -8,6 +8,7 @@ import 'package:tree_agent_loop/src/settings/ssh_config.dart';
 import 'package:tree_agent_loop/src/store/file_store.dart';
 import 'package:tree_agent_loop/src/store/records.dart';
 import 'package:tree_agent_loop/src/store/tree_paths.dart';
+import 'package:tree_agent_loop/src/workspace/station_command.dart';
 import 'package:tree_agent_loop/src/workspace/workspace_io.dart';
 
 /// C：SSH 模式的 tree.agent **不得**再落到本机执行站（契约 §8.1 / §8.3）。
@@ -132,8 +133,9 @@ void main() {
               sshReadCount++;
               if (failFirstSshRead) {
                 failFirstSshRead = false;
-                throw StateError(
-                  '$kSshLeaseUnknownCode: 租约未登记（插件进程可能重启过）',
+                throw const StationCommandFailure(
+                  '租约未登记（插件进程可能重启过）',
+                  code: kLeaseUnknownCode,
                 );
               }
               if (sshReadFails) throw StateError('文件不存在：notes/a.txt');
@@ -167,8 +169,9 @@ void main() {
             case 'local.file.read':
               if (failFirstLocalRead) {
                 failFirstLocalRead = false;
-                throw StateError(
-                  '$kLocalLeaseUnknownCode: 租约未登记（插件进程可能重启过）',
+                throw const StationCommandFailure(
+                  '租约未登记（插件进程可能重启过）',
+                  code: kLeaseUnknownCode,
                 );
               }
               return <String, dynamic>{
@@ -298,7 +301,7 @@ void main() {
     expect(localRegisterCount, 1);
   });
 
-  test('local_lease_unknown：重登记后重试一次（与 SSH 侧同一判据）', () async {
+  test('lease_unknown：重登记后重试一次（与 SSH 侧同一判据）', () async {
     final AgentRuntime rt = runtime();
     final WorkspaceIO io = (await rt.workspaceIoFor('local_agt', 's1'))!;
     failFirstLocalRead = true;
@@ -381,7 +384,7 @@ void main() {
     expect((calls.last['scope'] as Map)['mode_key'], 'ssh');
   });
 
-  test('ssh_lease_unknown：重登记后重试一次；其它错误不重试', () async {
+  test('ssh lease_unknown：重登记后重试一次；其它错误不重试', () async {
     final AgentRuntime rt = runtime();
     final WorkspaceIO io = (await rt.workspaceIoFor('ssh_agt', 's1'))!;
     failFirstSshRead = true;

@@ -40,29 +40,51 @@ const String kSshWorkspaceStationReadme =
     '建/复用一条既有中转站隧道，再把命令翻译成目标机 tree_agent 的 fs.* / exec.run；'
     '路径校验用「远端根 + 工作空间内相对路径」，插件不碰本机文件、不起本机进程。'
     '租约由 ssh.lease.register 登记（凭据只在登记时过线一次，并记下登记方插件 id：'
-    '别的插件想用这条租约直接拒 lease_denied），插件重启后命令会回 ssh_lease_unknown，'
+    '别的插件想用这条租约直接拒 lease_denied），插件重启后命令会回 lease_unknown 码，'
     '调用方应重新登记。';
 
 /// 核心拼出的自建站 id（与 `PluginBus.selfBuiltStationId` 同形；自检/测试可用）。
 String sshWorkspaceStationId(String pluginId) =>
     'plugin.$pluginId.execute.$kSshWorkspaceStationName';
 
-/// 执行站命令失败（可读中文；由 [SshWorkspaceExecutor.execute] 的调用方转成
-/// `{reply: {error: ...}}`，与 `local_executor` 的错误面同形）。
+/// 执行站命令失败（可读中文 + **稳定错误码**；由 [SshWorkspaceExecutor.execute]
+/// 的调用方转成 `{reply: {error, code}}`，与 `local_executor` 的错误面同形）。
+///
+/// 契约 §4：失败必带码且禁空——码值逐字对齐 `tree_protocol` 的
+/// `ExecStationErrorCodes`（插件仓不 import 协议包，一致性由桌面仓的码表门禁
+/// 扫字面量兜住）。
 class SshStationError implements Exception {
-  SshStationError(this.message);
+  SshStationError(this.message, {required this.code})
+    : assert(code.isNotEmpty, 'SshStationError 必须带错误码');
 
   final String message;
+
+  /// 稳定错误码（值必须是 `tree_protocol` 码表里的一条）。
+  final String code;
 
   @override
   String toString() => message;
 }
 
+/// 本执行器产生的稳定错误码（与 `local_executor` 的 `LocalCodes` 同一口径）。
+abstract final class SshCodes {
+  static const String commandUnknown = 'command_unknown';
+  static const String backendUnreachable = 'backend_unreachable';
+  static const String invalidArguments = 'invalid_arguments';
+  static const String fileNotFound = 'file_not_found';
+  static const String notAFile = 'not_a_file';
+  static const String dirNotEmpty = 'dir_not_empty';
+  static const String targetExists = 'target_exists';
+  static const String badBase64 = 'bad_base64';
+  static const String unknown = 'unknown';
+}
+
 /// 租约未登记 / 插件重启过：调用方应重新 `ssh.lease.register` 再重试一次。
 ///
-/// 这个前缀是**契约**：tree.agent 只在看到它时丢弃缓存租约并重登记重试
+/// 这个码是**契约**（契约 §4.2 只登记 `lease_unknown` 一条；本机与 SSH 同码）：
+/// tree.agent 只在看到它时丢弃缓存租约并重登记重试
 /// （其它失败可能是 `file.write` 写了一半之类的业务错误，**绝不重试**）。
-const String kSshLeaseUnknownCode = 'ssh_lease_unknown';
+const String kSshLeaseUnknownCode = 'lease_unknown';
 
 /// 租约归属不符：登记方与调用方不是同一个插件，**fail-closed 拒绝且不重试**。
 ///
@@ -216,7 +238,10 @@ class SshWorkspaceExecutor {
       case 'ssh.exec.command':
         return _terminal(lease, arguments);
       default:
-        throw SshStationError('SSH 工作空间执行站不支持命令：$command');
+        throw SshStationError(
+          'SSH 工作空间执行站不支持命令：$command',
+          code: SshCodes.commandUnknown,
+        );
     }
   }
 
@@ -232,19 +257,29 @@ class SshWorkspaceExecutor {
     if (ssh.isEmpty) {
       throw SshStationError(
         'ssh.lease.register 需要 ssh 配置对象（host / username / 凭据）',
+        code: SshCodes.invalidArguments,
       );
     }
     final Map<String, dynamic> ensured = await ensureTunnel(ssh);
     if (ensured['ok'] != true) {
-      throw SshStationError('建立 SSH 隧道失败：${ensured['error'] ?? '未给出原因'}');
+      throw SshStationError(
+        '建立 SSH 隧道失败：${ensured['error'] ?? '未给出原因'}',
+        code: SshCodes.backendUnreachable,
+      );
     }
     final String connId = (ensured['conn_id'] ?? '').toString().trim();
     if (connId.isEmpty) {
-      throw SshStationError('建立 SSH 隧道失败：核心未回 conn_id');
+      throw SshStationError(
+        '建立 SSH 隧道失败：核心未回 conn_id',
+        code: SshCodes.backendUnreachable,
+      );
     }
     final String root = (ensured['root'] ?? '').toString().trim();
     if (!root.startsWith('/')) {
-      throw SshStationError('远端工作空间根不是绝对路径：${root.isEmpty ? '(空)' : root}');
+      throw SshStationError(
+        '远端工作空间根不是绝对路径：${root.isEmpty ? '(空)' : root}',
+        code: SshCodes.backendUnreachable,
+      );
     }
     final String requested =
         (arguments['ssh_lease_id'] ?? arguments['lease_id'] ?? '')
@@ -256,10 +291,11 @@ class SshWorkspaceExecutor {
     final _SshLease? existing = _leases[leaseId];
     if (existing != null && existing.registrant != sourcePluginId) {
       throw SshStationError(
-        '$kLeaseDeniedCode: 租约 $leaseId 由插件 '
+        '租约 $leaseId 由插件 '
         '${existing.registrant.isEmpty ? '核心' : existing.registrant} 登记，'
         '${sourcePluginId.isEmpty ? '核心' : sourcePluginId} 不能顶掉它'
         '（fail-closed）',
+        code: kLeaseDeniedCode,
       );
     }
     _leases[leaseId] = _SshLease(
@@ -297,7 +333,10 @@ class SshWorkspaceExecutor {
       final _SshLease? cached = _leases[leaseId];
       if (cached != null) {
         if (cached.registrant != sourcePluginId) {
-          throw SshStationError(_deniedFor(leaseId, cached, sourcePluginId));
+          throw SshStationError(
+            _deniedFor(leaseId, cached, sourcePluginId),
+            code: kLeaseDeniedCode,
+          );
         }
         return cached;
       }
@@ -311,13 +350,16 @@ class SshWorkspaceExecutor {
         return _leases[leaseId]!;
       }
       throw SshStationError(
-        '$kSshLeaseUnknownCode: 租约 $leaseId 未登记（插件进程可能重启过；'
-        '请重新 ssh.lease.register）',
+        '租约 $leaseId 未登记（插件进程可能重启过；请重新 ssh.lease.register）',
+        code: kSshLeaseUnknownCode,
       );
     }
     final Map<String, dynamic> ssh = _asMap(arguments['ssh']);
     if (ssh.isEmpty) {
-      throw SshStationError('缺少 ssh_lease_id（先 ssh.lease.register）或 ssh 配置');
+      throw SshStationError(
+        '缺少 ssh_lease_id（先 ssh.lease.register）或 ssh 配置',
+        code: SshCodes.invalidArguments,
+      );
     }
     await _registerLease(arguments, sourcePluginId);
     final String registered = (arguments['ssh_lease_id'] ?? '')
@@ -335,7 +377,7 @@ class SshWorkspaceExecutor {
     _SshLease lease,
     String sourcePluginId,
   ) =>
-      '$kLeaseDeniedCode: 租约 $leaseId 由插件 '
+      '租约 $leaseId 由插件 '
       '${lease.registrant.isEmpty ? '核心' : lease.registrant} 登记，'
       '${sourcePluginId.isEmpty ? '核心' : sourcePluginId} 不能用它（fail-closed）';
 
@@ -366,8 +408,12 @@ class SshWorkspaceExecutor {
       <String, dynamic>{'path': path},
     );
     final String type = (stat['type'] ?? '').toString();
-    if (type == 'missing') throw SshStationError('文件不存在：$relative');
-    if (type == 'dir') throw SshStationError('目标是目录，不能读取：$relative');
+    if (type == 'missing') {
+      throw SshStationError('文件不存在：$relative', code: SshCodes.fileNotFound);
+    }
+    if (type == 'dir') {
+      throw SshStationError('目标是目录，不能读取：$relative', code: SshCodes.notAFile);
+    }
     // **分块下载通道**（`raw: true`）：二进制原样回 base64，不做行处理、不受
     // 8 MiB 的文本读取上限约束——调用方按 `offset` 递进、按 `eof` 收口。
     if (arguments['raw'] == true) {
@@ -501,13 +547,19 @@ class SshWorkspaceExecutor {
     final String encoded =
         (arguments['base64'] ?? arguments['content_base64'] ?? '').toString();
     if (encoded.isEmpty) {
-      throw SshStationError('ssh.file.writeBytes 需要 base64（要写入的二进制）');
+      throw SshStationError(
+        'ssh.file.writeBytes 需要 base64（要写入的二进制）',
+        code: SshCodes.invalidArguments,
+      );
     }
     final List<int> bytes;
     try {
       bytes = base64Decode(encoded);
     } on FormatException {
-      throw SshStationError('ssh.file.writeBytes 的 base64 非法');
+      throw SshStationError(
+        'ssh.file.writeBytes 的 base64 非法',
+        code: SshCodes.badBase64,
+      );
     }
     await _ensureParent(lease, path);
     // `append: true` = 分块写的后续块（第一块用默认 write 截断重建）。
@@ -539,7 +591,10 @@ class SshWorkspaceExecutor {
     final String from = (arguments['from'] ?? arguments['path'] ?? '').toString();
     final String to = (arguments['to'] ?? arguments['new_path'] ?? '').toString();
     if (from.trim().isEmpty || to.trim().isEmpty) {
-      throw SshStationError('ssh.file.rename 需要 from 与 to');
+      throw SshStationError(
+        'ssh.file.rename 需要 from 与 to',
+        code: SshCodes.invalidArguments,
+      );
     }
     final String source = _absPath(lease, from);
     final String target = _absPath(lease, to);
@@ -583,7 +638,9 @@ class SshWorkspaceExecutor {
       <String, dynamic>{'path': base},
     );
     final String type = (stat['type'] ?? '').toString();
-    if (type == 'missing') throw SshStationError('路径不存在：$relative');
+    if (type == 'missing') {
+      throw SshStationError('路径不存在：$relative', code: SshCodes.fileNotFound);
+    }
     final List<String> entries = <String>[];
     final List<Map<String, dynamic>> details = <Map<String, dynamic>>[];
     if (type != 'dir') {
@@ -691,7 +748,9 @@ class SshWorkspaceExecutor {
     Map<String, dynamic> arguments,
   ) async {
     final String pattern = (arguments['pattern'] ?? '').toString();
-    if (pattern.isEmpty) throw SshStationError('ssh.file.grep 需要 pattern');
+    if (pattern.isEmpty) {
+      throw SshStationError('ssh.file.grep 需要 pattern', code: SshCodes.invalidArguments);
+    }
     final bool regex = arguments['regex'] == true;
     final bool ignoreCase = arguments['ignore_case'] == true;
     final RegExp matcher = regex
@@ -712,7 +771,9 @@ class SshWorkspaceExecutor {
       <String, dynamic>{'path': base},
     );
     final String type = (stat['type'] ?? '').toString();
-    if (type == 'missing') throw SshStationError('路径不存在：$relative');
+    if (type == 'missing') {
+      throw SshStationError('路径不存在：$relative', code: SshCodes.fileNotFound);
+    }
 
     final List<String> files = <String>[];
     if (type == 'dir') {
@@ -828,7 +889,9 @@ class SshWorkspaceExecutor {
       <String, dynamic>{'path': path},
     );
     final String type = (stat['type'] ?? '').toString();
-    if (type == 'missing') throw SshStationError('路径不存在：$relative');
+    if (type == 'missing') {
+      throw SshStationError('路径不存在：$relative', code: SshCodes.fileNotFound);
+    }
     final bool recursive = arguments['recursive'] == true;
     if (type == 'dir') {
       if (!recursive) {
@@ -839,7 +902,10 @@ class SshWorkspaceExecutor {
         );
         final Object? entries = listed['entries'];
         if (entries is List && entries.isNotEmpty) {
-          throw SshStationError('目录非空，删除需要 recursive=true：$relative');
+          throw SshStationError(
+            '目录非空，删除需要 recursive=true：$relative',
+            code: SshCodes.dirNotEmpty,
+          );
         }
       }
       await _call(lease, AgentMethods.fsRemove, <String, dynamic>{
@@ -882,7 +948,10 @@ class SshWorkspaceExecutor {
 
     if (hookAction == 'status') {
       if (taskId.isEmpty) {
-        throw SshStationError('hook_action=status 需要 task_id');
+        throw SshStationError(
+          'hook_action=status 需要 task_id',
+          code: SshCodes.invalidArguments,
+        );
       }
       final Map<String, dynamic> reply = await _call(
         lease,
@@ -907,7 +976,10 @@ class SshWorkspaceExecutor {
 
     if (hookAction == 'cancel') {
       if (taskId.isEmpty) {
-        throw SshStationError('hook_action=cancel 需要 task_id');
+        throw SshStationError(
+          'hook_action=cancel 需要 task_id',
+          code: SshCodes.invalidArguments,
+        );
       }
       final Map<String, dynamic> reply = await _call(
         lease,
@@ -922,7 +994,12 @@ class SshWorkspaceExecutor {
       };
     }
 
-    if (command.isEmpty) throw SshStationError('ssh.exec.command 需要 command');
+    if (command.isEmpty) {
+      throw SshStationError(
+        'ssh.exec.command 需要 command',
+        code: SshCodes.invalidArguments,
+      );
+    }
 
     if (arguments['hook'] == true) {
       final String stamp = DateTime.now().microsecondsSinceEpoch.toString();
@@ -939,7 +1016,10 @@ class SshWorkspaceExecutor {
       );
       final String id = (reply['id'] ?? '').toString();
       if (id.isEmpty) {
-        throw SshStationError('远端后台任务未返回 id');
+        throw SshStationError(
+          '远端后台任务未返回 id',
+          code: SshCodes.backendUnreachable,
+        );
       }
       return <String, dynamic>{
         'text': '[terminal hook] 已在远端后台启动：$command',
@@ -991,6 +1071,25 @@ class SshWorkspaceExecutor {
 
   // ───────────────────────── 基础设施 ─────────────────────────
 
+  /// 远端 agent 的业务错误码 → 契约 §4.2 的站错误码。
+  ///
+  /// 只映射**语义等价**的几条；其余（权限、执行失败、帧过大…）如实落 `unknown`，
+  /// 免得调用方把"未知失败"当成可重试的租约失效。
+  static String _codeForRemoteError(Object? errorCode) {
+    switch (errorCode) {
+      case TunnelErrorCodes.notFound:
+        return SshCodes.fileNotFound;
+      case TunnelErrorCodes.alreadyExists:
+        return SshCodes.targetExists;
+      case TunnelErrorCodes.notEmpty:
+        return SshCodes.dirNotEmpty;
+      case TunnelErrorCodes.pathOutOfRoot:
+        return SshCodes.invalidArguments;
+      default:
+        return SshCodes.unknown;
+    }
+  }
+
   Future<Map<String, dynamic>> _call(
     _SshLease lease,
     String method,
@@ -1004,8 +1103,14 @@ class SshWorkspaceExecutor {
     if (reply['ok'] != true) {
       final String reason = (reply['error'] ?? '未知失败').toString();
       final Object? kind = reply['error_kind'];
+      // 链路级失败（隧道断了/没就绪）= 后端不可达；业务失败按远端错误码落码
+      // （`fs.rename` 的目标已存在、`fs.stat` 的路径不存在都在这里收口）。
+      final String code = kind != null
+          ? SshCodes.backendUnreachable
+          : _codeForRemoteError(reply['error_code']);
       throw SshStationError(
         kind == null ? reason : '$reason（${kind.toString()}）',
+        code: code,
       );
     }
     final Object? result = reply['result'];
@@ -1016,17 +1121,26 @@ class SshWorkspaceExecutor {
   String _absPath(_SshLease lease, Object? raw) {
     final String relative = (raw ?? '').toString().trim();
     if (relative.isEmpty) {
-      throw SshStationError('缺少 path（工作空间内相对路径）');
+      throw SshStationError(
+        '缺少 path（工作空间内相对路径）',
+        code: SshCodes.invalidArguments,
+      );
     }
     if (relative.startsWith('/')) {
-      throw SshStationError('path 必须是工作空间内相对路径：$relative');
+      throw SshStationError(
+        'path 必须是工作空间内相对路径：$relative',
+        code: SshCodes.invalidArguments,
+      );
     }
     final String root = lease.root.endsWith('/')
         ? lease.root.substring(0, lease.root.length - 1)
         : lease.root;
     final String absolute = normalizePosixPath('$root/$relative');
     if (!isWithinRoot(absolute, lease.root)) {
-      throw SshStationError('path 越出工作空间根目录：$relative');
+      throw SshStationError(
+        'path 越出工作空间根目录：$relative',
+        code: SshCodes.invalidArguments,
+      );
     }
     return absolute;
   }

@@ -200,7 +200,7 @@ tree.agent 的 agent / 工具在 SSH 工作空间上跑时，**不能**再落到
   登记时过线一次**；后续命令只带 `ssh_lease_id` + `root`。租约记住**登记方**
   （`meta.source_plugin_id`）：别的插件拿同一个 `ssh_lease_id` 来问 ⇒ `lease_denied`
   （fail-closed，与本机侧同一口径，不去猜也不静默回退）。插件进程重启后租约丢失，
-  命令回 `ssh_lease_unknown:` 前缀，tree.agent 据此**重登记并只重试一次**（其它业务失败
+  命令回 `lease_unknown` 码，tree.agent 据此**重登记并只重试一次**（其它业务失败
   绝不重放）。
 - **为什么命令名带 `ssh.` 前缀**：核心 `station/command` 按命令名**全局**路由；
   `local_executor` 占用同后缀的 `local.*`（自建执行站命令全局唯一，无前缀会同名冲突）。
@@ -252,7 +252,7 @@ dart test
   健康时仍是 no-op）；④ 重建前按一次性 token 收上一世 agent（且**守卫命令形状**没有"无条件 kill"）；
 - `plugin_loop_test`：L1 分发（含未知方法 `-32601`）、去重（同 key 复用 `conn_id`）、错误分类、`shutdown`/stdin 关闭退出、
   慢 `ensure` 不堵 `ping`；另有 **SSH 工作空间执行站 3 条**（hello 后申报形状 / `station/request` 投递
-  `ssh.lease.register` + `ssh.file.read` 走既有 L2 / 未登记租约回 `ssh_lease_unknown`）；
+  `ssh.lease.register` + `ssh.file.read` 走既有 L2 / 未登记租约回 `lease_unknown` 码）；
 - `exec_station_test`：**执行站 17 条**——命令表与 `local_executor` 的 `local.*` 命名隔离、
   租约登记（ssh 配置只在这里建隧道）、未登记租约错误契约、**租约归属**（非登记方借句柄 ⇒
   `lease_denied`，与本机侧同一口径）、`file.read` 相对→远端绝对路径与行切片 / 二进制 base64 /

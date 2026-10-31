@@ -128,12 +128,14 @@ class LlmJsonCaller {
         'error': modelId.isEmpty
             ? 'agent $agentId 尚未指定模型：llm.call 需要该 agent 的模型'
             : '模型配置不存在：$modelId（可能已被删除）',
+        'code': 'invalid_arguments',
       };
     }
     if (config.baseUrl.trim().isEmpty || config.apiKey.trim().isEmpty) {
       return <String, dynamic>{
         'error': '模型「${config.name.isEmpty ? config.modelId : config.name}」'
             '缺少 base_url 或 api_key',
+        'code': 'invalid_arguments',
       };
     }
     final String effectiveModel = (model ?? '').trim().isEmpty
@@ -147,6 +149,7 @@ class LlmJsonCaller {
     if (built.isEmpty) {
       return const <String, dynamic>{
         'error': 'llm.call 需要 messages（数组）或 prompt（字符串）',
+        'code': 'invalid_arguments',
       };
     }
     // 工具声明：**原样透传**，不解析成 spec 再重建——插件给自己的前缀要与对话
@@ -157,6 +160,7 @@ class LlmJsonCaller {
         if (item is! Map) {
           return const <String, dynamic>{
             'error': 'llm.call 的 tools 里有非对象元素（应为 OpenAI 工具声明）',
+            'code': 'invalid_arguments',
           };
         }
         rawTools.add(
@@ -319,7 +323,11 @@ class LlmJsonCaller {
     );
     if (failure.isNotEmpty) {
       log?.call('llm.call 失败（agent=$agentId model=$effectiveModel）：$failure');
-      return <String, dynamic>{'error': failure, 'model': effectiveModel};
+      return <String, dynamic>{
+        'error': failure,
+        'model': effectiveModel,
+        'code': 'backend_unreachable',
+      };
     }
     final String raw = text.toString();
     final Object? parsed = _tryParseJson(raw);
@@ -348,6 +356,7 @@ class LlmJsonCaller {
             : '模型没有返回合法 JSON（站点处硬设了 response_format=json_object；'
                   '若该端点不支持该参数，请换用支持的模型）',
         'error_kind': 'json_parse',
+        'code': 'unknown',
         'text': raw,
         'text_length': raw.length,
         'truncated_suspect': truncated,

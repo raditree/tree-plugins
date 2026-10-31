@@ -363,8 +363,12 @@ class PluginLoop {
                 'reply': <String, dynamic>{'payload': executed},
               });
             } catch (error) {
+              // 失败必带码（契约 §4）：执行站异常带自己的码，其它一律 `unknown`。
               _reply(id, <String, dynamic>{
-                'reply': <String, dynamic>{'error': error.toString()},
+                'reply': <String, dynamic>{
+                  'error': error.toString(),
+                  'code': error is SshStationError ? error.code : 'unknown',
+                },
               });
             }
             return;

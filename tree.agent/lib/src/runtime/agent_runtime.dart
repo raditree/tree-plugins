@@ -55,13 +55,12 @@ import '../ws/ws_hub.dart';
 const String kLocalStationCommandPrefix = 'local.';
 const String kSshStationCommandPrefix = 'ssh.';
 
-/// 本机执行站（`local_executor`）的租约登记命令与**租约失效前缀**（契约 §8.3）：
+/// 本机执行站（`local_executor`）的租约登记命令与**租约失效码**（契约 §8.3）：
 /// 看到后者才丢弃缓存租约、重新登记并重试一次（其余失败可能是写了一半，绝不重试）。
 const String kLocalLeaseRegisterCommand = 'local.lease.register';
-const String kLocalLeaseUnknownCode = 'local_lease_unknown';
 
-/// SSH 执行站（`ssh_executor`）的**租约失效前缀**，判据与本机侧同一条。
-const String kSshLeaseUnknownCode = 'ssh_lease_unknown';
+/// 租约失效的**唯一**码（本机与 SSH 同码，契约 §4.2 只登记 `lease_unknown`）。
+const String kLeaseUnknownCode = 'lease_unknown';
 
 /// 一条本机命令在 SSH 模式下的执行站命令名：前缀 `local.` 换 `ssh.`。
 ///
@@ -1033,7 +1032,7 @@ class AgentRuntime {
             scope,
           );
         } catch (error) {
-          if (!'$error'.contains(kSshLeaseUnknownCode)) rethrow;
+          if (!_isLeaseUnknown(error)) rethrow;
           _sshLeases.remove(_sshLeaseKey(agentId, ssh));
           final _SshWorkspaceLease renewed = await _sshLeaseFor(agentId, ssh);
           return client(
@@ -1054,7 +1053,7 @@ class AgentRuntime {
             scope,
           );
         } catch (error) {
-          if (!'$error'.contains(kLocalLeaseUnknownCode)) rethrow;
+          if (!_isLeaseUnknown(error)) rethrow;
           _localLeases.remove(root);
           final String renewed = await _localLeaseFor(root, scope);
           return client(
@@ -1067,6 +1066,13 @@ class AgentRuntime {
     }
     return client(command, arguments, scope);
   }
+
+  /// 失败是否**确定未执行**（只有 `lease_unknown` 这一个码可以安全重发）。
+  ///
+  /// 判据必须是结构化错误码，不是消息文本：过去两侧各扫 `*_lease_unknown`
+  /// 前缀，插件换文案就会静默失去重登记能力（契约 §4.1）。
+  static bool _isLeaseUnknown(Object error) =>
+      error is StationCommandFailure && error.code == kLeaseUnknownCode;
 
   /// 取（或登记）本机工作空间租约（`local_executor` 侧那张表）。
   ///

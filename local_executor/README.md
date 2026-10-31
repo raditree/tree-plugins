@@ -34,7 +34,7 @@
 - 终端命令在 `root` 下执行；错误/越界以可读中文回给调用方；
 - **租约归属 fail-closed**：租约记住登记方（`meta.source_plugin_id`），别的插件拿同一个
   `local_lease_id` 来问 ⇒ `lease_denied`，不去猜、不静默回退；租约表里没有 ⇒
-  `local_lease_unknown`（调用方据此重登记并只重试一次）。
+  `lease_unknown` 码（调用方据此重登记并只重试一次）。
 
 ## 限制
 

@@ -32,16 +32,29 @@ const List<String> kLocalWorkspaceCommands = <String>[
 
 /// 租约未登记 / 插件重启过：调用方应重新 `local.lease.register` 再重试一次。
 ///
-/// 这个前缀是**契约**（与 `ssh_executor` 的 `ssh_lease_unknown` 同一角色）：
+/// 这个码是**契约**（与 `ssh_executor` 的同一个 `lease_unknown` 同一角色，契约 §4.2）：
 /// 调用方只在看到它时才丢弃缓存租约、重登记并重试；其它失败可能是写了一半，
-/// **绝不重试**。`code` 字段链路（契约 §4）落地后统一成 `lease_unknown`。
-const String kLocalLeaseUnknownCode = 'local_lease_unknown';
+/// **绝不重试**。
+const String kLeaseUnknownCode = 'lease_unknown';
 
 /// 租约归属不符：登记方与调用方不是同一个插件，**fail-closed 拒绝且不重试**。
 ///
 /// 为什么这条必须在插件侧：核心过去替本机看着"租约只能登记方自己用"
 /// （`workspace/register` 那套簿记），租约统一到插件侧后这个判断只剩这里一个落点。
 const String kLeaseDeniedCode = 'lease_denied';
+
+/// 本机执行器产生的稳定错误码（值逐字对齐 `tree_protocol` 的
+/// `ExecStationErrorCodes`；插件仓不 import 协议包，一致性由桌面仓的码表门禁
+/// 扫字面量兜住）。
+abstract final class LocalCodes {
+  static const String commandUnknown = 'command_unknown';
+  static const String invalidArguments = 'invalid_arguments';
+  static const String fileNotFound = 'file_not_found';
+  static const String notAFile = 'not_a_file';
+  static const String dirNotEmpty = 'dir_not_empty';
+  static const String targetExists = 'target_exists';
+  static const String badBase64 = 'bad_base64';
+}
 
 /// `local.file.read` **文本模式**单次最多读的原文（8 MiB，与 SSH 侧同口径）。
 const int _kMaxReadBytes = 8 * 1024 * 1024;
@@ -53,10 +66,14 @@ const int _kMaxReadTextChars = 512 * 1024;
 String localWorkspaceStationId(String pluginId) =>
     'plugin.$pluginId.execute.$kLocalWorkspaceStationName';
 
-/// 执行器错误：带可读中文原因，入口原样回给核心。
+/// 执行器错误：带可读中文原因与**稳定错误码**（契约 §4：失败必带码，禁空）。
 class ExecutorError implements Exception {
-  ExecutorError(this.message);
+  ExecutorError(this.message, {required this.code})
+    : assert(code.isNotEmpty, 'ExecutorError 必须带错误码');
   final String message;
+
+  /// 稳定错误码（值必须是 `tree_protocol` 码表里的一条）。
+  final String code;
   @override
   String toString() => message;
 }
@@ -121,7 +138,10 @@ class LocalExecutor {
       case 'local.exec.command':
         return _terminal(root, arguments);
       default:
-        throw ExecutorError('本机执行器不支持命令：$command');
+        throw ExecutorError(
+          '本机执行器不支持命令：$command',
+          code: LocalCodes.commandUnknown,
+        );
     }
   }
 
@@ -139,11 +159,15 @@ class LocalExecutor {
     if (raw.isEmpty || !p.isAbsolute(raw)) {
       throw ExecutorError(
         'local.lease.register 需要绝对路径 dir（本机工作空间根）',
+        code: LocalCodes.invalidArguments,
       );
     }
     final String normalized = p.normalize(raw);
     if (!Directory(normalized).existsSync()) {
-      throw ExecutorError('工作空间根目录不存在：$normalized');
+      throw ExecutorError(
+        '工作空间根目录不存在：$normalized',
+        code: LocalCodes.fileNotFound,
+      );
     }
     final String leaseId = requested.isNotEmpty
         ? requested
@@ -151,10 +175,11 @@ class LocalExecutor {
     final _LocalLease? existing = _leases[leaseId];
     if (existing != null && existing.registrant != sourcePluginId) {
       throw ExecutorError(
-        '$kLeaseDeniedCode: 租约 $leaseId 由插件 '
+        '租约 $leaseId 由插件 '
         '${existing.registrant.isEmpty ? '核心' : existing.registrant} 登记，'
         '${sourcePluginId.isEmpty ? '核心' : sourcePluginId} 不能顶掉它'
         '（fail-closed）',
+        code: kLeaseDeniedCode,
       );
     }
     _leases[leaseId] = _LocalLease(
@@ -175,25 +200,30 @@ class LocalExecutor {
     if (id.isEmpty) {
       throw ExecutorError(
         '缺少 local_lease_id（先 local.lease.register 登记工作空间根）',
+        code: LocalCodes.invalidArguments,
       );
     }
     final _LocalLease? lease = _leases[id];
     if (lease == null) {
       throw ExecutorError(
-        '$kLocalLeaseUnknownCode: 租约 $id 未登记（插件进程可能重启过；'
-        '请重新 local.lease.register）',
+        '租约 $id 未登记（插件进程可能重启过；请重新 local.lease.register）',
+        code: kLeaseUnknownCode,
       );
     }
     if (lease.registrant != sourcePluginId) {
       throw ExecutorError(
-        '$kLeaseDeniedCode: 租约 $id 由插件 '
+        '租约 $id 由插件 '
         '${lease.registrant.isEmpty ? '核心' : lease.registrant} 登记，'
         '${sourcePluginId.isEmpty ? '核心' : sourcePluginId} 不能用它'
         '（fail-closed）',
+        code: kLeaseDeniedCode,
       );
     }
     if (!Directory(lease.root).existsSync()) {
-      throw ExecutorError('工作空间根目录不存在：${lease.root}');
+      throw ExecutorError(
+        '工作空间根目录不存在：${lease.root}',
+        code: LocalCodes.fileNotFound,
+      );
     }
     return lease.root;
   }
@@ -207,13 +237,24 @@ class LocalExecutor {
 
   String _resolve(String root, String relative) {
     final String rel = relative.trim();
-    if (rel.isEmpty) throw ExecutorError('缺少 path（工作空间内相对路径）');
+    if (rel.isEmpty) {
+      throw ExecutorError(
+        '缺少 path（工作空间内相对路径）',
+        code: LocalCodes.invalidArguments,
+      );
+    }
     if (p.isAbsolute(rel)) {
-      throw ExecutorError('path 必须是工作空间内相对路径：$rel');
+      throw ExecutorError(
+        'path 必须是工作空间内相对路径：$rel',
+        code: LocalCodes.invalidArguments,
+      );
     }
     final String joined = p.normalize(p.join(root, rel));
     if (joined != root && !p.isWithin(root, joined)) {
-      throw ExecutorError('path 越出工作空间根目录：$rel');
+      throw ExecutorError(
+        'path 越出工作空间根目录：$rel',
+        code: LocalCodes.invalidArguments,
+      );
     }
     return joined;
   }
@@ -228,9 +269,17 @@ class LocalExecutor {
     final String relative = (args['path'] ?? args['file_path'] ?? '').toString();
     final String path = _resolve(root, relative);
     final File file = File(path);
-    if (!file.existsSync()) throw ExecutorError('文件不存在：$relative');
+    if (!file.existsSync()) {
+      throw ExecutorError(
+        '文件不存在：$relative',
+        code: LocalCodes.fileNotFound,
+      );
+    }
     if (FileSystemEntity.typeSync(path) == FileSystemEntityType.directory) {
-      throw ExecutorError('目标是目录，不能读取：$relative');
+      throw ExecutorError(
+        '目标是目录，不能读取：$relative',
+        code: LocalCodes.notAFile,
+      );
     }
     final int size = file.lengthSync();
     // **分块下载通道**（`raw: true`）：二进制原样回 base64，不做行处理、不受
@@ -366,7 +415,10 @@ class LocalExecutor {
       entries.add(_relative(root, base));
       addDetail(File(base), _relative(root, base), 'file');
     } else {
-      throw ExecutorError('路径不存在：$relative');
+      throw ExecutorError(
+        '路径不存在：$relative',
+        code: LocalCodes.fileNotFound,
+      );
     }
     return <String, dynamic>{
       'path': relative,
@@ -386,13 +438,19 @@ class LocalExecutor {
     final String path = _resolve(root, relative);
     final FileSystemEntityType type = FileSystemEntity.typeSync(path);
     if (type == FileSystemEntityType.notFound) {
-      throw ExecutorError('路径不存在：$relative');
+      throw ExecutorError(
+        '路径不存在：$relative',
+        code: LocalCodes.fileNotFound,
+      );
     }
     final bool recursive = args['recursive'] == true;
     if (type == FileSystemEntityType.directory) {
       final Directory dir = Directory(path);
       if (!recursive && dir.listSync().isNotEmpty) {
-        throw ExecutorError('目录非空，删除需要 recursive=true：$relative');
+        throw ExecutorError(
+          '目录非空，删除需要 recursive=true：$relative',
+          code: LocalCodes.dirNotEmpty,
+        );
       }
       dir.deleteSync(recursive: recursive);
     } else {
@@ -423,13 +481,19 @@ class LocalExecutor {
     final String encoded = (args['base64'] ?? args['content_base64'] ?? '')
         .toString();
     if (encoded.isEmpty) {
-      throw ExecutorError('local.file.writeBytes 需要 base64（要写入的二进制）');
+      throw ExecutorError(
+        'local.file.writeBytes 需要 base64（要写入的二进制）',
+        code: LocalCodes.invalidArguments,
+      );
     }
     final List<int> bytes;
     try {
       bytes = base64Decode(encoded);
     } on FormatException {
-      throw ExecutorError('local.file.writeBytes 的 base64 非法');
+      throw ExecutorError(
+        'local.file.writeBytes 的 base64 非法',
+        code: LocalCodes.badBase64,
+      );
     }
     final File file = File(path);
     await file.parent.create(recursive: true);
@@ -455,16 +519,25 @@ class LocalExecutor {
     final String from = (args['from'] ?? args['path'] ?? '').toString();
     final String to = (args['to'] ?? args['new_path'] ?? '').toString();
     if (from.trim().isEmpty || to.trim().isEmpty) {
-      throw ExecutorError('local.file.rename 需要 from 与 to');
+      throw ExecutorError(
+        'local.file.rename 需要 from 与 to',
+        code: LocalCodes.invalidArguments,
+      );
     }
     final String source = _resolve(root, from);
     final String target = _resolve(root, to);
     final FileSystemEntityType type = FileSystemEntity.typeSync(source);
     if (type == FileSystemEntityType.notFound) {
-      throw ExecutorError('文件不存在：$from');
+      throw ExecutorError(
+        '文件不存在：$from',
+        code: LocalCodes.fileNotFound,
+      );
     }
     if (FileSystemEntity.typeSync(target) != FileSystemEntityType.notFound) {
-      throw ExecutorError('目标已存在，rename 不覆盖：$to');
+      throw ExecutorError(
+        '目标已存在，rename 不覆盖：$to',
+        code: LocalCodes.targetExists,
+      );
     }
     final String parent = p.dirname(target);
     if (!Directory(parent).existsSync()) {
@@ -485,7 +558,12 @@ class LocalExecutor {
     Map<String, dynamic> args,
   ) async {
     final String pattern = (args['pattern'] ?? '').toString();
-    if (pattern.isEmpty) throw ExecutorError('local.file.grep 需要 pattern');
+    if (pattern.isEmpty) {
+      throw ExecutorError(
+        'local.file.grep 需要 pattern',
+        code: LocalCodes.invalidArguments,
+      );
+    }
     final bool regex = args['regex'] == true;
     final bool ignoreCase = args['ignore_case'] == true;
     final RegExp matcher = regex
@@ -546,7 +624,10 @@ class LocalExecutor {
     } else if (FileSystemEntity.typeSync(base) == FileSystemEntityType.file) {
       scanFile(File(base));
     } else {
-      throw ExecutorError('路径不存在：$relative');
+      throw ExecutorError(
+        '路径不存在：$relative',
+        code: LocalCodes.fileNotFound,
+      );
     }
     return <String, dynamic>{
       'pattern': pattern,
@@ -570,6 +651,7 @@ class LocalExecutor {
       if (task == null) {
         throw ExecutorError(
           '未知 task_id：$taskId（现有：${_hooks.keys.join('、')}）',
+          code: LocalCodes.invalidArguments,
         );
       }
       if (hookAction == 'cancel') {
@@ -578,13 +660,23 @@ class LocalExecutor {
         return task.statusPayload(prefix: '已请求终止');
       }
       if (hookAction == 'status') return task.statusPayload();
-      throw ExecutorError('未知 hook_action：$hookAction（可用：status / cancel）');
+      throw ExecutorError(
+        '未知 hook_action：$hookAction（可用：status / cancel）',
+        code: LocalCodes.invalidArguments,
+      );
     }
     if (args['hook'] == true) {
-      if (command.isEmpty) throw ExecutorError('command 不能为空');
+      if (command.isEmpty) {
+        throw ExecutorError('command 不能为空', code: LocalCodes.invalidArguments);
+      }
       return _startHook(root, command);
     }
-    if (command.isEmpty) throw ExecutorError('local.exec.command 需要 command');
+    if (command.isEmpty) {
+      throw ExecutorError(
+        'local.exec.command 需要 command',
+        code: LocalCodes.invalidArguments,
+      );
+    }
     final int softTimeout =
         ((args['timeout_seconds'] as num?)?.toInt() ?? 0);
     if (softTimeout > 0) {

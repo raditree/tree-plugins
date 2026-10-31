@@ -65,6 +65,19 @@ abstract final class Cmd {
   static const String stateFetch = 'plugin.stateFetch';
 }
 
+/// **执行站回包信封的键名**（与核心 `ExecStationEnvelopeKeys` 逐字一致）。
+///
+/// 插件仓不许 import `tree_protocol`（L-21），所以这里抄同一组名字；两张表的一致性
+/// 由桌面仓的 `exec_station_error_code_gate_test.dart` 扫字面量兜住。
+abstract final class Envelope {
+  static const String command = 'command';
+  static const String ok = 'ok';
+  static const String mountId = 'mount_id';
+  static const String payload = 'payload';
+  static const String error = 'error';
+  static const String code = 'code';
+}
+
 /// **插件 UI 的约定 method**（走通知，不是请求；也不在 `PluginRpcMethods` 里）。
 ///
 /// 为什么单独一张表而不挂进 [M]：UI 帧的家在 `PluginUiFrameType`（核心把这两个
@@ -208,8 +221,18 @@ Map<String, dynamic> asJson(Object? value) {
 
 /// 执行站命令失败（原因已经是人话，直接转给日志或回包）。
 class CmdFailureException implements Exception {
-  CmdFailureException(this.message, [this.payload = const <String, Object?>{}]);
+  CmdFailureException(
+    this.message, {
+    this.code = '',
+    this.payload = const <String, Object?>{},
+  });
   final String message;
+
+  /// 执行站回包里的**稳定错误码**（契约 §4）；老产物没给码时为空串。
+  ///
+  /// 消费方只按它分支（`lease_unknown` ⇒ 重登记并只重试一次），**不再嗅探 message**
+  /// ——文案改一个字就静默破坏重试语义，是这条链此前最大的坑（契约 §3.2）。
+  final String code;
 
   /// 失败回包里**一并递回来的那份结果**。
   ///
@@ -360,20 +383,22 @@ class PluginChannel {
       M.stationCommand,
       params,
     );
-    final Object? error = response['error'];
+    final Object? error = response[Envelope.error];
     final String reason = error?.toString() ?? '';
-    if (reason.trim().isNotEmpty || response['ok'] == false) {
+    if (reason.trim().isNotEmpty || response[Envelope.ok] == false) {
       // **失败也要把 payload 带走**（不带走 = 插件只能弃权，见 [CmdFailureException.payload]）。
-      final Object? payload = response['payload'];
+      final Object? payload = response[Envelope.payload];
       throw CmdFailureException(
         // 两条判据收敛成同一个异常：只缺原因就补一句可读的（不许抛一个空消息）。
         reason.trim().isEmpty
             ? '核心回 ok:false 且没有给出原因（command=$command）'
             : reason,
-        payload is Map ? asMap(payload) : const <String, Object?>{},
+        // 码同样原样带出（老产物没有 code ⇒ 空串，调用方按"不可分支"处理）。
+        code: (response[Envelope.code] ?? '').toString(),
+        payload: payload is Map ? asMap(payload) : const <String, Object?>{},
       );
     }
-    final Object? payload = response['payload'];
+    final Object? payload = response[Envelope.payload];
     return payload is Map ? asMap(payload) : response;
   }
 

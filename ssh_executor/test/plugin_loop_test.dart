@@ -653,7 +653,7 @@ void main() {
       expect(denied['error'].toString(), contains('越出工作空间根目录'));
     });
 
-    test('未登记租约经执行站回 ssh_lease_unknown（tree.agent 据此重登记）', () async {
+    test('未登记租约经执行站回 lease_unknown 码（tree.agent 据此重登记）', () async {
       await harness.request(95, StationMethods.request, <String, dynamic>{
         'station_id': sshWorkspaceStationId(kPluginId),
         'payload': <String, dynamic>{
@@ -665,7 +665,7 @@ void main() {
         },
       });
       final Map<String, dynamic> reply = asMap(harness.resultOf(95)['reply']);
-      expect(reply['error'].toString(), contains(kSshLeaseUnknownCode));
+      expect(reply['code'], kSshLeaseUnknownCode);
     });
   });
 }
