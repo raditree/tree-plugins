@@ -179,6 +179,16 @@ Future<Map<String, dynamic>?> handleRequest(
               args,
               scope,
             );
+        // 站级失败口径（契约 §2.4 / Q-7 (a)）：载荷里 `error` 非空 = 命令失败，
+        // 回 `{error, payload}` 让核心把 `ok:false` 与载荷**一起**带回调用方
+        // （`llm.call` 已付费正文不能丢，known-issues #31）。
+        // 工具级失败（未知命令等）仍走 `{text, is_error}` 的 payload，不是站级失败。
+        final String stationError = asString(result['error']);
+        if (stationError.isNotEmpty) {
+          return <String, dynamic>{
+            'reply': <String, dynamic>{'error': stationError, 'payload': result},
+          };
+        }
         return <String, dynamic>{
           'reply': <String, dynamic>{'payload': result},
         };

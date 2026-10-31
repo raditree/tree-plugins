@@ -13,6 +13,7 @@ import '../agent/subagent_service.dart';
 import '../agent_store.dart';
 import '../compat/protocol_types.dart';
 import '../llm/llm_agent_engine.dart';
+import '../llm/llm_json_caller.dart';
 import '../llm/llm_summarizer.dart';
 import '../paths.dart';
 import '../settings/core_settings.dart';
@@ -113,7 +114,7 @@ class AgentRuntime {
       registry: registry,
       settings: settings,
     );
-    final UsageLog usageLog = UsageLog(TreePaths(paths.root));
+    usageLog = UsageLog(TreePaths(paths.root));
     Map<String, Object?> overridesFor(String agentId) {
       for (final AgentRecord record in readAgentRecords(paths)) {
         if (record.id == agentId) return overridesOf(record);
@@ -129,6 +130,12 @@ class AgentRuntime {
         agentOverrides: overridesFor,
       ),
     )..usageLog = usageLog;
+    // 宿主能力 `llm.call` 的落点：一次性调用，缺省硬设 JSON（显式 text 时改走
+    // 对话同形态以复用前缀缓存）。账落在调用方给的会话上。
+    llmCaller = LlmJsonCaller(
+      resolveModel: (String modelId) => settings.model(modelId),
+      agentOverrides: overridesFor,
+    );
     terminalHooks = TerminalHookManager(
       client: _stationCommand,
       scopeFor: _stationScopeFor,
@@ -138,6 +145,16 @@ class AgentRuntime {
             sessionId: sessionId,
             notice: notice,
           ),
+    );
+    // 工具执行器**一份**：生成循环与宿主 `tool.call` 共用同一张工具表
+    // （内置子集 + spec + 贡献工具），两条入口不许各建一份（否则表会漂）。
+    stationToolRunner = StationToolRunner(
+      contributed: () => contributedTools,
+      toolRunsRunner: runToolRuns,
+      specRunner: _runSpecTool,
+      hooks: terminalHooks,
+      client: _stationCommand,
+      scopeFor: _stationScopeFor,
     );
     conversation = ConversationService(
       store: store,
@@ -151,14 +168,7 @@ class AgentRuntime {
             resolveModel: (String modelId) => settings.model(modelId),
             agentOverrides: overridesFor,
             usageLog: usageLog,
-            toolRunner: StationToolRunner(
-              contributed: () => contributedTools,
-              toolRunsRunner: runToolRuns,
-              specRunner: _runSpecTool,
-              hooks: terminalHooks,
-              client: _stationCommand,
-              scopeFor: _stationScopeFor,
-            ),
+            toolRunner: stationToolRunner,
           ),
     );
     teamService = TeamService(
@@ -220,6 +230,11 @@ class AgentRuntime {
   late final SubagentService subagentService;
   late final CompactionService compaction;
   late final ConversationService conversation;
+  late final UsageLog usageLog;
+  late final LlmJsonCaller llmCaller;
+
+  /// 生成循环与宿主 `tool.call` 共用的工具执行器（构造期创建，只一份）。
+  late final StationToolRunner stationToolRunner;
 
   /// 运行中工具登记表（与核心同一实现；工具编排接线后由工具执行器登记）。
   late final ToolRunRegistry toolRuns = ToolRunRegistry();
@@ -235,10 +250,13 @@ class AgentRuntime {
   /// 本插件自建 `agent_tools` 执行站对外申报的命令。
   ///
   /// 领域原语来自 [kAgentToolCommands]；spec.* 是 S1 新增的规范域命令
-  /// （见 [SpecTool.stationCommands]）。执行站注册（入口）必须用这一份，
-  /// 否则 extra-tools 之类经站调用的插件会被核心按“未知命令”拒绝。
+  /// （见 [SpecTool.stationCommands]）；宿主能力五条来自 [kAgentHostCommands]
+  /// （Q-7 (a)：llm.call / fs.read / tool.call / agent.compact / session.rename）。
+  /// 执行站注册（入口）必须用这一份，否则 extra-tools 之类经站调用的插件会被核心
+  /// 按“未知命令”拒绝。
   static List<String> get agentToolCommands => <String>[
     ...kAgentToolCommands,
+    ...kAgentHostCommands,
     ...SpecTool.stationCommands,
   ];
 
@@ -616,6 +634,12 @@ class AgentRuntime {
       case 'message.run':
         final ToolOutcome r = await MessageTool.run(invocation, messageDispatcher);
         return <String, dynamic>{'text': r.content, 'is_error': r.isError};
+      case 'llm.call':
+      case 'fs.read':
+      case 'tool.call':
+      case 'agent.compact':
+      case 'session.rename':
+        return _handleHostCommand(command, arguments, invocation, scope);
       case 'spec.list':
       case 'spec.read':
       case 'spec.select':
@@ -643,6 +667,224 @@ class AgentRuntime {
         return <String, dynamic>{'text': '未知领域工具命令：$command', 'is_error': true};
     }
   }
+
+  /// **宿主能力命令**（`kAgentHostCommands`）：Q-5 A 让名后由 tree.agent 认领。
+  ///
+  /// 回包与核心信封同形：`error` 非空 ⇒ 核心按失败处理，但 `payload` 会一起带回
+  /// 调用方（`StationReply.failedWith`）——`llm.call` 的"已付费正文"靠它抢救。
+  Future<Map<String, dynamic>> _handleHostCommand(
+    String command,
+    Map<String, dynamic> arguments,
+    ToolInvocation invocation,
+    Map<String, dynamic> scope,
+  ) async {
+    switch (command) {
+      case 'llm.call':
+        return _llmCall(arguments, invocation.agentId, invocation.sessionId);
+      case 'fs.read':
+        return _fsRead(arguments, invocation.agentId, invocation.sessionId);
+      case 'tool.call':
+        return _toolCall(arguments, invocation.agentId, invocation.sessionId);
+      case 'agent.compact':
+        return _agentCompact(arguments, invocation.agentId);
+      case 'session.rename':
+        return _sessionRename(
+          arguments,
+          invocation.agentId,
+          invocation.sessionId,
+        );
+      default:
+        return <String, dynamic>{'error': '未知宿主命令：$command'};
+    }
+  }
+
+  /// 一次性 LLM 调用（复用目标 agent 的模型与成员级覆盖）。
+  ///
+  /// 返回形状与旧核心的 `llm.call` 逐字一致：成功 `{ok, json, text, model, usage}`；
+  /// 失败 `{error, error_kind?, text, text_length, truncated_suspect?, model}`。
+  /// `response_format: "text"` 时**不发**该字段（为复用对话前缀缓存，见节点 #27）。
+  Future<Map<String, dynamic>> _llmCall(
+    Map<String, dynamic> arguments,
+    String agentId,
+    String sessionId,
+  ) async {
+    final CoreAgent? agent = store.agent(agentId);
+    if (agent == null) return <String, dynamic>{'error': 'agent 不存在：$agentId'};
+    final Object? rawMessages = arguments['messages'];
+    final Object? rawTools = arguments['tools'];
+    return llmCaller.call(
+      agentId: agentId,
+      modelId: agent.modelId,
+      messages: rawMessages is List ? rawMessages : null,
+      prompt: _text(arguments['prompt']),
+      system: _text(arguments['system']),
+      model: _text(arguments['model']),
+      temperature: _number(arguments['temperature'])?.toDouble(),
+      maxTokens: _number(arguments['max_tokens'])?.toInt(),
+      tools: rawTools is List ? rawTools : null,
+      responseFormat: _responseFormatOf(arguments['response_format']),
+      usageSink: sessionId.isEmpty ? null : usageLog.sinkFor(sessionId),
+    );
+  }
+
+  static String? _responseFormatOf(Object? raw) {
+    final String value = raw is Map ? _text(raw['type']) : _text(raw);
+    return value.toLowerCase() == 'text' ? 'text' : null;
+  }
+
+  /// 读目标 agent 工作空间里的文件（目录解析只在 tree.agent 里做一份）。
+  ///
+  /// 回包键与执行站的 `file.read` 对齐：`{path, content, total_lines, start_line,
+  /// truncated}`（二进制内容额外带 `base64`）。
+  Future<Map<String, dynamic>> _fsRead(
+    Map<String, dynamic> arguments,
+    String agentId,
+    String sessionId,
+  ) async {
+    final String path = _text(arguments['path']).isEmpty
+        ? _text(arguments['file_path'])
+        : _text(arguments['path']);
+    if (path.isEmpty) {
+      return <String, dynamic>{'error': 'fs.read 需要 path'};
+    }
+    final WorkspaceIO? io = await workspaceIoFor(agentId, sessionId);
+    if (io == null) {
+      return <String, dynamic>{'error': '工作空间不可用（执行站未接线或该 agent 没有工作空间）'};
+    }
+    try {
+      final FileContent content = await io.readFile(
+        path,
+        startLine: _number(arguments['start_line'])?.toInt(),
+        lineCount: _number(arguments['line_count'])?.toInt(),
+      );
+      return <String, dynamic>{
+        'path': path,
+        'content': content.text,
+        'total_lines': content.totalLines,
+        'start_line': content.startLine,
+        'truncated': content.truncated,
+        if (content.base64 != null) 'base64': content.base64,
+      };
+    } catch (error) {
+      return <String, dynamic>{'error': '$error'};
+    }
+  }
+
+  /// 执行任意工具：贡献工具经 `plugin.toolCall` 转给贡献插件，其余走本插件的工具表。
+  ///
+  /// 口径与旧核心一致：**命令本身成功 = `ok:true`**；工具自己的失败只体现在
+  /// `is_error:true` + `result` 文本里（模型与插件读同一段可读原因）。
+  Future<Map<String, dynamic>> _toolCall(
+    Map<String, dynamic> arguments,
+    String agentId,
+    String sessionId,
+  ) async {
+    final String tool = _text(arguments['tool']);
+    if (tool.isEmpty) return <String, dynamic>{'error': 'tool.call 需要 tool'};
+    final Object? rawArguments = arguments['arguments'];
+    final Map<String, dynamic> callArguments = rawArguments is Map
+        ? rawArguments.map(
+            (dynamic key, dynamic value) => MapEntry(key.toString(), value),
+          )
+        : <String, dynamic>{};
+    ContributedTool? contributed;
+    if (contributedTools.isEmpty) await refreshContributedTools();
+    for (final ContributedTool item in contributedTools) {
+      if (item.name == tool || item.coreName == tool) {
+        contributed = item;
+        break;
+      }
+    }
+    if (contributed != null) {
+      final Map<String, dynamic> forwarded = await _stationCommand(
+        'plugin.toolCall',
+        <String, dynamic>{
+          'plugin_id': contributed.pluginId,
+          'tool': contributed.coreName,
+          'arguments': callArguments,
+          'scope': _stationScopeFor(agentId, sessionId),
+        },
+        const <String, dynamic>{},
+      );
+      return <String, dynamic>{
+        'tool': tool,
+        'result': (forwarded['result'] ?? '').toString(),
+        'is_error': forwarded['is_error'] == true,
+        // 转给贡献插件不算工具中转；本插件没有 relay 挂钩。
+        'relayed': false,
+      };
+    }
+    final ToolOutcome outcome = await stationToolRunner.run(
+      ToolInvocation(
+        id: 'tool.call-${DateTime.now().microsecondsSinceEpoch}',
+        name: tool,
+        arguments: callArguments,
+        agentId: agentId,
+        sessionId: sessionId,
+      ),
+    );
+    return <String, dynamic>{
+      'tool': tool,
+      'result': outcome.content,
+      'is_error': outcome.isError,
+      'relayed': false,
+    };
+  }
+
+  /// 手动压缩一次：与 REST `/compact` 同一个实现（生成中的 agent 拒绝）。
+  Future<Map<String, dynamic>> _agentCompact(
+    Map<String, dynamic> arguments,
+    String agentId,
+  ) async {
+    final String sessionId = _text(arguments['session_id']);
+    if (conversation.isRunning(agentId)) {
+      return <String, dynamic>{
+        'success': true,
+        'compressed': false,
+        'reason': 'agent_working',
+        'context_size': 0,
+      };
+    }
+    final CompactionResult result = await compaction.compact(agentId, sessionId);
+    return result.toJson();
+  }
+
+  /// 改会话标题；空标题**显式拒绝**（store 层"空标题=不改名"不能在命令层静默成功）。
+  ///
+  /// 改名后广播 `session_renamed` 帧：前端没有"插件发起"的本地路径，不推就看不到。
+  Future<Map<String, dynamic>> _sessionRename(
+    Map<String, dynamic> arguments,
+    String agentId,
+    String sessionId,
+  ) async {
+    final String title = _text(arguments['title']);
+    if (title.isEmpty) {
+      return <String, dynamic>{'error': 'session.rename 需要非空 title'};
+    }
+    final String target = sessionId.isEmpty ? 'session_default' : sessionId;
+    if (!store.renameSession(agentId, target, title)) {
+      return <String, dynamic>{'error': '会话不存在：$target'};
+    }
+    hub.broadcast(<String, dynamic>{
+      'type': WsOutboundType.sessionRenamed,
+      'data': <String, dynamic>{
+        'agent_id': agentId,
+        'session_id': target,
+        'title': title,
+      },
+    });
+    return <String, dynamic>{
+      'renamed': true,
+      'title': title,
+      'session_id': target,
+    };
+  }
+
+  static String _text(Object? value) =>
+      value == null ? '' : '$value'.trim();
+
+  static num? _number(Object? value) =>
+      value is num ? value : num.tryParse('${value ?? ''}'.trim());
 
   Map<String, dynamic> _todoReply(List<TodoItem> todos) => <String, dynamic>{
     'text': todos.isEmpty
