@@ -1,0 +1,89 @@
+# 插件仓独立流水线（L-21 / D-9）。
+#
+# 插件仓可能被第三方单独 clone（没有桌面仓、没有 tree_core / tree_protocol 的
+# package 解析），所以这里必须能**只凭本仓**跑绿：
+# 1. `contract`：检出桌面仓只为拿 `tool/check_plugin_repo_contract.dart`
+#    （门禁的唯一权威副本，避免插件仓再复制一份而漂移），跑 `--selftest` + 全仓扫描；
+# 2. `plugins`：对本仓每个 Dart 插件包跑 `dart pub get` / `dart analyze` / `dart test`。
+#
+# 两条刻意固定：
+# - 一律 `windows-latest`：插件是被 Windows 桌面核心拉起的驻留进程，门禁在真目标平台跑；
+# - SDK 用维护版本（Dart 3.13.4，见桌面仓 docs/handover.md §5.1）：版本落后时
+#   `dart pub get` 会因 `sdk: ^3.13.0` 直接失败，这是有意的红灯。
+#
+# 两个仓都是公开仓，跨仓检出无需 PAT。
+
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  DART_SDK: '3.13.4'
+  DESKTOP_REPO: raditree/Tree
+  DESKTOP_REF: desktop
+
+jobs:
+  contract:
+    name: 零核心依赖（check_plugin_repo_contract）
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出插件仓
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+      - name: 检出桌面仓（门禁脚本所在）
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DESKTOP_REPO }}
+          ref: ${{ env.DESKTOP_REF }}
+          path: desktop
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ env.DART_SDK }}
+      - name: 门禁自检（证明脚本坏了不会静默放行）
+        run: dart run desktop/tool/check_plugin_repo_contract.dart --selftest
+      - name: 插件源码不得 import / 依赖核心包
+        run: dart run desktop/tool/check_plugin_repo_contract.dart --plugin-root plugin
+
+  plugins:
+    name: ${{ matrix.plugin }}（analyze + test）
+    needs: contract
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 只列有 pubspec.yaml 的 Dart 插件包；_kit / release / sample 等夹具不进矩阵。
+        # local_executor 没有 test/ 目录（只用 analyze 守编译），其余都要跑全量测试。
+        include:
+          - plugin: extra-tools
+            tests: true
+          - plugin: files
+            tests: true
+          - plugin: local_executor
+            tests: false
+          - plugin: mcp
+            tests: true
+          - plugin: self_updater
+            tests: true
+          - plugin: ssh_executor
+            tests: true
+          - plugin: tree.agent
+            tests: true
+    defaults:
+      run:
+        working-directory: ${{ matrix.plugin }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ env.DART_SDK }}
+      - run: dart pub get
+      - run: dart analyze
+      - if: matrix.tests
+        run: dart test
