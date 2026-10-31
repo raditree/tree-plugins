@@ -128,7 +128,7 @@ lib/src/llm/               平移：llm_types / openai_codec / sse_parser / llm_
                            llm_agent_engine / llm_json_caller / llm_summarizer / vision_files
 lib/src/workspace/workspace_io.dart  引擎用到的窄工作空间契约（执行站接线后补全）
 lib/src/settings/core_settings.dart  插件侧 CoreSettings 门面（领域设置 + frame_rate，夹取口径同核心）
-lib/src/settings/file_settings_sink.dart  模型池 yaml 落盘 + settings.yaml 只更新 token 速率（保留其余键）
+lib/src/settings/file_settings_sink.dart  模型池 yaml 落盘 + settings.yaml 只更新 token 速率（保留其余键）；L-22 乙方案落地后改落 `config/agent_settings.yaml`，核心退出该键（桌面仓 `docs/pluginization/agent_pluginization.md` §4.8.1）
 lib/src/agent/attachment_prompt.dart + tool_result_repair.dart  附件提示词 / 工具卡自动修复文案
 lib/src/store/usage_log.dart   会话用量账本（追加 jsonl、坏行容忍、只读尾部）
 lib/src/llm/llm_result_gate.dart  超长工具结果重定向/退化口径
