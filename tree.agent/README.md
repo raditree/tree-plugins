@@ -67,20 +67,23 @@ UI 不碰 SSH 凭据。站点 readme / 命令表见 `lib/src/station/agent_execu
 
 ## 执行器依赖（L-24）
 
-> **local_executor 是 tree.agent 的必需依赖**（`requires.plugins: local_executor >=0.4.0`）。
+> **local_executor 是 tree.agent 的必需依赖**（`requires.plugins: local_executor >=0.5.0`）。
 > 执行器缺失/被卸载时 tree.agent 不应启动；已运行时卸载执行器，核心会先要求确认，
 > 确认后**停用 tree.agent**，不会回退到核心内置执行器。
 
 
 
 本机：read / write / edit / list / grep / terminal / tool_runs 由 `local_executor` 自建执行站
-（`plugin.local_executor.execute.local`，命令 `file.*` / `exec.command`）执行；tree.agent 登记
-工作空间租约并随命令下发 `lease_id`。
+（`plugin.local_executor.execute.local`，命令 `local.file.*` / `local.exec.command`）执行；
+tree.agent 发一次 `local.lease.register {dir}` 登记工作空间，后续命令只带 `local_lease_id`。
+**租约表在执行器那边**（契约 §8.3）：核心不再持有 `workspace/register` 那套簿记，也不再
+往 arguments 里注入 `root`。
 
 SSH：tree.agent 在 SSH 模式先向 `ssh_executor` 自建站
 （`plugin.ssh_executor.execute.ssh_workspace`）发 `ssh.lease.register` 取远端根，随后
-`file.*` / `exec.command` 映射为 `ssh.file.*` / `ssh.exec.command`，带 `ssh_lease_id`；执行器
-不可用或租约失效会显式失败（只重登记重试一次），**不回退本机核心 IO**。SSH 后台 hook 尚未支持。
+**只换前缀**：`local.file.*` / `local.exec.command` → `ssh.file.*` / `ssh.exec.command`，
+句柄键同步换成 `ssh_lease_id`（两侧命令族逐字对称，没有第二张映射表）。执行器
+不可用或租约失效会显式失败（`*_lease_unknown` ⇒ 重登记并只重试一次），**不回退本机 IO**。
 
 ## 跑
 
@@ -165,7 +168,7 @@ lib/src/delegate.dart      api/delegate 信封 → 路由分发 → {status, hea
 按 `docs/pluginization/agent_api_contract.md` 的 §1 逐组实现，**先只读、后写**；
 每组的请求/回包/失败码/副作用逐字对齐（G-1 决策：等价优先，除两条新增端点外
 不改行为）。数据来自核心的数据根（原地接管，不搬迁），通过核心的文档化出口
-（`workspace/register` 租约、`/api/store/tree.agent`、`/api/logs/plugin:tree.agent`）
+（执行站命令、`/api/store/tree.agent`、`/api/logs/plugin:tree.agent`）
 而不是 import 核心包。
 
 每搬一条路由的验收步骤：

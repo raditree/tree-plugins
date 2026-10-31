@@ -69,7 +69,7 @@ class TerminalHookManager {
       invocation.sessionId,
     );
     final Map<String, dynamic> result = await client(
-      'exec.command',
+      'local.exec.command',
       <String, dynamic>{
         'command': command,
         'hook': true,
@@ -131,7 +131,7 @@ class TerminalHookManager {
     if (run == null) return ToolOutcome('未知 task_id：$taskId', isError: true);
     try {
       final Map<String, dynamic> result = await client(
-        'exec.command',
+        'local.exec.command',
         <String, dynamic>{'hook_action': 'status', 'task_id': taskId},
         scopeFor(run.agentId, run.sessionId),
       );
@@ -147,7 +147,7 @@ class TerminalHookManager {
     if (run == null) return ToolOutcome('未知 task_id：$taskId', isError: true);
     try {
       final Map<String, dynamic> result = await client(
-        'exec.command',
+        'local.exec.command',
         <String, dynamic>{'hook_action': 'cancel', 'task_id': taskId},
         scopeFor(run.agentId, run.sessionId),
       );

@@ -28,7 +28,6 @@ void main() {
 
   tearDown(() async {
     AgentRuntime.stationClient = null;
-    AgentRuntime.workspaceRegister = null;
     await AgentRuntime.debugCloseAll();
     try {
       if (temp.existsSync()) temp.deleteSync(recursive: true);
@@ -79,16 +78,12 @@ void main() {
     await runtime.waitIdle();
   });
 
-  test('工作空间租约：先 register 再让 fs.* 带 lease_id', () async {
+  test('工作空间租约：先 local.lease.register，再让 local.* 带 local_lease_id', () async {
     final AgentRuntime runtime = AgentRuntime(
       paths: paths,
       engine: ScriptedAgent(chunkDelay: Duration.zero),
     );
-    final List<Map<String, dynamic>> registered = <Map<String, dynamic>>[];
     final List<Map<String, dynamic>> calls = <Map<String, dynamic>>[];
-    AgentRuntime.workspaceRegister = (String id, String dir) async {
-      registered.add(<String, dynamic>{'id': id, 'dir': dir});
-    };
     AgentRuntime.stationClient = (
       String command,
       Map<String, dynamic> arguments,
@@ -99,6 +94,13 @@ void main() {
         'arguments': arguments,
         'scope': scope,
       });
+      if (command == 'local.lease.register') {
+        return <String, dynamic>{
+          'ok': true,
+          'lease_id': arguments['local_lease_id'],
+          'root': arguments['dir'],
+        };
+      }
       return <String, dynamic>{
         'content': 'hello',
         'total_lines': 1,
@@ -113,13 +115,17 @@ void main() {
     expect(io, isNotNull);
     final content = await io!.readFile('a.txt');
     expect(content.text, 'hello');
-    expect(registered, hasLength(1));
-    expect(registered.single['dir'], contains(temp.path));
-    expect(calls.single['command'], 'file.read');
+    expect(calls, hasLength(2));
+    expect(calls.first['command'], 'local.lease.register');
+    final Map<String, dynamic> registerArgs =
+        calls.first['arguments'] as Map<String, dynamic>;
+    expect('${registerArgs['dir']}', contains(temp.path));
+    expect(calls.last['command'], 'local.file.read');
     final Map<String, dynamic> args =
-        calls.single['arguments'] as Map<String, dynamic>;
-    expect(args['lease_id'], registered.single['id']);
-    expect(args.containsKey('root'), isFalse, reason: 'root 由核心注入，不由 agent 传');
+        calls.last['arguments'] as Map<String, dynamic>;
+    expect(args['local_lease_id'], registerArgs['local_lease_id']);
+    expect(args.containsKey('root'), isFalse, reason: 'root 只在执行器那张租约表里');
+    expect(args.containsKey('lease_id'), isFalse, reason: '核心租约簿记已撤');
 
     await io.deleteFile('b.txt');
     final WorkspaceFiles files = io as WorkspaceFiles;
@@ -128,32 +134,19 @@ void main() {
     final List<String> commands = calls
         .map((Map<String, dynamic> call) => '${call['command']}')
         .toList();
-    expect(commands, containsAll(<String>['file.delete', 'file.writeBytes', 'file.mkdir']));
-  });
-
-  test('reconnectSsh：经执行站下发 ssh.reconnect，带 agent 身份', () async {
-    final AgentRuntime runtime = AgentRuntime(
-      paths: paths,
-      engine: ScriptedAgent(chunkDelay: Duration.zero),
+    expect(
+      commands,
+      containsAll(<String>[
+        'local.file.delete',
+        'local.file.writeBytes',
+        'local.file.mkdir',
+      ]),
     );
-    final List<Map<String, dynamic>> calls = <Map<String, dynamic>>[];
-    AgentRuntime.stationClient = (
-      String command,
-      Map<String, dynamic> arguments,
-      Map<String, dynamic> scope,
-    ) async {
-      calls.add(<String, dynamic>{
-        'command': command,
-        'arguments': arguments,
-        'scope': scope,
-      });
-      return <String, dynamic>{'ok': true, 'agent_id': 'agt', 'stale': true};
-    };
-    final Map<String, dynamic> result = await runtime.reconnectSsh('agt');
-    expect(result['stale'], isTrue);
-    expect(calls.single['command'], 'ssh.reconnect');
-    expect((calls.single['arguments'] as Map)['agent_id'], 'agt');
-    expect((calls.single['scope'] as Map)['agent_id'], 'agt');
+    expect(
+      commands.where((String c) => c == 'local.lease.register').length,
+      1,
+      reason: '同一个根只登记一次',
+    );
   });
 
   test('默认引擎是 LlmAgentEngine（生产路径）；未知 agent 返回 null（端点 404）', () async {

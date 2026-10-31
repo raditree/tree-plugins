@@ -42,12 +42,6 @@ Future<void> _onReady(PluginKitServer server) async {
   // 执行站入口：hello 之后插件才能主动向核心下 station/command。
   if (_enableStationClient) {
     AgentRuntime.pluginId = kPluginId;
-    AgentRuntime.workspaceRegister = (String workspaceId, String dir) async {
-      server.channel.notify(M.workspaceRegister, <String, dynamic>{
-        'workspace_id': workspaceId,
-        'dir': dir,
-      });
-    };
     AgentRuntime.stationClient = (String command, Map<String, dynamic> arguments, Map<String, dynamic> scope) =>
         server.channel.command(command, arguments, '', scope);
     AgentRuntime.stationTrigger =
@@ -1946,7 +1940,7 @@ Future<int> selfTest() async {
     final Directory specWorkspace = Directory(
       p.join(temp.path, 'workspaces', 'agt'),
     )..createSync(recursive: true);
-    // 假执行站：把 file.* 落到临时工作空间（自检不开真执行站）。
+    // 假执行站：把 local.* 落到临时工作空间（自检不开真执行站）。
     Future<Map<String, dynamic>> specStation(
       String command,
       Map<String, dynamic> arguments,
@@ -1955,7 +1949,14 @@ Future<int> selfTest() async {
       String abs(String relative) =>
           p.join(specWorkspace.path, p.normalize(relative));
       switch (command) {
-        case 'file.read':
+        case 'local.lease.register':
+          // 租约表在插件侧：自检只需要"登记方自己认得这个句柄"。
+          return <String, dynamic>{
+            'ok': true,
+            'lease_id': arguments['local_lease_id'],
+            'root': specWorkspace.path,
+          };
+        case 'local.file.read':
           final String text = await File(
             abs(arguments['path'].toString()),
           ).readAsString();
@@ -1965,14 +1966,14 @@ Future<int> selfTest() async {
             'start_line': 1,
             'truncated': false,
           };
-        case 'file.write':
+        case 'local.file.write':
           final File file = File(abs(arguments['path'].toString()));
           await file.parent.create(recursive: true);
           await file.writeAsString(arguments['content'].toString());
           return <String, dynamic>{
             'bytes_written': arguments['content'].toString().length,
           };
-        case 'file.list':
+        case 'local.file.list':
           // 与 local_executor 同口径：entries 是**工作空间根为基准的相对路径**
           // （`.self/spec/x.md`），不是裸文件名（SpecService.reset 依赖这一点）。
           final String rel = arguments['path'].toString();
@@ -1986,12 +1987,12 @@ Future<int> selfTest() async {
                       : p.join(rel, p.basename(entity.path)),
             ],
           };
-        case 'file.delete':
+        case 'local.file.delete':
           final File file = File(abs(arguments['path'].toString()));
           final bool deleted = file.existsSync();
           if (deleted) await file.delete();
           return <String, dynamic>{'deleted': deleted};
-        case 'file.mkdir':
+        case 'local.file.mkdir':
           await Directory(
             abs(arguments['path'].toString()),
           ).create(recursive: true);

@@ -3,9 +3,10 @@ import 'dart:typed_data';
 
 import 'station_command.dart';
 
-/// 通过核心执行站读写工作空间（`fs.read` / `fs.write` / `fs.list`）。
+/// 通过核心执行站读写工作空间（`local.file.read` / `local.file.write` / …）。
 ///
-/// 插件不做任何文件系统操作：路径与越界校验、local/SSH 差异全部由执行站承担。
+/// 插件不做任何文件系统操作：路径与越界校验、local/SSH 差异全部由执行站承担
+/// （命令名两侧的**后缀逐字相同**，只换限定词，见 `runtime/agent_runtime.dart`）。
 class StationWorkspaceIo implements StationWorkspace {
   StationWorkspaceIo({
     required this.client,
@@ -43,7 +44,7 @@ class StationWorkspaceIo implements StationWorkspace {
     int? startLine,
     int? lineCount,
   }) async {
-    final Map<String, dynamic> result = await _call('file.read', <String, dynamic>{
+    final Map<String, dynamic> result = await _call('local.file.read', <String, dynamic>{
       'path': path,
       'start_line': ?startLine,
       'line_count': ?lineCount,
@@ -60,7 +61,7 @@ class StationWorkspaceIo implements StationWorkspace {
 
   @override
   Future<int> writeFile(String path, String content) async {
-    final Map<String, dynamic> result = await _call('file.write', <String, dynamic>{
+    final Map<String, dynamic> result = await _call('local.file.write', <String, dynamic>{
       'path': path,
       'content': content,
     });
@@ -73,7 +74,7 @@ class StationWorkspaceIo implements StationWorkspace {
     int maxDepth = 2,
     int maxEntries = 500,
   }) async {
-    final Map<String, dynamic> result = await _call('file.list', <String, dynamic>{
+    final Map<String, dynamic> result = await _call('local.file.list', <String, dynamic>{
       'path': path,
       'max_depth': maxDepth,
       'max_entries': maxEntries,
@@ -85,7 +86,7 @@ class StationWorkspaceIo implements StationWorkspace {
 
   @override
   Future<void> deleteFile(String path, {bool recursive = false}) async {
-    await _call('file.delete', <String, dynamic>{
+    await _call('local.file.delete', <String, dynamic>{
       'path': path,
       'recursive': recursive,
     });
@@ -94,7 +95,7 @@ class StationWorkspaceIo implements StationWorkspace {
   @override
   Future<int> writeBytes(String path, List<int> bytes) async {
     final Map<String, dynamic> result = await _call(
-      'file.writeBytes',
+      'local.file.writeBytes',
       <String, dynamic>{
         'path': path,
         'base64': base64Encode(bytes),
@@ -105,7 +106,7 @@ class StationWorkspaceIo implements StationWorkspace {
 
   @override
   Future<void> makeDirectory(String path) async {
-    await _call('file.mkdir', <String, dynamic>{
+    await _call('local.file.mkdir', <String, dynamic>{
       'path': path,
       'recursive': true,
     });

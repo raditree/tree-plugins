@@ -7,7 +7,8 @@ import '../workspace/station_command.dart';
 /// 通过核心执行站执行的**内置工具子集**（read / write / list / grep / terminal）。
 ///
 /// 插件不直接碰文件与进程：每个工具都翻译成 `station/command` 的 `fs.*` /
-/// `terminal.exec`，身份（agent/team/mode/session）由 [scopeFor] 解析后随命令下发。
+/// `local.exec.command`（SSH 模式下由 `_stationCommand` 换成 `ssh.exec.command`），
+/// 身份（agent/team/mode/session）由 [scopeFor] 解析后随命令下发。
 /// 这是 A3 工具编排的落点；L-24 把执行站迁到 local_executor 后，这里零改动。
 class StationToolRunner implements ToolRunner {
   StationToolRunner({
@@ -197,7 +198,7 @@ class StationToolRunner implements ToolRunner {
   ) async {
     final String path = (invocation.arguments['path'] ?? '').toString().trim();
     if (path.isEmpty) return const ToolOutcome('read 需要 path', isError: true);
-    final Map<String, dynamic> result = await client('file.read', <String, dynamic>{
+    final Map<String, dynamic> result = await client('local.file.read', <String, dynamic>{
       'path': path,
       if (invocation.arguments['start_line'] != null)
         'start_line': invocation.arguments['start_line'],
@@ -215,7 +216,7 @@ class StationToolRunner implements ToolRunner {
   ) async {
     final String path = (invocation.arguments['path'] ?? '').toString().trim();
     if (path.isEmpty) return const ToolOutcome('write 需要 path', isError: true);
-    final Map<String, dynamic> result = await client('file.write', <String, dynamic>{
+    final Map<String, dynamic> result = await client('local.file.write', <String, dynamic>{
       'path': path,
       'content': (invocation.arguments['content'] ?? '').toString(),
     }, scope);
@@ -234,7 +235,7 @@ class StationToolRunner implements ToolRunner {
     final bool replaceAll = invocation.arguments['replace_all'] == true;
     if (path.isEmpty) return const ToolOutcome('file_path 不能为空', isError: true);
     if (oldText.isEmpty) return const ToolOutcome('old_text 不能为空', isError: true);
-    final Map<String, dynamic> read = await client('file.read', <String, dynamic>{
+    final Map<String, dynamic> read = await client('local.file.read', <String, dynamic>{
       'path': path,
     }, scope);
     final String text = (read['content'] ?? '').toString();
@@ -253,7 +254,7 @@ class StationToolRunner implements ToolRunner {
         ? text.replaceAll(oldText, newText)
         : text.replaceFirst(oldText, newText);
     final Map<String, dynamic> written = await client(
-      'file.write',
+      'local.file.write',
       <String, dynamic>{'path': path, 'content': next},
       scope,
     );
@@ -267,7 +268,7 @@ class StationToolRunner implements ToolRunner {
     ToolInvocation invocation,
     Map<String, dynamic> scope,
   ) async {
-    final Map<String, dynamic> result = await client('file.list', <String, dynamic>{
+    final Map<String, dynamic> result = await client('local.file.list', <String, dynamic>{
       'path': (invocation.arguments['path'] ?? '.').toString(),
       if (invocation.arguments['max_depth'] != null)
         'max_depth': invocation.arguments['max_depth'],
@@ -283,7 +284,7 @@ class StationToolRunner implements ToolRunner {
   ) async {
     final String pattern = (invocation.arguments['pattern'] ?? '').toString();
     if (pattern.isEmpty) return const ToolOutcome('grep 需要 pattern', isError: true);
-    final Map<String, dynamic> result = await client('file.grep', <String, dynamic>{
+    final Map<String, dynamic> result = await client('local.file.grep', <String, dynamic>{
       'pattern': pattern,
       if (invocation.arguments['path'] != null)
         'path': invocation.arguments['path'],
@@ -324,7 +325,7 @@ class StationToolRunner implements ToolRunner {
       return manager.start(invocation);
     }
     if (command.isEmpty) return const ToolOutcome('terminal 需要 command', isError: true);
-    final Map<String, dynamic> result = await client('exec.command', <String, dynamic>{
+    final Map<String, dynamic> result = await client('local.exec.command', <String, dynamic>{
       'command': command,
       'timeout_seconds': invocation.arguments['timeout_seconds'] ?? 300,
       if (invocation.arguments['hook'] != null)

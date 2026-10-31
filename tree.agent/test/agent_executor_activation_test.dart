@@ -58,7 +58,6 @@ void main() {
     await seedAgents();
     await AgentRuntime.debugCloseAll();
     calls = <Map<String, dynamic>>[];
-    AgentRuntime.workspaceRegister = (String id, String dir) async {};
     AgentRuntime.stationClient =
         (
           String command,
@@ -84,7 +83,6 @@ void main() {
 
   tearDown(() async {
     AgentRuntime.stationClient = null;
-    AgentRuntime.workspaceRegister = null;
     await AgentRuntime.debugCloseAll();
     try {
       if (temp.existsSync()) temp.deleteSync(recursive: true);

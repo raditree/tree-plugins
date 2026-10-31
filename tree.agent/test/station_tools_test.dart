@@ -28,7 +28,7 @@ void main() {
         'scope': scope,
       });
       switch (command) {
-        case 'file.read':
+        case 'local.file.read':
           final content = await io.readFile(arguments['path'].toString());
           return <String, dynamic>{
             'path': arguments['path'],
@@ -37,24 +37,24 @@ void main() {
             'start_line': 1,
             'truncated': false,
           };
-        case 'file.write':
+        case 'local.file.write':
           final bytes = await io.writeFile(
             arguments['path'].toString(),
             arguments['content'].toString(),
           );
           return <String, dynamic>{'bytes_written': bytes};
-        case 'file.list':
+        case 'local.file.list':
           final entries = await io.listFiles(
             relativePath: arguments['path'].toString(),
           );
           return <String, dynamic>{'entries': entries};
-        case 'file.grep':
+        case 'local.file.grep':
           return <String, dynamic>{
             'matches': <Map<String, dynamic>>[
               <String, dynamic>{'path': '.self/a.md', 'line': 1, 'text': '命中'},
             ],
           };
-        case 'exec.command':
+        case 'local.exec.command':
           return <String, dynamic>{
             'text': 'exit=0\nhello',
             'is_error': false,
@@ -161,7 +161,7 @@ void main() {
       ),
     );
     final Map<String, dynamic> last = calls.last;
-    expect(last['command'], 'exec.command');
+    expect(last['command'], 'local.exec.command');
     expect((last['arguments'] as Map)['hook'], isTrue);
   });
 
