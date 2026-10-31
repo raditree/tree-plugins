@@ -1,0 +1,98 @@
+{
+  "generated_at": "2026-11-01T07:05:54.305874",
+  "platform": "windows",
+  "dart_version": "3.13.4 (stable) (Tue Sep 15 01:01:15 2026 -0700) on \"windows_x64\"",
+  "params": {
+    "output_tokens": 256,
+    "history_messages": 40,
+    "runs": 3,
+    "chars_per_token": 2,
+    "token_scale": 2.0
+  },
+  "scenarios": [
+    {
+      "token_rate": 40,
+      "frame_rate": 25,
+      "window_ms": 40.0,
+      "runs": 3,
+      "first_chunk_ms_median": 47,
+      "total_ms_median": 6408,
+      "frames_median": 160,
+      "tokens_per_frame_avg": 1.6,
+      "tokens_per_frame_max": 2,
+      "frames_per_second_median": 25.0,
+      "cpu_percent": 1.0,
+      "wall_ms": 25641
+    },
+    {
+      "token_rate": 40,
+      "frame_rate": 20,
+      "window_ms": 50.0,
+      "runs": 3,
+      "first_chunk_ms_median": 62,
+      "total_ms_median": 6408,
+      "frames_median": 128,
+      "tokens_per_frame_avg": 2.0,
+      "tokens_per_frame_max": 3,
+      "frames_per_second_median": 20.0,
+      "cpu_percent": 1.6,
+      "wall_ms": 25630
+    },
+    {
+      "token_rate": 200,
+      "frame_rate": 25,
+      "window_ms": 40.0,
+      "runs": 3,
+      "first_chunk_ms_median": 47,
+      "total_ms_median": 1292,
+      "frames_median": 32,
+      "tokens_per_frame_avg": 8.0,
+      "tokens_per_frame_max": 10,
+      "frames_per_second_median": 24.8,
+      "cpu_percent": 0.3,
+      "wall_ms": 5155
+    },
+    {
+      "token_rate": 200,
+      "frame_rate": 20,
+      "window_ms": 50.0,
+      "runs": 3,
+      "first_chunk_ms_median": 63,
+      "total_ms_median": 1282,
+      "frames_median": 26,
+      "tokens_per_frame_avg": 9.8,
+      "tokens_per_frame_max": 13,
+      "frames_per_second_median": 20.3,
+      "cpu_percent": 0.9,
+      "wall_ms": 5140
+    },
+    {
+      "token_rate": 1000,
+      "frame_rate": 25,
+      "window_ms": 40.0,
+      "runs": 3,
+      "first_chunk_ms_median": 47,
+      "total_ms_median": 267,
+      "frames_median": 7,
+      "tokens_per_frame_avg": 36.6,
+      "tokens_per_frame_max": 49,
+      "frames_per_second_median": 26.2,
+      "cpu_percent": 0.0,
+      "wall_ms": 1067
+    },
+    {
+      "token_rate": 1000,
+      "frame_rate": 20,
+      "window_ms": 50.0,
+      "runs": 3,
+      "first_chunk_ms_median": 63,
+      "total_ms_median": 266,
+      "frames_median": 6,
+      "tokens_per_frame_avg": 42.7,
+      "tokens_per_frame_max": 64,
+      "frames_per_second_median": 22.6,
+      "cpu_percent": 0.0,
+      "wall_ms": 1064
+    }
+  ]
+}
