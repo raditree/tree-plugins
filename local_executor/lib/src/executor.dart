@@ -4,6 +4,55 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
+/// 自建执行站的**站名段**（核心拼成 `plugin.local_executor.execute.local`）。
+const String kLocalWorkspaceStationName = 'local';
+
+/// `local.lease.register`：登记一条**本机工作空间租约**（tree.agent 第一次用某个
+/// 本机工作空间时发一次；之后所有命令只带 `local_lease_id`）。
+const String kLocalLeaseRegisterCommand = 'local.lease.register';
+
+/// 本机执行站的命令表。
+///
+/// **与 `ssh_executor` 逐字对称**（[docs/exec_station_contract.md] §8.1）：后缀同一套，
+/// 只换限定词 `local.` / `ssh.`，限定词正是 `StationScope.mode_key` 的两个取值。
+/// 命令名全局唯一（核心按名字查自建站），所以本机族**不能**再叫 `file.*`——
+/// 那既分不清本机还是远端，也和 A5 之后"核心不认识执行器"的口径不符。
+const List<String> kLocalWorkspaceCommands = <String>[
+  kLocalLeaseRegisterCommand,
+  'local.file.read',
+  'local.file.write',
+  'local.file.list',
+  'local.file.grep',
+  'local.file.delete',
+  'local.file.mkdir',
+  'local.file.writeBytes',
+  'local.file.rename',
+  'local.exec.command',
+];
+
+/// 租约未登记 / 插件重启过：调用方应重新 `local.lease.register` 再重试一次。
+///
+/// 这个前缀是**契约**（与 `ssh_executor` 的 `ssh_lease_unknown` 同一角色）：
+/// 调用方只在看到它时才丢弃缓存租约、重登记并重试；其它失败可能是写了一半，
+/// **绝不重试**。`code` 字段链路（契约 §4）落地后统一成 `lease_unknown`。
+const String kLocalLeaseUnknownCode = 'local_lease_unknown';
+
+/// 租约归属不符：登记方与调用方不是同一个插件，**fail-closed 拒绝且不重试**。
+///
+/// 为什么这条必须在插件侧：核心过去替本机看着"租约只能登记方自己用"
+/// （`workspace/register` 那套簿记），租约统一到插件侧后这个判断只剩这里一个落点。
+const String kLeaseDeniedCode = 'lease_denied';
+
+/// `local.file.read` **文本模式**单次最多读的原文（8 MiB，与 SSH 侧同口径）。
+const int _kMaxReadBytes = 8 * 1024 * 1024;
+
+/// `local.file.read` 返回文本的上限（512 KiB，与 SSH 侧同口径）。
+const int _kMaxReadTextChars = 512 * 1024;
+
+/// 核心拼出的自建站 id（与 `PluginBus.selfBuiltStationId` 同形；自检/测试可用）。
+String localWorkspaceStationId(String pluginId) =>
+    'plugin.$pluginId.execute.$kLocalWorkspaceStationName';
+
 /// 执行器错误：带可读中文原因，入口原样回给核心。
 class ExecutorError implements Exception {
   ExecutorError(this.message);
@@ -12,57 +61,148 @@ class ExecutorError implements Exception {
   String toString() => message;
 }
 
-/// 本机执行器：只认 `root`（租约根）与相对路径，**不认 agent/team/mode 身份**。
+/// 一条本机工作空间租约：绝对根目录 + 登记方插件 id（插件进程内有效）。
+class _LocalLease {
+  _LocalLease({
+    required this.leaseId,
+    required this.root,
+    required this.registrant,
+  });
+
+  final String leaseId;
+
+  /// 本机**绝对**工作空间根（越界校验的基线）。
+  final String root;
+
+  /// 登记方的插件 id（空 = 核心登记的）；只有它自己能再用这条租约。
+  final String registrant;
+}
+
+/// 本机执行器：只认**自己登记的租约**与相对路径，**不认 agent/team/mode 身份**。
+///
+/// `root` 的唯一来源是租约表：arguments 里出现的 `root` / `workspace_root` 一律忽略
+/// （核心 `sanitizeStationArguments` 也会剥掉调用方自带的那份，两道都不靠调用方自觉）。
 class LocalExecutor {
   LocalExecutor();
 
   final Map<String, _HookTask> _hooks = <String, _HookTask>{};
+  final Map<String, _LocalLease> _leases = <String, _LocalLease>{};
   int _hookSeq = 0;
+
+  /// 已登记的租约数（诊断 / 自检）。
+  int get leaseCount => _leases.length;
 
   Future<Map<String, dynamic>> execute(
     String command,
-    Map<String, dynamic> arguments,
-  ) async {
+    Map<String, dynamic> arguments, {
+    String sourcePluginId = '',
+  }) async {
+    if (command == kLocalLeaseRegisterCommand) {
+      return _registerLease(arguments, sourcePluginId);
+    }
+    final String root = _rootOf(arguments, sourcePluginId);
     switch (command) {
-      case 'fs.read':
-      case 'file.read':
-        return _read(arguments);
-      case 'fs.write':
-      case 'file.write':
-        return _write(arguments);
-      case 'fs.list':
-      case 'file.list':
-        return _list(arguments);
-      case 'fs.grep':
-      case 'file.grep':
-        return _grep(arguments);
-      case 'fs.delete':
-      case 'file.delete':
-        return _delete(arguments);
-      case 'fs.mkdir':
-      case 'file.mkdir':
-        return _mkdir(arguments);
-      case 'fs.writeBytes':
-      case 'file.writeBytes':
-        return _writeBytes(arguments);
-      case 'terminal.exec':
-      case 'exec.command':
-        return _terminal(arguments);
+      case 'local.file.read':
+        return _read(root, arguments);
+      case 'local.file.write':
+        return _write(root, arguments);
+      case 'local.file.list':
+        return _list(root, arguments);
+      case 'local.file.grep':
+        return _grep(root, arguments);
+      case 'local.file.delete':
+        return _delete(root, arguments);
+      case 'local.file.mkdir':
+        return _mkdir(root, arguments);
+      case 'local.file.writeBytes':
+        return _writeBytes(root, arguments);
+      case 'local.file.rename':
+        return _rename(root, arguments);
+      case 'local.exec.command':
+        return _terminal(root, arguments);
       default:
         throw ExecutorError('本机执行器不支持命令：$command');
     }
   }
 
-  String _root(Map<String, dynamic> args) {
-    final String root = (args['root'] ?? '').toString().trim();
-    if (root.isEmpty || !p.isAbsolute(root)) {
-      throw ExecutorError('执行器需要绝对路径 root（工作空间租约由核心注入）');
+  /// `local.lease.register`：`{dir, local_lease_id?}` → `{ok, lease_id, root}`。
+  ///
+  /// 目录键刻意叫 `dir` 而不是 `root`：核心的 `sanitizeStationArguments` 会把
+  /// `root` / `workspace_root` 从 arguments 里剥掉，用那两个键**根本到不了插件**。
+  Future<Map<String, dynamic>> _registerLease(
+    Map<String, dynamic> arguments,
+    String sourcePluginId,
+  ) async {
+    final String requested =
+        (arguments['local_lease_id'] ?? '').toString().trim();
+    final String raw = (arguments['dir'] ?? '').toString().trim();
+    if (raw.isEmpty || !p.isAbsolute(raw)) {
+      throw ExecutorError(
+        'local.lease.register 需要绝对路径 dir（本机工作空间根）',
+      );
     }
-    final String normalized = p.normalize(root);
+    final String normalized = p.normalize(raw);
     if (!Directory(normalized).existsSync()) {
       throw ExecutorError('工作空间根目录不存在：$normalized');
     }
-    return normalized;
+    final String leaseId = requested.isNotEmpty
+        ? requested
+        : _leaseIdFor(normalized);
+    final _LocalLease? existing = _leases[leaseId];
+    if (existing != null && existing.registrant != sourcePluginId) {
+      throw ExecutorError(
+        '$kLeaseDeniedCode: 租约 $leaseId 由插件 '
+        '${existing.registrant.isEmpty ? '核心' : existing.registrant} 登记，'
+        '${sourcePluginId.isEmpty ? '核心' : sourcePluginId} 不能顶掉它'
+        '（fail-closed）',
+      );
+    }
+    _leases[leaseId] = _LocalLease(
+      leaseId: leaseId,
+      root: normalized,
+      registrant: sourcePluginId,
+    );
+    return <String, dynamic>{
+      'ok': true,
+      'lease_id': leaseId,
+      'root': normalized,
+    };
+  }
+
+  /// 命令进来的第一道：租约必须存在、必须是自己人登记、根目录必须还在。
+  String _rootOf(Map<String, dynamic> args, String sourcePluginId) {
+    final String id = (args['local_lease_id'] ?? '').toString().trim();
+    if (id.isEmpty) {
+      throw ExecutorError(
+        '缺少 local_lease_id（先 local.lease.register 登记工作空间根）',
+      );
+    }
+    final _LocalLease? lease = _leases[id];
+    if (lease == null) {
+      throw ExecutorError(
+        '$kLocalLeaseUnknownCode: 租约 $id 未登记（插件进程可能重启过；'
+        '请重新 local.lease.register）',
+      );
+    }
+    if (lease.registrant != sourcePluginId) {
+      throw ExecutorError(
+        '$kLeaseDeniedCode: 租约 $id 由插件 '
+        '${lease.registrant.isEmpty ? '核心' : lease.registrant} 登记，'
+        '${sourcePluginId.isEmpty ? '核心' : sourcePluginId} 不能用它'
+        '（fail-closed）',
+      );
+    }
+    if (!Directory(lease.root).existsSync()) {
+      throw ExecutorError('工作空间根目录不存在：${lease.root}');
+    }
+    return lease.root;
+  }
+
+  /// 确定性租约 id（同一目录复用同一条；Windows 大小写不敏感）。
+  String _leaseIdFor(String normalizedRoot) {
+    final String identity =
+        normalizedRoot.replaceAll('\\', '/').toLowerCase();
+    return 'local_ws_${base64Url.encode(utf8.encode(identity)).replaceAll('=', '')}';
   }
 
   String _resolve(String root, String relative) {
@@ -81,20 +221,64 @@ class LocalExecutor {
   String _relative(String root, String absolute) =>
       p.relative(absolute, from: root).replaceAll('\\', '/');
 
-  Future<Map<String, dynamic>> _read(Map<String, dynamic> args) async {
-    final String root = _root(args);
+  Future<Map<String, dynamic>> _read(
+    String root,
+    Map<String, dynamic> args,
+  ) async {
     final String relative = (args['path'] ?? args['file_path'] ?? '').toString();
     final String path = _resolve(root, relative);
     final File file = File(path);
     if (!file.existsSync()) throw ExecutorError('文件不存在：$relative');
-    final List<int> bytes = await file.readAsBytes();
+    if (FileSystemEntity.typeSync(path) == FileSystemEntityType.directory) {
+      throw ExecutorError('目标是目录，不能读取：$relative');
+    }
+    final int size = file.lengthSync();
+    // **分块下载通道**（`raw: true`）：二进制原样回 base64，不做行处理、不受
+    // 8 MiB 的文本读取上限约束——调用方按 `offset` 递进、按 `eof` 收口。
+    if (args['raw'] == true) {
+      final int startOffset =
+          ((args['offset'] as num?)?.toInt() ?? 0).clamp(0, 1 << 62);
+      final int? length = (args['length'] as num?)?.toInt();
+      final int want = length != null && length > 0 ? length : _kMaxReadBytes;
+      final List<int> chunk = <int>[];
+      if (startOffset < size) {
+        final RandomAccessFile raf = file.openSync();
+        try {
+          raf.setPositionSync(startOffset);
+          final int remaining = size - startOffset;
+          final int take = remaining < want ? remaining : want;
+          chunk.addAll(raf.readSync(take));
+        } finally {
+          raf.closeSync();
+        }
+      }
+      return <String, dynamic>{
+        'path': _relative(root, path),
+        'base64': base64Encode(chunk),
+        'offset': startOffset,
+        'size': size,
+        'eof': startOffset + chunk.length >= size,
+      };
+    }
+    List<int> rawBytes;
+    if (size > _kMaxReadBytes) {
+      final RandomAccessFile raf = file.openSync();
+      try {
+        rawBytes = raf.readSync(_kMaxReadBytes);
+      } finally {
+        raf.closeSync();
+      }
+    } else {
+      rawBytes = await file.readAsBytes();
+    }
+    final bool cappedBySize = rawBytes.length < size;
     String text;
     String? base64;
     try {
-      text = utf8.decode(bytes);
+      text = utf8.decode(rawBytes);
     } on FormatException {
       text = '';
-      base64 = base64Encode(bytes);
+      base64 = base64Encode(rawBytes);
     }
     final List<String> lines = text.split('\n');
     final int total = text.isEmpty ? 0 : lines.length;
@@ -107,10 +291,13 @@ class LocalExecutor {
     final String content = total == 0
         ? ''
         : lines.sublist(first - 1, end).join('\n');
-    final bool truncated = content.length > 512 * 1024;
+    final bool truncated =
+        cappedBySize || content.length > _kMaxReadTextChars;
     return <String, dynamic>{
       'path': _relative(root, path),
-      'content': truncated ? content.substring(0, 512 * 1024) : content,
+      'content': content.length > _kMaxReadTextChars
+          ? content.substring(0, _kMaxReadTextChars)
+          : content,
       'total_lines': total,
       'start_line': total == 0 ? 1 : first,
       'truncated': truncated,
@@ -118,8 +305,10 @@ class LocalExecutor {
     };
   }
 
-  Future<Map<String, dynamic>> _write(Map<String, dynamic> args) async {
-    final String root = _root(args);
+  Future<Map<String, dynamic>> _write(
+    String root,
+    Map<String, dynamic> args,
+  ) async {
     final String relative = (args['path'] ?? args['file_path'] ?? '').toString();
     final String path = _resolve(root, relative);
     final String content = (args['content'] ?? '').toString();
@@ -132,13 +321,27 @@ class LocalExecutor {
     };
   }
 
-  Future<Map<String, dynamic>> _list(Map<String, dynamic> args) async {
-    final String root = _root(args);
+  Future<Map<String, dynamic>> _list(
+    String root,
+    Map<String, dynamic> args,
+  ) async {
     final String relative = (args['path'] ?? '.').toString();
     final String base = _resolve(root, relative);
     final int maxDepth = ((args['max_depth'] as num?)?.toInt() ?? 2).clamp(0, 32);
     final int maxEntries = ((args['max_entries'] as num?)?.toInt() ?? 500).clamp(1, 5000);
     final List<String> entries = <String>[];
+    // 与 `entries` 同序的元信息（文件面板要 size / mtime；`entries` 保持纯字符串
+    // 是为了兼容既有调用方：tree.agent 的 WorkspaceIO 只吃字符串表）。
+    final List<Map<String, dynamic>> details = <Map<String, dynamic>>[];
+    void addDetail(FileSystemEntity entity, String rel, String type) {
+      final FileStat stat = entity.statSync();
+      details.add(<String, dynamic>{
+        'name': rel,
+        'type': type,
+        if (type != 'dir') 'size': stat.size,
+        'mtime_ms': stat.modified.millisecondsSinceEpoch,
+      });
+    }
     void walk(Directory dir, int depth) {
       if (entries.length >= maxEntries) return;
       final List<FileSystemEntity> children = dir.listSync(followLinks: false)
@@ -148,9 +351,11 @@ class LocalExecutor {
         final String rel = _relative(root, child.path);
         if (child is Directory) {
           entries.add('$rel/');
+          addDetail(child, rel, 'dir');
           if (depth < maxDepth) walk(child, depth + 1);
         } else if (child is File) {
           entries.add(rel);
+          addDetail(child, rel, 'file');
         }
       }
     }
@@ -159,6 +364,7 @@ class LocalExecutor {
       walk(Directory(base), 0);
     } else if (type == FileSystemEntityType.file) {
       entries.add(_relative(root, base));
+      addDetail(File(base), _relative(root, base), 'file');
     } else {
       throw ExecutorError('路径不存在：$relative');
     }
@@ -166,13 +372,16 @@ class LocalExecutor {
       'path': relative,
       'root': root,
       'entries': entries,
+      'details': details,
       'count': entries.length,
       'truncated': entries.length >= maxEntries,
     };
   }
 
-  Future<Map<String, dynamic>> _delete(Map<String, dynamic> args) async {
-    final String root = _root(args);
+  Future<Map<String, dynamic>> _delete(
+    String root,
+    Map<String, dynamic> args,
+  ) async {
     final String relative = (args['path'] ?? '').toString();
     final String path = _resolve(root, relative);
     final FileSystemEntityType type = FileSystemEntity.typeSync(path);
@@ -192,8 +401,10 @@ class LocalExecutor {
     return <String, dynamic>{'path': relative, 'deleted': true};
   }
 
-  Future<Map<String, dynamic>> _mkdir(Map<String, dynamic> args) async {
-    final String root = _root(args);
+  Future<Map<String, dynamic>> _mkdir(
+    String root,
+    Map<String, dynamic> args,
+  ) async {
     final String relative = (args['path'] ?? '').toString();
     final String path = _resolve(root, relative);
     final Directory dir = Directory(path);
@@ -203,34 +414,78 @@ class LocalExecutor {
     return <String, dynamic>{'path': relative, 'created': true};
   }
 
-  Future<Map<String, dynamic>> _writeBytes(Map<String, dynamic> args) async {
-    final String root = _root(args);
+  Future<Map<String, dynamic>> _writeBytes(
+    String root,
+    Map<String, dynamic> args,
+  ) async {
     final String relative = (args['path'] ?? '').toString();
     final String path = _resolve(root, relative);
     final String encoded = (args['base64'] ?? args['content_base64'] ?? '')
         .toString();
     if (encoded.isEmpty) {
-      throw ExecutorError('fs.writeBytes 需要 base64（要写入的二进制）');
+      throw ExecutorError('local.file.writeBytes 需要 base64（要写入的二进制）');
     }
     final List<int> bytes;
     try {
       bytes = base64Decode(encoded);
     } on FormatException {
-      throw ExecutorError('fs.writeBytes 的 base64 非法');
+      throw ExecutorError('local.file.writeBytes 的 base64 非法');
     }
     final File file = File(path);
     await file.parent.create(recursive: true);
-    await file.writeAsBytes(bytes, flush: true);
+    // `append: true` = 分块写的后续块（第一块用默认 write 截断重建）。
+    final bool append = args['append'] == true;
+    await file.writeAsBytes(
+      bytes,
+      mode: append ? FileMode.append : FileMode.write,
+      flush: true,
+    );
     return <String, dynamic>{
       'path': _relative(root, path),
       'bytes_written': bytes.length,
+      'appended': append,
     };
   }
 
-  Future<Map<String, dynamic>> _grep(Map<String, dynamic> args) async {
-    final String root = _root(args);
+  /// 原子重命名（与 SSH 侧同口径：源不存在 / 目标已存在都显式报错，绝不覆盖）。
+  Future<Map<String, dynamic>> _rename(
+    String root,
+    Map<String, dynamic> args,
+  ) async {
+    final String from = (args['from'] ?? args['path'] ?? '').toString();
+    final String to = (args['to'] ?? args['new_path'] ?? '').toString();
+    if (from.trim().isEmpty || to.trim().isEmpty) {
+      throw ExecutorError('local.file.rename 需要 from 与 to');
+    }
+    final String source = _resolve(root, from);
+    final String target = _resolve(root, to);
+    final FileSystemEntityType type = FileSystemEntity.typeSync(source);
+    if (type == FileSystemEntityType.notFound) {
+      throw ExecutorError('文件不存在：$from');
+    }
+    if (FileSystemEntity.typeSync(target) != FileSystemEntityType.notFound) {
+      throw ExecutorError('目标已存在，rename 不覆盖：$to');
+    }
+    final String parent = p.dirname(target);
+    if (!Directory(parent).existsSync()) {
+      Directory(parent).createSync(recursive: true);
+    }
+    final FileSystemEntity moved = type == FileSystemEntityType.directory
+        ? Directory(source).renameSync(target)
+        : File(source).renameSync(target);
+    return <String, dynamic>{
+      'path': _relative(root, moved.path),
+      'from': _relative(root, source),
+      'to': _relative(root, moved.path),
+    };
+  }
+
+  Future<Map<String, dynamic>> _grep(
+    String root,
+    Map<String, dynamic> args,
+  ) async {
     final String pattern = (args['pattern'] ?? '').toString();
-    if (pattern.isEmpty) throw ExecutorError('grep 需要 pattern');
+    if (pattern.isEmpty) throw ExecutorError('local.file.grep 需要 pattern');
     final bool regex = args['regex'] == true;
     final bool ignoreCase = args['ignore_case'] == true;
     final RegExp matcher = regex
@@ -302,8 +557,10 @@ class LocalExecutor {
     };
   }
 
-  Future<Map<String, dynamic>> _terminal(Map<String, dynamic> args) async {
-    final String root = _root(args);
+  Future<Map<String, dynamic>> _terminal(
+    String root,
+    Map<String, dynamic> args,
+  ) async {
     final String command = (args['command'] ?? '').toString().trim();
     final String hookAction =
         (args['hook_action'] ?? '').toString().trim().toLowerCase();
@@ -327,7 +584,7 @@ class LocalExecutor {
       if (command.isEmpty) throw ExecutorError('command 不能为空');
       return _startHook(root, command);
     }
-    if (command.isEmpty) throw ExecutorError('terminal.exec 需要 command');
+    if (command.isEmpty) throw ExecutorError('local.exec.command 需要 command');
     final int softTimeout =
         ((args['timeout_seconds'] as num?)?.toInt() ?? 0);
     if (softTimeout > 0) {
@@ -434,6 +691,7 @@ class LocalExecutor {
       'text':
           '[terminal hook] 已在后台启动。\ntask_id: $id\n日志：$relative（用 read 查看，或 hook_action=status + task_id 查询）',
       'is_error': false,
+      'running': true,
       'task_id': id,
       'log_relative': relative,
     };

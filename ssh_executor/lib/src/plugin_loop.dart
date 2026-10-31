@@ -347,10 +347,17 @@ class PluginLoop {
           // error），与 `local_executor` 的错误面同形。
           final String command = (payload['command'] ?? '').toString().trim();
           if (command.isNotEmpty) {
+            // 发起方插件 id：核心 `_forwardStationCommand` 放在 meta 里带下来，
+            // 租约归属比对靠它（不比对 = 谁猜到会用的句柄都能借别人的隧道）。
+            final Object? meta = params['meta'];
+            final String sourcePluginId = meta is Map
+                ? (meta['source_plugin_id'] ?? '').toString().trim()
+                : '';
             try {
               final Map<String, dynamic> executed = await _executeStation.execute(
                 command,
                 _argumentsOf(payload['arguments']),
+                sourcePluginId: sourcePluginId,
               );
               _reply(id, <String, dynamic>{
                 'reply': <String, dynamic>{'payload': executed},

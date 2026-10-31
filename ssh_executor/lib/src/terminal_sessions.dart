@@ -279,7 +279,9 @@ class SshTerminalSessions {
   _SshTerminal _require(String sessionId) {
     final _SshTerminal? session = _sessions[sessionId];
     if (session == null) {
-      throw SshTerminalError(404, '终端会话不存在：$sessionId');
+      // 与「会话已存在」同一档：404 在这套不变量里专指「没有这条路由 / 插件没装」，
+      // 会话不存在是资源状态冲突 ⇒ 409（本机侧同形，见 local_executor 的 StateError 映射）。
+      throw SshTerminalError(409, '终端会话不存在：$sessionId');
     }
     return session;
   }

@@ -313,7 +313,72 @@ void main() {
     );
   });
 
+  test('租约归属：登记方之外的插件借句柄 ⇒ lease_denied（与本机侧同一口径）', () async {
+    // 契约 §8.3：租约统一到插件侧后，「租约只能登记方自己用」这道闸门只剩执行器一个
+    // 落点。不比对发起方（核心 meta 里带下来的 source_plugin_id），任何插件猜到会
+    // 句柄就能借别人的隧道读写远端文件。
+    Future<Map<String, dynamic>> registerAs(String pluginId) =>
+        executor.execute(
+          kSshLeaseRegisterCommand,
+          <String, dynamic>{'ssh': sshJson(), 'ssh_lease_id': 'lease-1'},
+          sourcePluginId: pluginId,
+        );
+    await registerAs('tree.agent');
+    agent.putFile('/home/u/ws/notes/a.txt', 'hello\n');
+    final Map<String, dynamic> mine = await executor.execute(
+      'ssh.file.read',
+      <String, dynamic>{'ssh_lease_id': 'lease-1', 'path': 'notes/a.txt'},
+      sourcePluginId: 'tree.agent',
+    );
+    expect(mine['content'], 'hello\n');
+
+    await expectLater(
+      executor.execute(
+        'ssh.file.read',
+        <String, dynamic>{'ssh_lease_id': 'lease-1', 'path': 'notes/a.txt'},
+        sourcePluginId: 'demo_intruder',
+      ),
+      throwsA(
+        isA<SshStationError>().having(
+          (SshStationError error) => error.message,
+          'message',
+          allOf(contains(kLeaseDeniedCode), contains('tree.agent')),
+        ),
+      ),
+    );
+    // 顶不掉：重登记同一条句柄也只认原登记方。
+    await expectLater(registerAs('demo_intruder'), throwsA(
+      isA<SshStationError>().having(
+        (SshStationError error) => error.message,
+        'message',
+        contains(kLeaseDeniedCode),
+      ),
+    ));
+    expect(executor.leaseCount, 1);
+    // 归属不符**不是**租约失效：带了完整 ssh 配置也不能自动重登记（否则入侵者
+    // 只要把凭据再递一次就顶掉了原登记方）。
+    await expectLater(
+      executor.execute(
+        'ssh.file.read',
+        <String, dynamic>{
+          'ssh_lease_id': 'lease-1',
+          'path': 'notes/a.txt',
+          'ssh': sshJson(),
+        },
+        sourcePluginId: 'demo_intruder',
+      ),
+      throwsA(
+        isA<SshStationError>().having(
+          (SshStationError error) => error.message,
+          'message',
+          allOf(contains(kLeaseDeniedCode), isNot(contains(kSshLeaseUnknownCode))),
+        ),
+      ),
+    );
+  });
+
   test('file.read：相对路径 → 远端绝对路径，行切片与 total_lines 对齐', () async {
+
     agent.putFile('/home/u/ws/notes/a.txt', 'hello\nworld\n');
     await register();
     final Map<String, dynamic> result = await executor.execute(

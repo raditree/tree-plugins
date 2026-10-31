@@ -13,13 +13,13 @@ const String kSshWorkspaceStationName = 'ssh_workspace';
 /// SSH 工作空间时发一次；之后所有命令只带 `ssh_lease_id`）。
 const String kSshLeaseRegisterCommand = 'ssh.lease.register';
 
-/// 自建执行站的命令表（**与 `local_executor` 的 `file.*` / `exec.command` 语义对齐**）。
+/// 自建执行站的命令表（**与 `local_executor` 的 `local.*` 逐字对称**）。
 ///
-/// 为什么命令名要加 `ssh.` 前缀，而不是直接复用 `file.read`：
-/// 核心 `station/command` **只按命令名全局查执行站**（`StationPoints.ownerOfCommand` →
-/// 自建站命令表），而 `local_executor` 已经登记了 `file.*` / `exec.command`；
-/// 同名会被核心以“已被其它插件执行站占用”拒绝，也分不清该走本机还是远端。
-/// 所以本插件用独立的 `ssh.*` 命令族，由 tree.agent 在 SSH 模式下改写命令名后下发。
+/// 为什么命令名要加限定词（`ssh.` / `local.`）而不是直接叫 `file.read`：
+/// 核心 `station/command` **只按命令名全局查执行站**（自建站命令表），同名会被核心以
+/// “已被其它插件执行站占用”拒绝，也分不清该走本机还是远端。限定词取
+/// `StationScope.mode_key` 的两个取值，所以“选哪个命令名”与“目标 agent 在哪个工作面”
+/// 是同一个词的两次使用（契约 §8.1）。tree.agent 只需把前缀 `local.` 换成 `ssh.`。
 const List<String> kSshWorkspaceCommands = <String>[
   kSshLeaseRegisterCommand,
   'ssh.file.read',
@@ -36,11 +36,12 @@ const List<String> kSshWorkspaceCommands = <String>[
 /// 站介绍（`station/register` 的 `readme` 必填；面板的站点详情直接展示）。
 const String kSshWorkspaceStationReadme =
     'SSH 工作空间执行站（ssh_executor 自建）：tree.agent 在 SSH 模式下把 '
-    'file.* / exec.command 改写成 ssh.* 后经核心下发到这里。插件先按 ssh 配置'
+    'local.* 换成同后缀的 ssh.* 后经核心下发到这里。插件先按 ssh 配置'
     '建/复用一条既有中转站隧道，再把命令翻译成目标机 tree_agent 的 fs.* / exec.run；'
     '路径校验用「远端根 + 工作空间内相对路径」，插件不碰本机文件、不起本机进程。'
-    '租约由 ssh.lease.register 登记（凭据只在登记时过线一次），插件重启后命令会回 '
-    'ssh_lease_unknown，调用方应重新登记。';
+    '租约由 ssh.lease.register 登记（凭据只在登记时过线一次，并记下登记方插件 id：'
+    '别的插件想用这条租约直接拒 lease_denied），插件重启后命令会回 ssh_lease_unknown，'
+    '调用方应重新登记。';
 
 /// 核心拼出的自建站 id（与 `PluginBus.selfBuiltStationId` 同形；自检/测试可用）。
 String sshWorkspaceStationId(String pluginId) =>
@@ -57,6 +58,18 @@ class SshStationError implements Exception {
   String toString() => message;
 }
 
+/// 租约未登记 / 插件重启过：调用方应重新 `ssh.lease.register` 再重试一次。
+///
+/// 这个前缀是**契约**：tree.agent 只在看到它时丢弃缓存租约并重登记重试
+/// （其它失败可能是 `file.write` 写了一半之类的业务错误，**绝不重试**）。
+const String kSshLeaseUnknownCode = 'ssh_lease_unknown';
+
+/// 租约归属不符：登记方与调用方不是同一个插件，**fail-closed 拒绝且不重试**。
+///
+/// 本机侧（`local_executor`）同一个码、同一段判断：租约统一到插件侧之后，
+/// 「租约只能登记方自己用」这道闸门只剩执行器这一个落点（契约 §8.3）。
+const String kLeaseDeniedCode = 'lease_denied';
+
 /// 一次 SSH 工作空间租约：远端根 + 隧道会话（插件进程内有效）。
 class _SshLease {
   _SshLease({
@@ -64,6 +77,7 @@ class _SshLease {
     required this.connId,
     required this.root,
     required this.ssh,
+    required this.registrant,
   });
 
   final String leaseId;
@@ -74,13 +88,10 @@ class _SshLease {
 
   /// 登记时的 SSH 配置（**含凭据**，只在本插件内存里；不回给调用方）。
   final Map<String, dynamic> ssh;
-}
 
-/// 租约未登记 / 插件重启过：调用方应重新 `ssh.lease.register` 再重试一次。
-///
-/// 这个前缀是**契约**：tree.agent 只在看到它时丢弃缓存租约并重登记重试
-/// （其它失败可能是 `file.write` 写了一半之类的业务错误，**绝不重试**）。
-const String kSshLeaseUnknownCode = 'ssh_lease_unknown';
+  /// 登记方的插件 id（空 = 核心登记的）；只有它自己能再用这条租约。
+  final String registrant;
+}
 
 /// 一条租约的**非机密**视图：会话型功能（终端）只需要连接与远端根。
 class SshLeaseTarget {
@@ -172,31 +183,38 @@ class SshWorkspaceExecutor {
   );
 
   /// 执行一条命令；失败抛 [SshStationError]（调用方转成 `reply.error`）。
+  ///
+  /// [sourcePluginId] 是核心在 `station/request` 的 `meta` 里带下来的**发起方插件 id**：
+  /// 登记时记进租约表，每条命令进来先比对（不比对就等于谁猜到会用的句柄都能借别人的
+  /// 隧道读写）。
   Future<Map<String, dynamic>> execute(
     String command,
-    Map<String, dynamic> arguments,
-  ) async {
+    Map<String, dynamic> arguments, {
+    String sourcePluginId = '',
+  }) async {
+    if (command == kSshLeaseRegisterCommand) {
+      return _registerLease(arguments, sourcePluginId);
+    }
+    final _SshLease lease = await _leaseOf(arguments, sourcePluginId);
     switch (command) {
-      case kSshLeaseRegisterCommand:
-        return _registerLease(arguments);
       case 'ssh.file.read':
-        return _read(await _leaseOf(arguments), arguments);
+        return _read(lease, arguments);
       case 'ssh.file.write':
-        return _write(await _leaseOf(arguments), arguments);
+        return _write(lease, arguments);
       case 'ssh.file.list':
-        return _list(await _leaseOf(arguments), arguments);
+        return _list(lease, arguments);
       case 'ssh.file.grep':
-        return _grep(await _leaseOf(arguments), arguments);
+        return _grep(lease, arguments);
       case 'ssh.file.delete':
-        return _delete(await _leaseOf(arguments), arguments);
+        return _delete(lease, arguments);
       case 'ssh.file.mkdir':
-        return _mkdir(await _leaseOf(arguments), arguments);
+        return _mkdir(lease, arguments);
       case 'ssh.file.writeBytes':
-        return _writeBytes(await _leaseOf(arguments), arguments);
+        return _writeBytes(lease, arguments);
       case 'ssh.file.rename':
-        return _rename(await _leaseOf(arguments), arguments);
+        return _rename(lease, arguments);
       case 'ssh.exec.command':
-        return _terminal(await _leaseOf(arguments), arguments);
+        return _terminal(lease, arguments);
       default:
         throw SshStationError('SSH 工作空间执行站不支持命令：$command');
     }
@@ -208,6 +226,7 @@ class SshWorkspaceExecutor {
   /// → `{ok, lease_id, conn_id, root, host, agent}`。
   Future<Map<String, dynamic>> _registerLease(
     Map<String, dynamic> arguments,
+    String sourcePluginId,
   ) async {
     final Map<String, dynamic> ssh = _asMap(arguments['ssh']);
     if (ssh.isEmpty) {
@@ -234,15 +253,26 @@ class SshWorkspaceExecutor {
     final String leaseId = requested.isNotEmpty
         ? requested
         : _leaseIdFor(ssh, root);
+    final _SshLease? existing = _leases[leaseId];
+    if (existing != null && existing.registrant != sourcePluginId) {
+      throw SshStationError(
+        '$kLeaseDeniedCode: 租约 $leaseId 由插件 '
+        '${existing.registrant.isEmpty ? '核心' : existing.registrant} 登记，'
+        '${sourcePluginId.isEmpty ? '核心' : sourcePluginId} 不能顶掉它'
+        '（fail-closed）',
+      );
+    }
     _leases[leaseId] = _SshLease(
       leaseId: leaseId,
       connId: connId,
       root: root,
       ssh: ssh,
+      registrant: sourcePluginId,
     );
     log?.call(
       'SSH 工作空间租约登记：$leaseId → $root（$connId，'
-      '${(ssh['host'] ?? '').toString()}）',
+      '${(ssh['host'] ?? '').toString()}，登记方 '
+      '${sourcePluginId.isEmpty ? '核心' : sourcePluginId}）',
     );
     return <String, dynamic>{
       'ok': true,
@@ -255,21 +285,29 @@ class SshWorkspaceExecutor {
   }
 
   /// 取命令要用的租约：优先 `ssh_lease_id`；只有带完整 `ssh` 配置时才允许自动登记。
-  Future<_SshLease> _leaseOf(Map<String, dynamic> arguments) async {
+  Future<_SshLease> _leaseOf(
+    Map<String, dynamic> arguments,
+    String sourcePluginId,
+  ) async {
     final String leaseId =
         (arguments['ssh_lease_id'] ?? arguments['lease_id'] ?? '')
             .toString()
             .trim();
     if (leaseId.isNotEmpty) {
       final _SshLease? cached = _leases[leaseId];
-      if (cached != null) return cached;
+      if (cached != null) {
+        if (cached.registrant != sourcePluginId) {
+          throw SshStationError(_deniedFor(leaseId, cached, sourcePluginId));
+        }
+        return cached;
+      }
       final Map<String, dynamic> ssh = _asMap(arguments['ssh']);
       if (ssh.isNotEmpty) {
         await _registerLease(<String, dynamic>{
           ...arguments,
           'ssh': ssh,
           'ssh_lease_id': leaseId,
-        });
+        }, sourcePluginId);
         return _leases[leaseId]!;
       }
       throw SshStationError(
@@ -281,7 +319,7 @@ class SshWorkspaceExecutor {
     if (ssh.isEmpty) {
       throw SshStationError('缺少 ssh_lease_id（先 ssh.lease.register）或 ssh 配置');
     }
-    await _registerLease(arguments);
+    await _registerLease(arguments, sourcePluginId);
     final String registered = (arguments['ssh_lease_id'] ?? '')
         .toString()
         .trim();
@@ -290,6 +328,16 @@ class SshWorkspaceExecutor {
     }
     return _leases.values.last;
   }
+
+  /// 归属不符的原因（`local_executor` 里是同一段话的同一份语义）。
+  static String _deniedFor(
+    String leaseId,
+    _SshLease lease,
+    String sourcePluginId,
+  ) =>
+      '$kLeaseDeniedCode: 租约 $leaseId 由插件 '
+      '${lease.registrant.isEmpty ? '核心' : lease.registrant} 登记，'
+      '${sourcePluginId.isEmpty ? '核心' : sourcePluginId} 不能用它（fail-closed）';
 
   /// 确定性租约 id（同一 host/port/user/root/login_shell 复用同一条）。
   String _leaseIdFor(Map<String, dynamic> ssh, String root) {

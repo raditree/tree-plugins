@@ -12,7 +12,7 @@ SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型�
 > 两条 L1 路径共用同一个 `TunnelManager` 台账与同一个 `TunnelSshTransport`，行为/失败分类/回退判据逐条一致。
 >
 > 另外自建一个**执行站** `plugin.ssh_executor.execute.ssh_workspace`（`shared`）：tree.agent 在
-> SSH 模式下把 `file.*` / `exec.command` 改写成 `ssh.*` 命令下发到这里，由本插件翻译成目标机
+> SSH 模式下把 `local.*` 命令**只换前缀**成 `ssh.*` 下发到这里，由本插件翻译成目标机
 > `tree_agent` 的 `fs.*` / `exec.run`（见「SSH 工作空间执行站」一节）。
 
 ## 职责（只做这四件事）
@@ -37,7 +37,8 @@ SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型�
 5. **为 tree.agent 的 SSH 工作空间自建执行站**（`ssh.workspace`）：登记远端租约
    （`ssh.lease.register`）后，把 `ssh.file.*` / `ssh.exec.command` 翻译成目标机 `tree_agent` 的
    `fs.*` / `exec.run`。命令名带 `ssh.` 前缀是**必须的**：核心 `station/command` 只按命令名全局
-   查执行站，`file.*` / `exec.command` 已被 `local_executor` 占用，同名分不清本机/远端。
+   查执行站，同后缀的 `local.file.*` / `local.exec.command` 已被 `local_executor` 占用，
+   无前缀时同名分不清本机/远端。两侧**逐字对称**，tree.agent 只做前缀与租约键的替换。
 
 **它不做**：不做临终回退（插件崩了就等于"没有中转站"，核心下一次 IO 解析自然走内置 —— 插件不必知道内置存在）；
 不做端口转发；不申报 agent 工具；**不碰本机文件、不起本机进程**（执行站只转发到目标机 agent）；
@@ -61,7 +62,7 @@ SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型�
 | [lib/src/tunnel_config.dart](lib/src/tunnel_config.dart) | L1 `config` 解析（含 `login_shell` 三态、`agents_dir`）、去重键、`host:port/user` 安全标签 |
 | [lib/src/agent_binary.dart](lib/src/agent_binary.dart) | 随包 `tree_agent` 的本机定位（`binary_path` / `TREE_AGENT_BINARY` / **与插件同级的 `agents/`**）与 sha 校验 |
 | [lib/src/ui_panel.dart](lib/src/ui_panel.dart) | **左栏面板**（`activity` 槽位）：只读状态 + 两个动作（重连 / 关闭，关闭两段式）；视图只用受限控件集；刷新 300ms 节流 |
-| [lib/src/exec_station.dart](lib/src/exec_station.dart) | **SSH 工作空间执行站**：命令表 / 远端租约 / `file.*` 与 `exec.command` 的远端等价物（翻译成 `fs.*` / `exec.run`；路径越界校验；无核心包依赖） |
+| [lib/src/exec_station.dart](lib/src/exec_station.dart) | **SSH 工作空间执行站**：命令表 / 远端租约 / `local.file.*` 与 `local.exec.command` 的远端等价物（翻译成 `fs.*` / `exec.run`；路径越界校验；无核心包依赖） |
 | [lib/src/sha256.dart](lib/src/sha256.dart) | 最小 SHA-256（**不引 `crypto`**：本插件只允许 `dartssh2` + `tree_tunnel_protocol` 两个运行时依赖） |
 | `test/` | 假远端 / 假 dialer / 假时钟 + 各层用例（见下） |
 
@@ -175,8 +176,8 @@ SSH 执行器新架构里的**「中转站」**（`ssh_executor`，**binary 型�
 ## SSH 工作空间执行站（tree.agent 的 SSH 模式，2026-10-25 加）
 
 tree.agent 的 agent / 工具在 SSH 工作空间上跑时，**不能**再落到本机执行站
-（`local_executor` 的 `file.*`）：远端根在本机不存在，核心的 `workspace/register`
-租约也校验不过。本插件因此自建一个执行站：
+（`local_executor` 的 `local.*`）：远端根在本机不存在，租约表里那条 `dir` 也校验不过。
+本插件因此自建一个执行站：
 
 - **站点 id**：`plugin.ssh_executor.execute.ssh_workspace`（`kind: execute`、`shared: true`、
   `allowed_plugins: ['tree.agent']`）；`hello` 之后异步申报，不阻塞读循环。
@@ -184,7 +185,7 @@ tree.agent 的 agent / 工具在 SSH 工作空间上跑时，**不能**再落到
   - `ssh.lease.register`：`{ssh: {...}, ssh_lease_id?}` → 建/复用隧道并返回
     `{lease_id, conn_id, root, host, agent}`（`root` 是 `agent.hello.root` 的远端绝对根）；
   - `ssh.file.read` / `write` / `list` / `grep` / `delete` / `mkdir` / `writeBytes` / `rename`：
-    参数与返回**逐条对齐** `local_executor` 的 `file.*`（路径一律是**工作空间内相对路径**，
+    参数与返回**逐条对齐** `local_executor` 的 `local.file.*`（路径一律是**工作空间内相对路径**，
     插件拼上远端根并做越界校验，再翻译成 `fs.*`；`file.read` 的分块拉取 / 行切片 /
     512 KiB 截断 / 二进制 base64 与 `local_executor` 同口径）；
     - `read{raw:true, offset, length}`：**分块下载通道**，二进制原样回 `{base64, offset, size, eof}`，
@@ -196,18 +197,20 @@ tree.agent 的 agent / 工具在 SSH 工作空间上跑时，**不能**再落到
   - `ssh.exec.command`：前台命令 → `exec.run`，回 `{text, is_error, exit_code}`
     （对齐 `terminal.exec`）。
 - **租约**：tree.agent 首次用某个 SSH 工作空间时发一次 `ssh.lease.register`，**凭据只在
-  登记时过线一次**；后续命令只带 `ssh_lease_id` + `root`。插件进程重启后租约丢失，
+  登记时过线一次**；后续命令只带 `ssh_lease_id` + `root`。租约记住**登记方**
+  （`meta.source_plugin_id`）：别的插件拿同一个 `ssh_lease_id` 来问 ⇒ `lease_denied`
+  （fail-closed，与本机侧同一口径，不去猜也不静默回退）。插件进程重启后租约丢失，
   命令回 `ssh_lease_unknown:` 前缀，tree.agent 据此**重登记并只重试一次**（其它业务失败
   绝不重放）。
-- **为什么命令名不是 `file.*`**：核心 `station/command` 按命令名**全局**路由；`local_executor`
-  已占用 `file.*` / `exec.command`（自建执行站命令全局唯一，同名会被核心拒绝）。所以
-  `ssh.*` 是**语义对齐、名字隔离**，由 tree.agent 在 SSH 模式做映射。
+- **为什么命令名带 `ssh.` 前缀**：核心 `station/command` 按命令名**全局**路由；
+  `local_executor` 占用同后缀的 `local.*`（自建执行站命令全局唯一，无前缀会同名冲突）。
+  所以 `ssh.*` 是**语义对齐、名字隔离**，由 tree.agent 在 SSH 模式换前缀。
 - **不回落**：站不可用 / 未注册时，tree.agent 的 SSH IO 显式失败（可读错误），
   不会降级到本机 `file.*`。
 
 ### 仍未覆盖（明确 TODO）
 
-1. `exec.command` 的**后台 hook**（`hook: true` / `hook_action: status|cancel`）：agent 侧
+1. `ssh.exec.command` 的**后台 hook**（`hook: true` / `hook_action: status|cancel`）：agent 侧
    `exec.spawn` / `exec.list` / `exec.query` / `exec.kill` 已具备，但 tree.agent 的 hook
    台账语义（软超时接管、`task_id` 生命周期）还没接 —— 本切片显式报“暂不支持后台 hook”。
 2. ~~`ssh.file.read` 单次最多 8 MiB~~ **已解**（2026-10-25）：`read{raw,offset,length}` 分块通道 +
@@ -216,8 +219,9 @@ tree.agent 的 agent / 工具在 SSH 工作空间上跑时，**不能**再落到
    隧道回来再发；执行站命令目前没有等待链（需要插件内等待/重试，且必须保证写命令不重放）。
 4. 凭据在 `ssh.lease.register` 的 arguments 里经核心转发一次（核心不落日志）；后续可改成
    “插件从 `data_dir` 读 agent 的 `ssh:` 段”或一次性的租约握手，避免凭据出现在站消息里。
-5. tree.agent 侧租约是**插件侧租约**，未登记到核心 `workspace/register`（核心只接受本机
-   存在目录）；远端根目前只存在于执行站台账与 tree.agent 缓存里。
+5. ~~tree.agent 侧租约是**插件侧租约**，未登记到核心 `workspace/register`~~ **这是设计**
+   （契约 §8.3）：插件侧租约表是 `root` 的唯一来源，核心的 `workspace/register` 簿记正在撤除。
+   远端根只存在于执行站台账与 tree.agent 缓存里，核心从头到尾不知道也不需要知道。
 
 ## 测试
 
@@ -249,10 +253,13 @@ dart test
 - `plugin_loop_test`：L1 分发（含未知方法 `-32601`）、去重（同 key 复用 `conn_id`）、错误分类、`shutdown`/stdin 关闭退出、
   慢 `ensure` 不堵 `ping`；另有 **SSH 工作空间执行站 3 条**（hello 后申报形状 / `station/request` 投递
   `ssh.lease.register` + `ssh.file.read` 走既有 L2 / 未登记租约回 `ssh_lease_unknown`）；
-- `exec_station_test`：**执行站 12 条**——命令表与 `local_executor` 命名隔离、租约登记（ssh 配置只在这里
-  建隧道）、未登记租约错误契约、`file.read` 相对→远端绝对路径与行切片 / 二进制 base64、越界路径拒绝、
-  `file.write`/`writeBytes` 自动建父目录、`file.list` 递归目录尾斜杠、`file.grep` 跳过隐藏目录、
-  `file.delete`（文件 / 非空目录需 recursive）/ `mkdir`、`exec.command` 输出契约与后台 hook 显式未支持、
+- `exec_station_test`：**执行站 17 条**——命令表与 `local_executor` 的 `local.*` 命名隔离、
+  租约登记（ssh 配置只在这里建隧道）、未登记租约错误契约、**租约归属**（非登记方借句柄 ⇒
+  `lease_denied`，与本机侧同一口径）、`file.read` 相对→远端绝对路径与行切片 / 二进制 base64 /
+  `raw` 分块、`writeBytes{append}` 分块写、越界路径拒绝、
+  `file.write`/`writeBytes` 自动建父目录、`file.list` 递归目录尾斜杠与 `details`、`file.grep` 跳过隐藏目录、
+  `file.delete`（文件 / 非空目录需 recursive）/ `mkdir`、`file.rename`、
+  `exec.command` 输出契约与后台 hook 映射、
   L2 失败透传；
 - `tunnel_ui_panel_test`：**左栏面板 16 条**——`ui/manifest` 只发一条且槽位/键/空归属正确、视图只用受限控件集、
   无隧道时有指路文案、有隧道时列出 label/state/agent 版本/安装路径/两个按钮、**视图不出现任何凭据**、

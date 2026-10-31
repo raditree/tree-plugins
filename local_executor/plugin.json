@@ -1,8 +1,8 @@
 {
   "id": "local_executor",
   "name": "本机执行器",
-  "version": "0.4.0",
-  "description": "本机文件与终端执行器：挂载核心执行站的 fs.* / terminal.exec 命令，在租约根目录内读写与执行；核心不碰文件、不起进程。",
+  "version": "0.5.0",
+  "description": "本机文件与终端执行器：自建执行站申报 local.file.* / local.exec.command（与 ssh_executor 的 ssh.* 同后缀），在本地登记的租约根内读写与执行；root 只来自 local.lease.register 那张表，核心不碰文件、不起进程。",
   "runtime": "headless",
   "files": [
     "tree_local_executor.exe"

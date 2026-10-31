@@ -1,7 +1,9 @@
 // local_executor —— 本机执行器插件（L-24）。
 //
-// 核心执行站把 fs.* / terminal.exec 挂到本插件；插件在**租约根目录**内读写、
-// 起进程。核心不碰文件、不起进程，也不解析 agent/team/mode 身份。
+// 命令族 `local.file.*` / `local.exec.command` **由本插件自建执行站申报**（A5 起
+// 核心不再持有这些名字，也不认识"本机/远端"这对概念）。租约由 `local.lease.register`
+// 在本插件进程内登记：**root 只有一个来源 = 自己那张租约表**，插件在租约根目录内
+// 读写、起进程；核心不碰文件、不起进程，也不解析 agent/team/mode 身份。
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -13,24 +15,18 @@ import 'terminal_sessions.dart';
 
 const String kPluginId = 'local_executor';
 const String kDisplayName = '本机执行器';
-const String kVersion = '0.4.0';
+const String kVersion = '0.5.0';
 final LocalExecutor _executor = LocalExecutor();
 
-/// 自建执行站：插件内部定义命令，核心只登记与路由。
-const List<String> kExecutorCommands = <String>[
-  'file.read',
-  'file.write',
-  'file.list',
-  'file.grep',
-  'file.delete',
-  'file.mkdir',
-  'file.writeBytes',
-  'exec.command',
-];
+/// 自建执行站：插件内部定义命令，核心只登记与路由（与 `ssh_executor` 逐字对称）。
+const List<String> kExecutorCommands = kLocalWorkspaceCommands;
 
 const String kStationReadme =
-    '本机执行器自建执行站：接 file.* / exec.command。调用方带 lease_id + '
-    '工作空间内相对路径，核心只登记 lease_id → 目录并路由，不碰文件、不起进程。';
+    '本机执行器自建执行站：接 local.file.* / local.exec.command（与 ssh_executor 的 '
+    'ssh.* 同后缀，只换限定词）。调用方先 local.lease.register 登记本机绝对目录 '
+    '（记下登记方插件 id），之后每条命令带 local_lease_id + 工作空间内相对路径；'
+    'root 只从这张租约表里查，arguments 里自带的 root / workspace_root 一律忽略，'
+    '登记方与调用方不是同一个插件直接拒（lease_denied）。核心只路由，不碰文件、不起进程。';
 
 /// 终端会话表（REST 建会话、广播站推输出；null = 未接线，自检不建）。
 TerminalSessions? _terminals;
@@ -55,8 +51,8 @@ Future<void> _onReady(PluginKitServer server) async {
       M.stationRegister,
       <String, dynamic>{
         'kind': 'execute',
-        'name': 'local',
-        'description': '本机执行器（file.* / exec.command）',
+        'name': kLocalWorkspaceStationName,
+        'description': '本机执行器（local.file.* / local.exec.command）',
         'readme': kStationReadme,
         'commands': kExecutorCommands,
         'shared': true,
@@ -120,10 +116,13 @@ Future<Map<String, dynamic>?> handleRequest(
   final Map<String, dynamic> payload = asMap(params['payload']);
   final String command = asString(payload['command']);
   final Map<String, dynamic> arguments = asMap(payload['arguments']);
+  // 登记方比对的身份来源：核心 `_forwardStationCommand` 在 meta 里带上发起方插件 id。
+  final String sourcePluginId = asString(asMap(params['meta'])['source_plugin_id']);
   try {
     final Map<String, dynamic> result = await _executor.execute(
       command,
       arguments,
+      sourcePluginId: sourcePluginId,
     );
     return <String, dynamic>{
       'reply': <String, dynamic>{'payload': result},
@@ -195,7 +194,9 @@ Future<Map<String, dynamic>> _delegate(Map<String, dynamic> envelope) async {
         return _json(404, <String, dynamic>{'detail': '未知终端动作：$path'});
     }
   } on StateError catch (error) {
-    return _json(404, <String, dynamic>{'detail': error.message});
+    // 会话「已存在 / 不存在」是资源状态冲突 ⇒ 409（与 ssh 侧同形）。404 在这套不变量里
+    // 专指「插件没装 / 没有这条路由」，兼作资源冲突就让 UI 分不清该重连还是该换 id。
+    return _json(409, <String, dynamic>{'detail': error.message});
   } catch (error) {
     return _json(500, <String, dynamic>{'detail': '终端会话失败：$error'});
   }
@@ -261,124 +262,288 @@ Future<int> selfTest() async {
   final Directory temp = Directory.systemTemp.createTempSync('local_exec_');
   try {
     final LocalExecutor executor = LocalExecutor();
-    final Map<String, dynamic> root = <String, dynamic>{'root': temp.path};
+    const String owner = 'tree.agent';
+    const String intruder = 'demo_intruder';
 
-    final Map<String, dynamic> written = await executor.execute('fs.write', <String, dynamic>{
-      ...root,
-      'path': 'notes/a.txt',
-      'content': 'hello\nworld\n',
-    });
-    check.check(written['bytes_written'], 12, 'fs.write 返回字节数');
+    // 租约：root 的唯一来源。id / 绝对根都要回给调用方（调用方只认这个句柄）。
+    final Map<String, dynamic> lease = await executor.execute(
+      kLocalLeaseRegisterCommand,
+      <String, dynamic>{'dir': temp.path, 'local_lease_id': 'selftest'},
+      sourcePluginId: owner,
+    );
+    check.check(lease['lease_id'], 'selftest', 'local.lease.register 回租约 id');
+    check.check(lease['root'], temp.path, 'local.lease.register 回绝对根');
+    check.check(executor.leaseCount, 1, '登记后租约表里有 1 条');
 
-    final Map<String, dynamic> read = await executor.execute('fs.read', <String, dynamic>{
-      ...root,
-      'path': 'notes/a.txt',
-    });
-    check.check(read['content'], 'hello\nworld\n', 'fs.read 读回内容');
-    check.check(read['total_lines'], 3, 'fs.read 总行数');
+    Future<Map<String, dynamic>> run(
+      String command, [
+      Map<String, dynamic> args = const <String, dynamic>{},
+    ]) => executor.execute(
+      command,
+      <String, dynamic>{'local_lease_id': 'selftest', ...args},
+      sourcePluginId: owner,
+    );
+    // 失败路径：返回原因原文（自检按**码前缀**断言，不靠"抛没抛"猜）。
+    Future<String> why(
+      String command, [
+      Map<String, dynamic> args = const <String, dynamic>{},
+      String as = owner,
+    ]) async {
+      try {
+        await executor.execute(
+          command,
+          <String, dynamic>{'local_lease_id': 'selftest', ...args},
+          sourcePluginId: as,
+        );
+        return '';
+      } on ExecutorError catch (error) {
+        return error.message;
+      }
+    }
 
-    final Map<String, dynamic> listed = await executor.execute('fs.list', <String, dynamic>{
-      ...root,
-      'path': '.',
-      'max_depth': 3,
-    });
+    final Map<String, dynamic> written = await run(
+      'local.file.write',
+      <String, dynamic>{'path': 'notes/a.txt', 'content': 'hello\nworld\n'},
+    );
+    check.check(written['bytes_written'], 12, 'local.file.write 返回字节数');
+
+    final Map<String, dynamic> read = await run(
+      'local.file.read',
+      <String, dynamic>{'path': 'notes/a.txt'},
+    );
+    check.check(read['content'], 'hello\nworld\n', 'local.file.read 读回内容');
+    check.check(read['total_lines'], 3, 'local.file.read 总行数');
+
+    final Map<String, dynamic> listed = await run(
+      'local.file.list',
+      <String, dynamic>{'path': '.', 'max_depth': 3},
+    );
     check.that(
       (listed['entries'] as List<dynamic>).contains('notes/a.txt'),
-      'fs.list 能看到写入的文件',
+      'local.file.list 能看到写入的文件',
+    );
+    // `details` 与 `entries` 同序同数（契约 §8.2：两侧键集必须相同，文件面板要 size）。
+    final List<dynamic> details = listed['details'] as List<dynamic>;
+    check.check(
+      details.length,
+      (listed['entries'] as List<dynamic>).length,
+      'local.file.list 的 details 与 entries 同数',
+    );
+    final Map<String, dynamic> detailOf = details
+        .cast<Map<String, dynamic>>()
+        .firstWhere(
+          (Map<String, dynamic> d) => d['name'] == 'notes/a.txt',
+        );
+    check.check(detailOf['type'], 'file', 'details 里有条目类型');
+    check.check(detailOf['size'], 12, 'details 里有 size');
+    check.that(
+      (detailOf['mtime_ms'] as num).toInt() > 0,
+      'details 里有 mtime_ms',
     );
 
-    final Map<String, dynamic> grep = await executor.execute('fs.grep', <String, dynamic>{
-      ...root,
-      'pattern': 'world',
-    });
-    check.check(grep['count'], 1, 'fs.grep 命中一行');
+    final Map<String, dynamic> grep = await run(
+      'local.file.grep',
+      <String, dynamic>{'pattern': 'world'},
+    );
+    check.check(grep['count'], 1, 'local.file.grep 命中一行');
 
-    final Map<String, dynamic> escaped = <String, dynamic>{
-      'root': temp.path,
-      'path': '../outside.txt',
-    };
-    var rejected = false;
+    check.that(
+      (await why('local.file.write', <String, dynamic>{
+        'path': '../outside.txt',
+        'content': 'x',
+      }))
+          .contains('越出工作空间根目录'),
+      '越界路径被拒绝',
+    );
+    // 注入 root 的**可证伪**测试：`notes/a.txt` 在租约根里有、在 systemTemp 里
+    // 没有——插件若听信 arguments 里的 root，这条必然报「文件不存在」。
+    final Map<String, dynamic> ignoresRootArg = await run(
+      'local.file.read',
+      <String, dynamic>{
+        'path': 'notes/a.txt',
+        'root': Directory.systemTemp.path,
+      },
+    );
+    check.check(
+      ignoresRootArg['content'],
+      'hello\nworld\n',
+      'arguments 里的 root 被忽略（root 只来自租约表）',
+    );
+
+    // 租约的两道 fail-closed：未登记（可重登记重试）与归属不符（绝不重试）。
+    check.that(
+      (await why(
+            'local.file.read',
+            <String, dynamic>{'path': 'notes/a.txt'},
+            intruder,
+          ))
+              .contains(kLeaseDeniedCode),
+      '别人的租约直接被拒（lease_denied）',
+    );
+    check.that(
+      (await why(
+            kLocalLeaseRegisterCommand,
+            <String, dynamic>{'dir': temp.path, 'local_lease_id': 'selftest'},
+            intruder,
+          ))
+              .contains(kLeaseDeniedCode),
+      '顶不掉别人登记的租约（lease_denied）',
+    );
+    var unknownSeen = false;
     try {
-      await executor.execute('fs.write', escaped);
-    } on ExecutorError {
-      rejected = true;
+      await executor.execute(
+        'local.file.read',
+        <String, dynamic>{'local_lease_id': 'never_registered'},
+        sourcePluginId: owner,
+      );
+    } on ExecutorError catch (error) {
+      unknownSeen = error.message.contains(kLocalLeaseUnknownCode);
     }
-    check.that(rejected, '越界路径被拒绝');
+    check.that(unknownSeen, '未登记的租约回 local_lease_unknown 前缀');
+    check.that(
+      (await why('local.file.read', <String, dynamic>{
+        'local_lease_id': '',
+        'path': 'notes/a.txt',
+      }))
+          .contains('local_lease_id'),
+      '没带租约句柄显式失败（不回落当前目录）',
+    );
 
-    final Map<String, dynamic> made = await executor.execute('fs.mkdir', <String, dynamic>{
-      ...root,
-      'path': 'bin',
-    });
-    check.check(made['created'], true, 'fs.mkdir 创建目录');
+    final Map<String, dynamic> made = await run(
+      'local.file.mkdir',
+      <String, dynamic>{'path': 'bin'},
+    );
+    check.check(made['created'], true, 'local.file.mkdir 创建目录');
 
-    final Map<String, dynamic> bytes = await executor.execute('fs.writeBytes', <String, dynamic>{
-      ...root,
-      'path': 'bin/a.bin',
-      'base64': 'AQID',
-    });
-    check.check(bytes['bytes_written'], 3, 'fs.writeBytes 写入二进制');
+    final Map<String, dynamic> bytes = await run(
+      'local.file.writeBytes',
+      <String, dynamic>{'path': 'bin/a.bin', 'base64': 'AQID'},
+    );
+    check.check(bytes['bytes_written'], 3, 'local.file.writeBytes 写入二进制');
+    check.check(bytes['appended'], false, 'writeBytes 默认整写（appended=false）');
+    final Map<String, dynamic> appended = await run(
+      'local.file.writeBytes',
+      <String, dynamic>{'path': 'bin/a.bin', 'base64': 'BA==', 'append': true},
+    );
+    check.check(appended['appended'], true, 'writeBytes 可追加');
     check.check(
       File('${temp.path}/bin/a.bin').readAsBytesSync(),
-      <int>[1, 2, 3],
-      'fs.writeBytes 字节内容',
+      <int>[1, 2, 3, 4],
+      'append 把块续到文件尾',
     );
 
-    final Map<String, dynamic> deleted = await executor.execute('fs.delete', <String, dynamic>{
-      ...root,
-      'path': 'bin/a.bin',
-    });
-    check.check(deleted['deleted'], true, 'fs.delete 删除文件');
+    // raw 分块通道：不做行处理、按 offset 递进、按 eof 收口。
+    final Map<String, dynamic> raw = await run(
+      'local.file.read',
+      <String, dynamic>{'path': 'bin/a.bin', 'raw': true, 'offset': 1, 'length': 2},
+    );
+    check.check(
+      base64Decode('${raw['base64']}'),
+      <int>[2, 3],
+      'raw 读回指定区间的字节',
+    );
+    check.check(raw['offset'], 1, 'raw 回显 offset');
+    check.check(raw['size'], 4, 'raw 回文件总长');
+    check.check(raw['eof'], false, 'raw 没读到尾部时 eof=false（调用方据此续读）');
+    final Map<String, dynamic> rawTail = await run(
+      'local.file.read',
+      <String, dynamic>{'path': 'bin/a.bin', 'raw': true, 'offset': 3, 'length': 99},
+    );
+    check.check(base64Decode('${rawTail['base64']}'), <int>[4], 'raw 尾块只回剩下的字节');
+    check.check(rawTail['eof'], true, 'raw 读到文件尾时 eof=true');
+
+    final Map<String, dynamic> renamed = await run(
+      'local.file.rename',
+      <String, dynamic>{'from': 'bin/a.bin', 'to': 'bin/b.bin'},
+    );
+    check.check(renamed['to'], 'bin/b.bin', 'local.file.rename 回目标路径');
+    check.that(
+      File('${temp.path}/bin/b.bin').existsSync(),
+      'rename 后新名存在',
+    );
     check.that(
       !File('${temp.path}/bin/a.bin').existsSync(),
+      'rename 后旧名消失',
+    );
+    check.that(
+      (await why('local.file.rename', <String, dynamic>{
+        'from': 'notes/a.txt',
+        'to': 'bin/b.bin',
+      }))
+          .contains('不覆盖'),
+      'rename 不覆盖已存在的目标',
+    );
+    check.that(
+      (await why('local.file.rename', <String, dynamic>{
+        'from': 'notes/missing.txt',
+        'to': 'bin/c.bin',
+      }))
+          .contains('文件不存在'),
+      'rename 源不存在显式报错',
+    );
+
+    final Map<String, dynamic> deleted = await run(
+      'local.file.delete',
+      <String, dynamic>{'path': 'bin/b.bin'},
+    );
+    check.check(deleted['deleted'], true, 'local.file.delete 删除文件');
+    check.that(
+      !File('${temp.path}/bin/b.bin').existsSync(),
       '删除后文件不存在',
     );
 
-    final Map<String, dynamic> terminal = await executor.execute('terminal.exec', <String, dynamic>{
-      ...root,
-      'command': Platform.isWindows ? 'echo hi' : 'printf hi',
-    });
+    final Map<String, dynamic> terminal = await run(
+      'local.exec.command',
+      <String, dynamic>{
+        'command': Platform.isWindows ? 'echo hi' : 'printf hi',
+      },
+    );
     check.that(
       '${terminal['text']}'.contains('hi'),
-      'terminal.exec 能执行并回输出',
+      'local.exec.command 能执行并回输出',
     );
 
-    final Map<String, dynamic> hook = await executor.execute('exec.command', <String, dynamic>{
-      ...root,
-      'command': Platform.isWindows ? 'ping -n 5 127.0.0.1 >nul' : 'sleep 3',
-      'hook': true,
-    });
+    final Map<String, dynamic> hook = await run(
+      'local.exec.command',
+      <String, dynamic>{
+        'command': Platform.isWindows ? 'ping -n 5 127.0.0.1 >nul' : 'sleep 3',
+        'hook': true,
+      },
+    );
     final String taskId = (hook['task_id'] ?? '').toString();
     check.that(taskId.isNotEmpty, 'terminal hook 后台启动返回 task_id');
-    final Map<String, dynamic> status = await executor.execute('exec.command', <String, dynamic>{
-      ...root,
-      'hook_action': 'status',
-      'task_id': taskId,
-    });
+    final Map<String, dynamic> status = await run(
+      'local.exec.command',
+      <String, dynamic>{'hook_action': 'status', 'task_id': taskId},
+    );
     check.that(
       '${status['text']}'.contains('运行中') ||
           '${status['text']}'.contains('已结束'),
       'terminal hook 可查询状态',
     );
-    final Map<String, dynamic> soft = await executor.execute('exec.command', <String, dynamic>{
-      ...root,
-      'command': Platform.isWindows ? 'ping -n 6 127.0.0.1 >nul' : 'sleep 5',
-      'timeout_seconds': 1,
-    });
+    final Map<String, dynamic> soft = await run(
+      'local.exec.command',
+      <String, dynamic>{
+        'command': Platform.isWindows ? 'ping -n 6 127.0.0.1 >nul' : 'sleep 5',
+        'timeout_seconds': 1,
+      },
+    );
     check.that(
       (soft['task_id'] ?? '').toString().isNotEmpty,
       '同步命令软超时转后台',
     );
-    await executor.execute('exec.command', <String, dynamic>{
-      ...root,
-      'hook_action': 'cancel',
-      'task_id': (soft['task_id'] ?? '').toString(),
-    });
+    await run(
+      'local.exec.command',
+      <String, dynamic>{
+        'hook_action': 'cancel',
+        'task_id': (soft['task_id'] ?? '').toString(),
+      },
+    );
 
-    final Map<String, dynamic> cancelled = await executor.execute('exec.command', <String, dynamic>{
-      ...root,
-      'hook_action': 'cancel',
-      'task_id': taskId,
-    });
+    final Map<String, dynamic> cancelled = await run(
+      'local.exec.command',
+      <String, dynamic>{'hook_action': 'cancel', 'task_id': taskId},
+    );
     check.that(
       '${cancelled['text']}'.contains('已请求终止') ||
           '${cancelled['text']}'.contains('已结束'),
