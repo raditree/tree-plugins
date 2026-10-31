@@ -29,6 +29,7 @@ import '../store/subagent_registry.dart';
 import '../store/subagent_store.dart';
 import '../store/tree_paths.dart';
 import '../store/usage_log.dart';
+import '../takeover.dart';
 import '../team/message_dispatcher.dart';
 import '../team/team_service.dart';
 import '../team/team_workspace.dart';
@@ -324,9 +325,21 @@ class AgentRuntime {
   static final Map<String, AgentRuntime> _byRoot = <String, AgentRuntime>{};
 
   /// 取（或创建）某个数据根的运行时。
+  ///
+  /// **数据接管**（agent_pluginization.md §4.5）在这里做：它是"本进程第一次
+  /// 碰这个数据根"的唯一入口。原地接管（文件位置与格式不变），首次只备份一次
+  /// `agents/` + `data/`（`config/takeover.json` 为标记）。接管失败**不阻断业务**：
+  /// 标记未写 = 未接管，用户数据原样可用，下次启动会再试一遍。
   static AgentRuntime forDataDir(String dataDir) {
     final String root = p.normalize(Directory(dataDir).absolute.path);
-    return _byRoot.putIfAbsent(root, () => AgentRuntime(paths: AgentDataPaths(root)));
+    return _byRoot.putIfAbsent(root, () {
+      final AgentDataPaths paths = AgentDataPaths(root);
+      final TakeoverReport takeover = takeOverData(paths);
+      if (!takeover.ok && !takeover.alreadyTakenOver) {
+        stderr.writeln('[tree.agent] 数据接管未完成（继续使用现有数据）：${takeover.error}');
+      }
+      return AgentRuntime(paths: paths);
+    });
   }
 
   /// 测试用：关掉全部缓存运行时。

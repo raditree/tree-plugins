@@ -282,12 +282,47 @@ Future<void> main(List<String> args) async {
     exitCode = await selfTest();
     return;
   }
+  final int? takeoverExit = _runTakeoverCli(args);
+  if (takeoverExit != null) {
+    exitCode = takeoverExit;
+    return;
+  }
   await buildServer().run(stdin);
   try {
     await stdout.flush();
   } catch (_) {
     // 管道已被对端关掉（核心退出）：刷不出去不算错误。
   }
+}
+
+/// 数据接管运维入口：`--takeover-status <数据根>` / `--rollback-takeover <数据根>`。
+///
+/// 这两个模式**不启动协议循环**（不与核心通信），结果 JSON 写 stdout；
+/// 退出码 0 = 健康 / 成功，1 = 有问题，2 = 用法错误。
+int? _runTakeoverCli(List<String> args) {
+  final bool wantRollback = args.contains('--rollback-takeover');
+  final bool wantStatus = args.contains('--takeover-status');
+  if (!wantStatus && !wantRollback) return null;
+  final String flag = wantRollback ? '--rollback-takeover' : '--takeover-status';
+  final int index = args.indexOf(flag);
+  final String dir = index + 1 < args.length ? args[index + 1].trim() : '';
+  if (dir.isEmpty) {
+    stderr.writeln('用法：$flag <数据根目录>');
+    return 2;
+  }
+  final AgentDataPaths paths = AgentDataPaths(p.absolute(dir));
+  final Map<String, dynamic> result;
+  final bool ok;
+  if (wantRollback) {
+    final RollbackReport report = rollbackTakeover(paths);
+    ok = report.ok;
+    result = report.toJson();
+  } else {
+    result = takeoverStatus(paths);
+    ok = (result['problem'] as String).isEmpty;
+  }
+  stdout.writeln(const JsonEncoder.withIndent('  ').convert(result));
+  return ok ? 0 : 1;
 }
 
 /// 假核心自检（**同码**跑真读循环）：A1 上线要件 + A2 第一条委派路由。

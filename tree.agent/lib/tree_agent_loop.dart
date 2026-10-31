@@ -81,6 +81,7 @@ export 'src/settings/core_settings.dart';
 export 'src/settings/domain_settings.dart';
 export 'src/store/usage_log.dart';
 export 'src/subagent_store.dart';
+export 'src/takeover.dart';
 export 'src/team/message_dispatcher.dart';
 export 'src/team/team_model.dart';
 export 'src/team/team_repair.dart';
