@@ -124,14 +124,26 @@ void main() {
     expect(saved, 2);
   });
 
-  test('token 速率：从 settings.yaml 读、夹取、默认 1000', () {
+  test('token 速率：读 agent_settings.yaml 优先，缺失回退旧键并镜像新文件', () {
+    // 只有旧键（L-22 迁移前形态）：读到 250，并当场原子写 agent_settings.yaml。
     File(p.join(paths.root, 'config', 'settings.yaml'))
       ..createSync(recursive: true)
-      ..writeAsStringSync('token_acquisition_rate: 250\n');
+      ..writeAsStringSync('token_acquisition_rate: 250\nframe_rate: 60\n');
+    expect(loadDomainSettings(paths).tokenAcquisitionRate, 250);
+    final File agentFile = File(paths.agentSettingsFile);
+    expect(agentFile.existsSync(), isTrue);
+    expect(agentFile.readAsStringSync(), contains('token_acquisition_rate: 250'));
+    // 平台文件不被插件改写（帧率等键原样）。
     expect(
-      loadDomainSettings(paths).tokenAcquisitionRate,
-      250,
+      File(p.join(paths.root, 'config', 'settings.yaml')).readAsStringSync(),
+      contains('frame_rate: 60'),
     );
+
+    // 新文件已存在 ⇒ 不再读旧键（即使旧键被手改成别的值）。
+    File(p.join(paths.root, 'config', 'settings.yaml'))
+        .writeAsStringSync('token_acquisition_rate: 900\n');
+    agentFile.writeAsStringSync('token_acquisition_rate: 300\n');
+    expect(loadDomainSettings(paths).tokenAcquisitionRate, 300);
 
     final DomainSettings settings = DomainSettings();
     expect(settings.tokenAcquisitionRate, DomainSettings.tokenRateMax);

@@ -21,6 +21,14 @@ class AgentDataPaths {
   /// `<root>/config/models`：模型池配置（每个模型一个 yaml）。
   String get modelsDir => p.join(root, 'config', 'models');
 
+  /// `<root>/config/agent_settings.yaml`：领域设置（L-22 乙方案后**只**由本插件写）。
+  String get agentSettingsFile =>
+      p.join(root, 'config', 'agent_settings.yaml');
+
+  /// `<root>/config/settings.yaml`：平台设置；旧版核心曾把 token 速率混装在这里，
+  /// 现在只在迁移兜底时读它。
+  String get platformSettingsFile => p.join(root, 'config', 'settings.yaml');
+
   /// 单个 agent 配置：`<root>/agents/<id>.yaml`。
   String agentFile(String agentId) =>
       p.join(agentsDir, '${safeSegment(agentId)}.yaml');

@@ -22,7 +22,7 @@ class FileDomainSettingsSink implements DomainSettingsSink {
   final WriteQueue _queue = WriteQueue();
 
   static const String _modelHeader = 'Tree 模型配置：api_key 为明文，请勿外传。';
-  static const String _settingsHeader = 'Tree 全局设置：可直接手改（未知键会被原样保留）。';
+  static const String _settingsHeader = 'Tree 领域设置（tree.agent）：可直接手改。';
 
   @override
   void saveModel(CoreModelConfig model) {
@@ -44,14 +44,16 @@ class FileDomainSettingsSink implements DomainSettingsSink {
 
   @override
   void saveTokenRate(int rate) {
-    final String file = paths.settingsFile;
+    // L-22 乙方案：领域键落 `config/agent_settings.yaml`（**不再**改写平台
+    // settings.yaml，否则会与核心的全量重写互相覆盖）。
+    final String file = paths.agentSettingsFile;
     final String? current = AtomicFile.readStringOrNullSync(file);
     Map<String, dynamic> map = <String, dynamic>{};
     if (current != null && current.trim().isNotEmpty) {
       try {
         map = Map<String, dynamic>.of(YamlCodec.decode(current));
       } catch (error) {
-        log?.call('settings.yaml 解析失败，token 速率将覆盖写入：$file：$error');
+        log?.call('agent_settings.yaml 解析失败，token 速率将覆盖写入：$file：$error');
         map = <String, dynamic>{};
       }
     }

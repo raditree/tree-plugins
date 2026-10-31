@@ -78,8 +78,11 @@ class TreePaths {
   /// 会话数据目录（每个 agent 一个子目录）。
   String get sessionsDataDir => p.join(root, 'data');
 
-  /// 全局设置文件。
+  /// 全局设置文件（平台设置；旧版核心曾混装 token 速率）。
   String get settingsFile => p.join(configDir, 'settings.yaml');
+
+  /// 领域设置文件（L-22 乙方案后由本插件独占写）。
+  String get agentSettingsFile => p.join(configDir, 'agent_settings.yaml');
 
   /// MCP 服务配置（可直接手改的 yaml）。
   String get mcpConfigFile => p.join(configDir, 'mcp.yaml');

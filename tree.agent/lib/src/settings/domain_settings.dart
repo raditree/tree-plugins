@@ -1,8 +1,8 @@
 import 'dart:io';
 
-import 'package:path/path.dart' as p;
-
 import '../paths.dart';
+import '../store/atomic_file.dart';
+import '../store/yaml_codec.dart';
 import '../yaml_utils.dart';
 
 /// `token_scale` 的默认值（与核心 `defaultTokenScale` 同值）。
@@ -241,15 +241,15 @@ abstract interface class DomainSettingsSink {
 
   void deleteModel(String modelId);
 
-  /// token 速率变更（写回 settings.yaml 的 token_acquisition_rate）。
+  /// token 速率变更（写 `config/agent_settings.yaml` 的 `token_acquisition_rate`）。
   void saveTokenRate(int rate);
 }
 
 /// 领域设置（模型池 + token 速率）——从核心 `CoreSettings` 拆出的**领域半边**。
 ///
-/// 核心的 `CoreSettings` 混装平台开关与领域配置；插件只保留后者。存储位置与核心
-/// 相同（`config/models/*.yaml`、`config/settings.yaml` 的 `token_acquisition_rate`），
-/// 这样双跑期两边读到的是同一份数据。
+/// 核心的 `CoreSettings` 混装平台开关与领域配置；插件只保留后者。存储位置按
+/// L-22 乙方案分文件：模型池 `config/models/*.yaml`、token 速率
+/// `config/agent_settings.yaml`（旧核心的 `settings.yaml` 只在迁移期兜底读）。
 class DomainSettings {
   DomainSettings({this.sink});
 
@@ -358,22 +358,39 @@ List<CoreModelConfig> readModelConfigs(AgentDataPaths paths) {
 
 /// 从磁盘装载领域设置（模型池 + token 速率）。
 ///
-/// `settings.yaml` 的 `token_acquisition_rate` 与核心共用同一份文件；缺失/非法时用
-/// 默认 1000（近似不限速）。
+/// L-22 乙方案（阶段 1）：优先读 `config/agent_settings.yaml`；不存在则回退读平台
+/// `settings.yaml` 的旧键，并**当场原子写一份新文件**（"写完即可见"的同步语义，
+/// 让核心下一次启动就能安全删旧键，且与两侧启动顺序无关）。缺失 = 默认 1000。
 DomainSettings loadDomainSettings(AgentDataPaths paths) {
   final DomainSettings settings = DomainSettings();
   for (final CoreModelConfig model in readModelConfigs(paths)) {
     settings.putModel(model);
   }
-  final Map<String, dynamic>? settingsYaml = readYamlMap(
-    File(p.join(paths.root, 'config', 'settings.yaml')),
-  );
-  final Object? rawRate = settingsYaml?['token_acquisition_rate'];
-  if (rawRate is num) {
-    settings.setTokenAcquisitionRate(rawRate.toInt());
-  } else if (rawRate is String) {
-    final int? parsed = int.tryParse(rawRate.trim());
-    if (parsed != null) settings.setTokenAcquisitionRate(parsed);
+  final int? rate = _readTokenRate(paths.agentSettingsFile);
+  if (rate != null) {
+    settings.setTokenAcquisitionRate(rate);
+    return settings;
+  }
+  final int? legacy = _readTokenRate(paths.platformSettingsFile);
+  if (legacy != null) {
+    settings.setTokenAcquisitionRate(legacy);
+    // 镜像到领域文件：只写这一个键，不碰平台 settings.yaml 的其它内容。
+    AtomicFile.writeStringAtomicSync(
+      paths.agentSettingsFile,
+      YamlCodec.encode(<String, dynamic>{
+        'token_acquisition_rate': settings.tokenAcquisitionRate,
+      }, header: 'Tree 领域设置（tree.agent）：可直接手改。'),
+    );
   }
   return settings;
+}
+
+/// 读某个 yaml 文件里的有效 token 速率（文件不存在 / 坏值 ⇒ null）。
+int? _readTokenRate(String path) {
+  final Map<String, dynamic>? map = readYamlMap(File(path));
+  if (map == null) return null;
+  final Object? raw = map['token_acquisition_rate'];
+  if (raw is num) return raw.toInt();
+  if (raw is String) return int.tryParse(raw.trim());
+  return null;
 }
