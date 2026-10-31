@@ -220,7 +220,7 @@ tree.agent 的 agent / 工具在 SSH 工作空间上跑时，**不能**再落到
 4. 凭据在 `ssh.lease.register` 的 arguments 里经核心转发一次（核心不落日志）；后续可改成
    “插件从 `data_dir` 读 agent 的 `ssh:` 段”或一次性的租约握手，避免凭据出现在站消息里。
 5. ~~tree.agent 侧租约是**插件侧租约**，未登记到核心 `workspace/register`~~ **这是设计**
-   （契约 §8.3）：插件侧租约表是 `root` 的唯一来源，核心的 `workspace/register` 簿记正在撤除。
+   （契约 §8.3）：插件侧租约表是 `root` 的唯一来源，核心那套 `workspace/register` 簿记已于 2026-10-31 片 3 撤除。
    远端根只存在于执行站台账与 tree.agent 缓存里，核心从头到尾不知道也不需要知道。
 
 ## 测试
