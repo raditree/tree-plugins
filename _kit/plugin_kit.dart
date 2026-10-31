@@ -52,7 +52,7 @@ abstract final class M {
 
   // ── 插件 → 核心（上行通知，不等应答）─────────────────────────────
   static const String stationStream = 'station/stream';
-  static const String workspaceRegister = 'workspace/register';
+  // 2026-10-31 片 3：`workspace/register` 已撤除（租约归执行器插件，契约 §8.3）。
   static const String log = 'log';
 }
 
