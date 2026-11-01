@@ -262,7 +262,7 @@ class ConversationService {
   ///
   /// 帧字段（与现状 server 一致）：
   /// `{type, agent_id, content, attachments, session_id}`。
-  Future<void> handleUserMessage(Map<String, dynamic> frame) {
+  Future<void> handleUserMessage(Map<String, dynamic> frame) async {
     final String agentId = frame['agent_id'] as String? ?? '';
     final String content = frame['content'] as String? ?? '';
     final String sessionId = frame['session_id'] as String? ?? '';
@@ -279,6 +279,8 @@ class ConversationService {
     }
     // 会话解析必须先于排队：前端可能在会话创建前就发消息（session_id 为空）
     final CoreSession session = _resolveSession(agent, sessionId, content);
+    // 消息已改存会话库：同步 append/读之前先异步装载该会话缓存。
+    await store.ensureMessagesLoaded(agent.id, session.sessionId);
     store.appendMessage(
       CoreMessage(
         id: CoreIds.message(),
@@ -357,10 +359,11 @@ class ConversationService {
     required String content,
     String senderId = '',
     String senderName = '',
-  }) {
+  }) async {
     final CoreAgent? agent = store.agent(agentId);
-    if (agent == null) return Future<void>.value();
+    if (agent == null) return;
     final CoreSession session = _resolveSession(agent, sessionId, content);
+    await store.ensureMessagesLoaded(agent.id, session.sessionId);
     final String sender = senderName.trim().isEmpty ? senderId : senderName;
     final String text = sender.trim().isEmpty
         ? content
@@ -441,7 +444,7 @@ class ConversationService {
     required String sessionId,
     required String notice,
     SubagentTag? subagent,
-  }) {
+  }) async {
     final CoreAgent? agent = store.agent(agentId);
     // **临时员工被唤醒**（terminal hook 完成 / 后台任务完成）：临时员工没有自己的会话
     // （会话只属于真实 agent；`SubagentStore.session` 是纯转发），所以会话、历史与
@@ -453,7 +456,8 @@ class ConversationService {
     final CoreSubagent? record = subagents?.handle(agentId);
     final String ownerId = record?.ownerAgentId ?? agentId;
     final CoreSession? session = store.session(ownerId, sessionId);
-    if (agent == null || session == null) return Future<void>.value();
+    if (agent == null || session == null) return;
+    await store.ensureMessagesLoaded(ownerId, session.sessionId);
     if (record != null) {
       // 完成提示是**它自己的输入**（不是给发起者的"完成报告"）：用 `notice` 而不是
       // `subagent_report`——后者会被它自己的历史排掉（`SubagentStore.messages` 按标记
@@ -586,6 +590,7 @@ class ConversationService {
   }) async {
     final String id = toolCallId.trim();
     if (id.isEmpty) return null;
+    await store.ensureMessagesLoaded(agentId, sessionId);
     for (final CoreMessage message in store.sessionMessages(
       agentId,
       sessionId,
@@ -610,6 +615,7 @@ class ConversationService {
     required String toolName,
     required String result,
   }) async {
+    await store.ensureMessagesLoaded(agentId, sessionId);
     final bool wrote = store.repairToolResult(
       agentId,
       sessionId,
@@ -1215,6 +1221,7 @@ class ConversationService {
     if (session == null) {
       return SubagentTurnResult(error: '会话不可用：${request.sessionId}');
     }
+    await store.ensureMessagesLoaded(owner.id, session.sessionId);
     final String runKey = _runKey(tag.id, request.sessionId);
     if (_running.containsKey(runKey)) {
       return SubagentTurnResult(
@@ -1305,6 +1312,7 @@ class ConversationService {
       parentId: record.parentId,
       level: record.level,
     );
+    await store.ensureMessagesLoaded(record.ownerAgentId, record.sessionId);
     store.appendMessage(
       CoreMessage(
         id: CoreIds.message(),

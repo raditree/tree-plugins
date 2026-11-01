@@ -317,6 +317,14 @@ class MemoryStore implements TreeStore {
       messages(agentId, sessionId).where((CoreMessage m) => !m.isTool).length;
 
   @override
+  Future<void> ensureMessagesLoaded(
+    String agentId,
+    String sessionId,
+  ) async {
+    // 内存实现没有"装载"这一步：消息本来就在内存里。
+  }
+
+  @override
   CoreMessage appendMessage(CoreMessage message) {
     final List<CoreMessage> list = _messages.putIfAbsent(
       _messagesKey(message.agentId, message.sessionId),

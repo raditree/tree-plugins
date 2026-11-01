@@ -1,22 +1,26 @@
 import 'agent/question_store.dart';
 import 'paths.dart';
-import 'session_store.dart';
+import 'store/conversation_db.dart';
 import 'store/tree_paths.dart';
 import 'tool/question_channel.dart';
 
 /// 会话历史单页上限（与核心 `CoreServer._historyPageMax` 同值）。
 const int kHistoryPageMax = 2000;
 
-/// `GET /api/conversations/{agentId}` 的分页实现（与核心逐行同算法）。
+/// `GET /api/conversations/{agentId}` 的分页实现。
 ///
-/// 语义：
-/// - `session_id=all`：合并该 agent **全部会话**的消息，再按 timestamp 升序；
-/// - 默认按 `timestamp` 升序（相同时间戳保持输入顺序——核心与本实现都是同一
-///   Dart sort 在相同输入上的同一次置换）；
+/// **只读显示行**（messages_display store）：列表页一行卡片不再拖着
+/// tool_arguments / tool_result 全量重负载——详细数据由
+/// `GET /api/conversations/{agentId}/messages/{messageId}` 按点击即查。
+///
+/// 语义（与 jsonl 时代逐字对照）：
+/// - `session_id=all`：该 agent **全部会话**合并；排序从 timestamp 换成
+///   **seq**（会话库的 agent 全局单调键，落库顺序的显式化，规格 §3.1.2）；
 /// - `limit` 取**末尾**一页；`before` 取该消息之前的一页；`from` 按下标；
 ///   `at` 以该消息为中心取一页；都找不到时按核心口径退回末尾一页；
 /// - 响应 `offset` = 这一页第一条的全局下标；`has_more` = 前面还有没有。
-Map<String, dynamic> conversationPage(
+Future<Map<String, dynamic>> conversationPage(
+  ConversationDb db,
   AgentDataPaths paths,
   String agentId, {
   required String sessionId,
@@ -24,17 +28,13 @@ Map<String, dynamic> conversationPage(
   String before = '',
   int? from,
   String at = '',
-}) {
-  final List<Map<String, dynamic>> ordered = sessionId == 'all'
-      ? <Map<String, dynamic>>[
-          for (final SessionRecord session in readSessions(paths, agentId))
-            ...readMessages(paths, agentId, session.sessionId),
-        ]
-      : readMessages(paths, agentId, sessionId);
-  ordered.sort(
-    (Map<String, dynamic> a, Map<String, dynamic> b) =>
-        _timestampOf(a).compareTo(_timestampOf(b)),
-  );
+}) async {
+  final List<Map<String, dynamic>> ordered = <Map<String, dynamic>>[
+    for (final Map<String, dynamic> row in await db.displayRows(
+      sessionId: sessionId == 'all' ? null : sessionId,
+    ))
+      displayRowToJson(row, agentId),
+  ];
 
   final int pageSize = limit <= 0
       ? 0
@@ -88,6 +88,22 @@ Map<String, dynamic> conversationPage(
   };
 }
 
+/// 消息数：**非工具消息**（与核心 `messageCount` 同口径：排 `kind == tool`，
+/// 排临时员工消息**除了**完成报告）。只扫显示行，不再全量读消息文件。
+Future<int> messageCountOf(ConversationDb db, String sessionId) async {
+  int count = 0;
+  for (final Map<String, dynamic> row in await db.displayRows(
+    sessionId: sessionId,
+  )) {
+    final String kind = '${row['kind'] ?? 'text'}';
+    final String subagentId = '${row['subagent_id'] ?? ''}';
+    if (kind == 'tool') continue;
+    if (subagentId.isNotEmpty && kind != 'subagent_report') continue;
+    count++;
+  }
+  return count;
+}
+
 /// 提问卡片的历史形态：用提问记录（真源）覆盖只追加消息里的旧状态。
 ///
 /// 与核心 `_messageJson` 同一处、同一顺序赋值（已有键保持位置，新键追加）——
@@ -108,10 +124,4 @@ Map<String, dynamic> _withQuestionOverlay(
   json['answers'] = record.answers;
   if (record.options.isNotEmpty) json['options'] = record.options;
   return json;
-}
-
-int _timestampOf(Map<String, dynamic> message) {
-  final Object? raw = message['timestamp'];
-  if (raw is String) return DateTime.tryParse(raw)?.millisecondsSinceEpoch ?? 0;
-  return 0;
 }

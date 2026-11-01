@@ -20,6 +20,7 @@ import 'src/delegate.dart'
         agentsPattern,
         cancelPattern,
         conversationsPattern,
+        messageDetailPattern,
         messagesPattern,
         modelPattern,
         modelsPattern,
@@ -135,6 +136,7 @@ const String kAgentEventsReadme =
 const List<Map<String, String>> kDeclaredRoutes = <Map<String, String>>[
   <String, String>{'method': 'GET', 'pattern': agentsPattern},
   <String, String>{'method': 'GET', 'pattern': conversationsPattern},
+  <String, String>{'method': 'GET', 'pattern': messageDetailPattern},
   <String, String>{'method': 'GET', 'pattern': agentDetailPattern},
   <String, String>{'method': 'GET', 'pattern': sessionsPattern},
   <String, String>{'method': 'GET', 'pattern': sessionDetailPattern},

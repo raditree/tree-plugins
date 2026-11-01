@@ -112,6 +112,8 @@ void main() {
       reloaded.sessions('agt').map((CoreSession s) => s.sessionId),
       containsAll(<String>['ses_a', 'session_default']),
     );
+    // 同步读前先装载会话库（Sembast 起冷缓存为空，装载是异步的）。
+    await reloaded.ensureMessagesLoaded('agt', 'ses_a');
     expect(reloaded.sessionMessages('agt', 'ses_a'), hasLength(4));
     expect(reloaded.lastTextMessage('agt')?.content, '回复');
     expect(reloaded.subagents('agt', 'ses_a').single.id, 'sub_x');

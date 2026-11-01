@@ -190,6 +190,14 @@ abstract interface class TreeStore {
   /// 追加顺序 = 读回顺序就与任何排序实现无关。
   CoreMessage appendMessage(CoreMessage message);
 
+  /// **异步装载**某会话的消息缓存（幂等）。
+  ///
+  /// 消息改存会话库（conversation.semdb，纯 Dart 异步 API）之后，同步的
+  /// [messages] / [appendMessage] 只认内存缓存：async 入口（对话服务、委派路由）
+  /// 在读写某会话之前必须先 await 这里。内存实现为空操作；
+  /// 收件人是临时员工（`sub_…`）时按它名册里的**会话主人**装载。
+  Future<void> ensureMessagesLoaded(String agentId, String sessionId);
+
   /// **自动修复落点**：按 `toolCallId` 找到那张工具卡，把"结果永远拿不到"的失败信息
   /// 写进去（`tool_result` 与 `tool_result_for_model` **一起**——它们分别是"给人看"
   /// 与"送模型"两个口径，见 [CoreMessage]）。

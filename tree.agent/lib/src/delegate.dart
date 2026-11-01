@@ -17,6 +17,7 @@ import 'spec/spec_service.dart';
 import 'session_store.dart';
 import 'settings/domain_settings.dart';
 import 'settings/ssh_config.dart';
+import 'store/conversation_db.dart';
 import 'store/records.dart';
 import 'store/tree_paths.dart';
 import 'teammates.dart';
@@ -46,6 +47,8 @@ const String questionAnswerPattern =
 const String modelsPattern = '/api/models'; // 模型池 #14
 const String conversationsPattern =
     '/api/conversations/{agentId}'; // 会话历史 #1（会话/历史组）
+const String messageDetailPattern =
+    '/api/conversations/{agentId}/messages/{messageId}'; // F1 新增：单条消息详情（点击即查）
 const String teammatesPattern =
     '/api/agents/{agentId}/teammates'; // 团队名册 #10（团队组）
 const String agentModelsInfoPattern =
@@ -215,10 +218,16 @@ Future<Map<String, dynamic>> _dispatchDelegate(
   if (method == 'DELETE' && _matches(conversationsPattern, path)) {
     final String agentId = _str(params['agentId']);
     final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
-    final int deleted = runtime.store.clearMessages(
-      agentId,
-      sessionId: _queryString(query, 'session_id'),
-    );
+    final String sid = _queryString(query, 'session_id');
+    // 返回条数按缓存计数：先异步装载目标会话，否则会把"未装载"当成"0 条"。
+    if (sid.isEmpty || sid == 'all') {
+      for (final CoreSession s in runtime.store.sessions(agentId)) {
+        await runtime.store.ensureMessagesLoaded(agentId, s.sessionId);
+      }
+    } else {
+      await runtime.store.ensureMessagesLoaded(agentId, sid);
+    }
+    final int deleted = runtime.store.clearMessages(agentId, sessionId: sid);
     return _jsonReply(200, <String, dynamic>{
       'success': true,
       'deleted': deleted,
@@ -625,7 +634,23 @@ Future<Map<String, dynamic>> _dispatchDelegate(
       );
     final List<Map<String, dynamic>> items = <Map<String, dynamic>>[];
     for (final AgentRecord record in records) {
-      final TextPreview? preview = lastTextPreview(paths, record.id);
+      // 预览改查会话库显示行（jsonl 已退役；旧"倒读文件尾 32KB"随迁移失效）。
+      TextPreview? preview;
+      try {
+        final ConversationDb db = await ConversationDbRegistry.open(
+          TreePaths(paths.root),
+          record.id,
+        );
+        final Map<String, dynamic>? row = await db.lastTextDisplayRow();
+        if (row != null) {
+          preview = TextPreview(
+            '${row['content'] ?? ''}',
+            (row['timestamp'] as num?)?.toInt() ?? 0,
+          );
+        }
+      } catch (_) {
+        // 库损坏/打不开：列表页宁可少一行预览，也不能整页 500。
+      }
       items.add(
         agentApiJson(
           record,
@@ -940,16 +965,21 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     );
   }
 
-  // 会话历史（分页 + 提问状态叠加）。
+  // 会话历史（分页 + 提问状态叠加；**只读显示行**，重负载走详情端点）。
   if (method == 'GET' && _matches(conversationsPattern, path)) {
     final String agentId = _str(params['agentId']);
     if (readAgentRecord(paths, agentId) == null) {
       return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
     }
     final String rawSession = _queryString(query, 'session_id');
+    final ConversationDb db = await ConversationDbRegistry.open(
+      TreePaths(paths.root),
+      agentId,
+    );
     return _jsonReply(
       200,
-      conversationPage(
+      await conversationPage(
+        db,
         paths,
         agentId,
         sessionId: rawSession.isEmpty ? 'session_default' : rawSession,
@@ -959,6 +989,55 @@ Future<Map<String, dynamic>> _dispatchDelegate(
         at: _queryString(query, 'at').trim(),
       ),
     );
+  }
+
+  // 单条消息详情（F1 新增，点击即查）：在途缓存优先，未命中查会话库详细行。
+  if (method == 'GET' && _matches(messageDetailPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final String messageId = _str(params['messageId']);
+    final String sessionId = _queryString(query, 'session_id');
+    if (readAgentRecord(paths, agentId) == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
+    }
+    Map<String, dynamic>? json;
+    // ① 在途优先：正在流式/跑着的消息还没落库完整结果，只查库会看到空卡片。
+    if (sessionId.isNotEmpty) {
+      final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+      await runtime.store.ensureMessagesLoaded(agentId, sessionId);
+      for (final CoreMessage m in runtime.store.sessionMessages(
+        agentId,
+        sessionId,
+      )) {
+        if (m.id == messageId) {
+          json = detailPayloadToJson(m.toJson());
+          break;
+        }
+      }
+    }
+    // ② 未命中查库。
+    if (json == null) {
+      final ConversationDb db = await ConversationDbRegistry.open(
+        TreePaths(paths.root),
+        agentId,
+      );
+      final Map<String, dynamic>? row = await db.detailRow(messageId);
+      if (row != null) {
+        json = detailPayloadToJson(
+          Map<String, dynamic>.from(row['payload'] as Map),
+        );
+      }
+    }
+    if (json == null) {
+      return _jsonReply(404, <String, dynamic>{
+        'detail': '消息不存在：$messageId',
+      });
+    }
+    // 提问状态叠加（真源在 questions 存储；与列表页同一口径）。
+    json = _withQuestionOverlay(
+      FileQuestionStore(TreePaths(paths.root)),
+      json,
+    );
+    return _jsonReply(200, json);
   }
 
   // 会话列表（读接口，但会像核心一样兜底默认会话）。
@@ -975,23 +1054,27 @@ Future<Map<String, dynamic>> _dispatchDelegate(
             b.updatedAt.compareTo(a.updatedAt),
       );
     }
+    final ConversationDb db = await ConversationDbRegistry.open(
+      TreePaths(paths.root),
+      agentId,
+    );
+    final List<Map<String, dynamic>> items = <Map<String, dynamic>>[];
+    for (final SessionRecord session in sessions) {
+      items.add(
+        sessionApiJson(
+          session,
+          messageCount: await messageCountOf(db, session.sessionId),
+        ),
+      );
+    }
     return _jsonReply(200, <String, dynamic>{
       'agent_id': agentId,
-      'sessions': <Map<String, dynamic>>[
-        for (final SessionRecord session in sessions)
-          sessionApiJson(
-            session,
-            messageCount: messageCountOf(
-              paths,
-              agentId,
-              session.sessionId,
-            ),
-          ),
-      ],
+      'sessions': items,
     });
   }
 
-  // 会话详情（消息为规范化的 CoreMessage.toJson 形态）。
+  // 会话详情（消息为规范化的 CoreMessage.toJson 形态；整份历史端点无 UI
+  // 调用方，保留全量详细行拼接，列表页的瘦身不影响它）。
   if (method == 'GET' && _matches(sessionDetailPattern, path)) {
     final String agentId = _str(params['agentId']);
     final String sessionId = _str(params['sessionId']);
@@ -999,12 +1082,20 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     if (session == null) {
       return _jsonReply(404, <String, dynamic>{'detail': '会话不存在'});
     }
+    final ConversationDb db = await ConversationDbRegistry.open(
+      TreePaths(paths.root),
+      agentId,
+    );
+    final List<Map<String, dynamic>> messages = <Map<String, dynamic>>[
+      for (final Map<String, dynamic> row in await db.detailRows(sessionId))
+        detailPayloadToJson(Map<String, dynamic>.from(row['payload'] as Map)),
+    ];
     return _jsonReply(200, <String, dynamic>{
       'session': sessionApiJson(
         session,
-        messageCount: messageCountOf(paths, agentId, sessionId),
+        messageCount: await messageCountOf(db, sessionId),
       ),
-      'messages': readMessages(paths, agentId, sessionId),
+      'messages': messages,
     });
   }
 
@@ -1106,17 +1197,23 @@ Future<Map<String, dynamic>> _dispatchDelegate(
             '不在这个会话（$sessionId）里——跨会话不保留是硬不变量。',
       });
     }
-    final List<Map<String, dynamic>> messages = <Map<String, dynamic>>[
-      for (final Map<String, dynamic> message
-          in readMessages(paths, record.ownerAgentId, sessionId))
-        if ('${message['subagent_id'] ?? ''}' == subagentId &&
-            '${message['kind']}' != 'subagent_report')
-          _withQuestionOverlay(runtime.questionStore, message),
-    ];
-    messages.sort(
-      (Map<String, dynamic> a, Map<String, dynamic> b) =>
-          _messageMs(a).compareTo(_messageMs(b)),
+    // 临时员工过程分栏读**详细行**（含工具结果全文——这是它的完整工作记录，
+    // 不是列表页）；seq 序即 append 序，不再按 timestamp 重排。
+    final ConversationDb db = await ConversationDbRegistry.open(
+      TreePaths(paths.root),
+      record.ownerAgentId,
     );
+    final List<Map<String, dynamic>> messages = <Map<String, dynamic>>[
+      for (final Map<String, dynamic> row in await db.detailRows(sessionId))
+        if ('${(row['payload'] as Map)['subagent_id'] ?? ''}' == subagentId &&
+            '${(row['payload'] as Map)['kind']}' != 'subagent_report')
+          _withQuestionOverlay(
+            runtime.questionStore,
+            detailPayloadToJson(
+              Map<String, dynamic>.from(row['payload'] as Map),
+            ),
+          ),
+    ];
     return _jsonReply(200, <String, dynamic>{
       'agent_id': agentId,
       'subagent_id': subagentId,
@@ -1244,6 +1341,3 @@ Map<String, dynamic> _withQuestionOverlay(
   if (record.options.isNotEmpty) json['options'] = record.options;
   return json;
 }
-
-int _messageMs(Map<String, dynamic> message) =>
-    DateTime.tryParse('${message['timestamp']}')?.millisecondsSinceEpoch ?? 0;

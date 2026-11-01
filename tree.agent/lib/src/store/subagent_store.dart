@@ -261,6 +261,18 @@ class SubagentStore implements TreeStore {
   @override
   CoreMessage appendMessage(CoreMessage message) => inner.appendMessage(message);
 
+  @override
+  Future<void> ensureMessagesLoaded(String agentId, String sessionId) {
+    // 临时员工没有自己的会话：装载的是**会话主人**的那一段。
+    final CoreSubagent? record = registry.isSubagent(agentId)
+        ? _record(agentId)
+        : null;
+    return inner.ensureMessagesLoaded(
+      record?.ownerAgentId ?? agentId,
+      sessionId,
+    );
+  }
+
   /// 自动修复一律转发给真 store：临时员工的工具卡与主 agent 的卡都在同一份
   /// `messages.jsonl` 里（`tool_call_id` 全局唯一），没有"按 agent 分栏"的问题。
   @override

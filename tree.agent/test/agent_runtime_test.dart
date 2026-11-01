@@ -48,9 +48,13 @@ void main() {
     await runtime.waitIdle();
     await runtime.store.flush();
 
-    final List<CoreMessage> messages = FileTreeStore(
-      TreePaths(paths.root),
-    ).sessionMessages('agt', sessionId);
+    // 新实例是冷缓存：同步读前先将会话库装载进内存（F1 起的固定姿势）。
+    final FileTreeStore reader = FileTreeStore(TreePaths(paths.root));
+    await reader.ensureMessagesLoaded('agt', sessionId);
+    final List<CoreMessage> messages = reader.sessionMessages(
+      'agt',
+      sessionId,
+    );
     expect(messages.first.role, 'user');
     expect(messages.first.content, '你好');
     expect(

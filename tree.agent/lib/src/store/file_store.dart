@@ -6,6 +6,7 @@ import 'package:path/path.dart' as p;
 import '../util/text_decoder.dart';
 
 import 'atomic_file.dart';
+import 'conversation_db.dart';
 import '../util/ids.dart';
 import 'tree_paths.dart';
 import 'tree_store.dart';
@@ -54,14 +55,14 @@ class FileTreeStore implements TreeStore {
   final Map<String, CoreMessage?> _preview = <String, CoreMessage?>{};
   final WriteQueue _queue = WriteQueue();
 
+  /// 会话库异步装载中的任务（`agent::session` → future；防并发重复读库）。
+  final Map<String, Future<void>> _hydrating = <String, Future<void>>{};
+
+  /// 本实例打开过的会话库路径（[close] 时逐个关句柄）。
+  final Set<String> _dbPaths = <String>{};
+
   bool _agentsScanned = false;
   final Set<String> _agentLoaded = <String>{};
-
-  /// 累计跳过的损坏消息行数（自检与日志用）。
-  int skippedMessageLines = 0;
-
-  /// 预览只需读文件尾部，避免为列表页一行摘要读进整份历史。
-  static const int _previewTailBytes = 32 * 1024;
 
   static const String _agentHeader =
       'Tree agent 配置：可直接手改（system_prompt 支持多行），'
@@ -168,19 +169,29 @@ class FileTreeStore implements TreeStore {
       final File file = File(agentFile);
       if (await file.exists()) await file.delete();
     });
+    final String dbPath = ConversationDbRegistry.pathFor(paths, id);
+    _dbPaths.remove(dbPath);
     _queue.enqueue(dataDir, () async {
+      // 会话库（conversation.semdb）在 agent 数据目录里：**必须先关句柄**再删目录，
+      // 否则 Windows 上打开中的文件会让递归删除失败。
+      await ConversationDbRegistry.close(dbPath);
       final Directory dir = Directory(dataDir);
       if (await dir.exists()) await dir.delete(recursive: true);
     });
     return true;
   }
 
+  /// 最后一条 agent 文本消息：**只看内存缓存**（同步接口无法查库）。
+  ///
+  /// 缓存由 [appendMessage]（本轮新消息）与 [_hydrate]（会话库存装载）填充；
+  /// 未装载的会话返回 null。需要跨进程可靠预览的调用方（HTTP 列表端点）
+  /// 已改走 `ConversationDb.lastTextDisplayRow`，jsonl 倒读尾巴随之退役。
   @override
   CoreMessage? lastTextMessage(String agentId) {
     _loadAgent(agentId);
     final List<CoreSession> ordered = sessions(agentId);
     for (final CoreSession session in ordered) {
-      final CoreMessage? preview = _previewFor(agentId, session.sessionId);
+      final CoreMessage? preview = _preview[_key(agentId, session.sessionId)];
       if (preview != null) return preview;
     }
     return null;
@@ -272,6 +283,14 @@ class FileTreeStore implements TreeStore {
     _subagents.remove(key);
     _preview.remove(key);
     final String dir = paths.sessionDir(agentId, sessionId);
+    // 会话库在 **agent 级**目录（不在会话目录里）：递归删目录收不到它，
+    // 必须显式删该会话的显示行 + 详细行。
+    final String dbPath = ConversationDbRegistry.pathFor(paths, agentId);
+    _dbPaths.add(dbPath);
+    _queue.enqueue(dbPath, () async {
+      final ConversationDb db = await conversationDb(agentId);
+      await db.deleteSession(sessionId);
+    });
     _queue.enqueue(dir, () async {
       final Directory target = Directory(dir);
       if (await target.exists()) await target.delete(recursive: true);
@@ -441,12 +460,17 @@ class FileTreeStore implements TreeStore {
       agent.updatedAt = message.timestamp;
       _writeAgent(agent);
     }
-    final String line = jsonEncode(message.toJson());
-    final String file = paths.messagesFile(message.agentId, message.sessionId);
-    _queue.enqueue(
-      paths.sessionDir(message.agentId, message.sessionId),
-      () => AtomicFile.appendLine(file, line),
+    // 持久化进会话库（显示行 + 详细行同事务）；每 agent 一条串行队列键，
+    // 保证 seq 分配与调用顺序一致（jsonl 时代由"每会话串行追加"提供同一保证）。
+    final String dbPath = ConversationDbRegistry.pathFor(
+      paths,
+      message.agentId,
     );
+    _dbPaths.add(dbPath);
+    _queue.enqueue(dbPath, () async {
+      final ConversationDb db = await conversationDb(message.agentId);
+      await db.appendMessage(message);
+    });
     return message;
   }
 
@@ -468,36 +492,26 @@ class FileTreeStore implements TreeStore {
     final CoreMessage existing = list[index];
     // 幂等：已经有结果就不再改（自动修复每次组装请求都会问一次）
     if (existing.toolResult.trim().isNotEmpty) return false;
-    list[index] = CoreMessage.fromJson(<String, dynamic>{
+    final CoreMessage repaired = CoreMessage.fromJson(<String, dynamic>{
       ...existing.toJson(),
       'tool_result': toolResult,
       'tool_result_for_model': toolResultForModel,
     });
-    _writeMessages(agentId, sessionId, list);
+    list[index] = repaired;
+    // 只改 detail payload（display 行没有 tool_result，无需动）；
+    // 排进该 agent 的写队列，与 append 串行，不会读到"半修"状态。
+    final String msgId = existing.id;
+    final String dbPath = ConversationDbRegistry.pathFor(paths, agentId);
+    _dbPaths.add(dbPath);
+    _queue.enqueue(dbPath, () async {
+      final ConversationDb db = await conversationDb(agentId);
+      await db.updateDetailResult(
+        msgId,
+        toolResult: toolResult,
+        toolResultForModel: toolResultForModel,
+      );
+    });
     return true;
-  }
-
-  /// 重写某会话的 `messages.jsonl`（**自动修复**专用：结果要写回**同一张**卡）。
-  ///
-  /// 只在"修理历史"这类罕见路径上调用：整份重写比 append 贵，但 append 一条同 id 的
-  /// 卡会出现两张卡、`tool_call_id` 重复。列表本身来自 [_loadMessages]（整份已加载），
-  /// 因此重写不会丢行。
-  void _writeMessages(
-    String agentId,
-    String sessionId,
-    List<CoreMessage> messages,
-  ) {
-    final String file = paths.messagesFile(agentId, sessionId);
-    final String content = messages
-        .map((CoreMessage m) => jsonEncode(m.toJson()))
-        .join('\n');
-    _queue.enqueue(
-      paths.sessionDir(agentId, sessionId),
-      () => AtomicFile.writeStringAtomic(
-        file,
-        content.isEmpty ? '' : '$content\n',
-      ),
-    );
   }
 
   @override
@@ -515,10 +529,11 @@ class FileTreeStore implements TreeStore {
       deleted += _messages[key]?.length ?? 0;
       _messages[key] = <CoreMessage>[];
       _preview.remove(key);
-      final String file = paths.messagesFile(agentId, id);
-      _queue.enqueue(paths.sessionDir(agentId, id), () async {
-        final File target = File(file);
-        if (await target.exists()) await target.delete();
+      final String dbPath = ConversationDbRegistry.pathFor(paths, agentId);
+      _dbPaths.add(dbPath);
+      _queue.enqueue(dbPath, () async {
+        final ConversationDb db = await conversationDb(agentId);
+        await db.deleteSession(id);
       });
     }
     return deleted;
@@ -538,6 +553,63 @@ class FileTreeStore implements TreeStore {
     await flush();
     final Object? error = _queue.lastError;
     if (error != null) log?.call('落盘期间出现错误（最后一次）：$error');
+    for (final String dbPath in _dbPaths.toList()) {
+      await ConversationDbRegistry.close(dbPath);
+    }
+    _dbPaths.clear();
+  }
+
+  /// 该 agent 的会话库句柄（打开幂等；首次打开顺带完成 jsonl 迁移）。
+  Future<ConversationDb> conversationDb(String agentId) async {
+    final String dbPath = ConversationDbRegistry.pathFor(paths, agentId);
+    _dbPaths.add(dbPath);
+    return ConversationDbRegistry.open(paths, agentId, log: log);
+  }
+
+  /// **异步装载**某会话的消息缓存（幂等）——会话消息进会话库后的唯一装载入口。
+  ///
+  /// 为什么必须异步：Sembast 只有异步 API，而 [messages] / [appendMessage] 的
+  /// 接口形状是同步的（契约如此，M1/M2 就这么跑）。折中：async 入口（对话服务、
+  /// 委派路由）在读写某会话之前先 `await` 这里；同步侧撞上未装载的缓存只会
+  /// 记一条错误日志（见 [_loadMessages]），**不静默兜底**。
+  @override
+  Future<void> ensureMessagesLoaded(String agentId, String sessionId) async {
+    _loadAgent(agentId);
+    final String key = _key(agentId, sessionId);
+    if (_messages.containsKey(key)) return;
+    final Future<void>? pending = _hydrating[key];
+    if (pending != null) return pending;
+    final Future<void> task = _hydrate(agentId, sessionId, key);
+    _hydrating[key] = task;
+    try {
+      await task;
+    } finally {
+      _hydrating.remove(key);
+    }
+  }
+
+  Future<void> _hydrate(String agentId, String sessionId, String key) async {
+    final String dbPath = ConversationDbRegistry.pathFor(paths, agentId);
+    // 先排干该 agent 的写队列：在途追加必须先落库，否则装载会漏掉最后几条。
+    await _queue.drain(dbPath);
+    final ConversationDb db = await conversationDb(agentId);
+    final List<CoreMessage> list = <CoreMessage>[];
+    for (final Map<String, dynamic> row in await db.detailRows(sessionId)) {
+      list.add(
+        CoreMessage.fromJson(
+          Map<String, dynamic>.from(row['payload'] as Map),
+        ),
+      );
+    }
+    _messages[key] = list;
+    CoreMessage? preview;
+    for (final CoreMessage m in list.reversed) {
+      if (!m.isTool && m.role == 'agent' && !m.isSubagentMessage) {
+        preview = m;
+        break;
+      }
+    }
+    _preview[key] = preview;
   }
 
   // ── 装载 ─────────────────────────────────────────────────────────────
@@ -614,21 +686,18 @@ class FileTreeStore implements TreeStore {
     }
   }
 
-  /// 装载某会话的全部消息（幂等）。
+  /// 同步装载入口已废除：消息改存会话库（conversation.semdb），装载走
+  /// [ensureMessagesLoaded]。这里只剩"缓存命中检查"：未命中**记错误日志暴露**
+  /// 调用方漏了 await，而不是静默给空列表（空列表会伪装成"会话没消息"）。
   void _loadMessages(String agentId, String sessionId) {
     _loadAgent(agentId);
     final String key = _key(agentId, sessionId);
     if (_messages.containsKey(key)) return;
     _messages[key] = <CoreMessage>[];
-    final String file = paths.messagesFile(agentId, sessionId);
-    final String? text = AtomicFile.readStringOrNullSync(file);
-    if (text == null || text.isEmpty) return;
-    final JsonlReadResult result = AtomicFile.decodeJsonl(text);
-    if (result.skipped > 0) {
-      skippedMessageLines += result.skipped;
-      log?.call('messages.jsonl 有 ${result.skipped} 行无法解析，已跳过：$file');
-    }
-    _messages[key] = result.records.map(CoreMessage.fromJson).toList();
+    log?.call(
+      '消息缓存未装载就被同步读取（agent=$agentId session=$sessionId）：'
+      '调用方需先 await ensureMessagesLoaded，本次按空会话继续。',
+    );
   }
 
   /// 装载某会话的临时员工名册（幂等）：
@@ -659,30 +728,6 @@ class FileTreeStore implements TreeStore {
     } catch (error) {
       log?.call('临时员工名册解析失败（当作空名册）：$file：$error');
     }
-  }
-
-  /// 会话最后一条 agent 文本消息（读文件尾部即可，避免整份历史进内存）。
-  CoreMessage? _previewFor(String agentId, String sessionId) {
-    final String key = _key(agentId, sessionId);
-    if (_preview.containsKey(key)) return _preview[key];
-    CoreMessage? found;
-    final String? tail = AtomicFile.readTailOrNullSync(
-      paths.messagesFile(agentId, sessionId),
-      _previewTailBytes,
-    );
-    if (tail != null && tail.isNotEmpty) {
-      final JsonlReadResult result = AtomicFile.decodeJsonl(tail);
-      for (final Map<String, dynamic> record in result.records.reversed) {
-        final CoreMessage message = CoreMessage.fromJson(record);
-        if (message.isTool || message.role != 'agent') continue;
-        // 预览只说"这个 agent 自己"的最后一句话，不看临时员工的产出
-        if (message.isSubagentMessage) continue;
-        found = message;
-        break;
-      }
-    }
-    _preview[key] = found;
-    return found;
   }
 
   // ── 落盘 ─────────────────────────────────────────────────────────────

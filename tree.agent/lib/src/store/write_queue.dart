@@ -37,6 +37,15 @@ class WriteQueue {
     );
   }
 
+  /// 排空**单个键**的在途任务（会话库装载前用：只等本 agent 的写，不等全队列）。
+  Future<void> drain(String key) async {
+    while (true) {
+      final Future<void>? tail = _tails[key];
+      if (tail == null) return;
+      await tail;
+    }
+  }
+
   /// 等待全部在途任务完成（含等待期间新入队的任务）。
   Future<void> flush() async {
     int seen = -1;
