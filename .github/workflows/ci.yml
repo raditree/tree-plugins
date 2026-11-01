@@ -77,9 +77,19 @@ jobs:
             tests: true
     defaults:
       run:
-        working-directory: ${{ matrix.plugin }}
+        working-directory: plugins/${{ matrix.plugin }}
     steps:
-      - uses: actions/checkout@v4
+      # 桌面仓放工作区根、插件仓放 `plugins/`：与本地形状一致，`ssh_executor` /
+      # `self_updater` 里写死的 `../../packages/tree_tunnel_protocol` 才能解析到。
+      - name: 检出桌面仓（提供 packages/ 这一层形状）
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DESKTOP_REPO }}
+          ref: ${{ env.DESKTOP_REF }}
+      - name: 检出本仓到 plugins/
+        uses: actions/checkout@v4
+        with:
+          path: plugins
       - uses: dart-lang/setup-dart@v1
         with:
           sdk: ${{ env.DART_SDK }}
