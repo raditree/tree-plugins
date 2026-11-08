@@ -15,6 +15,7 @@ import '../agent_store.dart';
 import '../compat/protocol_types.dart';
 import '../llm/llm_agent_engine.dart';
 import '../llm/llm_json_caller.dart';
+import '../llm/llm_relay.dart';
 import '../llm/llm_summarizer.dart';
 import '../paths.dart';
 import '../settings/core_settings.dart';
@@ -165,6 +166,7 @@ class AgentRuntime {
           agentOverrides: overridesFor,
           usageLog: usageLog,
           toolRunner: stationToolRunner,
+          llmRelay: _triggerLlmRelay,
         );
     // 工具表快照的失效出口在引擎上（C6-b）；注入自定义引擎（测试）时没有快照。
     llmEngine = resolvedEngine is LlmAgentEngine ? resolvedEngine : null;
@@ -1324,6 +1326,58 @@ class AgentRuntime {
             '${jsonEncode(t.parameters)}',
       )
       .join('\u0000');
+
+  /// **LLM 三步中转**（AC-4）：调本插件自建的中转站，把订阅者回包翻译成
+  /// [LlmRelayReply]。
+  ///
+  /// 失败 / 无订阅者 / 回包非法一律回 `handled:false`——会话层据此走内置路径
+  /// （fail-open，C9）；超时也在会话层统一截断。这里**不做任何业务判断**，
+  /// `error` / `error_reason` 的解释权在会话层（便于单测直接注入）。
+  Future<LlmRelayReply> _triggerLlmRelay({
+    required String point,
+    required Map<String, dynamic> data,
+    required String agentId,
+    required String sessionId,
+    required int turn,
+  }) async {
+    final StationTriggerClient? trigger = stationTrigger;
+    if (trigger == null) return const LlmRelayReply();
+    final String stationId =
+        'plugin.$pluginId.relay.${point.replaceAll('.', '_')}';
+    try {
+      final Map<String, dynamic> reply = await trigger(
+        stationId,
+        data,
+        <String, dynamic>{
+          'purpose': 'llm.relay',
+          'agent_id': agentId,
+          'session_id': sessionId,
+          'turn': turn,
+        },
+        _stationScopeFor(agentId, sessionId),
+      );
+      final Object? result = reply['result'];
+      if (reply['ok'] != true || result is! Map) {
+        return const LlmRelayReply();
+      }
+      if (result['handled'] != true) return const LlmRelayReply();
+      final Object? payload = result['data'];
+      return LlmRelayReply(
+        handled: true,
+        data: payload is Map
+            ? payload.map(
+                (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+              )
+            : null,
+      );
+    } catch (error) {
+      // 中转点自身失败绝不打断生成：交给会话层 fail-open，并留一行可读日志。
+      stderr.writeln(
+        '[tree.agent] LLM 中转站 $point 调用失败（fail-open）：$error',
+      );
+      return const LlmRelayReply();
+    }
+  }
 
   /// 某个 agent 的工作空间 IO（经核心执行站；未接线时返回 null）。
   Future<WorkspaceIO?> workspaceIoFor(String agentId, String sessionId) async {

@@ -7,6 +7,7 @@ import '../settings/core_settings.dart';
 import '../tool/tool_runner.dart';
 import '../util/ids.dart';
 import '../util/tokens.dart';
+import 'llm_relay.dart';
 import 'llm_result_gate.dart';
 import 'llm_transport.dart';
 import 'llm_types.dart';
@@ -166,6 +167,8 @@ class LlmSession {
     this.requestSilenceTimeout = defaultRequestSilenceTimeout,
     this.pullInputs,
     this.shouldTerminate,
+    this.llmRelay,
+    this.relayTimeout = const Duration(seconds: 30),
     this.log,
   });
 
@@ -261,6 +264,15 @@ class LlmSession {
   /// 只在**一次完整响应 + 它的整个工具批**落地之后询问——因此工具批永远原子，
   /// 注入消息绝不会让剩余工具被跳过。null = 不终止（老行为）。
   final bool Function()? shouldTerminate;
+
+  /// **LLM 三步中转点**（AC-4）；null = 未接线（三个点位全部走内置路径）。
+  ///
+  /// 契约：只有显式 `error:true` 才终止 loop；无订阅者 / null / 非法回包 / 异常 /
+  /// 超时一律 fail-open + 可读日志（C9）。
+  final LlmRelayHook? llmRelay;
+
+  /// 单个中转点的等待上限（超时 = fail-open）；测试可注入很短的值。
+  final Duration relayTimeout;
 
   /// 可读日志（上下文裁剪、工具异常等）。
   final void Function(String message)? log;
@@ -393,6 +405,29 @@ class LlmSession {
           } catch (error) {
             log?.call('投入 LLM 前改写点异常（已放行原请求）：$error');
           }
+        }
+      }
+      if (pluginStream == null) {
+        // AC-4 前置处理 / 请求体自动修复：都是**本插件自建**的中转点。
+        // 只有显式 `error:true` 才终止本轮；其余失败一律走内置路径（C9）。
+        for (final String point in <String>[
+          LlmRelayPoints.pre,
+          LlmRelayPoints.repair,
+        ]) {
+          final (LlmRequest?, String?) relayed = await _relayRequestPoint(
+            point,
+            request,
+            agentId: agentId,
+            sessionId: sessionId,
+            turn: turn,
+          );
+          if (relayed.$2 != null) {
+            log?.call('中转站 $point 显式报错，终止本轮：${relayed.$2}');
+            yield AgentError(relayed.$2!);
+            yield const AgentDone();
+            return;
+          }
+          if (relayed.$1 != null) request = relayed.$1!;
         }
       }
       final SplayTreeMap<int, _ToolCallDraft> drafts =
@@ -554,6 +589,61 @@ class LlmSession {
           }
         }
       }
+      // AC-4 后置处理：对"这一跳的思考 / 正文 / 工具调用"整体后处理。
+      //
+      // 正文增量**已经流式下发**，这里的改写只影响**下一跳的上下文**（assistant
+      // 消息与工具执行），不回滚用户已经看到的帧——重写已下发内容会让 UI、历史与
+      // 端点上下文三者互相打架。显式 `error:true` 则终止本轮（C9）。
+      final LlmRelayReply postReply = await _relay(
+        LlmRelayPoints.post,
+        <String, dynamic>{
+          'thinking': turnReasoning.toString(),
+          'content': text.toString(),
+          'tool_calls': <Map<String, dynamic>>[
+            for (final LlmToolCall call in calls) call.toWire(),
+          ],
+        },
+        agentId: agentId,
+        sessionId: sessionId,
+        turn: turn,
+      );
+      if (postReply.hasData) {
+        final Map<String, dynamic> data = postReply.data!;
+        final String postError = _relayErrorReason(data);
+        if (postError.isNotEmpty) {
+          log?.call('后置处理中转站显式报错，终止本轮：$postError');
+          yield AgentError(postError);
+          yield const AgentDone();
+          return;
+        }
+        final Object? content = data['content'];
+        if (content is String) {
+          text
+            ..clear()
+            ..write(content);
+        }
+        final Object? thinking = data['thinking'];
+        if (thinking is String) {
+          turnReasoning
+            ..clear()
+            ..write(thinking);
+        }
+        final Object? rewrittenCalls = data['tool_calls'];
+        if (rewrittenCalls is List) {
+          final List<LlmToolCall> parsed = <LlmToolCall>[
+            for (final Object? item in rewrittenCalls)
+              if (LlmToolCall.tryFromWire(item) case final LlmToolCall call)
+                call,
+          ];
+          if (parsed.length == rewrittenCalls.length) {
+            calls
+              ..clear()
+              ..addAll(parsed);
+          } else {
+            log?.call('后置处理回包的 tool_calls 有非法条目（已忽略整份改写）');
+          }
+        }
+      }
       if (endpointUsage == null) {
         // 端点这一跳没给 usage：本地估算兜底，并显式标注 estimated。
         //
@@ -684,6 +774,73 @@ class LlmSession {
         return;
       }
     }
+  }
+
+  /// 调一次中转点；未接线 / 异常 / 超时一律收敛成 `handled:false`（fail-open）。
+  Future<LlmRelayReply> _relay(
+    String point,
+    Map<String, dynamic> data, {
+    required String agentId,
+    required String sessionId,
+    required int turn,
+  }) async {
+    final LlmRelayHook? hook = llmRelay;
+    if (hook == null) return const LlmRelayReply();
+    try {
+      return await hook(
+        point: point,
+        data: data,
+        agentId: agentId,
+        sessionId: sessionId,
+        turn: turn,
+      ).timeout(relayTimeout);
+    } on TimeoutException {
+      log?.call('中转站 $point 超时（已忽略，走内置路径）');
+      return const LlmRelayReply();
+    } catch (error) {
+      log?.call('中转站 $point 异常（已忽略，走内置路径）：$error');
+      return const LlmRelayReply();
+    }
+  }
+
+  /// 请求类点位（`llm.pre` / `llm.repair`）：返回 `(改写后的请求?, 显式错误原因?)`。
+  Future<(LlmRequest?, String?)> _relayRequestPoint(
+    String point,
+    LlmRequest request, {
+    required String agentId,
+    required String sessionId,
+    required int turn,
+  }) async {
+    final LlmRelayReply reply = await _relay(
+      point,
+      request.toWire(stream: true),
+      agentId: agentId,
+      sessionId: sessionId,
+      turn: turn,
+    );
+    if (!reply.hasData) return (null, null);
+    final Map<String, dynamic> data = reply.data!;
+    final String reason = _relayErrorReason(data);
+    if (reason.isNotEmpty) return (null, reason);
+    // 契约：`{request?: 完整请求体}`；也接受"回包本身就是请求体"的写法。
+    final Object? raw = data['request'] ?? data;
+    final LlmRequest? rewritten = LlmRequest.tryFromWire(raw);
+    if (rewritten == null) {
+      log?.call('中转站 $point 回包不是合法请求（已放行原请求）');
+      return (null, null);
+    }
+    return (rewritten, null);
+  }
+
+  /// 回包里的**显式**错误（C9：只有 `error:true` 才 fail-closed）。
+  static String _relayErrorReason(Map<String, dynamic> data) {
+    final Object? error = data['error'];
+    final bool isError = error == true || error == 'true';
+    if (!isError) return '';
+    final String reason = (data['error_reason'] ?? data['reason'] ?? '')
+        .toString()
+        .trim();
+    return reason.isEmpty ? '中转站返回错误（未给原因）' : reason;
   }
 
   /// 把"这一跳 LLM 请求"包一层**可关闭的活性看护**（用户 2026-10-03：「沉默就登记、关闭即取消」）。

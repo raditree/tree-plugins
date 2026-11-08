@@ -8,6 +8,7 @@ import '../agent/tool_result_repair.dart';
 import '../settings/domain_settings.dart';
 import '../store/usage_log.dart';
 import '../tool/tool_runner.dart';
+import 'llm_relay.dart';
 import 'llm_session.dart';
 import 'llm_transport.dart';
 import 'llm_types.dart';
@@ -72,6 +73,7 @@ class LlmAgentEngine implements AgentEngine {
     this.visionResolver,
     this.awaitReady,
     this.usageLog,
+    this.llmRelay,
     this.log,
   });
 
@@ -143,6 +145,9 @@ class LlmAgentEngine implements AgentEngine {
 
   /// **「系统提示词构造过程」钩子**（中转站点位 `system.relay.prompt.system`）。
   SystemPromptRelayHook? systemPromptRelay;
+
+  /// **LLM 三步中转点**（AC-4，本插件自建）；null = 未接线（三步全走内置）。
+  LlmRelayHook? llmRelay;
 
   /// 外设就绪闸门（可选）：**每轮生成前**在这里有界地等一下 MCP/插件预热。
   ///
@@ -345,6 +350,7 @@ class LlmAgentEngine implements AgentEngine {
               vision: config.ifVision ? visionResolver : null,
             ),
       shouldTerminate: context.shouldTerminate,
+      llmRelay: llmRelay,
       log: log,
     );
     // usage 事件要**过一手**：真实 usage 里夹带着"本次上下文字符数"，学习完之后

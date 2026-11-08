@@ -106,6 +106,28 @@ Future<void> _onReady(PluginKitServer server) async {
     } catch (error) {
       server.channel.log('工具贡献收集站注册失败（不影响内置工具）：$error');
     }
+    // AC-4：LLM 三步中转点（前置 / 请求体自动修复 / 后置）。
+    // 每个点位唯一订阅者；无订阅者时本插件触发拿到 handled:false ⇒ 走内置路径。
+    for (final (String point, String name) in LlmRelayPoints.all) {
+      try {
+        final Map<String, dynamic> relay = await server.channel.request(
+          M.stationRegister,
+          <String, dynamic>{
+            'kind': 'relay',
+            'name': name,
+            'description': 'tree.agent LLM 中转点：$point',
+            'readme': kLlmRelayReadme,
+            'shared': true,
+          },
+        );
+        server.channel.log(
+          'LLM 中转点 $point：'
+          '${relay['ok'] == true ? relay['station_id'] : relay['error']}',
+        );
+      } catch (error) {
+        server.channel.log('LLM 中转点 $point 注册失败（不影响生成）：$error');
+      }
+    }
     // 执行器激活站：local 检查设备与工作空间；ssh 真建连并登记租约。
     try {
       final Map<String, dynamic> executor = await server.channel.request(
