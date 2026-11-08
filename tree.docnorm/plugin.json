@@ -1,0 +1,14 @@
+{
+  "id": "tree.docnorm",
+  "name": "Tree 文档归一化",
+  "version": "0.1.0",
+  "description": "headless 插件：扫描目标仓库、识别包与子包、抽取公开声明与 API 面（DN-2）；侦查文档契约并按三层规则源做 DocPolicy 检查（DN-3）。只读，不修改目标仓库。",
+  "runtime": "headless",
+  "files": [
+    "tree_docnorm.exe"
+  ],
+  "command": "tree_docnorm.exe",
+  "args": [],
+  "granularity": "team",
+  "scope": {}
+}

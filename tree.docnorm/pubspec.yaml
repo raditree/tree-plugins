@@ -1,0 +1,15 @@
+name: tree_docnorm
+description: tree.docnorm 插件的仓库扫描与语言适配层（DN-2）；不得反向依赖核心包。
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.13.0
+
+dependencies:
+  path: ^1.9.0
+  yaml: ^3.1.2
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.0
