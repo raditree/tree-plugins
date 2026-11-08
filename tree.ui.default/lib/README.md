@@ -73,7 +73,9 @@
 11. **消息流是一行式：模型消息高亮、工具与思考各占一行，完整内容去右栏「详情」窗**
     （[ui/widgets/tool_call_card.dart](ui/widgets/tool_call_card.dart)、[ui/widgets/thinking_card.dart](ui/widgets/thinking_card.dart)、
     [ui/widgets/detail_panel.dart](ui/widgets/detail_panel.dart)、[ui/services/detail_selection.dart](ui/services/detail_selection.dart)）：
-    模型消息是**高亮块**（左侧主色竖条 + 极淡同色底，**没有整圈边框**），用户消息仍是主色气泡；
+    模型消息是**高亮块**（左侧 3px **中性描边色**竖条、**无底色**、**没有整圈边框**），
+    用户消息是**中性气泡**（中性底 `#2D2D2D` / 浅色 `#EEEEEE` + 1px 中性边框 + 圆角，
+    文字走正文色）；绿色只留在交互态（工具/思考行悬停与选中、发送按钮、聚焦环，见下文「主题中性化」）；
     工具调用一行 =「中文标签 + 关键参数（等宽）」+ 行尾增量（编辑 / 写入按行数给 `+N -M`）、转圈或箭头；
     **临时员工**（`subagent`）的消息与工具行在**这一段开头**画一条标记「临时员工「名」 · 层级 N」
     （[ui/models/message.dart](ui/models/message.dart) 的 `subagentId` / `subagentName` / `subagentParentId` /
@@ -632,7 +634,8 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 「+」菜单展开原位变高与 Esc 收起、图片缩略图 vs 文件卡、点开预览）、`test/attachment_preview_test.dart`
 （附件预览：扩展名分类与大小文案、三档读取（文本 / 二进制 / 图片 / 缺失 / 目录 / 截断）、预览对话框）、
 `test/tool_row_detail_test.dart`（一行式：中文标签 + 关键参数、行尾增量、悬停提亮、点击 → 详情页完整参数与结果、空态与关闭、
-派生文本纯函数、右栏窗口接线源钉）、`test/message_stream_style_test.dart`（模型消息高亮块不套边框、用户消息仍是气泡、
+派生文本纯函数、右栏窗口接线源钉）、`test/message_stream_style_test.dart`（模型消息高亮块无底色且不套边框、
+用户消息是中性气泡（中性底 + 1px 边框、不用主色）、
 思考条摘要**不是斜体**，与工具调用条一致）、
 `test/right_panel_host_test.dart`（右栏窗口宿主：默认按 `openByDefault` 开窗、空态时右栏仍长期存在、
 「+」路由页 5 列排布且超过 20 个分页、点格子开窗 / chip 关窗、注入详情自动打开「详情」窗、已开窗口切走后仍常挂、

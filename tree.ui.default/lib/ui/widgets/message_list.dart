@@ -7,6 +7,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
+import '../app_theme.dart';
 import '../models/message.dart';
 import '../services/message_window.dart';
 import 'collapsed_run_row.dart';
@@ -18,8 +19,8 @@ import 'welcome_mark.dart';
 
 /// 消息列表组件（StatelessWidget）
 ///
-/// 渲染中栏消息列表。用户消息右对齐（蓝色气泡），agent 消息左对齐
-/// （白色气泡 + 灰色边框）。流式消息在内容末尾显示闪烁光标。
+/// 渲染中栏消息列表。用户消息右对齐（中性气泡 + 1px 中性边框），agent 消息左对齐
+/// （中性高亮块：左侧 3px 竖条、无底色）。流式消息在内容末尾显示闪烁光标。
 ///
 /// **槽位表**（用户 2026-10-04：「滑到哪加载哪，限制缓存长度，仅缓存窗口附近的消息」）：
 /// [slots] 按**全局下标**寻址（0 = 最旧那条），元素为 null 表示这一段还没取回来——
@@ -1585,11 +1586,17 @@ class _MessageBubbleState extends State<_MessageBubble>
   Widget build(BuildContext context) {
     final ChatMessage message = widget.message;
     final bool isUser = message.isUser;
-    final cs = Theme.of(context).colorScheme;
+    final ThemeData theme = Theme.of(context);
+    final cs = theme.colorScheme;
+    // 用户气泡改中性块（用户 2026-11-08：消息流一起中性化，绿色只留标志性位置）；
+    // 深浅各一档底色，配 1px 中性边框，不再用主色满色底。
+    final Color userBubbleColor = theme.brightness == Brightness.dark
+        ? AppTheme.userBubbleDark
+        : AppTheme.userBubbleLight;
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
         // 气泡最大宽度：只留一小段内边距，不再按 70% 压缩。
-        // 中栏被拖窄时（最小 360px）70% 只剩下 ~250px，右侧会空出一大片；
+        // 中栏被拖窄时（最小 360px）70% 只剩下 ~250px，右侧会空出一大块；
         // 留 7% 既能撑满可用宽度，又让左右气泡的对齐关系看得出来。
         final double maxBubbleWidth = constraints.maxWidth * 0.93;
         return Align(
@@ -1602,17 +1609,17 @@ class _MessageBubbleState extends State<_MessageBubble>
                   : const EdgeInsets.fromLTRB(12, 8, 14, 8),
               decoration: isUser
                   ? BoxDecoration(
-                      color: cs.primary,
+                      color: userBubbleColor,
                       borderRadius: BorderRadius.circular(_radius),
+                      border: Border.all(color: theme.dividerColor),
                     )
-                  // 模型消息不给「边框盒子」，改成**高亮块**：左侧主色竖条 + 极淡的
-                  // 同色底。盒子会把消息流切成一格一格，去掉之后整轮对话读起来是
-                  // 连续的；竖条仍让人一眼认出「这段是模型说的」。
+                  // 模型消息不给「边框盒子」，改成**高亮块**：左侧中性竖条，无底色。
+                  // 盒子会把消息流切成一格一格，去掉之后整轮对话读起来是连续的；
+                  // 竖条仍让人一眼认出「这段是模型说的」（中性色，不再抢主色）。
                   : BoxDecoration(
-                      color: cs.primary.withValues(alpha: 0.05),
                       border: Border(
                         left: BorderSide(
-                          color: cs.primary.withValues(alpha: 0.6),
+                          color: cs.outline,
                           width: 3,
                         ),
                       ),
@@ -1623,7 +1630,7 @@ class _MessageBubbleState extends State<_MessageBubble>
                 children: [
                   if (message.attachments != null &&
                       message.attachments!.isNotEmpty) ...<Widget>[
-                    _buildAttachments(isUser),
+                    _buildAttachments(),
                     const SizedBox(height: 6),
                   ],
                   _buildContent(message, isUser),
@@ -1640,11 +1647,9 @@ class _MessageBubbleState extends State<_MessageBubble>
 
   /// 构建消息内容（流式时追加闪烁光标）
   Widget _buildContent(ChatMessage message, bool isUser) {
-    // 用户气泡底色为 cs.primary（深色主题下为亮绿 #00FF8C），
-    // 文字用 onPrimary（深色墨绿）保证对比度，避免白字在亮绿上看不清。
-    final Color textColor = isUser
-        ? Theme.of(context).colorScheme.onPrimary
-        : Theme.of(context).colorScheme.onSurface;
+    // 用户气泡已是中性底（用户 2026-11-08：消息流去绿），文字用正文色；
+    // 模型消息同样用正文色，两者靠气泡/竖条区分角色，不再靠主色。
+    final Color textColor = Theme.of(context).colorScheme.onSurface;
     final String text = message.content;
     // 流式：只画「已揭示」的那一截，没揭示到的部分在账上等着逐帧放出来
     final String shown = message.isStreaming
@@ -1791,7 +1796,7 @@ class _MessageBubbleState extends State<_MessageBubble>
         ? '$mm-$dd'
         : '${t.year}-$mm-$dd';
     final Color color = isUser
-        ? Theme.of(context).colorScheme.onPrimary.withValues(alpha: 0.7)
+        ? Theme.of(context).colorScheme.onSurfaceVariant
         : Theme.of(context).colorScheme.outline;
     return Text(
       '$date $hour:$minute',
@@ -1800,14 +1805,14 @@ class _MessageBubbleState extends State<_MessageBubble>
   }
 
   /// 构建附件卡片列表
-  Widget _buildAttachments(bool isUser) {
+  Widget _buildAttachments() {
     final List<Attachment> attachments = widget.message.attachments!;
     final cs = Theme.of(context).colorScheme;
-    final Color textColor = isUser ? cs.onPrimary : cs.onSurface;
-    final Color subColor =
-        isUser ? cs.onPrimary.withValues(alpha: 0.7) : cs.onSurfaceVariant;
-    final Color borderColor =
-        isUser ? cs.onPrimary.withValues(alpha: 0.3) : Theme.of(context).dividerColor;
+    // 气泡已中性化（用户 2026-11-08）：附件卡跟随气泡文字色，用中性描边/底色，
+    // 不再用 onPrimary 的半透明绿。
+    final Color textColor = cs.onSurface;
+    final Color subColor = cs.onSurfaceVariant;
+    final Color borderColor = Theme.of(context).dividerColor;
     return Wrap(
       spacing: 6,
       runSpacing: 6,
@@ -1815,7 +1820,7 @@ class _MessageBubbleState extends State<_MessageBubble>
         final Widget card = Container(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
           decoration: BoxDecoration(
-            color: isUser ? cs.onPrimary.withValues(alpha: 0.08) : cs.surface,
+            color: cs.surface,
             borderRadius: BorderRadius.circular(6),
             border: Border.all(color: borderColor),
           ),

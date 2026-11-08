@@ -44,6 +44,12 @@ class AppTheme {
   /// 次要文字
   static const Color lightTextMuted = Color(0xFF616161);
 
+  // ==================== 消息流（用户气泡，中性化） ====================
+  /// 深色下用户气泡底色（中性抬升面，不再用主色满色底）
+  static const Color userBubbleDark = Color(0xFF2D2D2D);
+  /// 浅色下用户气泡底色
+  static const Color userBubbleLight = Color(0xFFEEEEEE);
+
   /// 浅色主题：中性白灰底 + 主题色只用于主色 / 选中 / 聚焦。
   ///
   /// [fontFamily] / [fontFamilyFallback] 是运行期字体偏好（字体族）；字重由

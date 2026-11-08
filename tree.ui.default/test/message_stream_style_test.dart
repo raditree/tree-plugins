@@ -1,13 +1,15 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:tree_ui_default/ui/app_theme.dart';
 import 'package:tree_ui_default/ui/models/message.dart';
 import 'package:tree_ui_default/ui/widgets/message_list.dart';
 import 'package:tree_ui_default/ui/widgets/thinking_card.dart';
 
 /// 消息流的排版口径（[lib/README.md](../lib/README.md) 不变量 11）：
-/// 模型消息是**高亮块**（左侧主色竖条 + 极淡同色底，没有整圈边框），
-/// 用户消息仍是主色气泡；工具调用 / 思考各占一行（见 tool_row_detail_test.dart）。
+/// 模型消息是**高亮块**（左侧中性竖条，无底色、没有整圈边框），
+/// 用户消息是**中性气泡**（中性底 + 1px 中性边框，不再用主色满色底）；
+/// 工具调用 / 思考各占一行（见 tool_row_detail_test.dart）。
 ChatMessage textMessage({
   required String id,
   required String role,
@@ -53,24 +55,46 @@ void main() {
     expect(border.top, BorderSide.none, reason: '只有左边一条竖线，不是整圈盒子');
     expect(border.right, BorderSide.none);
     expect(border.bottom, BorderSide.none);
-    expect(decoration.color, isNotNull, reason: '极淡的同色底');
+    expect(
+      decoration.color,
+      isNull,
+      reason: '去绿后模型消息无底色（用户 2026-11-08：消息流一起中性化）',
+    );
+    final ColorScheme cs =
+        Theme.of(tester.element(find.byType(MessageList))).colorScheme;
+    expect(
+      border.left.color,
+      cs.outline,
+      reason: '竖条是中性描边色，不再用主色',
+    );
     expect(find.text('这就是模型说的话'), findsOneWidget);
   });
 
-  testWidgets('用户消息仍是气泡：主色底 + 圆角，没有竖条',
+  testWidgets('用户消息是中性气泡：中性底 + 圆角 + 1px 边框，没有竖条',
       (WidgetTester tester) async {
     await pumpList(tester, <ChatMessage>[
       textMessage(id: 'u1', role: 'user', content: '这是我说的'),
     ]);
 
     expect(assistantHighlight(tester), isNull, reason: '用户消息不该有高亮竖条');
-    final Color primary =
-        Theme.of(tester.element(find.byType(MessageList))).colorScheme.primary;
-    final bool hasPrimaryBubble = tester
-        .widgetList<Container>(find.byType(Container))
-        .any((Container c) =>
-            (c.decoration as BoxDecoration?)?.color == primary);
-    expect(hasPrimaryBubble, isTrue, reason: '用户消息仍是主色气泡');
+    final ThemeData theme = Theme.of(tester.element(find.byType(MessageList)));
+    final Color primary = theme.colorScheme.primary;
+    BoxDecoration? bubble;
+    for (final Container c in tester.widgetList<Container>(
+      find.byType(Container),
+    )) {
+      final Decoration? d = c.decoration;
+      if (d is BoxDecoration && d.color == AppTheme.userBubbleLight) {
+        bubble = d;
+        break;
+      }
+    }
+    expect(bubble, isNotNull, reason: '用户消息是中性浅灰底气泡');
+    expect(bubble!.color, isNot(primary), reason: '不再用主色满色底');
+    expect(bubble.borderRadius, isNotNull, reason: '保持圆角');
+    final BoxBorder? border = bubble.border;
+    expect(border, isNotNull, reason: '1px 中性边框');
+    expect((border! as Border).top.width, 1);
     expect(find.text('这是我说的'), findsOneWidget);
   });
 
