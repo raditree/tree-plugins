@@ -1010,15 +1010,15 @@ class _TerminalPainter extends CustomPainter {
 
   /// 标准 16 色（暗色主题下可读的那一套）
   static const List<Color> _basic = <Color>[
-    Color(0xFF1B1F1C), // 0 黑
+    Color(0xFF1E1E1E), // 0 黑（中性，与中性底色一致）
     Color(0xFFE06C75), // 1 红
     Color(0xFF7FD1A6), // 2 绿
     Color(0xFFE8C07D), // 3 黄
     Color(0xFF6FB7E8), // 4 蓝
     Color(0xFFC792EA), // 5 品红
     Color(0xFF4DD0E1), // 6 青
-    Color(0xFFE6F3EC), // 7 白
-    Color(0xFF5E8E71), // 8 亮黑（灰）
+    Color(0xFFE6E6E6), // 7 白（中性）
+    Color(0xFF6B6B6B), // 8 亮黑（灰，中性）
     Color(0xFFFF8A80), // 9 亮红
     Color(0xFF9BE8C0), // 10 亮绿
     Color(0xFFF5D6A0), // 11 亮黄
