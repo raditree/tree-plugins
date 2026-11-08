@@ -1042,6 +1042,48 @@ class ApiService {
     );
   }
 
+  // ==================== 插件设置（tree.settings，K 系列） ====================
+
+  /// 聚合所有插件声明的设置 schema。
+  ///
+  /// 调用 `GET /api/plugin-settings/schema`，返回 `{schemas: [...]}`；路由由
+  /// `tree.settings` 插件承接，前缀刻意避开核心的 `/api/settings/*`。
+  static Future<Map<String, dynamic>> getPluginSettingsSchema() async {
+    return _getJson('/api/plugin-settings/schema');
+  }
+
+  /// 取某个插件的设置值（secret 只回 `has_value`）。
+  static Future<Map<String, dynamic>> getPluginSettingsValues(
+    String pluginId,
+  ) async {
+    return _getJson(
+      '/api/plugin-settings/values',
+      query: <String, String>{'plugin_id': pluginId},
+    );
+  }
+
+  /// 写入用户覆盖值（只提交脏字段）。
+  static Future<Map<String, dynamic>> updatePluginSettings(
+    String pluginId,
+    Map<String, dynamic> values,
+  ) async {
+    return _patchJson(
+      '/api/plugin-settings/values',
+      body: <String, dynamic>{'plugin_id': pluginId, 'values': values},
+    );
+  }
+
+  /// 清空覆盖值（回到 schema 默认）。
+  static Future<Map<String, dynamic>> resetPluginSettings(
+    String pluginId,
+    List<String> keys,
+  ) async {
+    return _postJson(
+      '/api/plugin-settings/reset',
+      body: <String, dynamic>{'plugin_id': pluginId, 'keys': keys},
+    );
+  }
+
   // ==================== 插件体系接口（右栏「插件」页） ====================
 
   /// 获取插件体系只读快照（右栏「插件」面板数据源）

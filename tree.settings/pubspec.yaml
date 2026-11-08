@@ -1,0 +1,15 @@
+name: tree_settings
+description: tree.settings 插件的设置 schema 与覆盖值存储（Sembast、纯 Dart）；不得反向依赖核心包。
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.13.0
+
+dependencies:
+  path: ^1.9.0
+  sembast: ^3.9.0
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.0

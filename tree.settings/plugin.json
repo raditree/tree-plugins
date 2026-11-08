@@ -1,0 +1,14 @@
+{
+  "id": "tree.settings",
+  "name": "Tree 插件设置",
+  "version": "0.1.0",
+  "description": "headless 插件：插件设置 schema 注册 + 用户覆盖值存取 + settings.changed 广播。每团队一个 Sembast 库 <data_root>/settings/<team_id>/settings.semdb；对外暴露执行站 settings.* 与委派路由 /api/plugin-settings/*；核心不存值、不聚合。",
+  "runtime": "headless",
+  "files": [
+    "tree_settings.exe"
+  ],
+  "command": "tree_settings.exe",
+  "args": [],
+  "granularity": "team",
+  "scope": {}
+}
