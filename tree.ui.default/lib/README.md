@@ -611,6 +611,41 @@
     - `WorkspaceRefreshService.takeAreas()` 是"取走即清空"：**只由主页面一个监听者**消费，再按区域透给
       「文件」窗（files）、「Git 历史」窗（git）、「Todo」窗（todo）与「正在执行的 tool」窗（两个监听者会互相抢）。
 
+29. **主题中性化：背景 / 表面 / 层次 / 边框 / 正文一律中性，绿色只留在标志性位置**（用户 2026-11-08：
+    「背景改为普通 IDE 的黑色、深灰色或者白色，只有一些标志性的地方以及一些特殊文字用绿色」）
+    （[ui/app_theme.dart](ui/app_theme.dart)、[ui/theme_service.dart](ui/theme_service.dart)）：
+    - 深色 = `#1E1E1E` 底 + `#252526` 面 + `#2D2D2D` 抬升 + `#333333` 边框 / `#3C3C3C` 描边 + `#E6E6E6`
+      正文 / `#9E9E9E` 次要文字；浅色 = `#F3F3F3` 底 + 白面 + `#E4E4E4` 抬升 + `#E0E0E0` 边框；
+    - **分割线 / 描边 / 卡片边 / 输入框常态边不再由主题色派生**（那是"满屏绿"的根源）：只有
+      `primary` / `primaryContainer`、输入框**聚焦环**、选中态与主按钮仍随主题色；`ThemeService.derive*`
+      保留（欢迎字标与既有派生断言仍用）；
+    - 组件一律走 `Theme.of(context)` 取值，所以中性化只改两个 `ThemeData`（`AppTheme.light/dark`）；
+      核心未就绪的错误页 / 单实例提示页也复用 `AppTheme.dark`，不再各抄一份；
+    - 终端 16 色里的 0 / 7 / 8 号（黑 / 白 / 亮黑）改中性，ANSI 语义色（红 / 绿 / 黄 / 蓝 …）保留。
+
+30. **设置页是 IDE 式「左目录 + 右内容」，按自身可用宽三档响应式**（用户 2026-11-08：「目前 UI 的插件设置页是
+    一整页的条目排开，应该改成左侧目录栏，右侧才是具体选项」）（[ui/pages/settings_page.dart](ui/pages/settings_page.dart)）：
+    - 7 个分类（外观 / 编辑器 / 模型 / 运行与链路 / 插件 / 窗口与托盘 / 关于），默认「外观」；
+      目录项 Key = `settings-nav-<id>`，chip 形态 = `settings-nav-chip-<id>`；
+    - 断点按**设置页自身宽度**：≥620 文字目录（176）/ 420~619 图标栏（44，Tooltip 显示名称）/
+      <420 顶部横向 chip 行——右栏默认 340、最小 240，所以默认落在图标栏档，内容宽度不劣化；
+    - 内容区每个分类一个 `ListView`（Key = `settings-content-scroll-<id>`），用 `IndexedStack` 常挂：
+      切分类**不丢滚动位置**，也不丢「主题色」卡里未提交的自定义色号草稿；
+    - 新手引导的 `focusModels` 直接选中「模型」分类（不再靠 `Scrollable.ensureVisible` 滚动锚点）；
+    - 新增设置项时**必须**归进某个分类（`_categories` 的 `sections`），不允许再加"堆在最下面"的分区。
+
+31. **右栏窗口可声明期望宽度：只放宽、不缩窄，用户缩过就彻底让位**（用户 2026-11-08：「右栏窗口允许打开时
+    根据具体的内容调整窗口的大小（如拉大右栏）。但保证用户主动缩小后仍可用」）
+    （[ui/widgets/right_panel_host.dart](ui/widgets/right_panel_host.dart)、[ui/pages/main_page.dart](ui/pages/main_page.dart)）：
+    - `RightPanelEntry.preferredWidth`（null = 不请求）；宿主只在**用户主动打开 / 聚焦**时回调
+      `onWindowActivated`，初始化按 `openByDefault` 挂载**不请求**（避免一启动就把右栏拉宽）；
+    - 主页面收到回调后**帧后**执行（外部 openRequest 走宿主 `didUpdateWidget`，同步改状态会报
+      "setState() called during build"），用既有 `_dragCouple` 夹取预算（中栏保底 360、左栏最低 200），
+      目标宽与当前宽**取大**——已经更宽就不动；
+    - **用户拖过右栏分隔条**（`_beginSideDrag(false)` → `_rightWidthUserOverride`）后，本会话内忽略所有
+      `preferredWidth`；中栏折叠（右栏承接空间）时也不参与；
+    - 期望宽度表：设置 720 / 文件 560 / MCP 520 / 模型信息 480 / 详情与 toolRuns 460 / questions 与 todo 400。
+
 ## 测试
 
 ```bash
@@ -623,6 +658,12 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 卡片上的开关不误跳详情页、站点页必定重新 GET、禁用发 `disabled=true` 而不是退订、改配置不把 int 写成 "8"、
 内置站只改上限）、`test/plugin_admin_api_test.dart`（真起假核心：新增插件带 `description`、站点三端点的路径转义与 body 形状）、
 `test/main_page_sidebar_width_test.dart`（三栏宽度：只有下限、合计预算、拖一侧对侧让位）、
+`test/main_page_window_width_test.dart`（右栏按窗口内容自适应：开设置放宽到 720、窄窗口只到预算允许的最大值、
+用户拖窄后不再被放宽且设置页降级 chip 导航、中栏折叠时不改宽度）、
+`test/settings_nav_test.dart`（设置页左目录：默认「外观」、点目录切分类、三档响应式（176 / 44 / chip）、
+切分类不丢自定义色号草稿、`focusModels` 落在「模型」）、
+`test/theme_neutral_test.dart`（主题中性化：背景 / 表面 / 层次 / 边框 / 正文三通道相等、分割线不再由主题色派生、
+主色与聚焦环仍随主题色）、
 `test/main_page_center_collapse_test.dart`（中栏折叠：让位给侧栏、State 与滚动位置不丢、三栏都收着也不溢出；
 窗口缩窄跨越阈值右栏自动折叠 / 恢复够宽自动展开、用户自己收的不被自动打开）、
 `test/welcome_mark_test.dart`（空态字标：TREE 大写宽字距 w800、主色渐变、HUD 三段线、接进真实中栏空态、加载中不出现）、
@@ -639,7 +680,8 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 思考条摘要**不是斜体**，与工具调用条一致）、
 `test/right_panel_host_test.dart`（右栏窗口宿主：默认按 `openByDefault` 开窗、空态时右栏仍长期存在、
 「+」路由页 5 列排布且超过 20 个分页、点格子开窗 / chip 关窗、注入详情自动打开「详情」窗、已开窗口切走后仍常挂、
-窗口标签过多时 chip 行常显滑动条（滚轮可横向翻）、chip 字重跟随界面字重设置）、
+窗口标签过多时 chip 行常显滑动条（滚轮可横向翻）、chip 字重跟随界面字重设置、
+打开 / 聚焦窗口会通知父级而初始化不通知）、
 `test/code_highlight_test.dart`（语言识别、各语言词法、注释与字符串的优先级、未闭合块注释、记号不重叠、控制器着色 +
 大文件退回单色 + 输入法组字交回平台）、`test/code_gutter_layout_test.dart`（行号槽布局：逐视觉行给号、折行的续行留空、宽度越窄折行越多、尾随换行与空文本各占一个号、纵向位置单调递增且末行底边 = totalHeight、宽度非法不抛）、`test/file_editor_test.dart`（真起假核心 HttpServer：改一下就进未保存态、Ctrl+S 发出
 完整内容与 `if_size`、保存失败给可见原因、409 冲突 → 覆盖保存带 force=1、截断/二进制/图片/外部 readOnly 四种只读闸门、
