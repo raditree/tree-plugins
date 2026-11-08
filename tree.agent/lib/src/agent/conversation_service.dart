@@ -317,6 +317,21 @@ class ConversationService {
         token.agentId == agentId || token.ownerAgentId == agentId,
   );
 
+  /// 某会话是否有在途轮次（`agent.state` / `agent.state.list` 的 `own_running`）。
+  bool isSessionRunning(String agentId, String sessionId) =>
+      _running.containsKey(_runKey(agentId, sessionId));
+
+  /// 某 agent 是否有名下的临时员工在跑。
+  bool hasSubagentRunning(String agentId) => _running.values.any(
+    (_RunToken token) => token.ownerAgentId == agentId,
+  );
+
+  /// 某会话当前排队的消息数（`direct + queue`；不含正在跑的那一条）。
+  int queueDepth(String agentId, String sessionId) {
+    final String key = _runKey(agentId, sessionId);
+    return (_directJobs[key]?.length ?? 0) + (_queueJobs[key]?.length ?? 0);
+  }
+
   /// 处理 `user_message`。
   ///
   /// 帧字段（与现状 server 一致）：
@@ -368,7 +383,12 @@ class ConversationService {
   /// 返回 `{ok, message_id, agent_id, session_id, duplicate?}`；校验失败返回
   /// `{ok:false, error}` 并已发一条可读 `error` 帧。返回的 Future 在**这一批队列
   /// 排空**后完成（`tip` 立即完成）——`waitIdle` 因此仍然等得到生成收尾。
-  Future<Map<String, dynamic>> acceptMessage(Map<String, dynamic> frame) async {
+  Future<Map<String, dynamic>> acceptMessage(
+    Map<String, dynamic> frame, {
+    /// 为 false 时**不等待这一批队列排空**（站点命令要在入队后立刻回执）。
+    /// 默认 true：REST/UI 路径与 `waitIdle` 依赖"返回时本轮已收尾"。
+    bool waitForTurn = true,
+  }) async {
     final MessageEnvelope envelope;
     try {
       envelope = MessageEnvelope.parse(frame);
@@ -412,12 +432,29 @@ class ConversationService {
     final CoreMessage appended = _appendInbound(agent, session, envelope);
     _broadcastInbound(agent, session, envelope, appended);
 
-    await _submitInbound(
+    // 站点命令要"入队即回执"：返回 `queued` 让调用方知道它是排在在途轮次之后。
+    final bool queued =
+        envelope.isTask &&
+        _running.containsKey(_runKey(agent.id, session.sessionId));
+    final Completer<void> enqueued = Completer<void>();
+    final Future<void> settled = _submitInbound(
       envelope,
       session,
       () => _runReply(agent, session, envelope.content),
       message: appended,
+      onEnqueued: () {
+        if (!enqueued.isCompleted) enqueued.complete();
+      },
     );
+    if (waitForTurn) {
+      await settled;
+    } else {
+      // 站点命令：等"已入台账 + 已进逻辑队列"就回执；生成在后台继续。
+      // `settled` 同时参与竞速：入队前异常时也不能让调用方一直等。
+      final Future<void> guarded = settled.catchError((Object _) {});
+      await Future.any<void>(<Future<void>>[enqueued.future, guarded]);
+      unawaited(guarded);
+    }
     return <String, dynamic>{
       'ok': true,
       'message_id': envelope.messageId,
@@ -426,6 +463,9 @@ class ConversationService {
       'subtype': envelope.subtype.wire,
       'inject_mode': envelope.injectMode.wire,
       'woke': envelope.wakesLoop,
+      'queued': queued,
+      'state': agentInstances?.instanceOf(agent.id).state.wire ??
+          (isRunning(agent.id) ? 'working' : 'idle'),
     };
   }
 
@@ -1787,6 +1827,7 @@ class ConversationService {
     CoreSession session,
     Future<void> Function() run, {
     CoreMessage? message,
+    void Function()? onEnqueued,
   }) async {
     final String agentId = envelope.targetAgentId;
     final String sessionId = session.sessionId;
@@ -1808,6 +1849,7 @@ class ConversationService {
       if (active == null) {
         // 没有在途 loop：tip 只补上下文，下一次生成自然从历史里读到。
         await _markInboxDone(inbox, envelope.messageId);
+        onEnqueued?.call();
         return;
       }
       if (envelope.injectMode == InjectMode.direct && message != null) {
@@ -1820,6 +1862,7 @@ class ConversationService {
                 ref: _toRef(message),
               ),
             );
+        onEnqueued?.call();
         return;
       }
       // queue tip：等本轮 loop 结束；排空时只收尾台账，不跑生成。
@@ -1838,6 +1881,8 @@ class ConversationService {
     (envelope.injectMode == InjectMode.direct ? _directJobs : _queueJobs)
         .putIfAbsent(key, () => <_MessageJob>[])
         .add(job);
+    // 入队已完成（台账 + 逻辑队列）；站点命令据此立刻回执，不必等生成。
+    onEnqueued?.call();
     await _ensurePump(agentId, sessionId);
   }
 
@@ -2061,6 +2106,10 @@ class ConversationService {
         'state': instance.state.wire,
         // `status` 是既有帧的字段名：两个都给，老消费者不用改。
         'status': instance.state.wire,
+        // 快照字段（与 `agent.state.list` 同口径）：晚到/断线的消费者能对上号。
+        'queue_depth': queueDepth(agentId, sessionId),
+        'own_running': isSessionRunning(agentId, sessionId),
+        'subagent_running': hasSubagentRunning(agentId),
         'updated_at': instance.updatedAt,
       },
     });

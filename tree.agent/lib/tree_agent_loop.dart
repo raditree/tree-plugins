@@ -76,6 +76,7 @@ export 'src/message/inbox_ledger.dart';
 export 'src/session_store.dart';
 export 'src/spec/builtin_spec_assets.dart';
 export 'src/station/agent_executor.dart';
+export 'src/station/agent_loop.dart';
 export 'src/station/agent_tools.dart';
 export 'src/station/tool_contributions.dart';
 export 'src/spec/builtin_specs.dart';

@@ -23,6 +23,7 @@ import '../settings/file_settings_sink.dart';
 import '../settings/ssh_config.dart';
 import '../spec/spec_service.dart';
 import '../station/agent_executor.dart';
+import '../station/agent_loop.dart';
 import '../station/agent_tools.dart';
 import '../station/tool_contributions.dart';
 import '../store/file_store.dart';
@@ -280,6 +281,11 @@ class AgentRuntime {
   /// `agent_tools` 站 readme（在既有领域原语说明后补 spec.* 一句）。
   static String get agentToolsReadme =>
       '$kAgentToolsReadme spec.*：工作空间规范 list / read / select / create / update / reset。';
+
+  /// `agent_loop` 站（AC-5）的命令表与 readme。
+  static List<String> get agentLoopCommands => kAgentLoopCommands;
+
+  static String get agentLoopReadme => kAgentLoopReadme;
 
   /// 本插件 id 与收集站触发入口（入口在 hello 后注入）。
   static String pluginId = 'tree.agent';
@@ -743,6 +749,144 @@ class AgentRuntime {
       default:
         return <String, dynamic>{'text': '未知领域工具命令：$command', 'is_error': true};
     }
+  }
+
+  /// **Agent loop 站点命令**（AC-5）：`agent.message.send` / `agent.state.list` /
+  /// `agent.state.get`。
+  Future<Map<String, dynamic>> handleAgentLoopCommand(
+    String command,
+    Map<String, dynamic> arguments,
+    Map<String, dynamic> scope,
+    Map<String, dynamic> meta,
+  ) async {
+    final String mode = _text(scope['mode_key']);
+    if (mode != 'local' && mode != 'ssh') {
+      return <String, dynamic>{
+        'error': 'scope 缺少确定的 mode_key（local | ssh）：站点命令 fail-closed',
+        'code': 'scope_denied',
+      };
+    }
+    switch (command) {
+      case 'agent.message.send':
+        return _agentMessageSend(arguments, meta);
+      case 'agent.state.list':
+        return _agentStateSnapshot();
+      case 'agent.state.get':
+        return _agentStateSnapshot(
+          agentId: _text(arguments['agent_id']),
+          sessionId: _text(arguments['session_id']),
+        );
+      default:
+        return <String, dynamic>{
+          'error': '未知 Agent loop 命令：$command',
+          'code': 'invalid_arguments',
+        };
+    }
+  }
+
+  /// `agent.message.send`：来源身份**只认核心 meta**，调用方自报的 `source` 无效。
+  Future<Map<String, dynamic>> _agentMessageSend(
+    Map<String, dynamic> arguments,
+    Map<String, dynamic> meta,
+  ) async {
+    final String sourcePlugin = _text(
+      meta['triggered_by'] ?? meta['source_plugin_id'],
+    );
+    if (sourcePlugin.isEmpty) {
+      return <String, dynamic>{
+        'error': '缺少来源插件身份（meta.triggered_by）：来源不可伪造',
+        'code': 'scope_denied',
+      };
+    }
+    final Object? rawMessage = arguments['message'];
+    final Map<String, dynamic> envelope = rawMessage is Map
+        ? Map<String, dynamic>.from(rawMessage)
+        : Map<String, dynamic>.from(arguments);
+    final Object? rawTarget = envelope['target'];
+    final Map<String, dynamic> target = rawTarget is Map
+        ? Map<String, dynamic>.from(rawTarget)
+        : <String, dynamic>{};
+    final String targetAgent = _text(target['agent_id'] ?? envelope['agent_id']);
+    if (targetAgent.isEmpty) {
+      return <String, dynamic>{
+        'error': 'agent.message.send 需要 target.agent_id',
+        'code': 'invalid_arguments',
+      };
+    }
+    final String targetSession = _text(
+      target['session_id'] ?? envelope['session_id'],
+    );
+    return conversation.acceptMessage(
+      <String, dynamic>{
+        ...envelope,
+        // **强制覆盖**：伪造 `source`（user / system / 别的 plugin_*）一律无效。
+        'source': <String, dynamic>{
+          'team_id': 'inner',
+          'agent_id': 'plugin_$sourcePlugin',
+          'session_id': 'main',
+        },
+        'target': <String, dynamic>{
+          'agent_id': targetAgent,
+          // 站点不传会话 ⇒ 落到该 agent 的默认会话（不是每次新建一个）。
+          'session_id': targetSession.isEmpty
+              ? CoreSession.defaultSessionId
+              : targetSession,
+        },
+      },
+      // 站点命令入队即回执；真正的生成在后台按消息机队列推进。
+      waitForTurn: false,
+    );
+  }
+
+  /// 状态快照（`agent.state.list` / `agent.state.get`）：晚订阅者的权威读法。
+  Map<String, dynamic> _agentStateSnapshot({
+    String agentId = '',
+    String sessionId = '',
+  }) {
+    final List<Map<String, dynamic>> agents = <Map<String, dynamic>>[];
+    for (final CoreAgent agent in store.agents()) {
+      if (agentId.isNotEmpty && agent.id != agentId) continue;
+      final AgentInstance? instance = agentInstances.existing(agent.id);
+      final List<Map<String, dynamic>> sessions = <Map<String, dynamic>>[
+        for (final CoreSession session in store.sessions(agent.id))
+          if (sessionId.isEmpty || session.sessionId == sessionId)
+            <String, dynamic>{
+              'session_id': session.sessionId,
+              'state':
+                  instance?.state.wire ??
+                  (conversation.isSessionRunning(agent.id, session.sessionId)
+                      ? 'working'
+                      : 'idle'),
+              'queue_depth': conversation.queueDepth(
+                agent.id,
+                session.sessionId,
+              ),
+              'own_running': conversation.isSessionRunning(
+                agent.id,
+                session.sessionId,
+              ),
+              'subagent_running': conversation.hasSubagentRunning(agent.id),
+            },
+      ];
+      if (sessionId.isNotEmpty && sessions.isEmpty) continue;
+      final String team = agent.teamId.trim().isEmpty
+          ? agent.id
+          : agent.teamId.trim();
+      agents.add(<String, dynamic>{
+        'team_id': team,
+        'agent_id': agent.id,
+        'state':
+            instance?.state.wire ??
+            (conversation.isRunning(agent.id) ? 'working' : 'idle'),
+        'updated_at': instance?.updatedAt ?? agent.updatedAt,
+        'sessions': sessions,
+      });
+    }
+    return <String, dynamic>{
+      'ok': true,
+      'agents': agents,
+      'count': agents.length,
+    };
   }
 
   /// **宿主能力命令**（`kAgentHostCommands`）：Q-5 A 让名后由 tree.agent 认领。

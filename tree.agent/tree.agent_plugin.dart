@@ -88,6 +88,25 @@ Future<void> _onReady(PluginKitServer server) async {
     } catch (error) {
       server.channel.log('领域工具执行站注册失败：$error');
     }
+    // AC-5：Agent loop 站点面（agent.message.send / agent.state.list / get）。
+    try {
+      final Map<String, dynamic> loopStation = await server.channel.request(
+        M.stationRegister,
+        <String, dynamic>{
+          'kind': 'execute',
+          'name': kAgentLoopStationName,
+          'description': 'tree.agent Agent loop 站点面（消息发送 / 状态快照）',
+          'readme': AgentRuntime.agentLoopReadme,
+          'commands': AgentRuntime.agentLoopCommands,
+        },
+      );
+      server.channel.log(
+        'Agent loop 执行站：'
+        '${loopStation['ok'] == true ? loopStation['station_id'] : loopStation['error']}',
+      );
+    } catch (error) {
+      server.channel.log('Agent loop 执行站注册失败：$error');
+    }
     try {
       final Map<String, dynamic> registered = await server.channel.request(
         M.stationRegister,
@@ -243,6 +262,46 @@ Future<Map<String, dynamic>?> handleRequest(
             'payload': error.payload,
             'code': error.code,
           },
+        };
+      } catch (error) {
+        return <String, dynamic>{
+          'reply': <String, dynamic>{'error': error.toString(), 'code': 'unknown'},
+        };
+      }
+    }
+    if (station == agentLoopStationId(kPluginId)) {
+      final Map<String, dynamic> meta = asMap(params['meta']);
+      final String dataDir = asString(meta['data_dir']);
+      if (dataDir.isEmpty) {
+        return <String, dynamic>{
+          'reply': <String, dynamic>{
+            'error': '缺少 data_dir（核心未在站请求里带数据根）',
+            'code': 'invalid_arguments',
+          },
+        };
+      }
+      final Map<String, dynamic> payload = asMap(params['payload']);
+      try {
+        final Map<String, dynamic> result = await AgentRuntime.forDataDir(dataDir)
+            .handleAgentLoopCommand(
+              asString(payload['command']),
+              asMap(payload['arguments']),
+              asMap(params['scope']),
+              meta,
+            );
+        final String stationError = asString(result['error']);
+        if (stationError.isNotEmpty) {
+          final String stamp = asString(result['code']);
+          return <String, dynamic>{
+            'reply': <String, dynamic>{
+              'error': stationError,
+              'payload': result,
+              'code': stamp.isEmpty ? 'unknown' : stamp,
+            },
+          };
+        }
+        return <String, dynamic>{
+          'reply': <String, dynamic>{'payload': result},
         };
       } catch (error) {
         return <String, dynamic>{
