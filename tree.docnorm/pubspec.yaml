@@ -1,7 +1,7 @@
 name: tree_docnorm
-description: tree.docnorm 插件的仓库扫描、契约侦查、注入计划与基线落盘（DN-2/3/4/6）；不得反向依赖核心包。
+description: tree.docnorm 插件的仓库扫描、契约侦查、注入计划、缺章节生成与基线落盘（DN-2/3/4/5/6）；不得反向依赖核心包。
 publish_to: 'none'
-version: 0.3.0
+version: 0.4.0
 
 environment:
   sdk: ^3.13.0

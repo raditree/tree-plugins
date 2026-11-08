@@ -142,18 +142,8 @@ class DocnormConfig {
   }
 }
 
-/// `docnorm.plan`：只读变更归集 + 注入单元 + 两额度估计（DN-4）。
-///
-/// - 变更只认 `git diff` 的内容差异（stat-dirty 不产计划）；
-/// - 单元按「最具体包 + 子包」归并，README 存在时注入 README，否则注入声明；
-/// - 每个单元同时给出 full / readme / declarations / assertions 四种估计，
-///   模式选择与 `context_cap` 分开报告，不做静默裁剪。
-Future<Map<String, Object?>> runPlan(
-  String repo, {
-  Map<String, Object?> overrides = const <String, Object?>{},
-  String mode = 'auto',
-  Map<String, String>? environment,
-}) async {
+/// 注入模式白名单：plan / generate 共用同一套取值。
+String validateMode(String mode) {
   final String requested = mode.trim().isEmpty ? 'auto' : mode.trim();
   const Set<String> modes = <String>{
     'auto',
@@ -168,7 +158,54 @@ Future<Map<String, Object?>> runPlan(
       code: 'invalid_arguments',
     );
   }
+  return requested;
+}
 
+/// 一个注入单元：按「最具体包 + 子包」归并（DN-4 口径，DN-5 生成复用）。
+class PlanUnit {
+  PlanUnit({
+    required this.package,
+    required this.subpackage,
+    required this.changedFiles,
+  });
+
+  final PackageUnit package;
+  final SubUnit? subpackage;
+  final Set<String> changedFiles;
+
+  String get key =>
+      subpackage == null ? package.id : '${package.id}@${subpackage!.path}';
+
+  String get root => subpackage?.path ?? package.root;
+}
+
+/// `docnorm.plan` / `docnorm.generate` 共用的加载结果（只读）。
+class PlanContext {
+  PlanContext({
+    required this.git,
+    required this.index,
+    required this.config,
+    required this.scan,
+    required this.changes,
+    required this.units,
+    required this.unmatched,
+  });
+
+  final GitRepository git;
+  final RepoIndex index;
+  final DocnormConfig config;
+  final ScanResult scan;
+  final GitChanges changes;
+  final List<PlanUnit> units;
+  final List<String> unmatched;
+}
+
+/// 一次加载仓库 / 配置 / 扫描 / 变更归集 / 注入单元（只读）。
+Future<PlanContext> loadPlanContext(
+  String repo, {
+  Map<String, Object?> overrides = const <String, Object?>{},
+  Map<String, String>? environment,
+}) async {
   final GitRepository git = await GitRepository.open(repo);
   final RepoIndex index = await RepoIndex.load(repo);
   final DocnormConfig config = DocnormConfig.load(
@@ -179,7 +216,7 @@ Future<Map<String, Object?>> runPlan(
   final ScanResult scan = await scanIndex(index);
   final GitChanges changes = await git.changedFiles();
 
-  final Map<String, _UnitBuilder> units = <String, _UnitBuilder>{};
+  final Map<String, PlanUnit> units = <String, PlanUnit>{};
   final List<String> unmatched = <String>[];
   for (final String path in changes.all) {
     final PackageUnit? package = _ownerPackage(path, scan.packages);
@@ -194,38 +231,74 @@ Future<Map<String, Object?>> runPlan(
     units
         .putIfAbsent(
           key,
-          () => _UnitBuilder(package: package, subpackage: subpackage),
+          () => PlanUnit(
+            package: package,
+            subpackage: subpackage,
+            changedFiles: <String>{},
+          ),
         )
         .changedFiles
         .add(path);
   }
+  final List<PlanUnit> sorted = units.values.toList()
+    ..sort((PlanUnit a, PlanUnit b) => a.key.compareTo(b.key));
+  return PlanContext(
+    git: git,
+    index: index,
+    config: config,
+    scan: scan,
+    changes: changes,
+    units: sorted,
+    unmatched: unmatched,
+  );
+}
+
+/// `docnorm.plan`：只读变更归集 + 注入单元 + 两额度估计（DN-4）。
+///
+/// - 变更只认 `git diff` 的内容差异（stat-dirty 不产计划）；
+/// - 单元按「最具体包 + 子包」归并，README 存在时注入 README，否则注入声明；
+/// - 每个单元同时给出 full / readme / declarations / assertions 四种估计，
+///   模式选择与 `context_cap` 分开报告，不做静默裁剪。
+Future<Map<String, Object?>> runPlan(
+  String repo, {
+  Map<String, Object?> overrides = const <String, Object?>{},
+  String mode = 'auto',
+  Map<String, String>? environment,
+}) async {
+  final String requested = validateMode(mode);
+
+  final PlanContext context = await loadPlanContext(
+    repo,
+    overrides: overrides,
+    environment: environment,
+  );
+  final DocnormConfig config = context.config;
 
   final List<Map<String, Object?>> unitPayloads = <Map<String, Object?>>[];
   final List<String> requiresChunking = <String>[];
   int plannedTokens = 0;
   int batches = 0;
-  for (final String key in units.keys.toList()..sort()) {
-    final _UnitBuilder builder = units[key]!;
-    final Map<String, Object?> unit = _buildUnit(
-      index: index,
-      builder: builder,
+  for (final PlanUnit unit in context.units) {
+    final Map<String, Object?> payload = _buildUnit(
+      index: context.index,
+      unit: unit,
       config: config,
       requested: requested,
     );
-    unitPayloads.add(unit);
-    final int tokens = unit['selected_tokens'] as int;
-    final int chunks = unit['chunks'] as int;
+    unitPayloads.add(payload);
+    final int tokens = payload['selected_tokens'] as int;
+    final int chunks = payload['chunks'] as int;
     plannedTokens += tokens;
     batches += chunks;
-    if (chunks > 1) requiresChunking.add(key);
+    if (chunks > 1) requiresChunking.add(unit.key);
   }
 
   final bool withinStage = plannedTokens <= config.stageBudget;
   return <String, Object?>{
     'command': 'docnorm.plan',
-    'repo': index.root,
+    'repo': context.index.root,
     'dry_run': true,
-    'git': changes.toJson(),
+    'git': context.changes.toJson(),
     'config': config.toJson(),
     'budget': <String, Object?>{
       'context_cap': config.contextCap,
@@ -243,7 +316,7 @@ Future<Map<String, Object?>> runPlan(
       'over_stage_by': withinStage ? 0 : plannedTokens - config.stageBudget,
     },
     'units': unitPayloads,
-    'unmatched': unmatched,
+    'unmatched': context.unmatched,
     'notes': <String>[
       '变更只认 git diff 的内容差异；stat-dirty / mode-only 不产计划',
       'context_cap 管单次调用；stage_budget 管阶段累计，两者分别报告',
@@ -252,39 +325,17 @@ Future<Map<String, Object?>> runPlan(
   };
 }
 
-class _UnitBuilder {
-  _UnitBuilder({required this.package, required this.subpackage});
-
-  final PackageUnit package;
-  final SubUnit? subpackage;
-  final Set<String> changedFiles = <String>{};
-
-  String get root => subpackage?.path ?? package.root;
-}
-
 Map<String, Object?> _buildUnit({
   required RepoIndex index,
-  required _UnitBuilder builder,
+  required PlanUnit unit,
   required DocnormConfig config,
   required String requested,
 }) {
-  final PackageUnit package = builder.package;
-  final String root = builder.root;
-  final List<RepoFile> files =
-      index.files
-          .where(
-            (RepoFile file) =>
-                _under(file.path, root) &&
-                _isCode(file.path) &&
-                !_isConfig(file.path),
-          )
-          .toList()
-        ..sort((RepoFile a, RepoFile b) => a.path.compareTo(b.path));
-  final RepoFile? readme = _fileOf(
-    index,
-    root == '.' ? 'README.md' : '$root/README.md',
-  );
-  final List<String> changed = builder.changedFiles.toList()..sort();
+  final PackageUnit package = unit.package;
+  final String root = unit.root;
+  final List<RepoFile> files = unitSourceFiles(index, root);
+  final RepoFile? readme = unitReadme(index, root);
+  final List<String> changed = unit.changedFiles.toList()..sort();
   final bool hasReadme = readme != null;
 
   final int full = _tokens(
@@ -339,12 +390,10 @@ Map<String, Object?> _buildUnit({
   final bool degraded = package.degraded || reasons.isNotEmpty;
 
   return <String, Object?>{
-    'key': builder.subpackage == null
-        ? package.id
-        : '${package.id}@${builder.subpackage!.path}',
+    'key': unit.key,
     'package': package.id,
     'root': root,
-    'subpackage': builder.subpackage?.path,
+    'subpackage': unit.subpackage?.path,
     'language': package.language,
     'mode': mode,
     'has_readme': hasReadme,
@@ -391,6 +440,38 @@ SubUnit? _ownerSubpackage(String path, List<SubUnit> subpackages) {
 
 bool _under(String path, String root) =>
     root == '.' || path == root || path.startsWith('$root/');
+
+/// 单元下的源码文件（排除文档 / 锁文件 / `.docnorm` 配置），按路径排序。
+List<RepoFile> unitSourceFiles(RepoIndex index, String root) => index.files
+    .where(
+      (RepoFile file) =>
+          _under(file.path, root) &&
+          _isCode(file.path) &&
+          !_isConfig(file.path),
+    )
+    .toList()
+  ..sort((RepoFile a, RepoFile b) => a.path.compareTo(b.path));
+
+/// 单元的 README（存在才返回；generate 不凭空新建 README）。
+RepoFile? unitReadme(RepoIndex index, String root) =>
+    _fileOf(index, root == '.' ? 'README.md' : '$root/README.md');
+
+/// 字符数 → token 的启发式估计（与 plan 的额度口径一致）。
+int estimateTokens(int chars, double scale) => _tokens(chars, scale);
+
+/// 声明行摘录：`comments` / `declarations` 档复用同一份口径。
+String declarationExcerpt(RepoFile file) => _excerpt(file, _declarationLine);
+
+/// 断言行摘录：测试相关变更的注入来源。
+String assertionExcerpt(RepoFile file) => _excerpt(file, _assertionLine);
+
+String _excerpt(RepoFile file, RegExp pattern) {
+  final StringBuffer buffer = StringBuffer();
+  for (final String line in const LineSplitter().convert(file.content)) {
+    if (pattern.hasMatch(line)) buffer.writeln(line.trimRight());
+  }
+  return buffer.toString();
+}
 
 /// 参与注入估计的源码：排除文档与锁文件（构建产物目录已在扫描时忽略）。
 bool _isCode(String path) {

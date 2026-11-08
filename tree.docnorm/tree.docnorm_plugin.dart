@@ -16,13 +16,14 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.docnorm';
 const String kDisplayName = 'Tree 文档归一化';
-const String kVersion = '0.3.0';
+const String kVersion = '0.4.0';
 const String kStationName = 'docnorm';
 const List<String> kDocnormCommands = <String>[
   'docnorm.scan',
   'docnorm.contract',
   'docnorm.check',
   'docnorm.plan',
+  'docnorm.generate',
   'docnorm.baseline',
   'docnorm.reanalyze',
 ];
@@ -32,6 +33,7 @@ const String kStationReadme =
     'docnorm.contract 侦查文档契约（章节/索引/链接/CHANGELOG/门禁，规则按 内置→仓库自述 合成）；'
     'docnorm.check 只跑 DocPolicy 四条检查；'
     'docnorm.plan 只读归集 git 内容变更并给出注入单元与 context_cap/stage_budget 两额度估计（stat-dirty 不产计划）；'
+    'docnorm.generate 经 llm.call 为单元 README 生成缺失章节提案（三模式×三档、context_cap 闸、只补缺、失败即 degraded）；'
     'docnorm.baseline [--commit] 建 L0（doc_contract/pkg_index/doc_state 入 tree.storage）并按提案只追加缺章节（默认 dry-run）；'
     'docnorm.reanalyze --changed 只重算受影响包。六族适配器 + fallback；对目标仓库只读，'
     '写盘仅追加且必须显式 commit；缺 tree.storage 时 fail-closed。';
@@ -50,7 +52,7 @@ PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
 
 Future<void> _onReady(PluginKitServer server) async {
   _activeServer = server;
-  server.channel.log('已上线：v$kVersion（tree.docnorm，DN-4/6）');
+  server.channel.log('已上线：v$kVersion（tree.docnorm，DN-4/5/6）');
   try {
     final Map<String, dynamic> result = await server.channel.request(
       M.stationRegister,
@@ -99,6 +101,23 @@ Future<Map<String, dynamic>?> handleRequest(
       final Map<String, Object?> result = await runPlan(
         repo,
         mode: asString(arguments['mode']),
+        overrides: arguments['config'] is Map
+            ? asMap(arguments['config'])
+            : const <String, Object?>{},
+      );
+      return <String, dynamic>{
+        'reply': <String, dynamic>{'payload': result},
+      };
+    }
+    if (command == 'docnorm.generate') {
+      final Map<String, dynamic> scope = asMap(params['scope']);
+      Future<GenerateReply> llm(GenerateRequest request) =>
+          _callLlm(request, scope);
+      final Map<String, Object?> result = await runGenerate(
+        repo,
+        llm: llm,
+        mode: asString(arguments['mode']),
+        tier: asString(arguments['tier']),
         overrides: arguments['config'] is Map
             ? asMap(arguments['config'])
             : const <String, Object?>{},
@@ -206,6 +225,49 @@ Future<Map<String, dynamic>> _callStorage(
     );
   }
   return server.channel.command(command, arguments, '', scope);
+}
+
+/// 向 `tree.agent` 的宿主能力站下 `llm.call`：身份 / 团队只透传本次请求的 scope。
+///
+/// 失败也把已付费的 `text` / `json` 带回 [GenerateReply]（known-issues #31），
+/// 由生成层统一判成 `degraded`，绝不用占位正文补齐。
+Future<GenerateReply> _callLlm(
+  GenerateRequest request,
+  Map<String, dynamic> scope,
+) async {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) {
+    return const GenerateReply(error: '插件尚未就绪：llm.call 通道不可用');
+  }
+  try {
+    final Map<String, dynamic> payload = await server.channel.command(
+      'llm.call',
+      <String, dynamic>{
+        'messages': <Map<String, dynamic>>[
+          <String, dynamic>{'role': 'system', 'content': request.system},
+          <String, dynamic>{'role': 'user', 'content': request.prompt},
+        ],
+      },
+      '',
+      scope,
+    );
+    final String reason = asString(payload['error']);
+    return GenerateReply(
+      text: asString(payload['text']),
+      json: payload['json'],
+      error: reason.trim().isNotEmpty
+          ? reason
+          : (payload['ok'] == false ? 'llm.call 返回 ok:false' : ''),
+    );
+  } on CmdFailureException catch (error) {
+    return GenerateReply(
+      text: asString(error.payload['text']),
+      json: error.payload['json'],
+      error: error.message,
+    );
+  } catch (error) {
+    return GenerateReply(error: 'llm.call 异常：$error');
+  }
 }
 
 List<Map<String, Object?>> _mapsOf(Object? value) {
@@ -338,6 +400,27 @@ indexes:
         collection,
       );
       switch (command) {
+        case 'llm.call':
+          final List<dynamic> messages = args['messages'] is List
+              ? args['messages'] as List<dynamic>
+              : <dynamic>[];
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'ok': messages.isNotEmpty,
+              'json': <String, dynamic>{
+                'sections': <Map<String, dynamic>>[
+                  <String, dynamic>{'heading': '职责', 'body': '示例包负责单一职责的演示。'},
+                  <String, dynamic>{'heading': '入口', 'body': '从 lib/a.dart 的 Alpha 进入。'},
+                  <String, dynamic>{'heading': '边界', 'body': '不处理网络与持久化，只做类型定义。'},
+                  <String, dynamic>{'heading': '测试', 'body': '运行 dart test 覆盖声明与边界。'},
+                ],
+              },
+              'text': '{}',
+              'model': 'fake',
+              'usage': <String, dynamic>{'total_tokens': 10},
+            },
+          };
         case 'storage.ensure':
           storageWrites += 1;
           return <String, dynamic>{
@@ -706,6 +789,28 @@ indexes:
       check.that(
         (asMap(planPayload['budget'])['context_cap'] as num? ?? 0) > 0,
         'plan 给出 context_cap',
+      );
+
+      final Map<String, dynamic> generateReply = await askCommand(
+        'generate',
+        'docnorm.generate',
+        <String, dynamic>{'repo': temp.path},
+      );
+      final Map<String, dynamic> generatePayload = asMap(
+        generateReply['payload'],
+      );
+      check.check(generatePayload['dry_run'], true, 'generate 只读');
+      check.that(
+        (generatePayload['sections'] as List<dynamic>?)?.isNotEmpty == true,
+        'generate 出章节提案',
+      );
+      check.that(
+        (asMap(generatePayload['budget'])['calls'] as num? ?? 0) > 0,
+        'generate 经 llm.call 生成',
+      );
+      check.that(
+        jsonEncode(generatePayload).contains('## 职责'),
+        'generate 提案可喂 baseline（## 职责）',
       );
     }
   } catch (error) {
