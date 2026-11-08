@@ -18,6 +18,7 @@ class RightPanelEntry {
     required this.bodyBuilder,
     this.openByDefault = false,
     this.autoOpenOnSelection = false,
+    this.preferredWidth,
   });
 
   /// 窗口唯一键（内置用固定名，插件槽位用 `panel:<slotKey>`）。
@@ -40,6 +41,13 @@ class RightPanelEntry {
   /// 插件卡片点进详情（[DetailSelection.inject]）会写进这里，从而在**没有选中 agent**
   /// 时也能把详情窗叫出来——这正是用户反馈的痛点。
   final bool autoOpenOnSelection;
+
+  /// 打开 / 聚焦这一窗时希望右栏有多宽（null = 不请求，保持用户当前宽度）。
+  ///
+  /// 用户 2026-11-08：「右栏窗口允许打开时根据具体的内容调整窗口的大小」。
+  /// 只由宿主回调交给父级（[RightPanelHost.onWindowActivated]），**宿主自己不改宽度**；
+  /// 父级只放宽、不缩窄，且用户手动拖过右栏后本会话内完全忽略它。
+  final double? preferredWidth;
 }
 
 /// 右栏「窗口宿主」：把设置 / 文件 / 详情 / 模型信息 / 插件面板等**统一成窗口**，
@@ -58,6 +66,7 @@ class RightPanelHost extends StatefulWidget {
     this.onCollapse,
     this.openRequestId,
     this.openRequestRevision = 0,
+    this.onWindowActivated,
   });
 
   /// 可用窗口集合（顺序即 chip 顺序 / 路由页顺序；由父级按当前 agent 与插件槽位算）。
@@ -71,6 +80,12 @@ class RightPanelHost extends StatefulWidget {
 
   /// [openRequestId] 的请求序号：只在**值变化**时生效，避免用户自己关掉后被拽回。
   final int openRequestRevision;
+
+  /// 用户**主动打开 / 聚焦**某窗时的通知（初始化按 `openByDefault` 挂载不触发）。
+  ///
+  /// 父级据此把右栏按 [RightPanelEntry.preferredWidth] 放宽；回调可能发生在 build
+  /// 期间（外部 openRequest 走 `didUpdateWidget`），**父级必须延后一帧再改状态**。
+  final ValueChanged<RightPanelEntry>? onWindowActivated;
 
   @override
   State<RightPanelHost> createState() => _RightPanelHostState();
@@ -165,12 +180,14 @@ class _RightPanelHostState extends State<RightPanelHost> {
 
   /// 打开某窗口并聚焦（已打开则只聚焦）。多个同 id 窗口只保留一个。
   void _openWindow(String id) {
-    if (_entryById(id) == null) return;
+    final RightPanelEntry? entry = _entryById(id);
+    if (entry == null) return;
     setState(() {
       if (!_open.contains(id)) _open.add(id);
       _active = id;
       _picking = false;
     });
+    _notifyActivated(entry);
   }
 
   /// 聚焦某个已打开的窗口。
@@ -180,6 +197,13 @@ class _RightPanelHostState extends State<RightPanelHost> {
       _active = id;
       _picking = false;
     });
+    final RightPanelEntry? entry = _entryById(id);
+    if (entry != null) _notifyActivated(entry);
+  }
+
+  /// 通知父级"用户刚打开 / 聚焦了这个窗口"（宽度请求由父级决定）。
+  void _notifyActivated(RightPanelEntry entry) {
+    widget.onWindowActivated?.call(entry);
   }
 
   /// 关掉某个窗口；关的是当前聚焦窗时落到相邻窗。

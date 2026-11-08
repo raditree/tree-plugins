@@ -157,6 +157,16 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   /// 是否正在拖拽侧栏分隔条（拖拽期间帧后收敛让位给拖拽本身）
   bool _sideDragging = false;
 
+  /// 正在拖的是不是**左栏**那一侧的分隔条（决定拖拽结束是否算"用户调过右栏宽度"）
+  bool _sideDragLeft = false;
+
+  /// 用户是否**亲手调过右栏宽度**（用户 2026-11-08：右栏窗口按内容自适应宽度）。
+  ///
+  /// 置真之后本会话内不再按窗口的 [RightPanelEntry.preferredWidth] 放宽：即使只放宽
+  /// 不缩窄，也会把用户刚调好的宽度抢回去。所以用户拖过右栏分隔条就彻底让位
+  /// （口径 D7：会话级全局，不按窗口分别记忆）。
+  bool _rightWidthUserOverride = false;
+
   /// 上一次布局的可用宽度：用来识别窗口"变窄 / 变宽"**跨越**阈值那一下
   /// （只在跨越时自动折叠 / 展开右栏，免得与用户手动操作打架）。
   double? _prevLayoutWidth;
@@ -910,7 +920,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         _buildAnimatedDivider(
           hidden: _leftCollapsed || leftAbsorbs,
           divider: DraggableDivider(
-            onDragStart: () => _beginSideDrag(),
+            onDragStart: () => _beginSideDrag(true),
             onDragEnd: _endSideDrag,
             onDrag: (delta) {
               setState(() {
@@ -939,7 +949,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         _buildAnimatedDivider(
           hidden: _rightCollapsed || rightAbsorbs,
           divider: DraggableDivider(
-            onDragStart: () => _beginSideDrag(),
+            onDragStart: () => _beginSideDrag(false),
             onDragEnd: _endSideDrag,
             onDrag: (delta) {
               setState(() {
@@ -1249,13 +1259,18 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   }
 
   /// 开始拖拽侧栏分隔条：暂停帧后收敛，让拖拽完全说了算。
-  void _beginSideDrag() {
+  ///
+  /// [draggedLeft] 区分拖的是哪一侧：拖右栏分隔条 = 用户亲手调过右栏宽度，
+  /// 之后本会话内不再让窗口的 `preferredWidth` 把它放宽（见 [_endSideDrag]）。
+  void _beginSideDrag(bool draggedLeft) {
     _sideDragging = true;
+    _sideDragLeft = draggedLeft;
   }
 
   /// 结束拖拽：恢复收敛（拖拽期间若窗口被改变，这里补一次校正）。
   void _endSideDrag() {
     _sideDragging = false;
+    if (!_sideDragLeft) _rightWidthUserOverride = true;
     _normalizeSideWidths();
   }
 
@@ -1572,12 +1587,49 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       entries: _rightPanelEntries(),
       openRequestId: _rightWindowId,
       openRequestRevision: _rightWindowRevision,
+      onWindowActivated: _onRightWindowActivated,
       onCollapse: () {
         setState(() {
           _rightCollapsed = true;
         });
       },
     );
+  }
+
+  /// 用户主动打开 / 聚焦某窗：按它的 `preferredWidth` 把右栏**放宽**（用户 2026-11-08）。
+  ///
+  /// 三条硬口径：
+  /// 1. **只放宽、不缩窄**——已经更宽就不动，避免把用户拉好的宽度改小；
+  /// 2. **不越预算**——复用 [_dragCouple] 从两侧借空间（中栏保底 360、左栏最低 200），
+  ///    预算不足时取允许的最大值，绝不溢出；
+  /// 3. **尊重用户**——拖过右栏分隔条（[_rightWidthUserOverride]）或中栏折叠让右栏
+  ///    承接宽度（[_rightAbsorbs]）时直接跳过。
+  ///
+  /// 回调可能发生在 build 期（外部 openRequest 走宿主的 `didUpdateWidget`），
+  /// 所以状态改动延后一帧（与 [_scheduleSideNormalize] 同一理由）。
+  void _onRightWindowActivated(RightPanelEntry entry) {
+    final double? preferred = entry.preferredWidth;
+    if (preferred == null) return;
+    if (_rightWidthUserOverride || _rightAbsorbs) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (_rightWidthUserOverride || _rightAbsorbs || _rightCollapsed) return;
+      if (_rightWidth >= preferred) return; // 只放宽，不缩窄
+      final double? available = _layoutAvailableWidth;
+      if (available == null) return;
+      final (double left, double right) = _dragCouple(
+        available,
+        preferred,
+        _leftCollapsed ? 0 : _leftWidth,
+        false,
+      );
+      if (right <= _rightWidth) return;
+      setState(() {
+        _rightWidth = right;
+        // 左栏正在承接中栏让出的宽度：它的宽度由窗口决定，不跟着改。
+        if (!_leftCollapsed && !_leftAbsorbs) _leftWidth = left;
+      });
+    });
   }
 
   /// 右栏可用窗口集合（顺序 = chip 顺序 = 「+」路由页顺序）。
@@ -1595,6 +1647,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         label: '文件',
         icon: Icons.folder_outlined,
         openByDefault: true,
+        // 长行 / 宽表格 / 分屏：打开时把右栏放宽到能读（用户 2026-11-08）
+        preferredWidth: 560,
         bodyBuilder: (BuildContext context) => workspaceId.isEmpty
             ? _buildNoAgentHint()
             : FilePanel(
@@ -1612,6 +1666,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         id: 'todo',
         label: 'Todo',
         icon: Icons.checklist_outlined,
+        // 列表为主，不必过宽
+        preferredWidth: 400,
         bodyBuilder: (BuildContext context) => workspaceId.isEmpty
             ? _buildNoAgentHint()
             : TodoPanel(
@@ -1625,18 +1681,24 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         id: 'mcp',
         label: 'MCP 配置',
         icon: Icons.hub_outlined,
+        // JSON 配置编辑：窄了只能横向滚
+        preferredWidth: 520,
         bodyBuilder: (BuildContext context) => const McpConfigPanel(),
       ),
       RightPanelEntry(
         id: 'modelInfo',
         label: '模型信息',
         icon: Icons.smart_toy_outlined,
+        // 模型参数表
+        preferredWidth: 480,
         bodyBuilder: (BuildContext context) => ModelInfoPanel(agentId: agentId),
       ),
       RightPanelEntry(
         id: 'questions',
         label: '问题回复',
         icon: Icons.forum_outlined,
+        // 列表为主，不必过宽
+        preferredWidth: 400,
         bodyBuilder: (BuildContext context) => QuestionPanel(
           sessionId: _currentSessionId,
           onNavigateToQuestion: _handleNavigateToQuestion,
@@ -1646,6 +1708,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         id: 'toolRuns',
         label: '正在执行的 tool',
         icon: Icons.terminal_outlined,
+        // 命令行摘要
+        preferredWidth: 460,
         bodyBuilder: (BuildContext context) => ToolRunsPanel(
           refreshTrigger: _toolRunsRefreshTrigger,
           onNavigate: _handleNavigateToToolRun,
@@ -1656,6 +1720,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         label: '详情',
         icon: Icons.article_outlined,
         autoOpenOnSelection: true,
+        // 工具参数与结果正文
+        preferredWidth: 460,
         bodyBuilder: (BuildContext context) =>
             DetailPanel(workspaceId: workspaceId, teamId: agentId),
       ),
@@ -1663,6 +1729,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         id: 'settings',
         label: '设置',
         icon: Icons.settings_outlined,
+        // 左目录 176 + 内容 ~544 = 完整 IDE 双栏（见设置页响应式断点）
+        preferredWidth: 720,
         bodyBuilder: (BuildContext context) => SettingsPage(
           embedded: true,
           focusModels: _settingsFocusModels,

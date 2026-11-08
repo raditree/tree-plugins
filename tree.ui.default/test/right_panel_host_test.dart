@@ -175,6 +175,44 @@ void main() {
     expect(chip('settings'), findsNothing);
   });
 
+  testWidgets('打开 / 聚焦窗口会通知父级；初始化与重复点当前窗不通知',
+      (WidgetTester tester) async {
+    final List<String> activated = <String>[];
+    tester.view.physicalSize = const Size(1000, 1200);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: SizedBox(
+          width: 1000,
+          height: 1200,
+          child: RightPanelHost(
+            entries: entries(),
+            onWindowActivated: (RightPanelEntry e) => activated.add(e.id),
+          ),
+        ),
+      ),
+    ));
+    await tester.pump();
+    expect(activated, isEmpty, reason: '按 openByDefault 初始化挂载不请求宽度');
+
+    // 「+」路由页点格子 = 用户主动打开
+    await openPicker(tester);
+    await tester.tap(pick('settings'));
+    await tester.pump();
+    expect(activated, <String>['settings']);
+
+    // 点另一个窗口的 chip = 用户主动聚焦
+    await tester.tap(chip('files'));
+    await tester.pump();
+    expect(activated, <String>['settings', 'files']);
+
+    // 再点当前已聚焦的窗口：没有状态变化，不重复请求
+    await tester.tap(chip('files'));
+    await tester.pump();
+    expect(activated, <String>['settings', 'files']);
+  });
+
   testWidgets('注入详情时「详情」窗自动打开并显示注入内容',
       (WidgetTester tester) async {
     await pumpHost(tester, entries());
