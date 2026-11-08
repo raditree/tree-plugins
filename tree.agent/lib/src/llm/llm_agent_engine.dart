@@ -704,6 +704,14 @@ class LlmAgentEngine implements AgentEngine {
     /// 批中途落进来的那些由 [flushRound] 在批**之后**调用它——同一条函数才能保证
     /// "就地发"与"推迟发"出去的字面完全一致（附件说明段与像素块两段口径都在这里）。
     Future<void> emitUser(CoreMessageRef ref) async {
+      // `system_message`（C4）：走独立的 system 通道，与钉住的系统提示词分开。
+      // 位置按到达顺序（调用方只在批之间/批之后调用它）。
+      if (ref.isSystemMessage) {
+        if (ref.content.trim().isNotEmpty) {
+          out.add(LlmMessage.system(ref.content));
+        }
+        return;
+      }
       // 用户上传的附件：路径必须写进提示词（附件已由前端上传到工作空间），否则
       // 模型对"用户发了图/文件"这件事一无所知 —— 只有 UI 气泡上的一张卡片。
       // 附件说明段与压缩估算共用同一个纯函数，两处口径逐字一致。
@@ -862,6 +870,18 @@ class LlmAgentEngine implements AgentEngine {
           // 这里动一个空白字符，重建前缀就与实发的对不上。
           pendingReasoning.add(ref.content);
         }
+        continue;
+      }
+      // `system_message`（C4）：独立 system 通道。工具批中途到达时同样推迟——
+      // 就地发会把批切成两半（后半批没有可挂的 reasoning）。
+      if (ref.isSystemMessage) {
+        if (ref.content.trim().isEmpty) continue;
+        if (toolBatch.isNotEmpty || pendingReasoning.isNotEmpty) {
+          deferredInputs.add(ref);
+          continue;
+        }
+        await flushRound();
+        await emitUser(ref);
         continue;
       }
       // hook/系统提示（`kind == 'notice'`）按 **user** 发出，而不是 assistant：

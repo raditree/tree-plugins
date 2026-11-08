@@ -165,6 +165,8 @@ class AgentRuntime {
       questions: questions,
       compaction: compaction,
       subagents: registry,
+      // AC-2 消息机接线：收件箱台账 + 活动状态 + `agent.state` 广播。
+      agentInstances: agentInstances,
       engine: engine ??
           LlmAgentEngine(
             resolveModel: (String modelId) => settings.model(modelId),

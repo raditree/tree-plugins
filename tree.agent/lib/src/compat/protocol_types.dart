@@ -26,6 +26,12 @@ abstract final class WsOutboundType {
   /// agent 工作状态（working/idle/...）。
   static const String agentStatus = 'agent_status';
 
+  /// 消息机状态机的广播帧（AC-2）：`{agent_id, session_id, state, updated_at}`。
+  ///
+  /// 与 [agentStatus] 并存而不是替换它：后者是界面按钮的既有口径（`own_running`
+  /// 等），前者是"每个 Agent 的活动状态"这一新主题，供插件与新消费者订阅。
+  static const String agentState = 'agent.state';
+
   /// 会话被创建。
   static const String sessionCreated = 'session_created';
 

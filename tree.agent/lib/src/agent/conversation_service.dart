@@ -3,6 +3,8 @@ import 'dart:convert';
 
 import '../compat/protocol_types.dart';
 import '../llm/llm_agent_engine.dart';
+import '../message/inbox_ledger.dart';
+import '../message/message_envelope.dart';
 
 import '../plugin/agent_events.dart';
 import '../settings/core_settings.dart';
@@ -14,6 +16,7 @@ import '../ws/ws_hub.dart';
 import '../store/subagent_registry.dart';
 import '../tool/subagent_tool.dart';
 import 'agent_engine.dart';
+import 'agent_instance.dart';
 import 'compaction_service.dart';
 import 'question_broker.dart';
 import 'scripted_agent.dart';
@@ -37,19 +40,12 @@ class _RunToken {
 
   /// **工具层**认的取消：只认真取消（用户 `stop` / 删除 agent / 关服）。
   ///
-  /// 与 [cancelled] 是两个量：[cancelled] 是**软**收敛信号——插话（新消息 / hook 提示）
-  /// 也要让流式立刻停、工具之间收敛；这一条是**硬**取消，正在执行的工具与
-  /// `ask_user_question` 的在途等待才认它（见 [AgentRunContext.isHardCancelled]）。
+  /// 与 [cancelled] 是两个量：[cancelled] 是**软**收敛信号；这一条是**硬**取消，
+  /// 正在执行的工具与 `ask_user_question` 的在途等待才认它
+  /// （见 [AgentRunContext.isHardCancelled]）。
   /// 用户 2026-10-04 断言：「任何工具调用执行期间不被插话打断，插入消息（包括
   /// terminal/subagent hook 完成消息）在工具调用期间必须排队等待」。
   bool hardCancelled = false;
-
-  /// 是否因"**收到新消息**"而被打断（与用户按 `stop` 区分）。
-  ///
-  /// 为什么要区分：用户按 stop 时应当看到"已停止本轮生成。"这条可见提示；
-  /// 而"我发新消息 → 旧那轮自动让位"是打断/插话（interjection）语义，
-  /// 再刷一条"已停止"只会造成噪声（用户根本没按停止）。
-  bool interrupted = false;
 
   /// 这一轮是不是**人**叫停的（用户按停止 / 用户插话）。
   ///
@@ -86,6 +82,29 @@ class _TurnOutcome {
   ///
   /// 只有"人叫停"才不向发起者注入结束提示（见 [cancelled] 与 subagent 的完成注入）。
   final bool userStopped;
+}
+
+/// 一条待执行的入站 task（消息机的逻辑队列元素）。
+///
+/// [epoch] 是入队时的 agent 代次：`stop` 之后旧代次的 task 一律作废（C8）；
+/// [run] 只负责跑这一轮，不负责落库/台账（那些在入站时已经做完）。
+class _MessageJob {
+  const _MessageJob({
+    required this.envelope,
+    required this.sessionId,
+    required this.sequence,
+    required this.epoch,
+    required this.run,
+  });
+
+  final MessageEnvelope envelope;
+  final String sessionId;
+
+  /// 本机入队序号（`created_at` 缺失时的稳定排序依据）。
+  final int sequence;
+
+  final int epoch;
+  final Future<void> Function() run;
 }
 
 /// 本轮正在生成的一条消息（与前端消息一一对应：先立 start，再追加 chunk）。
@@ -154,6 +173,7 @@ class ConversationService {
     this.questions,
     this.compaction,
     this.subagents,
+    this.agentInstances,
     AgentEngine? engine,
     this.pacer,
     this.pacingEnabled,
@@ -189,6 +209,13 @@ class ConversationService {
   /// 会话级**临时员工**名册（subagent）；为 null 时本服务不认识临时员工
   /// （`runSubagent` 仍可用，只是收尾不清理索引——生产由 CLI 注入）。
   final SubagentRegistry? subagents;
+
+  /// **Agent 实例注册表**（AC-1 骨架 / AC-2 消息机接线）。
+  ///
+  /// 非 null 时：每条入站消息先进 `inbox.jsonl` 台账（回执前落盘），活动状态由
+  /// 消息机驱动并广播 `agent.state`；null = 最小骨架（测试直接构造），行为与本
+  /// 改动之前一致（不落台账、不发新帧）。
+  final AgentInstanceRegistry? agentInstances;
 
   final AgentEngine engine;
 
@@ -238,10 +265,20 @@ class ConversationService {
   /// 因 `stop` 被丢弃的排队任务数（自检/测试用）。
   int droppedQueuedCount = 0;
 
-  /// 因"收到新消息"而被打断的在途轮次数（测试与排障用，见 [_interruptForNewMessage]）。
-  ///
-  /// 只统计**同一会话**的插话；跨会话的消息不会打断任何在途轮次（各会话并行）。
-  int interruptedRunCount = 0;
+  // ── 消息机（AC-2）─────────────────────────────────────────────────────
+  //
+  // 每个 **agent×会话** 两条逻辑队列：`direct` 优先、`queue` 次之（C11）。
+  // 它们只是**执行调度**；零丢失的真值是 [AgentInstance] 持有的 `inbox.jsonl` 台账
+  // （AC-1）。会话之间仍然并行（键里带 sessionId）。
+  final Map<String, List<_MessageJob>> _directJobs =
+      <String, List<_MessageJob>>{};
+  final Map<String, List<_MessageJob>> _queueJobs = <String, List<_MessageJob>>{};
+
+  /// 正在排空的会话（同一个键只允许一个排空循环；空队列时同步清掉）。
+  final Map<String, Future<void>> _pumping = <String, Future<void>>{};
+
+  /// 入队序号（本机稳定排序的兜底；发起者没给 `created_at` 时按它排）。
+  int _jobSequence = 0;
 
   /// 已提示过的"压缩失败 / 模型没配 max_seqlen"（同一件事只打扰用户一次）。
   final Set<String> _notified = <String>{};
@@ -262,6 +299,10 @@ class ConversationService {
   ///
   /// 帧字段（与现状 server 一致）：
   /// `{type, agent_id, content, attachments, session_id}`。
+  ///
+  /// AC-2 起这里只是**用户来源**的信封包装：真正入站走 [acceptMessage]（校验 →
+  /// 台账 → 分派）。用户消息缺省是 `common_message / task / direct`；到达时**不再
+  /// 打断**同会话在途轮次（`direct` 的插入点与迭代边界终止由 AC-3 接管）。
   Future<void> handleUserMessage(Map<String, dynamic> frame) async {
     final String agentId = frame['agent_id'] as String? ?? '';
     final String content = frame['content'] as String? ?? '';
@@ -272,39 +313,99 @@ class ConversationService {
     if (subagents?.isSubagent(agentId) ?? false) {
       return sendToSubagent(frame);
     }
-    final CoreAgent? agent = store.agent(agentId);
+    await acceptMessage(<String, dynamic>{
+      'message_id': frame['message_id'],
+      'type': MessageType.commonMessage.wire,
+      'subtype': MessageSubtype.task.wire,
+      'inject_mode': frame['inject_mode'] ?? InjectMode.direct.wire,
+      'source': <String, dynamic>{
+        'team_id': MessageSources.innerTeam,
+        'agent_id': MessageSources.user,
+        'session_id': MessageSources.mainSession,
+      },
+      'target': <String, dynamic>{
+        'agent_id': agentId,
+        'session_id': sessionId,
+      },
+      'content': content,
+      'attachments': frame['attachments'],
+    });
+  }
+
+  /// **统一入站入口**（AC-2 消息机）。
+  ///
+  /// 依次做四件事，顺序不可换：
+  /// 1. **校验信封**（`type / subtype / inject_mode / source / target`，见
+  ///    [MessageEnvelope.parse]）；
+  /// 2. **落库**到目标会话历史（`system_message` 存 `role=system`，其余 `user`），
+  ///    带上 C12 的加法键（`source_message_id` 等）；
+  /// 3. **收件箱台账**追加 `pending` 并等待落盘（零丢失口径，recon §3.5）；
+  /// 4. **分派**：`tip` 只补上下文、**不唤醒 loop**；`task` 进 direct/queue 队列，
+  ///    由排空循环按 `direct` 优先逐条执行。
+  ///
+  /// 返回 `{ok, message_id, agent_id, session_id, duplicate?}`；校验失败返回
+  /// `{ok:false, error}` 并已发一条可读 `error` 帧。返回的 Future 在**这一批队列
+  /// 排空**后完成（`tip` 立即完成）——`waitIdle` 因此仍然等得到生成收尾。
+  Future<Map<String, dynamic>> acceptMessage(Map<String, dynamic> frame) async {
+    final MessageEnvelope envelope;
+    try {
+      envelope = MessageEnvelope.parse(frame);
+    } on MessageEnvelopeException catch (error) {
+      _sendError('消息被拒绝：${error.message}');
+      return <String, dynamic>{'ok': false, 'error': error.message};
+    }
+    final CoreAgent? agent = store.agent(envelope.targetAgentId);
     if (agent == null) {
-      _sendError('未知 agent：$agentId');
-      return Future<void>.value();
+      _sendError('未知 agent：${envelope.targetAgentId}');
+      return <String, dynamic>{
+        'ok': false,
+        'error': '未知 agent：${envelope.targetAgentId}',
+      };
+    }
+    if (subagents?.isSubagent(agent.id) ?? false) {
+      _sendError('临时员工「${agent.name}」不是消息机目标：请直接对它发 user_message。');
+      return <String, dynamic>{'ok': false, 'error': '目标是临时员工'};
     }
     // 会话解析必须先于排队：前端可能在会话创建前就发消息（session_id 为空）
-    final CoreSession session = _resolveSession(agent, sessionId, content);
-    // 消息已改存会话库：同步 append/读之前先异步装载该会话缓存。
+    final CoreSession session = _resolveSession(
+      agent,
+      envelope.targetSessionId,
+      envelope.content,
+    );
     await store.ensureMessagesLoaded(agent.id, session.sessionId);
-    store.appendMessage(
-      CoreMessage(
-        id: CoreIds.message(),
-        agentId: agent.id,
-        sessionId: session.sessionId,
-        role: 'user',
-        content: content,
-        timestamp: DateTime.now().millisecondsSinceEpoch,
-        attachments: _attachments(frame['attachments']),
-      ),
+
+    // 幂等：发起者给了稳定 id 时，历史里已有同一条就不再落库/再跑一轮
+    // （崩溃重放与补发都靠它去重；本机补生成的 id 跳过去重）。
+    if (!envelope.generatedId &&
+        _hasSourceMessage(agent.id, session.sessionId, envelope.messageId)) {
+      return <String, dynamic>{
+        'ok': true,
+        'duplicate': true,
+        'message_id': envelope.messageId,
+        'agent_id': agent.id,
+        'session_id': session.sessionId,
+      };
+    }
+
+    final CoreMessage appended = _appendInbound(agent, session, envelope);
+    _broadcastInbound(agent, session, envelope, appended);
+
+    await _submitInbound(
+      envelope,
+      session,
+      () => _runReply(agent, session, envelope.content),
     );
-    // 新消息到达 = 插话：把**同一会话**在途的那一轮立刻打断（工具循环就此收敛），
-    // 让这条新消息的下一轮紧接着跑起来（顺序 / 代次 / 会话边界见 [_interruptForNewMessage]）。
-    _interruptForNewMessage(
-      agent.id,
-      sessionId: session.sessionId,
-      byUser: true,
-    );
-    return _enqueue(
-      agent.id,
-      session.sessionId,
-      () => _runReply(agent, session, content),
-    );
+    return <String, dynamic>{
+      'ok': true,
+      'message_id': envelope.messageId,
+      'agent_id': agent.id,
+      'session_id': session.sessionId,
+      'subtype': envelope.subtype.wire,
+      'inject_mode': envelope.injectMode.wire,
+      'woke': envelope.wakesLoop,
+    };
   }
+
 
   /// 处理 `stop`（单个 agent；`agent_id` 为 TOP 时的**级联**由核心层展开，
   /// 见 `CoreServer._handleStop`）。
@@ -328,6 +429,9 @@ class ConversationService {
     // 先取消在途提问：等待中的工具会立刻拿到 cancelled 结果，工具循环才能收敛。
     questions?.cancelForAgent(agentId);
     _epoch[agentId] = (_epoch[agentId] ?? 0) + 1;
+    // 尚未开始的入站 task 一律作废（C8）：从逻辑队列摘掉，并在台账里标
+    // `cancelled`——tip 不进队列，因此不受影响（它们只是上下文补充）。
+    _cancelQueuedMessages(agentId);
     // stop 是 agent 级的：该 agent 的**每个在途会话**都要停（会话可以并行跑），
     // **以及它名下正在跑的临时员工**（父那轮正卡在等它们）。
     final List<_RunToken> tokens = _running.values
@@ -349,10 +453,14 @@ class ConversationService {
 
   /// 团队消息投递（M5c）：把 **agent** 发来的消息落库并触发一轮生成。
   ///
-  /// 与 `user_message` 的区别：
+  /// 与 `user_message` 的区别只在**来源坐标**与正文前缀：
   /// - 消息带 `[来自 <发送者>]` 前缀——本项目的消息模型没有 sender 字段，而模型
   ///   必须知道该向谁回发（参考实现用 session.sender_id 表达同一件事）；
-  /// - 到点即执行：投递是"新消息"，不受此前 stop 的历史代次影响。
+  /// - 来源是真实 agent（`team_id` 取它的有效团队归属），因此它是
+  ///   `common_message / task / direct`——与用户消息走同一条消息机通道。
+  ///
+  /// AC-2 起**不再打断**目标会话的在途轮次：task 进 direct 队列，当前这一轮跑完后
+  /// 立即接上（迭代边界终止由 AC-3 接管）。
   Future<void> deliver({
     required String agentId,
     required String sessionId,
@@ -362,28 +470,42 @@ class ConversationService {
   }) async {
     final CoreAgent? agent = store.agent(agentId);
     if (agent == null) return;
-    final CoreSession session = _resolveSession(agent, sessionId, content);
-    await store.ensureMessagesLoaded(agent.id, session.sessionId);
     final String sender = senderName.trim().isEmpty ? senderId : senderName;
     final String text = sender.trim().isEmpty
         ? content
         : '[来自 $sender] $content';
-    store.appendMessage(
-      CoreMessage(
-        id: CoreIds.message(),
-        agentId: agent.id,
-        sessionId: session.sessionId,
-        role: 'user',
-        content: text,
-        timestamp: DateTime.now().millisecondsSinceEpoch,
-      ),
-    );
-    // 团队消息也是"有人对它说话"：同样打断**同一会话**在途那一轮
-    // （跨会话只排队，见 [_interruptForNewMessage]）
-    _interruptForNewMessage(agent.id, sessionId: session.sessionId);
-    return _enqueue(
-      agent.id,
-      session.sessionId,
+    final CoreAgent? senderAgent = senderId.trim().isEmpty
+        ? null
+        : store.agent(senderId);
+    // 顶层 agent 自成一队（与 `_effectiveTeamOf` / turn 事件同一口径）。
+    final String senderTeam = senderAgent == null
+        ? MessageSources.innerTeam
+        : (senderAgent.teamId.trim().isEmpty
+              ? senderAgent.id
+              : senderAgent.teamId.trim());
+    final MessageEnvelope envelope = MessageEnvelope.parse(<String, dynamic>{
+      'type': MessageType.commonMessage.wire,
+      'subtype': MessageSubtype.task.wire,
+      'inject_mode': InjectMode.direct.wire,
+      'source': <String, dynamic>{
+        'team_id': senderTeam,
+        'agent_id': senderAgent == null
+            ? MessageSources.system
+            : senderAgent.id,
+        'session_id': senderAgent == null ? MessageSources.mainSession : '',
+      },
+      'target': <String, dynamic>{
+        'agent_id': agent.id,
+        'session_id': sessionId,
+      },
+      'content': text,
+    });
+    final CoreSession session = _resolveSession(agent, sessionId, content);
+    await store.ensureMessagesLoaded(agent.id, session.sessionId);
+    _appendInbound(agent, session, envelope);
+    await _submitInbound(
+      envelope,
+      session,
       () => _runReply(agent, session, text),
     );
   }
@@ -478,8 +600,8 @@ class ConversationService {
         subagent: tag,
         transcriptAgentId: ownerId,
       );
-      _interruptForNewMessage(agentId, sessionId: session.sessionId);
-      // 它自己的历史（历史延续）：`store.messages(sub_…)` = 会话主人流里**它那一段**。
+      // 临时员工不走消息机的 Agent 实例（它没有自己的会话/状态机），只保留
+      // 会话级串行链；AC-2 起不再因新消息打断在途轮次。
       final List<CoreMessageRef> history = store
           .messages(agentId, session.sessionId)
           .map(_toRef)
@@ -519,58 +641,28 @@ class ConversationService {
           : MessageKinds.subagentReport,
       subagent: subagent,
     );
-    _interruptForNewMessage(agentId, sessionId: session.sessionId);
-    return _enqueue(
-      agentId,
-      session.sessionId,
+    // hook 完成提示是**系统来源的 task**：走消息机，`working` 时进 direct 队列而
+    // 不是打断当前这一轮（AC-2）。
+    final MessageEnvelope envelope = MessageEnvelope.parse(<String, dynamic>{
+      'type': MessageType.commonMessage.wire,
+      'subtype': MessageSubtype.task.wire,
+      'inject_mode': InjectMode.direct.wire,
+      'source': <String, dynamic>{
+        'team_id': MessageSources.innerTeam,
+        'agent_id': MessageSources.system,
+        'session_id': MessageSources.mainSession,
+      },
+      'target': <String, dynamic>{
+        'agent_id': agentId,
+        'session_id': session.sessionId,
+      },
+      'content': notice,
+    });
+    await _submitInbound(
+      envelope,
+      session,
       () => _runReply(agent, session, notice),
     );
-  }
-
-  /// 新消息到达时的"插话"：打断该 agent **同一会话**在途的那一轮生成。
-  ///
-  /// 语义：
-  /// - **会话级**：只找 `agentId|sessionId` 这条链上的在途轮次。**跨会话的消息既不
-  ///   打断也不排队**——各会话是并行的任务链，互不相干（被打断的那一轮不会再发言，
-  ///   见 [_runReply] 的 `interrupted` 分支：不推"已停止本轮生成"，也不产生最终答复，
-  ///   所以跨会话打断只会让那个会话的答复凭空消失。实测见 known-issues #9：leader 在
-  ///   团队会话里 `wait_for` 成员，成员回发落在默认会话 ⇒ 在途那一轮被自己的成员消息
-  ///   掐掉，工具结果后面再没有任何回复）；
-  /// - **不 bump epoch**（`stop` 才 bump）：打断的目的恰恰是"让刚入队的新消息
-  ///   赶紧跑起来"，把代次往前推会让新任务被当旧任务丢掉；
-  /// - **不碰在途工具，也不作废在途提问**（用户 2026-10-04 断言：「任何工具调用执行
-  ///   期间不被插话打断，插入消息（包括 terminal/subagent hook 完成消息）在工具调用
-  ///   期间必须排队等待」）：插话只置**软**标记（[cancelled] / [interrupted]），
-  ///   工具层认的**硬**取消（[hardCancelled]）只有 `stop` / 删除 agent / 关服会置。
-  ///   旧实现顺带 `questions.cancelForSession` ⇒ `ask_user_question` 正在等作答时，
-  ///   一条 hook 完成提示就能把它掐掉，用户面对的是一张点了没用的题卡；
-  ///   代价如实说：待答问题期间插进来的消息会**排队等到那道题被作答或显式取消**；
-  /// - 打断**只在"流式生成中"与"两次工具之间"生效**：正在执行的工具跑完才收敛
-  ///   （`WorkspaceIO.exec` 没有取消参数，且 M9 规定本地执行活着就永不超时、
-  ///   不按时间杀进程）；
-  /// - **只打断它自己那一轮**（用户 2026-10-03 硬断言：「发消息给主 agent，其子 agent
-  ///   不受影响（和"发消息给子 agent，父 agent 及其他子 agent 不受影响"一致）」）：
-  ///   同一会话里它名下的临时员工**不连带取消**——它们继续跑、完成报告照旧注入发起者；
-  ///   父那轮若正卡在 `subagent` / `wait_for` 这类阻塞工具上，按"正在执行的工具跑完才
-  ///   收敛"把这条新消息排队等它返回（"工具执行完前不接受新消息"是期望语义，不是 bug）。
-  /// - 有在途任务时计数 [interruptedRunCount]，便于测试与排障。
-  void _interruptForNewMessage(
-    String agentId, {
-    required String sessionId,
-    bool byUser = false,
-  }) {
-    final _RunToken? token = _running[_runKey(agentId, sessionId)];
-    if (token == null) return;
-    // **不碰在途工具，也不作废在途提问**（见方法文档最后一条）：插话只置软标记。
-    token.interrupted = true;
-    token.cancelled = true; // 复用既有取消通道：流式循环每帧检查，工具之间也检查
-    if (byUser) token.userStopped = true;
-    // **只打断它自己那一轮**（用户 2026-10-03 硬断言：「发消息给主 agent，其子 agent
-    // 不受影响（和"发消息给子 agent，父 agent 及其他子 agent 不受影响"一致）」）：
-    // 不再连带取消同一会话里它名下的临时员工——它们继续跑，完成报告照旧注入发起者。
-    // 终止在途临时员工只有两条**显式**路径：用户 `stop`（按 agent，仍连带它名下的）、
-    // 以及在"某个临时成员的视角"里按停止（`sub_…` ⇒ _stopAgentTree(cascade:false)）。
-    interruptedRunCount++;
   }
 
   /// **对账探针**（见 `ToolResultProbe`）：这次工具调用的结果**已经落库**了吗？
@@ -1119,19 +1211,16 @@ class ConversationService {
       );
     }
     if (cancelled) {
-      // 用户按 stop → 给一条可见提示；被"新消息"打断（interjection）则**不提示**：
-      // 用户刚发的话就是它的上下文，再刷"已停止本轮生成。"纯属噪声。
-      if (!token.interrupted) {
-        // 同样是"给人看"的一句话：模型不需要知道"这一轮被用户停了"（读到只会当成新指令）
-        _sendNotice(
-          agent,
-          session,
-          '已停止本轮生成。',
-          llmHidden: true,
-          subagent: subagent,
-          transcriptAgentId: ownerId,
-        );
-      }
+      // 取消只可能来自**显式停止**（用户 `stop` / 删除 agent / 关服）：AC-2 起
+      // 新消息不再打断在途轮次，因此这里总是给一条可见提示。
+      _sendNotice(
+        agent,
+        session,
+        '已停止本轮生成。',
+        llmHidden: true,
+        subagent: subagent,
+        transcriptAgentId: ownerId,
+      );
     }
     _publishTurnOutcome(
       agent: agent,
@@ -1139,7 +1228,6 @@ class ConversationService {
       teamAgentId: ownerId,
       errorMessage: failure,
       cancelled: cancelled,
-      interrupted: token.interrupted,
       contentChars: roundText.length,
       elapsedMs: turnWatch.elapsedMilliseconds,
       toolRounds: toolRound,
@@ -1328,13 +1416,7 @@ class ConversationService {
         subagentLevel: tag.level,
       ),
     );
-    // 插话：先打断它当前那一轮（工具之间的收敛口径与主 agent 完全一致）。
-    // 这是**用户**说的 → byUser：被中止的那一轮不向发起者注入结束提示。
-    _interruptForNewMessage(
-      record.id,
-      sessionId: record.sessionId,
-      byUser: true,
-    );
+    // AC-2 起不再打断它当前那一轮：这条消息排在会话串行链上，等当前轮收尾后执行。
     await _enqueue(
       record.id,
       record.sessionId,
@@ -1455,7 +1537,6 @@ class ConversationService {
     required String teamAgentId,
     required String? errorMessage,
     required bool cancelled,
-    required bool interrupted,
     required int contentChars,
     required int elapsedMs,
     required int toolRounds,
@@ -1486,10 +1567,8 @@ class ConversationService {
         agentId: agentId,
         sessionId: sessionId,
         teamId: effectiveTeam,
-        // 插话不算“用户停了本轮”（审计上这是两件事）
-        source: interrupted
-            ? AgentEvents.sourceInterjection
-            : AgentEvents.sourceUserStop,
+        // AC-2 起只有显式停止会取消本轮（新消息不再打断在途轮次）。
+        source: AgentEvents.sourceUserStop,
         contentChars: contentChars,
         elapsedMs: elapsedMs,
         toolRounds: toolRounds,
@@ -1595,13 +1674,302 @@ class ConversationService {
     sourceSessionId: message.sourceSessionId,
   );
 
+  /// 落库一条入站消息（C12 加法键：来源 / 类型 / 子类型 / 注入模式 / 幂等键）。
+  CoreMessage _appendInbound(
+    CoreAgent agent,
+    CoreSession session,
+    MessageEnvelope envelope,
+  ) {
+    final CoreMessage message = CoreMessage(
+      id: CoreIds.message(),
+      agentId: agent.id,
+      sessionId: session.sessionId,
+      // C4：`system_message` 存 system 角色（与钉住的系统提示词分开）；
+      // 其余入站消息是 user（引擎按"有人对它说话"翻译）。
+      role: envelope.llmRole,
+      content: envelope.content,
+      timestamp: DateTime.now().millisecondsSinceEpoch,
+      attachments: _attachments(envelope.attachments),
+      sourceMessageId: envelope.messageId,
+      messageType: envelope.type.wire,
+      messageSubtype: envelope.subtype.wire,
+      injectMode: envelope.injectMode.wire,
+      sourceTeamId: envelope.source.teamId,
+      sourceAgentId: envelope.source.agentId,
+      sourceSessionId: envelope.source.sessionId,
+    );
+    store.appendMessage(message);
+    return message;
+  }
+
+  /// 把非用户来源的入站消息推给界面（用户消息由前端自己回显，旧行为不变）。
+  void _broadcastInbound(
+    CoreAgent agent,
+    CoreSession session,
+    MessageEnvelope envelope,
+    CoreMessage message,
+  ) {
+    if (envelope.source.isUser) return;
+    hub.broadcast(<String, dynamic>{
+      'type': WsOutboundType.message,
+      'id': message.id,
+      'role': envelope.llmRole,
+      'content': envelope.content,
+      'agent_id': agent.id,
+      'session_id': session.sessionId,
+      'message_id': envelope.messageId,
+      'message_type': envelope.type.wire,
+      'message_subtype': envelope.subtype.wire,
+      'inject_mode': envelope.injectMode.wire,
+      'source': envelope.source.toJson(),
+    });
+  }
+
+  /// 历史里是否已经有这条入站消息（C12 的 `source_message_id` 去重）。
+  bool _hasSourceMessage(
+    String agentId,
+    String sessionId,
+    String sourceMessageId,
+  ) {
+    for (final CoreMessage message in store.sessionMessages(
+      agentId,
+      sessionId,
+    )) {
+      if (message.sourceMessageId == sourceMessageId) return true;
+    }
+    return false;
+  }
+
+  /// 消息机的分派：台账 → tip 直接完成 / task 进队列并触发排空。
+  Future<void> _submitInbound(
+    MessageEnvelope envelope,
+    CoreSession session,
+    Future<void> Function() run,
+  ) async {
+    final String agentId = envelope.targetAgentId;
+    final String sessionId = session.sessionId;
+    final MessageInbox? inbox = agentInstances
+        ?.instanceOf(agentId)
+        .inbox(sessionId);
+    if (inbox != null) {
+      try {
+        // 回执前落盘（recon §3.5）：appendPending 返回时该行已经 flush。
+        await inbox.appendPending(envelope.toJson());
+      } catch (error) {
+        // 台账写失败不阻断业务（fail-open）：消息已在历史里，重放靠它兜底。
+        log?.call('收件箱台账写入失败（消息照常处理）：$error');
+      }
+    }
+    if (envelope.isTip) {
+      // tip 只补上下文：**不唤醒 loop、不动状态**，入队即完成。
+      await _markInboxDone(inbox, envelope.messageId);
+      return;
+    }
+    final String key = _runKey(agentId, sessionId);
+    final _MessageJob job = _MessageJob(
+      envelope: envelope,
+      sessionId: sessionId,
+      sequence: ++_jobSequence,
+      epoch: _epoch[agentId] ?? 0,
+      run: run,
+    );
+    (envelope.injectMode == InjectMode.direct ? _directJobs : _queueJobs)
+        .putIfAbsent(key, () => <_MessageJob>[])
+        .add(job);
+    await _ensurePump(agentId, sessionId);
+  }
+
+  /// 保证该会话有一个排空循环在跑；已有时复用（返回同一个 Future）。
+  Future<void> _ensurePump(String agentId, String sessionId) {
+    final String key = _runKey(agentId, sessionId);
+    final Future<void>? existing = _pumping[key];
+    if (existing != null) return existing;
+    late final Future<void> pump;
+    pump = _enqueue(agentId, sessionId, () async {
+      try {
+        await _drainMessages(agentId, sessionId);
+      } finally {
+        // 队列空判定与清标记之间没有 await：不会漏掉刚入队的消息。
+        if (identical(_pumping[key], pump)) _pumping.remove(key);
+      }
+    }, respectEpoch: false);
+    _pumping[key] = pump;
+    return pump;
+  }
+
+  /// 排空一个会话的消息队列：`direct` 优先、同类按到达顺序，逐条执行（C11）。
+  Future<void> _drainMessages(String agentId, String sessionId) async {
+    final String key = _runKey(agentId, sessionId);
+    final MessageInbox? inbox = agentInstances
+        ?.existing(agentId)
+        ?.inbox(sessionId);
+    while (true) {
+      final _MessageJob? job = _takeNext(key);
+      if (job == null) break;
+      if ((_epoch[agentId] ?? 0) != job.epoch) {
+        // stop 已经作废这一代次的 task（tips 不进队列，因此保留）。
+        droppedQueuedCount++;
+        await _markInboxCancelled(inbox, job.envelope.messageId, 'stop');
+        continue;
+      }
+      // idle → working（状态机；同一 agent 已在跑时是幂等 no-op）。
+      _markAgentState(agentId, sessionId, AgentActivityState.working);
+      if (inbox != null) {
+        try {
+          await inbox.markInflight(job.envelope.messageId);
+        } catch (error) {
+          log?.call('收件箱台账（inflight）写入失败：$error');
+        }
+      }
+      bool failed = false;
+      try {
+        await job.run();
+      } catch (error) {
+        failed = true;
+        await _markInboxFailed(inbox, job.envelope.messageId, '$error');
+        _sendError('会话任务异常：$error');
+      }
+      if (!failed) {
+        if ((_epoch[agentId] ?? 0) != job.epoch) {
+          await _markInboxCancelled(inbox, job.envelope.messageId, 'stop');
+        } else {
+          await _markInboxDone(inbox, job.envelope.messageId);
+        }
+      }
+    }
+    // 排空后无在途轮次 → idle（其他会话/临时员工还在跑时保持 working）。
+    if (!isRunning(agentId)) {
+      _markAgentState(agentId, sessionId, AgentActivityState.idle);
+    }
+  }
+
+  /// 取下一条可执行 task：`direct` 队列优先，同类按 `created_at`（缺省按入队序）。
+  _MessageJob? _takeNext(String key) {
+    for (final List<_MessageJob>? queue in <List<_MessageJob>?>[
+      _directJobs[key],
+      _queueJobs[key],
+    ]) {
+      if (queue == null || queue.isEmpty) continue;
+      queue.sort(_compareJobs);
+      final _MessageJob job = queue.removeAt(0);
+      if (queue.isEmpty) {
+        if (identical(_directJobs[key], queue)) _directJobs.remove(key);
+        if (identical(_queueJobs[key], queue)) _queueJobs.remove(key);
+      }
+      return job;
+    }
+    return null;
+  }
+
+  /// 稳定排序：双方都有 `created_at` 时按它（再按 message_id 打破平局），
+  /// 否则按本机入队序——本机补生成的 id 没有可比的时间。
+  static int _compareJobs(_MessageJob a, _MessageJob b) {
+    final int at = a.envelope.createdAt;
+    final int bt = b.envelope.createdAt;
+    if (at > 0 && bt > 0) {
+      final int byTime = at.compareTo(bt);
+      if (byTime != 0) return byTime;
+      return a.envelope.messageId.compareTo(b.envelope.messageId);
+    }
+    return a.sequence.compareTo(b.sequence);
+  }
+
+  /// `stop` 作废尚未开始的 task（C8）：从两条队列摘掉并在台账标 `cancelled`。
+  void _cancelQueuedMessages(String agentId) {
+    final String prefix = '$agentId|';
+    for (final Map<String, List<_MessageJob>> queues in <
+      Map<String, List<_MessageJob>>
+    >[_directJobs, _queueJobs]) {
+      for (final String key in queues.keys.toList(growable: false)) {
+        if (!key.startsWith(prefix)) continue;
+        final List<_MessageJob> jobs = queues.remove(key) ?? <_MessageJob>[];
+        for (final _MessageJob job in jobs) {
+          droppedQueuedCount++;
+          final MessageInbox? inbox = agentInstances
+              ?.existing(agentId)
+              ?.inbox(job.sessionId);
+          unawaited(
+            inbox?.markCancelled(job.envelope.messageId, reason: 'stop') ??
+                Future<void>.value(),
+          );
+        }
+      }
+    }
+  }
+
+  Future<void> _markInboxDone(MessageInbox? inbox, String messageId) async {
+    if (inbox == null) return;
+    try {
+      await inbox.markDone(messageId);
+    } catch (error) {
+      log?.call('收件箱台账（done）写入失败：$error');
+    }
+  }
+
+  Future<void> _markInboxFailed(
+    MessageInbox? inbox,
+    String messageId,
+    String error,
+  ) async {
+    if (inbox == null) return;
+    try {
+      await inbox.markFailed(messageId, error);
+    } catch (error) {
+      log?.call('收件箱台账（failed）写入失败：$error');
+    }
+  }
+
+  Future<void> _markInboxCancelled(
+    MessageInbox? inbox,
+    String messageId,
+    String reason,
+  ) async {
+    if (inbox == null) return;
+    try {
+      await inbox.markCancelled(messageId, reason: reason);
+    } catch (error) {
+      log?.call('收件箱台账（cancelled）写入失败：$error');
+    }
+  }
+
+  /// 状态机迁移 + `agent.state` 广播（状态没变则不广播；未接线 = no-op）。
+  ///
+  /// 两态口径见 C10：`asking` 是 working 的附加标记/事件，不引入第三种状态。
+  void _markAgentState(
+    String agentId,
+    String sessionId,
+    AgentActivityState state,
+  ) {
+    final AgentInstance? instance = agentInstances?.instanceOf(agentId);
+    if (instance == null) return;
+    final AgentActivityState previous = instance.state;
+    if (state == AgentActivityState.working) {
+      instance.markWorking();
+    } else {
+      instance.markIdle();
+    }
+    if (instance.state == previous) return;
+    hub.broadcast(<String, dynamic>{
+      'type': WsOutboundType.agentState,
+      'data': <String, dynamic>{
+        'agent_id': agentId,
+        'session_id': sessionId,
+        'state': instance.state.wire,
+        // `status` 是既有帧的字段名：两个都给，老消费者不用改。
+        'status': instance.state.wire,
+        'updated_at': instance.updatedAt,
+      },
+    });
+  }
+
   /// 按 **agent×会话** 串行执行：同一会话的前一个任务（含失败）结束后才启动下一个，
   /// **不同会话各自一条链、并行启动**。
   Future<void> _enqueue(
     String agentId,
     String sessionId,
-    Future<void> Function() task,
-  ) {
+    Future<void> Function() task, {
+    bool respectEpoch = true,
+  }) {
     final String key = _runKey(agentId, sessionId);
     final Future<void> previous = _chains[key] ?? Future<void>.value();
     final Completer<void> gate = Completer<void>();
@@ -1614,7 +1982,7 @@ class ConversationService {
         // 前序任务的错误已在内部上报，不阻断队列
       }
       // stop 之后旧代次的排队任务一律丢弃（参考实现清空 broker 队列的等价语义）
-      if ((_epoch[agentId] ?? 0) != epoch) {
+      if (respectEpoch && (_epoch[agentId] ?? 0) != epoch) {
         droppedQueuedCount++;
         if (!gate.isCompleted) gate.complete();
         if (identical(_chains[key], gate.future)) _chains.remove(key);
