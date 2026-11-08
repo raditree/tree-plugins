@@ -25,7 +25,9 @@
    REST/WS；核心不可达时显示错误页而不是白屏。
 2. **帧过滤**：中栏只接收当前 agent + 当前会话的帧；成员窗口只接收该成员 + 该会话的帧——否则并行会话会串台。
 3. **重播去重**：断线重连后的重播帧必须按消息 id + 流式序号判掉，不得重复渲染。
-4. 协议常量从 `package:tree_protocol` 取，不写字面量。
+4. **协议常量从 `io/protocol_contract.dart` 取，不写字面量**：本插件零依赖（不 import
+   核心包），契约由 UI 自持；一致性靠核心面对外冻结（`/api/meta.ui_contract`）+
+   桌面仓的黑盒一致性套件。
 5. 密钥只读不显（模型面板走字段白名单）；日志不打印 token。
 6. 左栏列出**全部 agent（顶层 + 团队成员）**（[ui/pages/main_page.dart](ui/pages/main_page.dart) 的
    `_railAgents` + `railAgentsOf`）：成员也是独立 agent 文件（`team_id` 指向 TOP），点开就是它自己的
