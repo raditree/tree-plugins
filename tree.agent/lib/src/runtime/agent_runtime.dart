@@ -158,6 +158,16 @@ class AgentRuntime {
       client: _stationCommand,
       scopeFor: _stationScopeFor,
     );
+    final AgentEngine resolvedEngine =
+        engine ??
+        LlmAgentEngine(
+          resolveModel: (String modelId) => settings.model(modelId),
+          agentOverrides: overridesFor,
+          usageLog: usageLog,
+          toolRunner: stationToolRunner,
+        );
+    // 工具表快照的失效出口在引擎上（C6-b）；注入自定义引擎（测试）时没有快照。
+    llmEngine = resolvedEngine is LlmAgentEngine ? resolvedEngine : null;
     conversation = ConversationService(
       store: store,
       hub: hub,
@@ -167,13 +177,7 @@ class AgentRuntime {
       subagents: registry,
       // AC-2 消息机接线：收件箱台账 + 活动状态 + `agent.state` 广播。
       agentInstances: agentInstances,
-      engine: engine ??
-          LlmAgentEngine(
-            resolveModel: (String modelId) => settings.model(modelId),
-            agentOverrides: overridesFor,
-            usageLog: usageLog,
-            toolRunner: stationToolRunner,
-          ),
+      engine: resolvedEngine,
     );
     teamService = TeamService(
       store: store,
@@ -238,6 +242,9 @@ class AgentRuntime {
   late final SubagentService subagentService;
   late final CompactionService compaction;
   late final ConversationService conversation;
+
+  /// 真实 LLM 引擎（自定义引擎注入时为空）：工具表快照失效走它（C6-b）。
+  late final LlmAgentEngine? llmEngine;
   late final UsageLog usageLog;
   late final LlmJsonCaller llmCaller;
 
@@ -1284,9 +1291,13 @@ class AgentRuntime {
   }
 
   /// 触发工具贡献收集站并刷新缓存（无订阅者 / 未接线 ⇒ 空表，不阻断发消息）。
+  ///
+  /// **工具表快照失效**（C6-b 信号 1/2）：只有贡献表**真的变了**才失效——每次发消息
+  /// 都会调这里，若无条件失效，快照就退化成"每轮重建"，前缀缓存照样每轮作废。
   Future<void> refreshContributedTools() async {
     final StationTriggerClient? trigger = stationTrigger;
     if (trigger == null) return;
+    final String before = _contributedToolsSignature();
     try {
       final Map<String, dynamic> response = await trigger(
         toolCollectStationId(pluginId),
@@ -1300,7 +1311,19 @@ class AgentRuntime {
     } catch (_) {
       // 收集失败不阻断发送：工具表退回内置五项。
     }
+    if (_contributedToolsSignature() != before) {
+      llmEngine?.invalidateAllToolSnapshots();
+    }
   }
+
+  /// 贡献表的稳定签名（名称 / 说明 / schema；插件上下线都会改变它）。
+  String _contributedToolsSignature() => contributedTools
+      .map(
+        (ContributedTool t) =>
+            '${t.pluginId}|${t.coreName}|${t.description}|'
+            '${jsonEncode(t.parameters)}',
+      )
+      .join('\u0000');
 
   /// 某个 agent 的工作空间 IO（经核心执行站；未接线时返回 null）。
   Future<WorkspaceIO?> workspaceIoFor(String agentId, String sessionId) async {

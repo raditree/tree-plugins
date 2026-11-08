@@ -164,6 +164,8 @@ class LlmSession {
     this.toolWatchdogInterval = defaultToolWatchdogInterval,
     this.llmRequestRegistrar,
     this.requestSilenceTimeout = defaultRequestSilenceTimeout,
+    this.pullInputs,
+    this.shouldTerminate,
     this.log,
   });
 
@@ -248,6 +250,18 @@ class LlmSession {
   /// 「投入 LLM 前」请求改写钩子（中转站点位 `system.relay.llm.request`）；null = 未接线。
   final LlmRequestRewriter? llmRequestRewriter;
 
+  /// **插入点取件**（AC-3）：每次 LLM 请求之前取一次尚未进入上下文的入站消息。
+  ///
+  /// 返回的端点消息**只追加在末尾**（前缀缓存字节不变）；引擎已把它们从
+  /// `CoreMessageRef` 翻译好（附件 / 视觉 / system 通道）。null = 未接线。
+  final Future<List<LlmMessage>> Function()? pullInputs;
+
+  /// **迭代边界终止**（C1/I1）：本批工具跑完后是否结束 loop。
+  ///
+  /// 只在**一次完整响应 + 它的整个工具批**落地之后询问——因此工具批永远原子，
+  /// 注入消息绝不会让剩余工具被跳过。null = 不终止（老行为）。
+  final bool Function()? shouldTerminate;
+
   /// 可读日志（上下文裁剪、工具异常等）。
   final void Function(String message)? log;
 
@@ -329,6 +343,14 @@ class LlmSession {
         force: false,
       );
       if (compacted != null) base = compacted;
+      // 插入点（AC-3）：上一跳的工具结果已全部落地，发起下一跳之前把消息机
+      // 攒着的入站消息补进上下文。只追加在末尾——前面那串字节原样不动，端点
+      // 前缀缓存因此仍命中（这也是 `system_message` 不改钉住提示词的原因）。
+      final Future<List<LlmMessage>> Function()? pull = pullInputs;
+      if (pull != null) {
+        final List<LlmMessage> incoming = await pull();
+        if (incoming.isNotEmpty) inFlight.addAll(incoming);
+      }
       LlmRequest request = LlmRequest(
         model: model,
         messages: List<LlmMessage>.unmodifiable(current()),
@@ -591,7 +613,9 @@ class LlmSession {
         ),
       );
       for (final LlmToolCall call in calls) {
-        if (isCancelled()) {
+        // **工具批是原子的**（C1/I1）：入站消息 / 注入信号绝不跳过剩余工具。
+        // 只有硬取消（用户 `stop` / 删除 agent / 关服）才允许在这里收尾。
+        if ((isHardCancelled ?? isCancelled)()) {
           yield const AgentDone(cancelled: true);
           return;
         }
@@ -652,6 +676,12 @@ class LlmSession {
             toolCallId: call.id,
           ),
         );
+      }
+      // C1/I1：direct task 到达 ⇒ 本次响应 + 它的**整个**工具批已经跑完，
+      // 结束本 loop；消息机随后按 direct 优先开新 loop（不进入下一跳）。
+      if (shouldTerminate?.call() ?? false) {
+        yield AgentDone(finishReason: finishReason);
+        return;
       }
     }
   }

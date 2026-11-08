@@ -38,6 +38,12 @@ class _RunToken {
 
   bool cancelled = false;
 
+  /// **迭代边界终止**（C1/I1）：有 `direct task` 到达时置真。
+  ///
+  /// 引擎只在"一次完整响应 + 它的整个工具批"跑完后询问它；因此工具批永远是原子
+  /// 的，新消息不会让剩余工具被跳过。本轮 loop 结束后，消息机按 direct 优先开新 loop。
+  bool terminateAfterBatch = false;
+
   /// **工具层**认的取消：只认真取消（用户 `stop` / 删除 agent / 关服）。
   ///
   /// 与 [cancelled] 是两个量：[cancelled] 是**软**收敛信号；这一条是**硬**取消，
@@ -105,6 +111,17 @@ class _MessageJob {
 
   final int epoch;
   final Future<void> Function() run;
+}
+
+/// 一条**待注入**的入站消息（AC-3 插入点）。
+///
+/// 它已经在历史里（入站时落库），只是在途 loop 的上下文快照还没包含它；
+/// [messageId] 用于在真正注入后把台账标 `done`（零丢失口径）。
+class _PendingInput {
+  const _PendingInput({required this.messageId, required this.ref});
+
+  final String messageId;
+  final CoreMessageRef ref;
 }
 
 /// 本轮正在生成的一条消息（与前端消息一一对应：先立 start，再追加 chunk）。
@@ -280,6 +297,11 @@ class ConversationService {
   /// 入队序号（本机稳定排序的兜底；发起者没给 `created_at` 时按它排）。
   int _jobSequence = 0;
 
+  /// 每个**在途会话**攒下的待注入消息（AC-3）：入站时已有 loop 在跑，就让 loop
+  /// 在下一跳之前取走；loop 结束仍未取走的由 [_settlePendingInputs] 收尾。
+  final Map<String, List<_PendingInput>> _pendingInputs =
+      <String, List<_PendingInput>>{};
+
   /// 已提示过的"压缩失败 / 模型没配 max_seqlen"（同一件事只打扰用户一次）。
   final Set<String> _notified = <String>{};
 
@@ -394,6 +416,7 @@ class ConversationService {
       envelope,
       session,
       () => _runReply(agent, session, envelope.content),
+      message: appended,
     );
     return <String, dynamic>{
       'ok': true,
@@ -1043,6 +1066,14 @@ class ConversationService {
       fresh: freshContext,
       // 工具层看到的取消 = **硬**取消（插话不算）："任何工具调用执行期间不被插话打断"
       isHardCancelled: () => token.hardCancelled,
+      // AC-3 插入点与迭代边界终止：只对**真实 agent 的会话轮**接线；临时员工轮
+      // 没有消息机队列（它只走会话串行链），保持老行为。
+      pullInputs: subagent == null
+          ? () => _drainPendingInputs(runKey, agent.id, session.sessionId)
+          : null,
+      shouldTerminate: subagent == null
+          ? () => token.terminateAfterBatch
+          : null,
     );
 
     try {
@@ -1235,6 +1266,9 @@ class ConversationService {
       subagentId: subagent?.id ?? '',
     );
     _running.remove(runKey);
+    // 本轮结束仍未取走的待注入消息：它们已经在历史里（下一次生成会读到），
+    // 台账在这里收尾即可——不能留成 pending 让崩溃恢复重放。
+    _settlePendingInputs(runKey, agent.id, session.sessionId);
     // 本轮结束：清掉它的实时真值（下一轮会在**自己**首跳的 AgentUsage 里重新写入；
     // 预压缩不依赖它，故留着也不会误读，但及时回收避免跨轮脏值堆积）。
     _livePromptTokens.remove(runKey);
@@ -1741,13 +1775,22 @@ class ConversationService {
   }
 
   /// 消息机的分派：台账 → tip 直接完成 / task 进队列并触发排空。
+  ///
+  /// AC-3 起多一条**在途**分支：
+  /// - `working` 时的 `direct tip` 不再立即 done，而是进 [_pendingInputs]，由在途
+  ///   loop 在下一跳之前取走并注入（取走时再标 done）；
+  /// - `working` 时的 `direct task` 置 [token.terminateAfterBatch]，本批跑完后结束
+  ///   loop，随后由排空循环按 direct 优先开新 loop；
+  /// - `queue tip` 仍等本轮结束，但排空时**不产生 LLM 调用**（只把台账收尾）。
   Future<void> _submitInbound(
     MessageEnvelope envelope,
     CoreSession session,
-    Future<void> Function() run,
-  ) async {
+    Future<void> Function() run, {
+    CoreMessage? message,
+  }) async {
     final String agentId = envelope.targetAgentId;
     final String sessionId = session.sessionId;
+    final String key = _runKey(agentId, sessionId);
     final MessageInbox? inbox = agentInstances
         ?.instanceOf(agentId)
         .inbox(sessionId);
@@ -1760,23 +1803,73 @@ class ConversationService {
         log?.call('收件箱台账写入失败（消息照常处理）：$error');
       }
     }
+    final _RunToken? active = _running[key];
     if (envelope.isTip) {
-      // tip 只补上下文：**不唤醒 loop、不动状态**，入队即完成。
-      await _markInboxDone(inbox, envelope.messageId);
-      return;
+      if (active == null) {
+        // 没有在途 loop：tip 只补上下文，下一次生成自然从历史里读到。
+        await _markInboxDone(inbox, envelope.messageId);
+        return;
+      }
+      if (envelope.injectMode == InjectMode.direct && message != null) {
+        // 在途 loop 的下一跳之前注入；此刻**不**标 done（真正注入后再标）。
+        _pendingInputs
+            .putIfAbsent(key, () => <_PendingInput>[])
+            .add(
+              _PendingInput(
+                messageId: envelope.messageId,
+                ref: _toRef(message),
+              ),
+            );
+        return;
+      }
+      // queue tip：等本轮 loop 结束；排空时只收尾台账，不跑生成。
+    } else if (active != null && envelope.injectMode == InjectMode.direct) {
+      // direct task：本次响应 + 它的整个工具批跑完后结束 loop（C1/I1）。
+      active.terminateAfterBatch = true;
     }
-    final String key = _runKey(agentId, sessionId);
     final _MessageJob job = _MessageJob(
       envelope: envelope,
       sessionId: sessionId,
       sequence: ++_jobSequence,
       epoch: _epoch[agentId] ?? 0,
-      run: run,
+      // tip 不需要生成：排空时只是一次台账收尾（不产生 LLM 调用）。
+      run: envelope.isTip ? () async {} : run,
     );
     (envelope.injectMode == InjectMode.direct ? _directJobs : _queueJobs)
         .putIfAbsent(key, () => <_MessageJob>[])
         .add(job);
     await _ensurePump(agentId, sessionId);
+  }
+
+  /// 插入点取件（AC-3）：把该会话攒着的待注入消息一次性交给引擎。
+  ///
+  /// 同步取出（引擎的 `pullInputs` 是同步回调）、异步收尾台账；顺序即到达顺序。
+  AgentInputBatch _drainPendingInputs(String key, String agentId, String sessionId) {
+    final List<_PendingInput>? pending = _pendingInputs.remove(key);
+    if (pending == null || pending.isEmpty) return const AgentInputBatch();
+    final MessageInbox? inbox = agentInstances
+        ?.existing(agentId)
+        ?.inbox(sessionId);
+    for (final _PendingInput item in pending) {
+      unawaited(_markInboxDone(inbox, item.messageId));
+    }
+    return AgentInputBatch(
+      history: <CoreMessageRef>[
+        for (final _PendingInput item in pending) item.ref,
+      ],
+    );
+  }
+
+  /// loop 收尾时把没被取走的待注入消息收尾（它们已在历史里，下一次生成会读到）。
+  void _settlePendingInputs(String key, String agentId, String sessionId) {
+    final List<_PendingInput>? pending = _pendingInputs.remove(key);
+    if (pending == null || pending.isEmpty) return;
+    final MessageInbox? inbox = agentInstances
+        ?.existing(agentId)
+        ?.inbox(sessionId);
+    for (final _PendingInput item in pending) {
+      unawaited(_markInboxDone(inbox, item.messageId));
+    }
   }
 
   /// 保证该会话有一个排空循环在跑；已有时复用（返回同一个 Future）。
@@ -1806,14 +1899,18 @@ class ConversationService {
     while (true) {
       final _MessageJob? job = _takeNext(key);
       if (job == null) break;
-      if ((_epoch[agentId] ?? 0) != job.epoch) {
-        // stop 已经作废这一代次的 task（tips 不进队列，因此保留）。
+      final bool isTip = job.envelope.isTip;
+      if (!isTip && (_epoch[agentId] ?? 0) != job.epoch) {
+        // stop 已经作废这一代次的 task（tips 不在队列里等生成，因此保留）。
         droppedQueuedCount++;
         await _markInboxCancelled(inbox, job.envelope.messageId, 'stop');
         continue;
       }
       // idle → working（状态机；同一 agent 已在跑时是幂等 no-op）。
-      _markAgentState(agentId, sessionId, AgentActivityState.working);
+      // queue tip 不产生生成，**不动状态**（C2：tip 任意状态都不改变状态）。
+      if (!isTip) {
+        _markAgentState(agentId, sessionId, AgentActivityState.working);
+      }
       if (inbox != null) {
         try {
           await inbox.markInflight(job.envelope.messageId);
@@ -1883,7 +1980,13 @@ class ConversationService {
       for (final String key in queues.keys.toList(growable: false)) {
         if (!key.startsWith(prefix)) continue;
         final List<_MessageJob> jobs = queues.remove(key) ?? <_MessageJob>[];
+        final List<_MessageJob> tips = <_MessageJob>[];
         for (final _MessageJob job in jobs) {
+          // C8：stop 作废"可运行 task"；tip 只是上下文补充，必须保留。
+          if (job.envelope.isTip) {
+            tips.add(job);
+            continue;
+          }
           droppedQueuedCount++;
           final MessageInbox? inbox = agentInstances
               ?.existing(agentId)
@@ -1893,6 +1996,7 @@ class ConversationService {
                 Future<void>.value(),
           );
         }
+        if (tips.isNotEmpty) queues[key] = tips;
       }
     }
   }
@@ -2043,6 +2147,8 @@ class ConversationService {
     List<CoreMessageRef>? historyOverride,
     bool fresh = false,
     bool Function()? isHardCancelled,
+    AgentInputBatch Function()? pullInputs,
+    bool Function()? shouldTerminate,
   }) {
     // 压缩会把摘要与水位线写回会话对象；重新取一次避免拿到过期快照。
     // 历史与压缩状态按**归集归属**（`transcriptAgentId`）取：临时员工的消息写进
@@ -2066,6 +2172,8 @@ class ConversationService {
           ? const <Map<String, dynamic>>[]
           : currentSession.compactedContext,
       isHardCancelled: isHardCancelled,
+      pullInputs: pullInputs,
+      shouldTerminate: shouldTerminate,
       // 用户消息已在 handleUserMessage 里落库，因此这里取到的历史已含本次输入。
       // `messages()` 刻意排掉临时员工的消息：父 agent 的工具批必须保持原子。
       history:

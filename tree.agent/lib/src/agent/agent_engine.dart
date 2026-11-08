@@ -209,6 +209,24 @@ class CoreMessageRef {
   bool get isUser => role == 'user';
 }
 
+/// 一次**插入点取件**的结果（AC-3）。
+///
+/// 消息机在入站时已把消息落库，这里只交出"本轮上下文还没看见的那几条"。
+class AgentInputBatch {
+  const AgentInputBatch({
+    this.history = const <CoreMessageRef>[],
+    this.terminate = false,
+  });
+
+  /// 尚未进入本轮上下文的消息（按到达顺序；只会有 `tip` / `system_message`）。
+  final List<CoreMessageRef> history;
+
+  /// 是否有 `direct task` 到达：本批工具跑完后结束 loop（C1/I1）。
+  final bool terminate;
+
+  bool get isEmpty => history.isEmpty && !terminate;
+}
+
 /// 一次生成的输入。
 class AgentRunContext {
   const AgentRunContext({
@@ -222,6 +240,8 @@ class AgentRunContext {
     this.compactedMessageCount = 0,
     this.compactedContext = const <Map<String, dynamic>>[],
     this.isHardCancelled,
+    this.pullInputs,
+    this.shouldTerminate,
   });
 
   final String agentId;
@@ -262,11 +282,23 @@ class AgentRunContext {
   /// 用户 2026-10-04 断言：「任何工具调用执行期间不被插话打断，插入消息（包括
   /// terminal/subagent hook 完成消息）在工具调用期间必须排队等待」——
   /// 与 [AgentEngine.run] 的 `isCancelled` 是**两个量**：
-  /// - `isCancelled`（软）：插话也要让流式立刻停、工具之间收敛；
+  /// - `isCancelled`（软）：显式停止（用户 `stop`）时置真，流式立刻收尾；
   /// - `isHardCancelled`（硬）：正在跑的工具、以及 `ask_user_question` 的在途等待才认它。
   ///
   /// 为 null 时工具层退化为看软信号（老行为；未接线的引擎与测试不受影响）。
   final bool Function()? isHardCancelled;
+
+  /// **插入点取件**（AC-3）：每次 LLM 请求之前取一次尚未进入上下文的入站消息。
+  ///
+  /// 由消息机提供（同步取出并标记台账），引擎负责把它们翻译成端点消息追加到
+  /// 在途上下文末尾（**前缀字节不变**）。null = 未接线（最小骨架/测试）。
+  final AgentInputBatch Function()? pullInputs;
+
+  /// **迭代边界终止**（C1/I1）：本批工具跑完后是否结束 loop。
+  ///
+  /// 由消息机在 `direct task` 到达时置真。引擎只在**一次完整响应 + 它触发的
+  /// 整个工具批**跑完后询问它，因此工具批永远是原子的。
+  final bool Function()? shouldTerminate;
 }
 
 /// 回复引擎：给定一次 [AgentRunContext]，流式产出 [AgentEvent]。

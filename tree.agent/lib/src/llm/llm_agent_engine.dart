@@ -169,6 +169,44 @@ class LlmAgentEngine implements AgentEngine {
 
   final Map<String, LlmTransport> _transports = <String, LlmTransport>{};
 
+  /// 每个 **agent×会话** 的工具表快照（C6-b）。
+  ///
+  /// 工具表是请求前缀的一部分（`tools` 数组变了，端点缓存从第 0 个 token 起失效），
+  /// 因此不能每轮重建。失效信号只有四类：工具贡献变化、MCP/工具插件上下线、
+  /// agent 工作空间模式变化、显式 `agent.tools.refresh`——前两类在本插件里都表现
+  /// 为"贡献表变了"（[invalidateAllToolSnapshots]），后两类走
+  /// [invalidateToolSnapshots]。
+  final Map<String, List<ToolSpec>> _toolSnapshots = <String, List<ToolSpec>>{};
+
+  static String _toolSnapshotKey(String agentId, String sessionId) =>
+      '$agentId|$sessionId';
+
+  /// 取（必要时建）该会话的工具表快照。
+  List<ToolSpec> _toolSpecsFor(AgentRunContext context) =>
+      _toolSnapshots.putIfAbsent(
+        _toolSnapshotKey(context.agentId, context.sessionId),
+        () => toolRunner.specsFor(
+          agentId: context.agentId,
+          sessionId: context.sessionId,
+        ),
+      );
+
+  /// 失效某 agent 的工具表快照（[sessionId] 为空 = 它的全部会话）。
+  void invalidateToolSnapshots(String agentId, {String? sessionId}) {
+    if (sessionId != null) {
+      _toolSnapshots.remove(_toolSnapshotKey(agentId, sessionId));
+      return;
+    }
+    final String prefix = '$agentId|';
+    _toolSnapshots.removeWhere((String key, _) => key.startsWith(prefix));
+  }
+
+  /// 失效全部工具表快照（工具贡献表 / MCP / 工具插件集合发生变化时调用）。
+  void invalidateAllToolSnapshots() => _toolSnapshots.clear();
+
+  /// 自检读数：当前钉住的会话快照数。
+  int get toolSnapshotCount => _toolSnapshots.length;
+
   @override
   Stream<AgentEvent> run(
     AgentRunContext context, {
@@ -235,11 +273,9 @@ class LlmAgentEngine implements AgentEngine {
       thinkingTurn: thinkingModel,
     );
     // 这一轮能用的工具表：**内置与接管者必须拿到同一份**（否则插件看到的工具与世界
-    // 不一致，而这份表同时决定缓存前缀）。
-    final List<ToolSpec> toolSpecs = toolRunner.specsFor(
-      agentId: context.agentId,
-      sessionId: context.sessionId,
-    );
+    // 不一致，而这份表同时决定缓存前缀）。按 `agentId|sessionId` 钉住快照（C6-b）：
+    // 没有失效信号就不重建，否则"快照"退化成每轮缓存、前缀照样每轮失效。
+    final List<ToolSpec> toolSpecs = _toolSpecsFor(context);
     // **整轮接管**（中转站点位 `system.relay.loop.run`，阶段 8）：上下文已由核心装配完，
     // 在进入内置 LlmSession 之前先问一次。回 null（未接线 / 未接管 / 非法回包）⇒
     // 下面的内置路径逐字不变。接管者只决定**循环形状**；落库、上行帧、用量账本、
@@ -300,6 +336,15 @@ class LlmAgentEngine implements AgentEngine {
       ),
       llmHandler: llmTurnHandler,
       llmRequestRewriter: llmRequestRewriter,
+      // AC-3 插入点：消息机攒下的 tip / system_message 在每次请求前补进上下文。
+      pullInputs: context.pullInputs == null
+          ? null
+          : () => _translateInjectedInputs(
+              context,
+              config: config,
+              vision: config.ifVision ? visionResolver : null,
+            ),
+      shouldTerminate: context.shouldTerminate,
       log: log,
     );
     // usage 事件要**过一手**：真实 usage 里夹带着"本次上下文字符数"，学习完之后
@@ -316,6 +361,42 @@ class LlmAgentEngine implements AgentEngine {
       resolved: resolved,
       config: config,
     );
+  }
+
+  /// 把消息机在**插入点**交出的条目翻译成端点消息（AC-3）。
+  ///
+  /// 只朝向模型的入站角色：`system_message` 走 `LlmRole.system`（C4，与钉住的
+  /// 系统提示词分开），其余按 `user` 发；`llm_hidden` / 思考 / 工具卡不进上下文
+  /// （与历史翻译同一口径）。附件说明段与视觉块也沿用同一条路径，两处口径一致。
+  Future<List<LlmMessage>> _translateInjectedInputs(
+    AgentRunContext context, {
+    required CoreModelConfig config,
+    VisionFileResolver? vision,
+  }) async {
+    final AgentInputBatch batch =
+        context.pullInputs?.call() ?? const AgentInputBatch();
+    if (batch.history.isEmpty) return const <LlmMessage>[];
+    final List<LlmMessage> out = <LlmMessage>[];
+    for (final CoreMessageRef ref in batch.history) {
+      if (ref.llmHidden || ref.isTool || ref.isThinking) continue;
+      if (ref.isSystemMessage) {
+        if (ref.content.trim().isNotEmpty) {
+          out.add(LlmMessage.system(ref.content));
+        }
+        continue;
+      }
+      final String content = ref.isUser
+          ? '${ref.content}${attachmentsPromptSuffix(ref.attachments)}'
+          : ref.content;
+      if (content.trim().isEmpty) continue;
+      final List<LlmContentPart> parts = ref.isUser
+          ? await _visionParts(vision, config, context.agentId, ref.attachments)
+          : const <LlmContentPart>[];
+      out.add(
+        LlmMessage(role: LlmRole.user, content: content, contentParts: parts),
+      );
+    }
+    return out;
   }
 
   /// 一条事件流的 usage 那一手（**内置 loop 与插件接管的整轮共用同一个出口**）。
