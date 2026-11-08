@@ -1,0 +1,17 @@
+name: tree_storage
+description: tree.storage 插件的集合存储库（Sembast、纯 Dart）；不得反向依赖核心包。
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.13.0
+
+dependencies:
+  # 数据文件布局（storage/<namespace>/data.semdb）
+  path: ^1.9.0
+  # 纯 Dart 嵌入式数据库，零 native 依赖；追加日志 + 检查点，崩溃最多丢末条未提交写。
+  sembast: ^3.9.0
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.0
