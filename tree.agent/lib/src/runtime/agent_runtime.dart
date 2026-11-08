@@ -101,7 +101,7 @@ class AgentRuntime {
         // 本地留痕（测试 / 排障），并**同时**走 A4 的事件站出口。
         frames.add(frame);
         if (frames.length > 2000) frames.removeAt(0);
-        publishAgentEvent(frame);
+        _publishAgentEvent(frame);
       },
     );
     todoStore = FileTodoStore(TreePaths(paths.root));
@@ -285,22 +285,37 @@ class AgentRuntime {
   /// **payload 原样是旧 WS 帧**——UI 侧只需换收口，不改渲染字段。
   ///
   /// 空 session_id 用 `_` 兜底（topic 三段都不能为空，否则订阅匹配不到）。
-  /// `scope.mode_key` 决定"这条消息属于哪种工作面"：帧自身带 `mode_key` 就用它，
-  /// 否则按 local（UI 订阅是通配，不因此丢帧）。
-  static void publishAgentEvent(Map<String, dynamic> frame) {
+  ///
+  /// **信封必须自带可证明的归属**：核心的投递闸门（`StationIsolation.checkMessageScope`）
+  /// 要求 `team_id` 非空、`mode_key` 合法，缺一个就整条跳过——站点只涨
+  /// `skipped_scope`、`board_seq` 不动，订阅者一帧都收不到（现象正是"发消息后界面
+  /// 毫无反应"）。帧里的 `agent_id` / `session_id` 有两种摆法（顶层，或 `data` 里，
+  /// 如 `agent_status`），这里两种都认，并按 agent 的**有效团队归属**补 `team_id`。
+  void _publishAgentEvent(Map<String, dynamic> frame) {
     final StationTriggerClient? trigger = stationTrigger;
     final String stationId = eventsStationId;
     if (trigger == null || stationId.isEmpty) return;
-    final String sessionId =
-        (frame['session_id'] ?? frame['sessionId'] ?? '_').toString().trim();
+    final Map<String, dynamic> data = frame['data'] is Map
+        ? (frame['data'] as Map).map(
+            (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+          )
+        : const <String, dynamic>{};
+    String field(String key) => (frame[key] ?? data[key] ?? '').toString().trim();
+    final String agentId = field('agent_id');
+    final String sessionId = field('session_id');
     final String kind = (frame['type'] ?? 'event').toString().trim();
     if (kind.isEmpty) return;
     final String mode =
         (frame['mode_key'] ?? frame['mode'] ?? 'local').toString().trim();
+    final String teamId = _effectiveTeamOf(agentId);
     final Map<String, dynamic> scope = <String, dynamic>{
       'mode_key': mode == 'ssh' ? 'ssh' : 'local',
+      if (teamId.isNotEmpty) 'team_id': teamId,
+      if (agentId.isNotEmpty) 'agent_id': agentId,
+      if (sessionId.isNotEmpty) 'session_id': sessionId,
     };
-    final String topic = '$pluginId.$sessionId.$kind';
+    final String topic =
+        '$pluginId.${sessionId.isEmpty ? '_' : sessionId}.$kind';
     // 单向：投递结果不回灌业务（与核心 announce 同口径）；失败只留日志。
     unawaited(
       trigger(
@@ -310,8 +325,41 @@ class AgentRuntime {
             scope,
             topic: topic,
           )
+          .then(_noteDelivery)
           .catchError((Object error) => <String, dynamic>{'ok': false}),
     );
+  }
+
+  /// 投递结果为 0 且带跳过原因时留一条日志（**同一原因只报一次**，帧是高频的）。
+  ///
+  /// 没有这条，站点闸门拒绝就只剩计数在涨，现象是"界面什么都没发生"。
+  Map<String, dynamic> _noteDelivery(Map<String, dynamic> reply) {
+    final Object? result = reply['result'];
+    if (reply['ok'] != true || result is! Map) return reply;
+    final Object? skipped = result['skipped'];
+    final Object? delivered = result['delivered'];
+    if (skipped is! List || skipped.isEmpty) return reply;
+    if (delivered is num && delivered > 0) return reply;
+    final String reason = skipped.join('；');
+    if (reason == _lastDropReason) return reply;
+    _lastDropReason = reason;
+    stderr.writeln('[tree.agent] 事件站投递被跳过（$reason）');
+    return reply;
+  }
+
+  /// 上一次已上报的投递跳过原因（去重，避免每帧一条日志）。
+  String _lastDropReason = '';
+
+  /// agent 的**有效团队归属**：成员取 `team_id`，顶层 agent 自成一队。
+  ///
+  /// 与 `TeamService.teamIdOf` / `_teamOfFor` 同一口径；解析不出（未知 id）时留空
+  /// ⇒ 交给核心 fail-closed 拒投，不猜一个 team 蒙混过去。
+  String _effectiveTeamOf(String agentId) {
+    if (agentId.isEmpty) return '';
+    final CoreAgent? agent = store.agent(agentId);
+    if (agent == null) return '';
+    final String team = agent.teamId.trim();
+    return team.isEmpty ? agent.id : team;
   }
 
   /// 其它插件贡献的工具（最近一次采集结果）。
