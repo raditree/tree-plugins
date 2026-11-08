@@ -43,6 +43,8 @@ class DocStore {
     'pkg_index',
     'doc_state',
     'suggestions',
+    'graph_nodes',
+    'graph_edges',
   ];
 
   Future<Map<String, dynamic>> call(
@@ -145,6 +147,25 @@ class GitRepository {
     ]);
     return result.exitCode == 0 ? _text(result.stdout) : '';
   }
+
+  /// 最近 N 条提交标题（`git log --pretty=%s`）：DN-8 的风格探测来源。
+  Future<List<String>> recentSubjects({int limit = 20}) async {
+    final ProcessResult result = await _run(root, <String>[
+      'log',
+      '-n',
+      '$limit',
+      '--pretty=%s',
+    ]);
+    if (result.exitCode != 0) return const <String>[];
+    return _text(result.stdout)
+        .split('\n')
+        .map((String line) => line.trim())
+        .where((String line) => line.isNotEmpty)
+        .toList();
+  }
+
+  /// 执行 git 子命令（DN-8 的 add / commit / reset 用；仍只作用于本仓）。
+  Future<ProcessResult> exec(List<String> args) => _run(root, args);
 
   /// 内容变更归集：`git diff --numstat`（tracked）+ `git ls-files --others`
   /// （显式纳入的新文件）。

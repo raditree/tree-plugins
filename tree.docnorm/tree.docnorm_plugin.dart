@@ -16,7 +16,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.docnorm';
 const String kDisplayName = 'Tree 文档归一化';
-const String kVersion = '0.5.0';
+const String kVersion = '0.6.0';
 const String kStationName = 'docnorm';
 const List<String> kDocnormCommands = <String>[
   'docnorm.scan',
@@ -27,6 +27,8 @@ const List<String> kDocnormCommands = <String>[
   'docnorm.audit',
   'docnorm.baseline',
   'docnorm.reanalyze',
+  'docnorm.commit',
+  'docnorm.graph.build',
 ];
 
 const String kStationReadme =
@@ -37,7 +39,11 @@ const String kStationReadme =
     'docnorm.generate 经 llm.call 为单元 README 生成缺失章节提案（三模式×三档、context_cap 闸、只补缺、失败即 degraded）；'
     'docnorm.audit [--commit] 产四类建议（reuse/split_size/split_function/api_boundary）并补全 pkg_index 的收束事实/quality/stale（阈值读策略，默认 dry-run）；'
     'docnorm.baseline [--commit] 建 L0（doc_contract/pkg_index/doc_state 入 tree.storage）并按提案只追加缺章节（默认 dry-run）；'
-    'docnorm.reanalyze --changed 只重算受影响包。六族适配器 + fallback；对目标仓库只读，'
+    'docnorm.reanalyze --changed 只重算受影响包；'
+    'docnorm.commit [--commit] [--run-gates] 按 docs 域 / 最具体包 / unmatched 分批提交'
+    '（风格探测；门禁默认只列，--run-gates 才执行且失败整批不提交；不 push / amend）；'
+    'docnorm.graph.build [--commit] 只建三类确定性边（belongs_to / references / mentions）'
+    '到 graph_nodes / graph_edges。六族适配器 + fallback；对目标仓库只读，'
     '写盘仅追加且必须显式 commit；缺 tree.storage 时 fail-closed。';
 
 /// 当前握手完成的插件服务（由 [_onReady] 填入），用于向 tree.storage 下站命令。
@@ -54,7 +60,7 @@ PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
 
 Future<void> _onReady(PluginKitServer server) async {
   _activeServer = server;
-  server.channel.log('已上线：v$kVersion（tree.docnorm，DN-4/5/6/7）');
+  server.channel.log('已上线：v$kVersion（tree.docnorm，DN-4~8）');
   try {
     final Map<String, dynamic> result = await server.channel.request(
       M.stationRegister,
@@ -135,6 +141,32 @@ Future<Map<String, dynamic>?> handleRequest(
         Map<String, dynamic> args,
       ) => _callStorage(name, args, scope);
       final Map<String, Object?> result = await runAudit(
+        repo,
+        storage: storage,
+        commit: arguments['commit'] == true,
+        runId: asString(arguments['run_id']),
+      );
+      return <String, dynamic>{
+        'reply': <String, dynamic>{'payload': result},
+      };
+    }
+    if (command == 'docnorm.commit') {
+      final Map<String, Object?> result = await runCommit(
+        repo,
+        commit: arguments['commit'] == true,
+        runGates: arguments['run_gates'] == true,
+      );
+      return <String, dynamic>{
+        'reply': <String, dynamic>{'payload': result},
+      };
+    }
+    if (command == 'docnorm.graph.build') {
+      final Map<String, dynamic> scope = asMap(params['scope']);
+      Future<Map<String, dynamic>> storage(
+        String name,
+        Map<String, dynamic> args,
+      ) => _callStorage(name, args, scope);
+      final Map<String, Object?> result = await runGraphBuild(
         repo,
         storage: storage,
         commit: arguments['commit'] == true,
@@ -879,6 +911,68 @@ thresholds:
         0,
         'audit 重复运行 0 写',
       );
+
+      final Map<String, dynamic> commitDryReply = await askCommand(
+        'commit-dry',
+        'docnorm.commit',
+        <String, dynamic>{'repo': temp.path},
+      );
+      final Map<String, dynamic> commitDry = asMap(commitDryReply['payload']);
+      check.check(commitDry['dry_run'], true, 'commit 默认 dry-run');
+      check.that(
+        (commitDry['batches'] as List<dynamic>?)?.isNotEmpty == true,
+        'commit 按内容变更出批次',
+      );
+      check.check(
+        asMap(commitDry['commit_style'])['style'],
+        'plain',
+        'commit 风格探测：fixture 提交是 plain',
+      );
+      check.check(
+        asMap(commitDry['gates'])['mode'],
+        'listed',
+        '门禁默认只列不跑',
+      );
+      check.check(
+        asMap(commitDry['counts'])['committed'],
+        0,
+        'commit dry-run 0 提交',
+      );
+
+      final Map<String, dynamic> graphCommitReply = await askCommand(
+        'graph-commit',
+        'docnorm.graph.build',
+        <String, dynamic>{'repo': temp.path, 'commit': true},
+      );
+      final Map<String, dynamic> graphCommit = asMap(
+        graphCommitReply['payload'],
+      );
+      check.check(graphCommit['mode'], 'deterministic', 'graph 只做确定性边');
+      check.that(
+        (asMap(graphCommit['counts'])['edges'] as num? ?? 0) > 0,
+        'graph 产出三类边',
+      );
+      check.that(
+        (fakeDb['graph_nodes'] ?? <String, Map<String, Object?>>{}).isNotEmpty,
+        'graph_nodes 入库',
+      );
+      check.that(
+        (fakeDb['graph_edges'] ?? <String, Map<String, Object?>>{}).isNotEmpty,
+        'graph_edges 入库',
+      );
+      final int graphWrites = storageWrites;
+      final Map<String, dynamic> graphAgainReply = await askCommand(
+        'graph-again',
+        'docnorm.graph.build',
+        <String, dynamic>{'repo': temp.path, 'commit': true},
+      );
+      final Map<String, dynamic> graphAgain = asMap(graphAgainReply['payload']);
+      check.check(
+        asMap(graphAgain['storage'])['ops'],
+        0,
+        'graph 重复运行 0 写',
+      );
+      check.check(storageWrites, graphWrites, 'graph 重复运行 0 存储写');
     }
   } catch (error) {
     check.that(false, '自检过程未抛异常', actual: '$error');
