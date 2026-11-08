@@ -485,6 +485,21 @@ bool _isCode(String path) {
 bool _isConfig(String path) =>
     path == '.docnorm/config.json' || path.startsWith('.docnorm/');
 
+/// 测试文件判定（D13：收束与体积度量都排除测试）。
+bool isTestPath(String path) => _isTestPath(path);
+
+/// 文档文件判定（指纹口径只排文档，测试仍计入——与 baseline 一致）。
+bool isDocPath(String path) {
+  final String lower = path.toLowerCase();
+  return lower.endsWith('.md') || lower.endsWith('.markdown');
+}
+
+/// 参与代码指纹的文件集（baseline / audit 共用同一口径）。
+Set<String> fingerprintPathsIn(Iterable<RepoFile> files, String root) => <String>{
+  for (final RepoFile file in files)
+    if (_under(file.path, root) && !isDocPath(file.path)) file.path,
+};
+
 bool _isTestPath(String path) {
   final String lower = path.toLowerCase();
   final List<String> parts = lower.split('/');

@@ -16,7 +16,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.docnorm';
 const String kDisplayName = 'Tree 文档归一化';
-const String kVersion = '0.4.0';
+const String kVersion = '0.5.0';
 const String kStationName = 'docnorm';
 const List<String> kDocnormCommands = <String>[
   'docnorm.scan',
@@ -24,6 +24,7 @@ const List<String> kDocnormCommands = <String>[
   'docnorm.check',
   'docnorm.plan',
   'docnorm.generate',
+  'docnorm.audit',
   'docnorm.baseline',
   'docnorm.reanalyze',
 ];
@@ -34,6 +35,7 @@ const String kStationReadme =
     'docnorm.check 只跑 DocPolicy 四条检查；'
     'docnorm.plan 只读归集 git 内容变更并给出注入单元与 context_cap/stage_budget 两额度估计（stat-dirty 不产计划）；'
     'docnorm.generate 经 llm.call 为单元 README 生成缺失章节提案（三模式×三档、context_cap 闸、只补缺、失败即 degraded）；'
+    'docnorm.audit [--commit] 产四类建议（reuse/split_size/split_function/api_boundary）并补全 pkg_index 的收束事实/quality/stale（阈值读策略，默认 dry-run）；'
     'docnorm.baseline [--commit] 建 L0（doc_contract/pkg_index/doc_state 入 tree.storage）并按提案只追加缺章节（默认 dry-run）；'
     'docnorm.reanalyze --changed 只重算受影响包。六族适配器 + fallback；对目标仓库只读，'
     '写盘仅追加且必须显式 commit；缺 tree.storage 时 fail-closed。';
@@ -52,7 +54,7 @@ PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
 
 Future<void> _onReady(PluginKitServer server) async {
   _activeServer = server;
-  server.channel.log('已上线：v$kVersion（tree.docnorm，DN-4/5/6）');
+  server.channel.log('已上线：v$kVersion（tree.docnorm，DN-4/5/6/7）');
   try {
     final Map<String, dynamic> result = await server.channel.request(
       M.stationRegister,
@@ -121,6 +123,22 @@ Future<Map<String, dynamic>?> handleRequest(
         overrides: arguments['config'] is Map
             ? asMap(arguments['config'])
             : const <String, Object?>{},
+      );
+      return <String, dynamic>{
+        'reply': <String, dynamic>{'payload': result},
+      };
+    }
+    if (command == 'docnorm.audit') {
+      final Map<String, dynamic> scope = asMap(params['scope']);
+      Future<Map<String, dynamic>> storage(
+        String name,
+        Map<String, dynamic> args,
+      ) => _callStorage(name, args, scope);
+      final Map<String, Object?> result = await runAudit(
+        repo,
+        storage: storage,
+        commit: arguments['commit'] == true,
+        runId: asString(arguments['run_id']),
       );
       return <String, dynamic>{
         'reply': <String, dynamic>{'payload': result},
@@ -358,6 +376,9 @@ required_docs:
 indexes:
   - dir: docs
     index: docs/README.md
+thresholds:
+  package_lines: 1
+  file_lines: 1
 ''');
 
     bool gitOk = true;
@@ -811,6 +832,52 @@ indexes:
       check.that(
         jsonEncode(generatePayload).contains('## 职责'),
         'generate 提案可喂 baseline（## 职责）',
+      );
+
+      final Map<String, dynamic> auditDryReply = await askCommand(
+        'audit-dry',
+        'docnorm.audit',
+        <String, dynamic>{'repo': temp.path},
+      );
+      final Map<String, dynamic> auditDry = asMap(auditDryReply['payload']);
+      check.check(auditDry['dry_run'], true, 'audit 默认 dry-run');
+      check.that(
+        (auditDry['packages'] as List<dynamic>?)?.isNotEmpty == true,
+        'audit 出包收束事实',
+      );
+      check.that(
+        (auditDry['suggestions'] as List<dynamic>?)?.isNotEmpty == true,
+        'audit 按阈值 1 行产出建议',
+      );
+      final Map<String, dynamic> auditCommitReply = await askCommand(
+        'audit-commit',
+        'docnorm.audit',
+        <String, dynamic>{'repo': temp.path, 'commit': true},
+      );
+      final Map<String, dynamic> auditCommit = asMap(
+        auditCommitReply['payload'],
+      );
+      check.check(
+        asMap(auditCommit['storage'])['applied'],
+        true,
+        'audit --commit 写 suggestions / pkg_index',
+      );
+      check.that(
+        (fakeDb['suggestions'] ?? <String, Map<String, Object?>>{}).isNotEmpty,
+        'suggestions 入库',
+      );
+      final Map<String, dynamic> auditAgainReply = await askCommand(
+        'audit-again',
+        'docnorm.audit',
+        <String, dynamic>{'repo': temp.path, 'commit': true},
+      );
+      final Map<String, dynamic> auditAgain = asMap(
+        auditAgainReply['payload'],
+      );
+      check.check(
+        (auditAgain['storage'] as Map<String, dynamic>)['ops'],
+        0,
+        'audit 重复运行 0 写',
       );
     }
   } catch (error) {

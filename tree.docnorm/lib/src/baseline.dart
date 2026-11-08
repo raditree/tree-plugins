@@ -5,8 +5,10 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 
 import 'contract.dart';
+import 'plan.dart';
 import 'policy.dart';
 import 'scan.dart';
+import 'summary.dart';
 
 /// 基线 / 重算失败：稳定 [code] + 人话 [message]。
 class BaselineFailure implements Exception {
@@ -40,6 +42,7 @@ class DocStore {
     'doc_contract',
     'pkg_index',
     'doc_state',
+    'suggestions',
   ];
 
   Future<Map<String, dynamic>> call(
@@ -349,6 +352,10 @@ Future<Map<String, Object?>> runBaseline(
       ? runId.trim()
       : 'run-${repoFingerprint.substring(0, 12)}';
 
+  final Map<String, PackageSummary> summaries = <String, PackageSummary>{
+    for (final PackageUnit unit in scan.packages)
+      unit.id: summarizePackage(index, unit, policy.thresholds),
+  };
   final Map<String, Map<String, Object?>> desiredPackages =
       <String, Map<String, Object?>>{
         for (final PackageUnit unit in scan.packages)
@@ -356,6 +363,9 @@ Future<Map<String, Object?>> runBaseline(
             'schema': 1,
             'repo': repoKey,
             'package': unit.toJson(),
+            'summary': summaries[unit.id]!.toJson(),
+            'quality': summaries[unit.id]!.quality,
+            'stale': false,
           },
       };
   final Map<String, Map<String, Object?>> desiredStates =
@@ -560,6 +570,7 @@ Future<Map<String, Object?>> runReanalyze(
   final DocStore store = DocStore(storage);
   final RepoIndex index = await RepoIndex.load(repo);
   final String repoKey = repoKeyOf(index.root);
+  final DocPolicy policy = DocPolicy.resolve(index);
 
   final _Existing existing = await _loadExisting(store, repoKey);
   if (existing.packages.isEmpty) {
@@ -672,10 +683,18 @@ Future<Map<String, Object?>> runReanalyze(
     }
     recomputed.add(packageId);
     final String key = '$repoKey#pkg:${unit.id}';
+    final PackageSummary summary = summarizePackage(
+      subset,
+      unit,
+      policy.thresholds,
+    );
     desiredPackages[key] = <String, Object?>{
       'schema': 1,
       'repo': repoKey,
       'package': unit.toJson(),
+      'summary': summary.toJson(),
+      'quality': summary.quality,
+      'stale': false,
     };
     final Map<String, Object?> state = _pkgState(
       repoKey: repoKey,
@@ -828,15 +847,8 @@ bool _under(String path, String root) =>
     root == '.' || path == root || path.startsWith('$root/');
 
 /// 参与指纹的源码：排除 Markdown（文档改动不该让代码指纹变化）。
-Set<String> _sourcePaths(Iterable<RepoFile> files, String root) => <String>{
-  for (final RepoFile file in files)
-    if (_under(file.path, root) && !_isDoc(file.path)) file.path,
-};
-
-bool _isDoc(String path) {
-  final String lower = path.toLowerCase();
-  return lower.endsWith('.md') || lower.endsWith('.markdown');
-}
+Set<String> _sourcePaths(Iterable<RepoFile> files, String root) =>
+    fingerprintPathsIn(files, root);
 
 class _Existing {
   _Existing({

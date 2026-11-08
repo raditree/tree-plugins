@@ -4,6 +4,17 @@ import 'package:yaml/yaml.dart';
 
 import 'scan.dart';
 
+/// 建议 / 收束阈值的内置默认（D31：可被仓库策略覆盖，引擎不硬编码）。
+const Map<String, int> kDefaultThresholds = <String, int>{
+  'package_lines': 5000,
+  'file_lines': 1000,
+  'api_count': 20,
+  'declaration_count': 60,
+  'subpackage_count': 12,
+  'one_liner_chars': 60,
+  'min_one_liner_chars': 8,
+};
+
 /// 规则读取 / 合并失败：稳定 [code] + 人话 [message]。
 class PolicyFailure implements Exception {
   PolicyFailure(this.message, {this.code = 'invalid_policy'});
@@ -136,6 +147,7 @@ class DocPolicy {
     required this.mentions,
     required this.docSet,
     required this.linkFallbacks,
+    required this.thresholds,
     required this.layers,
     required this.repoFiles,
     required this.origins,
@@ -151,6 +163,9 @@ class DocPolicy {
   final List<MentionRule> mentions;
   final DocSetRule docSet;
   final List<LinkFallback> linkFallbacks;
+
+  /// 建议 / 收束阈值（D31）：体积、单文件、API 数、声明数、子包数与一句话长度。
+  final Map<String, int> thresholds;
 
   /// 生效的规则层，按优先级从低到高（`builtin` → `repo`）。
   final List<String> layers;
@@ -191,6 +206,7 @@ class DocPolicy {
     'link_fallbacks': linkFallbacks
         .map((LinkFallback r) => r.toJson())
         .toList(),
+    'thresholds': thresholds,
   };
 
   /// 三层规则源：内置空仓默认 → 仓库自述 → 规则包（pin+sha256，本期未实现）。
@@ -218,6 +234,7 @@ class DocPolicy {
       'mentions': 'builtin',
       'doc_set': 'builtin',
       'link_fallbacks': 'builtin',
+      'thresholds': 'builtin',
     };
     final List<String> overridden = <String>[];
     final List<String> repoFiles = <String>[];
@@ -230,6 +247,7 @@ class DocPolicy {
     List<MentionRule> mentions = const <MentionRule>[];
     DocSetRule docSet = const DocSetRule();
     List<LinkFallback> fallbacks = const <LinkFallback>[];
+    Map<String, int> thresholds = Map<String, int>.of(kDefaultThresholds);
 
     for (final String candidate in const <String>[
       'docnorm.yaml',
@@ -346,6 +364,14 @@ class DocPolicy {
               readmeOnly: set['readme_only'] as bool? ?? docSet.readmeOnly,
             );
             _mark(origins, overridden, key);
+          case 'thresholds':
+            thresholds = _intMap(
+              value,
+              '${policyFile.path}: $key',
+              thresholds,
+              warnings,
+            );
+            _mark(origins, overridden, key);
           case 'link_fallbacks':
             fallbacks = _maps(value, '${policyFile.path}: $key')
                 .map(
@@ -376,6 +402,7 @@ class DocPolicy {
       mentions: mentions,
       docSet: docSet,
       linkFallbacks: fallbacks,
+      thresholds: thresholds,
       layers: <String>['builtin', if (repoFiles.isNotEmpty) 'repo'],
       repoFiles: repoFiles,
       origins: origins,
@@ -437,6 +464,33 @@ class DocPolicy {
       if (item is! Map) throw PolicyFailure('$field 的每一项必须是对象');
       return _asMap(item, field);
     }).toList();
+  }
+
+  /// 阈值覆盖：只接受已知键的正整数；未知键进 warning（不阻断、不静默吞掉）。
+  static Map<String, int> _intMap(
+    Object? value,
+    String field,
+    Map<String, int> base,
+    List<String> warnings,
+  ) {
+    if (value is! Map) throw PolicyFailure('$field 必须是对象');
+    final Map<String, int> out = Map<String, int>.of(base);
+    for (final MapEntry<Object?, Object?> entry in value.entries) {
+      final String key = entry.key.toString().trim();
+      if (!kDefaultThresholds.containsKey(key)) {
+        warnings.add('$field 含未知阈值键：$key（已忽略）');
+        continue;
+      }
+      final Object? raw = entry.value;
+      final int? parsed = raw is num
+          ? raw.toInt()
+          : int.tryParse(raw.toString().trim());
+      if (parsed == null || parsed <= 0) {
+        throw PolicyFailure('$field.$key 必须是正整数：$raw');
+      }
+      out[key] = parsed;
+    }
+    return out;
   }
 
   static Map<String, Object?> _asMap(Object? value, String field) {
