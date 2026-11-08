@@ -85,6 +85,19 @@ SSH：tree.agent 在 SSH 模式先向 `ssh_executor` 自建站
 句柄键同步换成 `ssh_lease_id`（两侧命令族逐字对称，没有第二张映射表）。执行器
 不可用或租约失效会显式失败（`*_lease_unknown` ⇒ 重登记并只重试一次），**不回退本机 IO**。
 
+## 模型池（MP 系列）
+
+模型池按 `kind` 分三类，**不得串用**：`chat` / `embedding` / `decision`，协议分别固定
+`openai` / `openai` / `jev`。约束：
+
+- `POST /api/models` 校验组合与类型必填项（embedding 必须 `dimensions>0`；decision 必须
+  `confidence_threshold ∈ (0,1)`）；`PATCH /api/models/{id}` 不允许改 `kind` / `protocol`（400）。
+- Agent 与团队成员的模型绑定**只接受 `kind=chat`**：后端拒绝，不依赖前端过滤。
+- `EmbeddingClient` 走 OpenAI 兼容 `/embeddings`：自动分批、维度不符整批失败；
+  `DecisionClient` 走 JEV `noul`/`choice`/`score`，置信度低于模型阈值时由调用方回退。
+  两者的 `probe()` 用于能力探测（MP-7），失败给可读降级。
+- 两个客户端目前是库能力；docnorm 的 embedding / decision 消费随 DN-9 的站点契约接入。
+
 ## 跑
 
 ```
@@ -127,7 +140,8 @@ lib/src/tool/              平移：todo_store、question_channel、tool_runner�
 lib/src/plugin/            平移：agent_events（事件名常量与发布器）
 lib/src/compat/            旧下行帧名最小兼容层（提问卡片；A4 接站内主题后替换）
 lib/src/llm/               平移：llm_types / openai_codec / sse_parser / llm_transport / llm_session /
-                           llm_agent_engine / llm_json_caller / llm_summarizer / vision_files
+                           llm_agent_engine / llm_json_caller / llm_summarizer / vision_files；
+                           embedding_client（OpenAI `/embeddings`）/ decision_client（JEV noul/choice/score）
 lib/src/workspace/workspace_io.dart  引擎用到的窄工作空间契约（执行站接线后补全）
 lib/src/settings/core_settings.dart  插件侧 CoreSettings 门面（领域设置 + frame_rate，夹取口径同核心）
 lib/src/settings/file_settings_sink.dart  模型池 yaml 落盘 + settings.yaml 只更新 token 速率（保留其余键）；L-22 乙方案落地后改落 `config/agent_settings.yaml`，核心退出该键（桌面仓 `docs/pluginization/agent_pluginization.md` §4.8.1）

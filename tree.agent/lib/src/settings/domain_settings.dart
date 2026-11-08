@@ -431,7 +431,7 @@ class DomainSettings {
     return removed;
   }
 
-  /// 校验新增模型必填项（与核心一致：model_id / base_url / api_key）。
+  /// 校验新增模型必填项与 kind/protocol 组合（与核心一致：model_id / base_url / api_key）。
   static String? validateNewModel(Map<String, dynamic> payload) {
     final String modelId = (payload['model_id'] as String? ?? '').trim();
     if (modelId.isEmpty) return 'model_id 不能为空';
@@ -439,8 +439,109 @@ class DomainSettings {
     if (baseUrl.isEmpty) return 'base_url 不能为空';
     final String apiKey = (payload['api_key'] as String? ?? '').trim();
     if (apiKey.isEmpty) return 'api_key 不能为空';
+    return validateModelKindFields(payload);
+  }
+
+  /// 校验 PATCH 后的模型形态：kind/protocol 不可改，组合与类型必填项仍成立（MP-2）。
+  static String? validateModelChange(
+    CoreModelConfig existing,
+    Map<String, dynamic> payload,
+  ) => validateModelKindFields(payload, base: existing);
+
+  /// `kind` / `protocol` 组合与类型必填字段（MP-2 的唯一判据）。
+  ///
+  /// 规则来自 model-pool-kinds-recon §3：
+  /// - `chat` / `embedding` 只能用 `openai`，`decision` 只能用 `jev`；
+  /// - `embedding` 必须 `dimensions > 0`，`decision` 必须 `confidence_threshold ∈ (0,1)`；
+  /// - 未知 kind/protocol ⇒ 拒绝，不猜。
+  /// [base] 非空表示更新：`kind` / `protocol` 一律不可改。
+  static String? validateModelKindFields(
+    Map<String, dynamic> payload, {
+    CoreModelConfig? base,
+  }) {
+    String kind;
+    if (payload.containsKey('kind')) {
+      kind = (payload['kind'] ?? '').toString().trim();
+      if (kind.isEmpty) return 'kind 不能为空';
+      if (!kModelKinds.contains(kind)) {
+        return '未知模型类型：$kind（可选：${kModelKinds.join(' / ')}）';
+      }
+      if (base != null && kind != base.kind) {
+        return 'kind 创建后不可修改（当前 ${base.kind}）';
+      }
+    } else {
+      kind = base?.kind ?? kModelKindChat;
+    }
+
+    String protocol;
+    if (payload.containsKey('protocol')) {
+      protocol = (payload['protocol'] ?? '').toString().trim();
+      if (protocol.isEmpty) protocol = defaultProtocolFor(kind);
+      if (!kModelProtocols.contains(protocol)) {
+        return '未知模型协议：$protocol（可选：${kModelProtocols.join(' / ')}）';
+      }
+      if (base != null && protocol != base.protocol) {
+        return 'protocol 创建后不可修改（当前 ${base.protocol}）';
+      }
+    } else {
+      protocol = base?.protocol ?? defaultProtocolFor(kind);
+    }
+    final String expected = defaultProtocolFor(kind);
+    if (protocol != expected) {
+      return 'kind=$kind 只能使用 protocol=$expected（收到 $protocol）';
+    }
+
+    int dimensions;
+    if (payload.containsKey('dimensions')) {
+      final int? parsed = _intOrNull(payload['dimensions']);
+      if (payload['dimensions'] != null && parsed == null) {
+        return 'dimensions 必须是整数';
+      }
+      dimensions = parsed ?? 0;
+      if (parsed != null && parsed < 0) return 'dimensions 不能为负数';
+    } else {
+      dimensions = base?.dimensions ?? 0;
+    }
+
+    double threshold;
+    if (payload.containsKey('confidence_threshold')) {
+      final Object? raw = payload['confidence_threshold'];
+      if (raw == null) {
+        threshold = 0;
+      } else {
+        threshold = CoreModelConfig._readThreshold(raw);
+        if (threshold <= 0) {
+          return 'confidence_threshold 必须是 (0,1) 之间的数';
+        }
+      }
+    } else {
+      threshold = base?.confidenceThreshold ?? 0;
+    }
+
+    if (kind == kModelKindEmbedding && dimensions <= 0) {
+      return 'embedding 模型必须配置 dimensions（>0）';
+    }
+    if (kind == kModelKindDecision && threshold <= 0) {
+      return 'decision 模型必须配置 confidence_threshold（(0,1)）';
+    }
     return null;
   }
+
+  /// 非对话模型的绑定错误（Agent / 团队成员只允许 `kind=chat`）。
+  static String? modelKindError(
+    CoreModelConfig model, {
+    String role = '对话模型',
+  }) {
+    if (model.kind == kModelKindChat) return null;
+    return '该模型是 ${model.kind}，不能作为$role（需要 kind=chat）';
+  }
+
+  static int? _intOrNull(Object? raw) {
+    if (raw is num) return raw.toInt();
+    if (raw is String) return int.tryParse(raw.trim());
+    return null;
+  }
+
 
   int get tokenAcquisitionRate => _tokenAcquisitionRate;
 

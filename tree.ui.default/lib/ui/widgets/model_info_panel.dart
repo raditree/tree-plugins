@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
+import '../services/model_pool.dart';
 
 /// 模型信息面板（右栏「模型信息」Tab）
 ///
@@ -140,12 +141,15 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
           (data['agent'] as Map<String, dynamic>?)?.cast<String, dynamic>();
       if (!mounted) return;
       setState(() {
-        _models = rawModels
-            .map(
-              (dynamic e) =>
-                  Map<String, dynamic>.from(e as Map<dynamic, dynamic>),
-            )
-            .toList();
+        // 模型信息面板只列 chat 模型：embedding/decision 不能作为 Agent 主模型。
+        _models = chatModelsOf(
+          rawModels
+              .map(
+                (dynamic e) =>
+                    Map<String, dynamic>.from(e as Map<dynamic, dynamic>),
+              )
+              .toList(),
+        );
         // 当前 agent 绑定的模型优先；无则回退模型池第一个
         final String? boundModelId = current?['model_id'] as String?;
         final bool boundInPool =
@@ -558,7 +562,7 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
   Widget _buildModelDropdown() {
     if (_models.isEmpty) {
       return const Text(
-        '模型池为空，请先在 ~/.tree/config/models/ 下添加模型配置',
+        '没有可用的对话模型，请先在设置页新增 chat 模型',
         style: TextStyle(fontSize: 12, color: Colors.grey),
       );
     }

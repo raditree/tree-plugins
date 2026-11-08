@@ -702,8 +702,17 @@ class TeamService {
     }
     if (hasModel) {
       final String modelId = (body['model_id'] ?? '').toString().trim();
-      if (modelId.isNotEmpty && settings?.model(modelId) == null) {
-        return _error('模型不存在: $modelId（可先用 GET /api/models 获取可用模型池）');
+      if (modelId.isNotEmpty) {
+        final CoreModelConfig? model = settings?.model(modelId);
+        if (model == null) {
+          return _error('模型不存在: $modelId（可先用 GET /api/models 获取可用模型池）');
+        }
+        // MP-4：成员只允许绑定对话模型（前端过滤只是提示，后端必须拒绝）。
+        final String? kindError = DomainSettings.modelKindError(
+          model,
+          role: '成员的对话模型',
+        );
+        if (kindError != null) return _error(kindError);
       }
       member.modelId = modelId;
       member.reviewStatus = hasReview

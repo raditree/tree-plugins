@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../io/api_service.dart';
+import '../services/model_pool.dart';
 
 /// 创建 Agent 配置对话框
 ///
@@ -83,7 +84,9 @@ class _CreateAgentDialogState extends State<CreateAgentDialog> {
       } catch (_) {
         _lastSelectedModelId = null;
       }
-      final List<Map<String, dynamic>> models = await ApiService.getModels();
+      final List<Map<String, dynamic>> allModels = await ApiService.getModels();
+      // 创建 Agent 只允许 chat 模型（embedding/decision 不能当对话模型用）。
+      final List<Map<String, dynamic>> models = chatModelsOf(allModels);
       if (!mounted) return;
       setState(() {
         _models = models;
@@ -355,7 +358,7 @@ class _CreateAgentDialogState extends State<CreateAgentDialog> {
     }
     if (_models.isEmpty) {
       return const Text(
-        '模型池为空，请先在 ~/.tree/config/models/ 下添加模型配置',
+        '没有可用的对话模型，请先在设置页新增 chat 模型',
         style: TextStyle(fontSize: 13, color: Colors.grey),
       );
     }

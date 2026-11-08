@@ -727,9 +727,135 @@ void main() {
       );
     });
   });
+
+  group('MP-2 模型池校验与绑定', () {
+    test('POST /api/models：kind/protocol 组合与类型必填项', () async {
+      _expectError(
+        await _call(
+          'POST',
+          '/api/models',
+          paths,
+          body: <String, dynamic>{
+            'model_id': 'bad_chat',
+            'base_url': 'https://x/v1',
+            'api_key': 'k',
+            'kind': 'chat',
+            'protocol': 'jev',
+          },
+        ),
+        400,
+        'kind=chat 只能使用 protocol=openai（收到 jev）',
+      );
+      _expectError(
+        await _call(
+          'POST',
+          '/api/models',
+          paths,
+          body: <String, dynamic>{
+            'model_id': 'bad_emb',
+            'base_url': 'https://x/v1',
+            'api_key': 'k',
+            'kind': 'embedding',
+          },
+        ),
+        400,
+        'embedding 模型必须配置 dimensions（>0）',
+      );
+      _expectError(
+        await _call(
+          'POST',
+          '/api/models',
+          paths,
+          body: <String, dynamic>{
+            'model_id': 'bad_jev',
+            'base_url': 'https://x/v1',
+            'api_key': 'k',
+            'kind': 'decision',
+          },
+        ),
+        400,
+        'decision 模型必须配置 confidence_threshold（(0,1)）',
+      );
+      final Map<String, dynamic> ok = await _call(
+        'POST',
+        '/api/models',
+        paths,
+        body: <String, dynamic>{
+          'model_id': 'emb_new',
+          'base_url': 'https://x/v1',
+          'api_key': 'k',
+          'kind': 'embedding',
+          'dimensions': 1024,
+        },
+      );
+      expect(ok['status'], 200);
+      expect(
+        ((_bodyOf(ok)['model'] as Map)['kind']),
+        'embedding',
+      );
+    });
+
+    test('PATCH /api/models：kind / protocol 创建后不可改', () async {
+      _expectError(
+        await _call(
+          'PATCH',
+          '/api/models/m1',
+          paths,
+          params: <String, String>{'modelId': 'm1'},
+          body: <String, dynamic>{'kind': 'embedding'},
+        ),
+        400,
+        'kind 创建后不可修改（当前 chat）',
+      );
+      _expectError(
+        await _call(
+          'PATCH',
+          '/api/models/m1',
+          paths,
+          params: <String, String>{'modelId': 'm1'},
+          body: <String, dynamic>{'protocol': 'jev'},
+        ),
+        400,
+        'protocol 创建后不可修改（当前 openai）',
+      );
+      final Map<String, dynamic> renamed = await _call(
+        'PATCH',
+        '/api/models/m1',
+        paths,
+        params: <String, String>{'modelId': 'm1'},
+        body: <String, dynamic>{'name': '改名'},
+      );
+      expect(renamed['status'], 200);
+      expect((_bodyOf(renamed)['model'] as Map)['name'], '改名');
+    });
+
+    test('Agent 创建 / 修改拒绝非 chat 模型', () async {
+      _expectError(
+        await _call(
+          'POST',
+          '/api/agents',
+          paths,
+          body: <String, dynamic>{'name': '夹具', 'model_id': 'm_emb'},
+        ),
+        400,
+        '该模型是 embedding，不能作为对话模型（需要 kind=chat）',
+      );
+      await _seedAgent(paths);
+      _expectError(
+        await _call(
+          'PATCH',
+          '/api/agents/agt',
+          paths,
+          params: <String, String>{'agentId': 'agt'},
+          body: <String, dynamic>{'model_id': 'm_jev'},
+        ),
+        400,
+        '该模型是 decision，不能作为对话模型（需要 kind=chat）',
+      );
+    });
+  });
 }
 
-/// 委派信封：与核心 → 插件实际下发的字段一致。
 Future<Map<String, dynamic>> _call(
   String method,
   String path,
@@ -965,6 +1091,22 @@ void _writeModels(AgentDataPaths paths) {
     'model_id: m2\n'
     'name: 模型二\n'
     'base_url: http://127.0.0.1:8080/\n',
+  );
+  File(p.join(dir.path, 'm_emb.yaml')).writeAsStringSync(
+    'model_id: m_emb\n'
+    'name: 嵌入模型\n'
+    'kind: embedding\n'
+    'dimensions: 1024\n'
+    'base_url: https://api.example.com/v1\n'
+    'api_key: sk-emb\n',
+  );
+  File(p.join(dir.path, 'm_jev.yaml')).writeAsStringSync(
+    'model_id: m_jev\n'
+    'name: 决策模型\n'
+    'kind: decision\n'
+    'confidence_threshold: 0.7\n'
+    'base_url: https://api.example.com/v1\n'
+    'api_key: sk-jev\n',
   );
 }
 

@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../models/agent.dart';
 import '../models/message.dart';
+import '../services/model_pool.dart';
 import '../services/teammates_view.dart';
 import '../../io/api_service.dart';
 import '../../io/legacy_frame_bus.dart';
@@ -596,10 +597,13 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
       if (!mounted) return;
       final List<dynamic> raw = data['models'] as List<dynamic>? ?? <dynamic>[];
       setState(() {
-        _models = raw
-            .map((dynamic e) =>
-                (e as Map<dynamic, dynamic>).cast<String, dynamic>())
-            .toList();
+        // 成员模型分配只允许 chat：embedding/decision 不能当对话模型用。
+        _models = chatModelsOf(
+          raw
+              .map((dynamic e) =>
+                  (e as Map<dynamic, dynamic>).cast<String, dynamic>())
+              .toList(),
+        );
         _modelsLoading = false;
       });
     } catch (e) {
@@ -1009,6 +1013,11 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
               const SizedBox(height: 8),
               OutlinedButton(onPressed: _loadModels, child: const Text('重试')),
             ],
+          )
+        else if (_models.isEmpty)
+          Text(
+            '没有可用的对话模型，请先在设置页新增 chat 模型',
+            style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
           )
         else
           DropdownButtonFormField<String>(

@@ -646,6 +646,19 @@
       `preferredWidth`；中栏折叠（右栏承接空间）时也不参与；
     - 期望宽度表：设置 720 / 文件 560 / MCP 520 / 模型信息 480 / 详情与 toolRuns 460 / questions 与 todo 400。
 
+32. **模型池按 kind 分三类，消费方只列 chat**（MP-3 / MP-4，[ui/services/model_pool.dart](ui/services/model_pool.dart)、
+    [ui/pages/settings_page.dart](ui/pages/settings_page.dart)、[ui/widgets/create_agent_dialog.dart](ui/widgets/create_agent_dialog.dart)、
+    [ui/widgets/model_info_panel.dart](ui/widgets/model_info_panel.dart)、[ui/widgets/teammates_window_page.dart](ui/widgets/teammates_window_page.dart)）：
+    - `kind ∈ {chat, embedding, decision}`，旧数据缺省视为 `chat`；`protocol` 由 `kind` 推导
+      （chat/embedding → `openai`，decision → `jev`），编辑器只读展示；
+    - 设置页模型编辑器**新增时可选 kind，编辑时禁用**（后端 MP-2 规定 kind/protocol 不可改）；
+      新增请求必带 `kind` + `protocol`，编辑不带；embedding 必填 `dimensions > 0`，
+      decision 必填 `confidence_threshold ∈ (0,1)`；`base_url` / `api_key` 编辑留空 = 保留原值，密钥永不回显；
+    - 模型列表显示 kind 徽标，embedding 追加「· N 维」、decision 追加「· 阈值 X」；
+    - 创建 Agent / 右栏「模型信息」/ 团队成员模型分配**只列 chat**；没有 chat 模型时提示
+      「没有可用的对话模型，请先在设置页新增 chat 模型」。前端过滤只是体验层，
+      后端绑定校验仍须拒绝非 chat（MP-2）。
+
 ## 测试
 
 ```bash
@@ -662,6 +675,9 @@ flutter test                 # 仓库根的 test/：组件 + 假核心 HTTP/WS �
 用户拖窄后不再被放宽且设置页降级 chip 导航、中栏折叠时不改宽度）、
 `test/settings_nav_test.dart`（设置页左目录：默认「外观」、点目录切分类、三档响应式（176 / 44 / chip）、
 切分类不丢自定义色号草稿、`focusModels` 落在「模型」）、
+`test/model_pool_test.dart`（模型池 kind：缺省视为 chat、kind→protocol、条件字段组、`chatModelsOf` 过滤；
+三种 kind 的提交体（embedding 带 dimensions、decision 带 confidence_threshold）、编辑不下发 kind/protocol；
+维度与阈值校验；编辑器条件字段显示与编辑时 kind 禁用）、
 `test/theme_neutral_test.dart`（主题中性化：背景 / 表面 / 层次 / 边框 / 正文三通道相等、分割线不再由主题色派生、
 主色与聚焦环仍随主题色）、
 `test/main_page_center_collapse_test.dart`（中栏折叠：让位给侧栏、State 与滚动位置不丢、三栏都收着也不溢出；

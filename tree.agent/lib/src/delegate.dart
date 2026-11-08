@@ -507,10 +507,17 @@ Future<Map<String, dynamic>> _dispatchDelegate(
   if (method == 'PATCH' && _matches(modelPattern, path)) {
     final String modelId = _str(params['modelId']);
     final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
-    final CoreModelConfig? model = runtime.settings.updateModel(
-      modelId,
-      _bodyOf(envelope),
-    );
+    final CoreModelConfig? existing = runtime.settings.model(modelId);
+    if (existing == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': '模型不存在'});
+    }
+    final Map<String, dynamic> body = _bodyOf(envelope);
+    // MP-2：kind / protocol 创建后不可改，组合与类型必填项仍须成立。
+    final String? invalid = DomainSettings.validateModelChange(existing, body);
+    if (invalid != null) {
+      return _jsonReply(400, <String, dynamic>{'detail': invalid});
+    }
+    final CoreModelConfig? model = runtime.settings.updateModel(modelId, body);
     if (model == null) {
       return _jsonReply(404, <String, dynamic>{'detail': '模型不存在'});
     }
@@ -628,10 +635,12 @@ Future<Map<String, dynamic>> _dispatchDelegate(
   // 全局只读：agent 列表（22 键 + 预览 + 待处理成员数，按 updatedAt 降序）。
   if (method == 'GET' && _matches(agentsPattern, path)) {
     final List<AgentRecord> records = readAgentRecords(paths)
-      ..sort(
-        (AgentRecord a, AgentRecord b) =>
-            b.updatedAt.compareTo(a.updatedAt),
-      );
+      ..sort((AgentRecord a, AgentRecord b) {
+        final int byTime = b.updatedAt.compareTo(a.updatedAt);
+        // updatedAt 同刻时按 id 升序：文件扫描顺序在 Windows 上不稳定，
+        // 没有 tie-break 会让列表（与自检快照）偶发换序。
+        return byTime != 0 ? byTime : a.id.compareTo(b.id);
+      });
     final List<Map<String, dynamic>> items = <Map<String, dynamic>>[];
     for (final AgentRecord record in records) {
       // 预览改查会话库显示行（jsonl 已退役；旧"倒读文件尾 32KB"随迁移失效）。
@@ -675,8 +684,13 @@ Future<Map<String, dynamic>> _dispatchDelegate(
       return _jsonReply(400, <String, dynamic>{'detail': 'model_id 不能为空'});
     }
     final AgentRuntime runtime = _runtimeFor(paths, runtimeFor);
-    if (runtime.settings.model(modelId) == null) {
+    final CoreModelConfig? model = runtime.settings.model(modelId);
+    if (model == null) {
       return _jsonReply(400, <String, dynamic>{'detail': '模型不存在：$modelId'});
+    }
+    final String? kindError = DomainSettings.modelKindError(model);
+    if (kindError != null) {
+      return _jsonReply(400, <String, dynamic>{'detail': kindError});
     }
     final CoreAgent agent = runtime.store.createAgent(
       name: name,
@@ -701,8 +715,17 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     final Map<String, dynamic> body = _bodyOf(envelope);
     final String modelId = (body['model_id'] as String? ?? '').trim();
     final AgentRuntime runtime = _runtimeFor(paths, runtimeFor);
-    if (modelId.isNotEmpty && runtime.settings.model(modelId) == null) {
-      return _jsonReply(400, <String, dynamic>{'detail': '模型不存在：$modelId'});
+    if (modelId.isNotEmpty) {
+      final CoreModelConfig? model = runtime.settings.model(modelId);
+      if (model == null) {
+        return _jsonReply(400, <String, dynamic>{
+          'detail': '模型不存在：$modelId',
+        });
+      }
+      final String? kindError = DomainSettings.modelKindError(model);
+      if (kindError != null) {
+        return _jsonReply(400, <String, dynamic>{'detail': kindError});
+      }
     }
     final CoreAgent? agent = runtime.store.updateAgent(
       agentId,

@@ -10,8 +10,10 @@ import '../../io/api_service.dart';
 import '../../io/tray_service.dart';
 import '../services/code_highlight.dart';
 import '../services/editor_settings.dart';
+import '../services/model_pool.dart';
 import '../theme_service.dart';
 import '../widgets/core_log_card.dart';
+import '../widgets/plugin_settings_card.dart';
 
 /// 设置页面（desktop 分支：账号/等级/密码/后端地址/注销 五组设置已删除）
 ///
@@ -638,6 +640,7 @@ class _SettingsPageState extends State<SettingsPage> {
       label: '插件',
       icon: Icons.extension_outlined,
       sections: <Widget Function()>[
+        () => _section('插件设置', const PluginSettingsCard()),
         () => _section('插件发布源', _buildPluginReleaseCard()),
         () => _section('插件开发', _buildPluginDevCard()),
       ],
@@ -1773,15 +1776,32 @@ class _SettingsPageState extends State<SettingsPage> {
     final String modelId = model['model_id'] as String? ?? '';
     final String name = model['name'] as String? ?? modelId;
     final bool hasKey = model['has_api_key'] as bool? ?? false;
+    final String kind = modelKindOf(model);
+    // 非 chat 模型只显示各自的定义性参数；chat 仍显示 thinking / vision。
+    String kindDetail = '';
+    if (kind == kModelKindEmbedding) {
+      final num? dim = model['dimensions'] as num?;
+      if (dim != null) kindDetail = ' · ${dim.toInt()} 维';
+    } else if (kind == kModelKindDecision) {
+      final num? threshold = model['confidence_threshold'] as num?;
+      if (threshold != null) kindDetail = ' · 阈值 $threshold';
+    }
     return ListTile(
       contentPadding: EdgeInsets.zero,
       dense: true,
-      title: Text(name, style: const TextStyle(fontSize: 14)),
+      title: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Flexible(child: Text(name, style: const TextStyle(fontSize: 14))),
+          const SizedBox(width: 6),
+          _buildKindBadge(kind, cs),
+        ],
+      ),
       subtitle: Text(
-        '$modelId'
+        '$modelId$kindDetail'
         '${hasKey ? '' : ' · 未配置 API Key'}'
-        '${(model['thinking'] as bool? ?? false) ? ' · thinking' : ''}'
-        '${(model['if_vision'] as bool? ?? false) ? ' · vision' : ''}',
+        '${kind == kModelKindChat && (model['thinking'] as bool? ?? false) ? ' · thinking' : ''}'
+        '${kind == kModelKindChat && (model['if_vision'] as bool? ?? false) ? ' · vision' : ''}',
         style: const TextStyle(fontSize: 12),
       ),
       trailing: Row(
@@ -1804,13 +1824,37 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
+  /// 模型类型徽标（chat / embedding / decision）。
+  Widget _buildKindBadge(String kind, ColorScheme cs) {
+    final Color color = switch (kind) {
+      kModelKindEmbedding => Colors.blue,
+      kModelKindDecision => Colors.orange,
+      _ => cs.primary,
+    };
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        kind,
+        style: TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.w600,
+          color: color,
+        ),
+      ),
+    );
+  }
+
   /// 打开模型编辑对话框（[existing] 为 null 表示新增）
   Future<void> _openModelEditor(Map<String, dynamic>? existing) async {
     final Map<String, dynamic>? payload =
         await showDialog<Map<String, dynamic>>(
           context: context,
           builder: (BuildContext context) =>
-              _ModelEditorDialog(existing: existing),
+              ModelEditorDialog(existing: existing),
         );
     if (payload == null || !mounted) return;
     try {
@@ -2204,23 +2248,32 @@ class _SettingsPageState extends State<SettingsPage> {
 /// 提交时返回一份 `Map<String, dynamic>` 请求体（交给 `ApiService.createModel`
 /// 或 `updateModel`）。编辑模式下 **不预填 API Key**（后端从不回显密钥）：
 /// 留空即"不修改"，`has_api_key` 只用于提示当前是否已配置。
-class _ModelEditorDialog extends StatefulWidget {
+///
+/// kind（chat / embedding / decision）决定协议与专属字段：
+/// - 新增时可切换；**编辑时禁用**（后端规定 kind / protocol 创建后不可改）；
+/// - protocol 由 kind 推导并只读展示（chat/embedding → openai，decision → jev）。
+class ModelEditorDialog extends StatefulWidget {
   /// 待编辑模型（null = 新增）
   final Map<String, dynamic>? existing;
 
-  const _ModelEditorDialog({this.existing});
+  const ModelEditorDialog({super.key, this.existing});
 
   @override
-  State<_ModelEditorDialog> createState() => _ModelEditorDialogState();
+  State<ModelEditorDialog> createState() => _ModelEditorDialogState();
 }
 
-class _ModelEditorDialogState extends State<_ModelEditorDialog> {
+class _ModelEditorDialogState extends State<ModelEditorDialog> {
   final TextEditingController _modelId = TextEditingController();
   final TextEditingController _name = TextEditingController();
   final TextEditingController _baseUrl = TextEditingController();
   final TextEditingController _apiKey = TextEditingController();
   final TextEditingController _maxSeqlen = TextEditingController();
   final TextEditingController _maxOutput = TextEditingController();
+
+  /// embedding / decision 专属字段
+  final TextEditingController _dimensions = TextEditingController();
+  final TextEditingController _maxInputTokens = TextEditingController();
+  final TextEditingController _confidenceThreshold = TextEditingController();
 
   /// 思考强度可选档位（逗号分隔）。留空 = 用后端默认档位
   /// （low/high/max，见 `config.models.REASONING_EFFORT_CANONICAL`）。
@@ -2230,6 +2283,9 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
   bool _ifVision = false;
   String _reasoningEffort = '';
 
+  /// 新增时可选；编辑时固定为原值（后端禁止改 kind）。
+  String _kind = kModelKindChat;
+
   /// 思考强度档位兜底（与后端 REASONING_EFFORT_CANONICAL 一致）。
   ///
   /// 只列**有实际区分度**的档位：端点接受的枚举全集里
@@ -2237,6 +2293,10 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
   static const List<String> _reasoningEfforts = <String>['low', 'high', 'max'];
 
   bool get _isEdit => widget.existing != null;
+
+  /// 编辑前的 kind（null = 新增；旧数据缺省视为 chat）。
+  String? get _originalKind =>
+      widget.existing == null ? null : modelKindOf(widget.existing!);
 
   /// 解析逗号分隔的档位输入（兼容中文逗号与空白）。
   static List<String> _parseEffortOptions(String raw) {
@@ -2253,6 +2313,7 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
     super.initState();
     final Map<String, dynamic>? e = widget.existing;
     if (e == null) return;
+    _kind = modelKindOf(e);
     _modelId.text = e['model_id'] as String? ?? '';
     _name.text = e['name'] as String? ?? '';
     // base_url 后端已脱敏（仅协议+主机），编辑时留空表示"按原值不变"
@@ -2269,6 +2330,12 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
     if (seq != null) _maxSeqlen.text = '$seq';
     final int? out = (e['max_output_tokens'] as num?)?.toInt();
     if (out != null) _maxOutput.text = '$out';
+    final int? dim = (e['dimensions'] as num?)?.toInt();
+    if (dim != null) _dimensions.text = '$dim';
+    final int? maxInput = (e['max_input_tokens'] as num?)?.toInt();
+    if (maxInput != null) _maxInputTokens.text = '$maxInput';
+    final num? threshold = e['confidence_threshold'] as num?;
+    if (threshold != null) _confidenceThreshold.text = '$threshold';
   }
 
   @override
@@ -2279,6 +2346,9 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
     _apiKey.dispose();
     _maxSeqlen.dispose();
     _maxOutput.dispose();
+    _dimensions.dispose();
+    _maxInputTokens.dispose();
+    _confidenceThreshold.dispose();
     _effortOptions.dispose();
     super.dispose();
   }
@@ -2304,52 +2374,43 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
     ];
   }
 
-  void _submit() {
-    final String modelId = _modelId.text.trim();
-    if (modelId.isEmpty) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('model_id 不能为空')));
-      return;
-    }
-    final Map<String, dynamic> payload = <String, dynamic>{
-      'model_id': modelId,
-      'name': _name.text.trim(),
-      'thinking': _thinking,
-      'if_vision': _ifVision,
-    };
-    // base_url / api_key：编辑时留空表示沿用原值（后端据此保留）
-    final String baseUrl = _baseUrl.text.trim();
-    if (baseUrl.isNotEmpty) payload['base_url'] = baseUrl;
-    final String apiKey = _apiKey.text.trim();
-    if (apiKey.isNotEmpty) payload['api_key'] = apiKey;
-    if (_reasoningEffort.isNotEmpty) {
-      payload['reasoning_effort'] = _reasoningEffort;
-    }
-    // 可选档位：留空 = 用后端默认（low/high/max），此时**不下发该键**让后端保留
-    // 文件现值或走回退；非空则解析为列表下发（后端会归一化并校验默认档位落在其中）
-    final List<String> effortOptions = _parseEffortOptions(_effortOptions.text);
-    if (effortOptions.isNotEmpty) {
-      payload['reasoning_effort_options'] = effortOptions;
-    }
-    final int? seq = int.tryParse(_maxSeqlen.text.trim());
-    if (seq != null) payload['max_seqlen'] = seq;
-    final int? out = int.tryParse(_maxOutput.text.trim());
-    if (out != null) payload['max_output_tokens'] = out;
+  /// 从当前输入组装纯数据草稿（校验与请求体组装都在 [ModelEditorDraft]）。
+  ModelEditorDraft _currentDraft() {
+    return ModelEditorDraft(
+      originalKind: _originalKind,
+      kind: _isEdit ? _originalKind! : _kind,
+      modelId: _modelId.text,
+      name: _name.text,
+      baseUrl: _baseUrl.text,
+      apiKey: _apiKey.text,
+      reasoningEffort: _reasoningEffort,
+      reasoningEffortOptions: _parseEffortOptions(_effortOptions.text),
+      maxSeqlen: int.tryParse(_maxSeqlen.text.trim()),
+      maxOutputTokens: int.tryParse(_maxOutput.text.trim()),
+      thinking: _thinking,
+      ifVision: _ifVision,
+      dimensions: int.tryParse(_dimensions.text.trim()),
+      maxInputTokens: int.tryParse(_maxInputTokens.text.trim()),
+      confidenceThreshold: double.tryParse(_confidenceThreshold.text.trim()),
+    );
+  }
 
-    // 新增必须提供 base_url / api_key（后端校验），前端先行拦截给出可读提示
-    if (!_isEdit && (baseUrl.isEmpty || apiKey.isEmpty)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('新增模型必须填写 base_url 与 api_key')),
-      );
+  void _submit() {
+    final ModelEditorDraft draft = _currentDraft();
+    final String? error = draft.validate();
+    if (error != null) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(error)));
       return;
     }
-    Navigator.of(context).pop(payload);
+    Navigator.of(context).pop(draft.toPayload());
   }
 
   @override
   Widget build(BuildContext context) {
     final ColorScheme cs = Theme.of(context).colorScheme;
     final bool hasKey = widget.existing?['has_api_key'] as bool? ?? false;
+    final ModelKindFields fields = modelKindFieldsOf(_kind);
     return AlertDialog(
       title: Text(_isEdit ? '编辑模型' : '新增模型'),
       content: SingleChildScrollView(
@@ -2358,7 +2419,7 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
+            children: <Widget>[
               TextField(
                 controller: _modelId,
                 enabled: !_isEdit,
@@ -2373,6 +2434,41 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
                 controller: _name,
                 decoration: const InputDecoration(
                   labelText: '显示名称',
+                  isDense: true,
+                ),
+              ),
+              const SizedBox(height: 10),
+              DropdownButtonFormField<String>(
+                key: const Key('model-editor-kind'),
+                initialValue: _kind,
+                isExpanded: true,
+                decoration: InputDecoration(
+                  labelText: '模型类型（kind）',
+                  helperText: _isEdit
+                      ? '类型创建后不可修改'
+                      : 'chat 对话 / embedding 检索 / decision 决策',
+                  isDense: true,
+                ),
+                items: kModelKinds
+                    .map(
+                      (String k) => DropdownMenuItem<String>(
+                        value: k,
+                        child: Text(k),
+                      ),
+                    )
+                    .toList(),
+                onChanged: _isEdit
+                    ? null
+                    : (String? value) =>
+                        setState(() => _kind = value ?? kModelKindChat),
+              ),
+              const SizedBox(height: 10),
+              TextFormField(
+                key: ValueKey<String>('model-editor-protocol-$_kind'),
+                initialValue: protocolForKind(_kind),
+                enabled: false,
+                decoration: const InputDecoration(
+                  labelText: 'protocol（由 kind 推导）',
                   isDense: true,
                 ),
               ),
@@ -2399,97 +2495,151 @@ class _ModelEditorDialogState extends State<_ModelEditorDialog> {
                   isDense: true,
                 ),
               ),
-              const SizedBox(height: 10),
-              DropdownButtonFormField<String>(
-                initialValue: _reasoningEffort,
-                isExpanded: true,
-                decoration: const InputDecoration(
-                  labelText: '思考强度默认档位（reasoning_effort）',
-                  helperText: '仅在该模型可选档位内；可被各 Agent 覆盖',
-                  isDense: true,
+              if (fields.chat) ...<Widget>[
+                const SizedBox(height: 10),
+                DropdownButtonFormField<String>(
+                  initialValue: _reasoningEffort,
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                    labelText: '思考强度默认档位（reasoning_effort）',
+                    helperText: '仅在该模型可选档位内；可被各 Agent 覆盖',
+                    isDense: true,
+                  ),
+                  items: _buildEffortItems(),
+                  onChanged: (String? value) {
+                    setState(() => _reasoningEffort = value ?? '');
+                  },
                 ),
-                items: _buildEffortItems(),
-                onChanged: (String? value) {
-                  setState(() => _reasoningEffort = value ?? '');
-                },
-              ),
-              const SizedBox(height: 10),
-              TextField(
-                controller: _effortOptions,
-                // 重建下拉项：候选档位随本输入框内容变化（见 _buildEffortItems）
-                onChanged: (_) => setState(() {}),
-                decoration: const InputDecoration(
-                  labelText: '可选档位（reasoning_effort_options）',
-                  hintText: '如 low, high, max',
-                  helperText:
-                      '留空 = 默认 low/high/max；'
-                      '只列该端点真正区分的档位，别名会被折叠',
-                  isDense: true,
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _effortOptions,
+                  // 重建下拉项：候选档位随本输入框内容变化（见 _buildEffortItems）
+                  onChanged: (_) => setState(() {}),
+                  decoration: const InputDecoration(
+                    labelText: '可选档位（reasoning_effort_options）',
+                    hintText: '如 low, high, max',
+                    helperText:
+                        '留空 = 默认 low/high/max；'
+                        '只列该端点真正区分的档位，别名会被折叠',
+                    isDense: true,
+                  ),
                 ),
-              ),
-              const SizedBox(height: 10),
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _maxSeqlen,
-                      keyboardType: TextInputType.number,
-                      decoration: const InputDecoration(
-                        labelText: '总上下文上限 tokens',
-                        hintText: '如 65536',
-                        isDense: true,
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _maxSeqlen,
+                        keyboardType: TextInputType.number,
+                        decoration: const InputDecoration(
+                          labelText: '总上下文上限 tokens',
+                          hintText: '如 65536',
+                          isDense: true,
+                        ),
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: TextField(
-                      controller: _maxOutput,
-                      keyboardType: TextInputType.number,
-                      decoration: const InputDecoration(
-                        labelText: '最大输出 tokens',
-                        hintText: '留空不限',
-                        isDense: true,
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: TextField(
+                        controller: _maxOutput,
+                        keyboardType: TextInputType.number,
+                        decoration: const InputDecoration(
+                          labelText: '最大输出 tokens',
+                          hintText: '留空不限',
+                          isDense: true,
+                        ),
                       ),
                     ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  dense: true,
+                  value: _thinking,
+                  onChanged: (bool v) => setState(() => _thinking = v),
+                  activeThumbColor: cs.primary,
+                  title: const Text(
+                    '思考模型（thinking）',
+                    style: TextStyle(fontSize: 13),
                   ),
-                ],
-              ),
-              const SizedBox(height: 6),
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                dense: true,
-                value: _thinking,
-                onChanged: (bool v) => setState(() => _thinking = v),
-                activeThumbColor: cs.primary,
-                title: const Text(
-                  '思考模型（thinking）',
-                  style: TextStyle(fontSize: 13),
+                  subtitle: const Text(
+                    '开启后历史思考会按 DeepSeek 规则作为 reasoning_content 回传端点'
+                    '（带 tools 时官方要求回传，缺失会 400）；'
+                    '复用思考链能让后续思考更短、成功率更高，代价是输入 token 增加。',
+                    style: TextStyle(fontSize: 11),
+                  ),
                 ),
-                subtitle: const Text(
-                  '开启后历史思考会按 DeepSeek 规则作为 reasoning_content 回传端点'
-                  '（带 tools 时官方要求回传，缺失会 400）；'
-                  '复用思考链能让后续思考更短、成功率更高，代价是输入 token 增加。',
-                  style: TextStyle(fontSize: 11),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  dense: true,
+                  value: _ifVision,
+                  onChanged: (bool v) => setState(() => _ifVision = v),
+                  activeThumbColor: cs.primary,
+                  title: const Text(
+                    '支持图像输入（if_vision）',
+                    style: TextStyle(fontSize: 13),
+                  ),
+                  subtitle: const Text(
+                    '开启后：对话里的图片会先上传到该模型的 Files API，'
+                    '再以 file_id 引用发送（需端点支持 file 内容块，如 DeepSeek）；'
+                    '关闭时模型只会拿到图片在工作空间里的路径。',
+                    style: TextStyle(fontSize: 11),
+                  ),
                 ),
-              ),
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                dense: true,
-                value: _ifVision,
-                onChanged: (bool v) => setState(() => _ifVision = v),
-                activeThumbColor: cs.primary,
-                title: const Text(
-                  '支持图像输入（if_vision）',
-                  style: TextStyle(fontSize: 13),
+              ],
+              if (fields.embedding) ...<Widget>[
+                const SizedBox(height: 10),
+                TextField(
+                  key: const Key('model-editor-dimensions'),
+                  controller: _dimensions,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: '维度（dimensions）',
+                    hintText: '如 1024',
+                    helperText: '必填且 > 0；须与端点返回的向量维度一致',
+                    isDense: true,
+                  ),
                 ),
-                subtitle: const Text(
-                  '开启后：对话里的图片会先上传到该模型的 Files API，'
-                  '再以 file_id 引用发送（需端点支持 file 内容块，如 DeepSeek）；'
-                  '关闭时模型只会拿到图片在工作空间里的路径。',
-                  style: TextStyle(fontSize: 11),
+                const SizedBox(height: 10),
+                TextField(
+                  key: const Key('model-editor-max-input-tokens'),
+                  controller: _maxInputTokens,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: '最大输入 tokens（max_input_tokens）',
+                    hintText: '留空不限制',
+                    isDense: true,
+                  ),
                 ),
-              ),
+              ],
+              if (fields.decision) ...<Widget>[
+                const SizedBox(height: 10),
+                TextField(
+                  key: const Key('model-editor-confidence'),
+                  controller: _confidenceThreshold,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  decoration: const InputDecoration(
+                    labelText: '置信度阈值（confidence_threshold）',
+                    hintText: '0~1，如 0.7',
+                    helperText: '必填；低于阈值回退 chat / 人工',
+                    isDense: true,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  key: const Key('model-editor-max-input-tokens'),
+                  controller: _maxInputTokens,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: '最大输入 tokens（max_input_tokens）',
+                    hintText: '留空不限制',
+                    isDense: true,
+                  ),
+                ),
+              ],
             ],
           ),
         ),

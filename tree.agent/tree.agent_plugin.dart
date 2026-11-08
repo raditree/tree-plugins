@@ -792,6 +792,11 @@ Future<int> selfTest() async {
       M.apiDelegate,
       envelope('/api/agents/agt/sessions/ses_x/messages', 'agt'),
     );
+    // 先把只读快照（尤其 GET /api/agents 的预览）处理完，再发写请求：
+    // 否则 POST messages 落下的提示消息会与预览快照竞态，自检偶发红。
+    final Map<Object?, Map<String, dynamic>> early = await core.waitFor(
+      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25],
+    );
     core.ask(
       26,
       M.apiDelegate,
@@ -1032,9 +1037,11 @@ Future<int> selfTest() async {
       ),
     );
 
-    final Map<Object?, Map<String, dynamic>> byId = await core.waitFor(
-      <int>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57],
+    final Map<Object?, Map<String, dynamic>> late = await core.waitFor(
+      <int>[26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57],
     );
+    final Map<Object?, Map<String, dynamic>> byId =
+        <Object?, Map<String, dynamic>>{...early, ...late};
 
     check.that(byId.length == 58, '五十八条请求都有回包', actual: '${byId.length}');
     check.check(
@@ -1138,6 +1145,11 @@ Future<int> selfTest() async {
       <String, dynamic>{
         'model_id': 'm1',
         'name': '模型一',
+        'kind': 'chat',
+        'protocol': 'openai',
+        'dimensions': null,
+        'max_input_tokens': null,
+        'confidence_threshold': null,
         'base_url': 'https://api.example.com',
         'thinking': true,
         'if_vision': false,
@@ -1151,6 +1163,11 @@ Future<int> selfTest() async {
       <String, dynamic>{
         'model_id': 'm2',
         'name': 'm2',
+        'kind': 'chat',
+        'protocol': 'openai',
+        'dimensions': null,
+        'max_input_tokens': null,
+        'confidence_threshold': null,
         'base_url': 'http://127.0.0.1:8080',
         'thinking': false,
         'if_vision': false,
@@ -1553,6 +1570,8 @@ Future<int> selfTest() async {
         'attachments': null,
         'options': <String>['A', 'B'],
         'answered': true,
+        'preview': '',
+        'seq': 3,
         'is_streaming': false,
         'answer': 'B',
         'questions': <Map<String, dynamic>>[

@@ -497,6 +497,24 @@ void main() {
       expect(store.agent(member)!.reviewStatus, ReviewStatus.pendingReview);
     });
 
+    test('MP-4：成员只能绑定 chat 模型（embedding/decision 被拒）', () {
+      settings.createModel(<String, dynamic>{
+        'model_id': 'emb',
+        'kind': 'embedding',
+        'dimensions': 1024,
+        'base_url': 'https://api.example.com/v1',
+        'api_key': 'sk-emb',
+      });
+      final String member = create('成员甲')['member_id'] as String;
+      final Map<String, dynamic> result = service.assignModel(
+        topId: top.id,
+        memberId: member,
+        body: <String, dynamic>{'model_id': 'emb'},
+      );
+      expect(result['error'], contains('embedding'));
+      expect(store.agent(member)!.modelId, isEmpty);
+    });
+
     test('清空模型回退 pending_model；空 body 与非法值可读报错', () {
       final String member = create('成员甲')['member_id'] as String;
       service.assignModel(

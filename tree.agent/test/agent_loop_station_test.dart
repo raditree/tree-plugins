@@ -85,6 +85,22 @@ void main() {
     await Future<void>.delayed(const Duration(milliseconds: 5));
   }
 
+  /// 等到权威状态快照回 idle（比固定 sleep 稳：负载高时状态可能晚一拍）。
+  Future<void> waitIdle(String agentId) async {
+    final DateTime deadline = DateTime.now().add(const Duration(seconds: 3));
+    while (DateTime.now().isBefore(deadline)) {
+      final Map<String, dynamic> view = await runtime.handleAgentLoopCommand(
+        'agent.state.get',
+        <String, dynamic>{'agent_id': agentId},
+        <String, dynamic>{'mode_key': 'local'},
+        const <String, dynamic>{},
+      );
+      final List<dynamic> agents = view['agents'] as List<dynamic>? ?? <dynamic>[];
+      if (agents.isNotEmpty && (agents.single as Map)['state'] == 'idle') return;
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+  }
+
   Map<String, dynamic> scope([Map<String, dynamic> extra = const <String, dynamic>{}]) =>
       <String, dynamic>{'mode_key': 'local', ...extra};
 
@@ -214,6 +230,9 @@ void main() {
     engine.gate!.complete();
     engine.gate = null;
     await settle(2);
+    // activeRunCount 归零后，pump 还会写最后一拍状态；固定 sleep 在负载下会抖，
+    // 这里显式等到权威快照回 idle 再断言。
+    await waitIdle('agt');
 
     final Map<String, dynamic> idle = await runtime.handleAgentLoopCommand(
       'agent.state.get',

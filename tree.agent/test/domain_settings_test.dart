@@ -284,6 +284,90 @@ void main() {
     expect(sink.saved.last.toJson()['confidence_threshold'], 0.7);
     expect(sink.saved.last.toApiJson().containsKey('api_key'), isFalse);
   });
+
+  test('MP-2：kind/protocol 组合、类型必填项与不可改', () {
+    String? validate(Map<String, dynamic> payload) =>
+        DomainSettings.validateModelKindFields(payload);
+
+    expect(validate(<String, dynamic>{'kind': 'nope'}), contains('未知模型类型'));
+    expect(
+      validate(<String, dynamic>{'kind': 'chat', 'protocol': 'jev'}),
+      'kind=chat 只能使用 protocol=openai（收到 jev）',
+    );
+    expect(
+      validate(<String, dynamic>{'kind': 'decision', 'protocol': 'jev'}),
+      contains('confidence_threshold'),
+    );
+    expect(
+      validate(<String, dynamic>{'kind': 'embedding'}),
+      'embedding 模型必须配置 dimensions（>0）',
+    );
+    expect(
+      validate(<String, dynamic>{'kind': 'embedding', 'dimensions': 1024}),
+      isNull,
+    );
+    expect(
+      validate(<String, dynamic>{
+        'kind': 'decision',
+        'confidence_threshold': 0.7,
+      }),
+      isNull,
+    );
+    expect(
+      validate(<String, dynamic>{'kind': 'chat', 'dimensions': 'x'}),
+      'dimensions 必须是整数',
+    );
+    expect(
+      validate(<String, dynamic>{
+        'kind': 'decision',
+        'confidence_threshold': 1.5,
+      }),
+      'confidence_threshold 必须是 (0,1) 之间的数',
+    );
+
+    final CoreModelConfig embedding = CoreModelConfig(
+      modelId: 'emb',
+      kind: kModelKindEmbedding,
+      dimensions: 1024,
+      baseUrl: 'https://x/v1',
+      apiKey: 'k',
+    );
+    expect(
+      DomainSettings.validateModelChange(embedding, <String, dynamic>{
+        'kind': 'chat',
+      }),
+      'kind 创建后不可修改（当前 embedding）',
+    );
+    expect(
+      DomainSettings.validateModelChange(embedding, <String, dynamic>{
+        'protocol': 'jev',
+      }),
+      'protocol 创建后不可修改（当前 openai）',
+    );
+    expect(
+      DomainSettings.validateModelChange(embedding, <String, dynamic>{
+        'dimensions': 0,
+      }),
+      'embedding 模型必须配置 dimensions（>0）',
+    );
+    expect(
+      DomainSettings.validateModelChange(embedding, <String, dynamic>{
+        'dimensions': 512,
+      }),
+      isNull,
+    );
+
+    expect(
+      DomainSettings.modelKindError(
+        CoreModelConfig(modelId: 'c', baseUrl: 'x', apiKey: 'k'),
+      ),
+      isNull,
+    );
+    expect(
+      DomainSettings.modelKindError(embedding),
+      '该模型是 embedding，不能作为对话模型（需要 kind=chat）',
+    );
+  });
 }
 
 class _RecordingSink implements DomainSettingsSink {
