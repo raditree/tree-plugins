@@ -1,0 +1,58 @@
+name: tree_ui_default
+description: Tree 默认图形界面（runtime ui 插件；零依赖：契约由 lib/io/protocol_contract.dart 自持）
+# 防止意外发布到 pub.dev
+publish_to: 'none'
+
+# 插件版本（独立于核心版本；打包脚本按这里写 plugin.json 与发布索引）
+version: 1.0.5+1
+
+# desktop 分支：升级到 Dart 3（Flutter 3.47.5 / Dart 3.13.4），放弃 Windows 7/8（最低 Windows 10）
+environment:
+  sdk: ^3.13.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # iOS 风格图标
+  cupertino_icons: ^1.0.9
+  # WebSocket 通信（与后端实时消息）
+  web_socket_channel: ^3.0.3
+  # HTTP 请求（REST API 调用）
+  http: ^1.6.0
+  # 桌面文件拖拽
+  desktop_drop: ^0.8.4
+  # Markdown 渲染（模型输出默认 markdown 格式）
+  # 原 flutter_markdown 已停止维护（pub 标记 discontinued），改用其官方继任 fork
+  flutter_markdown_plus: ^1.0.12
+  # SSH/SFTP 客户端（纯 Dart，Windows 桌面可用）；SSH 模式连接由前端发起，IP 相对前端机器
+  dartssh2: ^4.1.0
+  file_picker: ^13.1.0
+  shared_preferences: ^2.5.5
+  path_provider: ^2.1.6
+  # 跨平台路径拼接（定位/拼接核心进程可执行文件路径）
+  path: ^1.9.0
+  # 零依赖（D2）：不写 tree_protocol。UI 自持契约在 lib/io/protocol_contract.dart，
+  # 一致性靠「核心面对外冻结 + 黑盒一致性套件」。
+  # PDF 预览（M7e）：核心只给字节，前端用 pdfrx（Dart native assets 带 pdfium）渲染。
+  # 注意：打 Windows 包时必须把 build/native_assets/windows/pdfium.dll 拷到 exe
+  # 旁边，否则用户机器上一打开 PDF 就报找不到 pdfium——tool/package_windows.dart 已做。
+  pdfrx: ^2.6.5
+  # 窗口控制：拦截关闭按钮（默认改为隐藏到系统托盘，避免误终止正在跑的任务）
+  window_manager: ^0.5.2
+  # 系统托盘图标与菜单（恢复窗口 / 退出）
+  tray_manager: ^0.7.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  # 代码规范 lint 规则集
+  flutter_lints: ^6.0.0
+
+# Flutter 相关配置
+flutter:
+  # 启用 Material Icons 字体
+  uses-material-design: true
+  # 托盘图标（tray_manager 需要**文件路径**，运行时由 Platform.resolvedExecutable 解析，
+  # 见 lib/io/tray_service.dart；打包脚本整目录拷贝，因此随 flutter_assets 一起进安装包）
+  assets:
+    - assets/tray_icon.ico

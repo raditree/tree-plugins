@@ -23,6 +23,7 @@ on:
 
 env:
   DART_SDK: '3.13.4'
+  FLUTTER_SDK: '3.47.5'
   DESKTOP_REPO: raditree/Tree
   DESKTOP_REF: desktop
 
@@ -49,6 +50,27 @@ jobs:
         run: dart run desktop/tool/check_plugin_repo_contract.dart --selftest
       - name: 插件源码不得 import / 依赖核心包
         run: dart run desktop/tool/check_plugin_repo_contract.dart --plugin-root plugin
+
+  ui:
+    name: tree.ui.default（flutter analyze + test）
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: tree.ui.default
+    steps:
+      # UI 插件零依赖（D2）：**不检出桌面仓**也能跑，验的就是这一点。
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_SDK }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      # 先只守 lib：test/ 里还有 7 条既有 info（thinking_window_test.dart，见桌面仓
+      # docs/handover.md §4.3），清掉之前把 `test` 纳入这里只会让流水线常年红灯。
+      - run: flutter analyze lib
+      - run: flutter test
 
   plugins:
     name: ${{ matrix.plugin }}（analyze + test）

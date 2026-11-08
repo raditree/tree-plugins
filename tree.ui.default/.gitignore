@@ -1,0 +1,8 @@
+# UI 插件（Flutter）自己的产物与缓存。
+# 与仓库根的 `.gitignore` 同口径：只提源码与随包资产，构建中间物一律不进仓。
+.output/
+.dart_tool/
+build/
+windows/flutter/ephemeral/
+*.pdb
+.flutter-plugins-dependencies

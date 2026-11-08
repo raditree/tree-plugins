@@ -3,3 +3,7 @@
 # 中间物进了仓，下一个人在别的机器上就会拿着一份过期的 package_config 编出旧依赖。
 .dart_tool/
 build/
+# Flutter 工程的平台中间物（tree.ui.default）/ 自检探针输出
+**/windows/flutter/ephemeral/
+.output/
+*.pdb

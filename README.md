@@ -27,6 +27,13 @@ tree-plugins/
 ├── hello_panel/                 # 一个目录 = 一个插件
 │   ├── plugin.json              # 开发期元数据（字段见下）
 │   └── hello_panel_plugin.dart    # 插件本体（入口，名字是**约定**）
+├── tree.agent/                  # 目录名 = 插件 id（允许带点）
+│   └── ...
+├── tree.ui.default/             # UI 插件（Flutter 工程；runtime: ui）
+│   ├── plugin.json
+│   ├── pubspec.yaml
+│   ├── lib/ · test/ · windows/  # 原桌面仓根 Flutter 工程整体迁入
+│   └── assets/tray_icon.ico
 └── <plugin_id>/
     ├── plugin.json
     └── <plugin_id>_plugin.dart
@@ -43,19 +50,22 @@ tree-plugins/
 现在一个插件一个文件、管道只一份：插件里只剩"这个插件干什么"。
 
 1. **入口名字是约定**：`<id>_plugin.dart`。构建脚本按它找入口，找不到就是**错误**不是跳过
-   （静默跳过在面板上只会变成"这个插件没得上"）。
+   （静默跳过在面板上只会变成"这个插件没得上"）。**UI 插件例外**：Flutter 工程没有这个入口，
+   由 `package_ui_plugin.dart` 独立构建（见下面「三种形状」）。
 2. **不依赖核心**：`binary` 型示例插件只用 `dart:` SDK，谁都不 `import package:tree_core` /
    `package:tree_protocol`——否则第三方拿到这个仓编不出来。代价是插件侧要自带一张方法名
    常量表（`_kit` 里的 `M`），所以桌面仓有一条用例把这张表逐个对回 `PluginRpcMethods`（漂了当场红）。
-   **例外（见下面「两种形状」）**：`ssh_executor` / `self_updater` 是 package 型，它们可以依赖
+   **例外（见下面「三种形状」）**：`ssh_executor` / `self_updater` 是 package 型，它们可以依赖
    `dartssh2` 这类第三方运行时库与协议包 `tree_tunnel_protocol`，但**仍然不许依赖 tree_core /
    tree_protocol**——“不反向依赖核心”是那条纪律的本体，“只用 dart:”只是它的形状之一。
 3. **必须带 `--selftest`**：假核心在**同一个进程里**跑真读循环（不连真核心、不起副作用）。
    它是装机后端到端验证读退出码的那一条，所以自检与生产**必须同码**。
+   **UI 插件是例外**：Flutter 工程没有 stdio 自检，自检由打包脚本的产物校验（zip 必含
+   `tree_ui.exe` 与 `plugin.json`）承担。
 4. **`suspend` / 转储由骨架接手**：声明 `suspension: keep` 的插件只需交一份 payload，
    递 `plugin.stateDump` 的命令、新一世 `plugin.stateFetch` 取回都在骨架里。
 
-## 两种形状（同一个入口约定）
+## 三种形状（同一个入口约定）
 
 `plugin.json` 形状不区分它，构建脚本按**目录里有没有 `pubspec.yaml`** 判：
 
@@ -63,6 +73,14 @@ tree-plugins/
 | --- | --- | --- | --- |
 | **单文件型** | 无 `pubspec.yaml` | 以**桌面仓根**为工作目录 `dart compile exe <id>_plugin.dart` | `minimal` / `suspendable` / `terminal_probe` / `compact` / `sample` |
 | **package 型** | 有 `pubspec.yaml` | 先在该目录 `dart pub get`，再以**该目录**为工作目录编译 | `ssh_executor` / `self_updater` |
+| **UI 型** | `runtime: ui` | **不走 `dart compile exe`**：`tool/package_ui_plugin.dart` 在目录里跑 `flutter build windows`，把 runner 改名 `tree_ui.exe` 后整包成 zip | `tree.ui.default` |
+
+**UI 插件零依赖（D2）**：`tree.ui.default` 是 Flutter 工程，它**自持**一份契约
+（`lib/io/protocol_contract.dart`，手写、不从核心生成），`pubspec.yaml` 里没有
+`tree_protocol` path 依赖，源码也不 import 核心包。一致性靠「核心面对外冻结（只增不改）+
+桌面仓的黑盒一致性套件（`packages/tree_core/test/ui_contract_blackbox_test.dart`）」，
+不靠源码 diff。因此 `build_plugins.dart` 读到 `runtime: ui` 会**显式跳过**并指路到
+`package_ui_plugin.dart`（不是静默跳过）。
 
 package 型的依赖里有 `path: ../../packages/tree_tunnel_protocol` ⇒ **本仓必须 clone 在桌面仓的
 `plugins/` 下才能编出这两条**。这不是意外，是取舍：“协议帧形状只住一处”比“本仓能独立编”值钱——
