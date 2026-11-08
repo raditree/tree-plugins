@@ -16,18 +16,26 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.docnorm';
 const String kDisplayName = 'Tree 文档归一化';
-const String kVersion = '0.1.0';
+const String kVersion = '0.2.0';
 const String kStationName = 'docnorm';
 const List<String> kDocnormCommands = <String>[
   'docnorm.scan',
   'docnorm.contract',
   'docnorm.check',
+  'docnorm.baseline',
+  'docnorm.reanalyze',
 ];
 
 const String kStationReadme =
     '文档归一化：docnorm.scan 扫描目标仓库，返回包图（包/子包/行数/公开声明/API 面/依赖）；'
     'docnorm.contract 侦查文档契约（章节/索引/链接/CHANGELOG/门禁，规则按 内置→仓库自述 合成）；'
-    'docnorm.check 只跑 DocPolicy 四条检查。六族适配器 + fallback；只读，不改目标仓库。';
+    'docnorm.check 只跑 DocPolicy 四条检查；'
+    'docnorm.baseline [--commit] 建 L0（doc_contract/pkg_index/doc_state 入 tree.storage）并按提案只追加缺章节（默认 dry-run）；'
+    'docnorm.reanalyze --changed 只重算受影响包。六族适配器 + fallback；对目标仓库只读，'
+    '写盘仅追加且必须显式 commit；缺 tree.storage 时 fail-closed。';
+
+/// 当前握手完成的插件服务（由 [_onReady] 填入），用于向 tree.storage 下站命令。
+PluginKitServer? _activeServer;
 
 PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
   channel: PluginChannel.stdio(kPluginId),
@@ -39,7 +47,8 @@ PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
 );
 
 Future<void> _onReady(PluginKitServer server) async {
-  server.channel.log('已上线：v$kVersion（tree.docnorm，DN-2）');
+  _activeServer = server;
+  server.channel.log('已上线：v$kVersion（tree.docnorm，DN-6）');
   try {
     final Map<String, dynamic> result = await server.channel.request(
       M.stationRegister,
@@ -84,6 +93,36 @@ Future<Map<String, dynamic>?> handleRequest(
         'reply': <String, dynamic>{'payload': result.toJson()},
       };
     }
+    if (command == 'docnorm.baseline' || command == 'docnorm.reanalyze') {
+      final Map<String, dynamic> scope = asMap(params['scope']);
+      Future<Map<String, dynamic>> storage(
+        String name,
+        Map<String, dynamic> args,
+      ) => _callStorage(name, args, scope);
+      final Map<String, Object?> result = command == 'docnorm.baseline'
+          ? await runBaseline(
+              repo,
+              storage: storage,
+              commit: arguments['commit'] == true,
+              sections: _mapsOf(arguments['sections']),
+              indexes: _mapsOf(arguments['indexes']),
+              rewriteAllowlist: _stringsOf(arguments['rewrite_allowlist']),
+              runId: asString(arguments['run_id']),
+            )
+          : await runReanalyze(
+              repo,
+              storage: storage,
+              changed: arguments['changed'] == true,
+              commit: arguments['commit'] == true,
+              sections: _mapsOf(arguments['sections']),
+              indexes: _mapsOf(arguments['indexes']),
+              rewriteAllowlist: _stringsOf(arguments['rewrite_allowlist']),
+              runId: asString(arguments['run_id']),
+            );
+      return <String, dynamic>{
+        'reply': <String, dynamic>{'payload': result},
+      };
+    }
     final DocContract contract = await inspectRepository(
       repo,
       rulesPackage: arguments['rules'] is Map
@@ -113,6 +152,10 @@ Future<Map<String, dynamic>?> handleRequest(
         },
       },
     };
+  } on BaselineFailure catch (error) {
+    return <String, dynamic>{
+      'reply': <String, dynamic>{'error': error.message, 'code': error.code},
+    };
   } on PolicyFailure catch (error) {
     return <String, dynamic>{
       'reply': <String, dynamic>{'error': error.message, 'code': error.code},
@@ -126,6 +169,41 @@ Future<Map<String, dynamic>?> handleRequest(
       'reply': <String, dynamic>{'error': '扫描失败：$error', 'code': 'scan_error'},
     };
   }
+}
+
+/// 向 `tree.storage` 下一条站命令：身份 / 团队只透传核心给本次请求的 scope。
+///
+/// 缺失时由存储侧拒绝（`identity_required` / `team_required`），这里收敛成
+/// `storage_unavailable`，让 baseline 在写盘前 fail-closed（TC-ST-10）。
+Future<Map<String, dynamic>> _callStorage(
+  String command,
+  Map<String, dynamic> arguments,
+  Map<String, dynamic> scope,
+) {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) {
+    throw BaselineFailure(
+      '插件尚未就绪：tree.storage 通道不可用',
+      code: 'storage_unavailable',
+    );
+  }
+  return server.channel.command(command, arguments, '', scope);
+}
+
+List<Map<String, Object?>> _mapsOf(Object? value) {
+  if (value is! List) return const <Map<String, Object?>>[];
+  return <Map<String, Object?>>[
+    for (final Object? item in value)
+      if (item is Map) asMap(item),
+  ];
+}
+
+List<String> _stringsOf(Object? value) {
+  if (value is! List) return const <String>[];
+  return <String>[
+    for (final Object? item in value)
+      if (asString(item).isNotEmpty) asString(item),
+  ];
 }
 
 Future<void> main(List<String> args) async {
@@ -201,6 +279,134 @@ indexes:
   - dir: docs
     index: docs/README.md
 ''');
+
+    bool gitOk = true;
+    try {
+      Process.runSync('git', <String>[
+        'init',
+        '--quiet',
+      ], workingDirectory: temp.path);
+      Process.runSync('git', <String>[
+        'add',
+        '-A',
+      ], workingDirectory: temp.path);
+      final ProcessResult committed = Process.runSync('git', <String>[
+        '-c',
+        'user.name=selftest',
+        '-c',
+        'user.email=selftest@local',
+        'commit',
+        '--quiet',
+        '--no-gpg-sign',
+        '-m',
+        'fixture',
+      ], workingDirectory: temp.path);
+      gitOk = committed.exitCode == 0;
+    } catch (_) {
+      gitOk = false;
+    }
+
+    // 假 tree.storage：只实现 baseline 用到的只读/写入命令。
+    final Map<String, Map<String, Map<String, Object?>>> fakeDb =
+        <String, Map<String, Map<String, Object?>>>{};
+    Map<String, Map<String, Object?>> collectionOf(String name) =>
+        fakeDb.putIfAbsent(name, () => <String, Map<String, Object?>>{});
+    int storageWrites = 0;
+    core.onMethod(M.stationCommand, (Map<String, dynamic> params) {
+      final String command = asString(params['command']);
+      final Map<String, dynamic> args = asMap(params['arguments']);
+      final String collection = asString(args['collection']);
+      final Map<String, Map<String, Object?>> records = collectionOf(
+        collection,
+      );
+      switch (command) {
+        case 'storage.ensure':
+          storageWrites += 1;
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'collection': collection,
+              'schema_version': args['schema_version'] ?? 1,
+            },
+          };
+        case 'storage.scan':
+          final String prefix = asString(args['prefix']);
+          final List<Map<String, Object?>> values = <Map<String, Object?>>[
+            for (final MapEntry<String, Map<String, Object?>> entry
+                in records.entries)
+              if (entry.key.startsWith(prefix))
+                <String, Object?>{
+                  'key': entry.key,
+                  'value': entry.value,
+                  'rev': 1,
+                },
+          ];
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'values': values,
+              'count': values.length,
+            },
+          };
+        case 'storage.get':
+          final Map<String, Object?>? value = records[asString(args['key'])];
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'value': value,
+              'rev': value == null ? 0 : 1,
+            },
+          };
+        case 'storage.put':
+          storageWrites += 1;
+          records[asString(args['key'])] = Map<String, Object?>.from(
+            asMap(args['value']),
+          );
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{'rev': 1},
+          };
+        case 'storage.delete':
+          storageWrites += 1;
+          records.remove(asString(args['key']));
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{'deleted': true},
+          };
+        case 'storage.tx':
+          storageWrites += 1;
+          final List<dynamic> ops = args['ops'] is List
+              ? args['ops'] as List<dynamic>
+              : <dynamic>[];
+          for (final Object? raw in ops) {
+            if (raw is! Map) continue;
+            final Map<String, dynamic> op = asMap(raw);
+            final Map<String, Map<String, Object?>> target = collectionOf(
+              asString(op['collection']),
+            );
+            if (asString(op['op']) == 'delete') {
+              target.remove(asString(op['key']));
+            } else {
+              target[asString(op['key'])] = Map<String, Object?>.from(
+                asMap(op['value']),
+              );
+            }
+          }
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'committed': true,
+              'count': ops.length,
+            },
+          };
+        default:
+          return <String, dynamic>{
+            'ok': false,
+            'error': '未知存储命令：$command',
+            'code': 'unknown_command',
+          };
+      }
+    });
 
     final ScanResult result = await scanRepository(temp.path);
     check.that(
@@ -317,6 +523,157 @@ indexes:
       !checkPayload.containsKey('sections'),
       'docnorm.check 不重复契约明细（无 sections）',
     );
+
+    Future<Map<String, dynamic>> askCommand(
+      Object id,
+      String command,
+      Map<String, dynamic> arguments,
+    ) async {
+      core.ask(id, M.stationRequest, <String, dynamic>{
+        'payload': <String, dynamic>{
+          'command': command,
+          'arguments': arguments,
+        },
+        'meta': <String, dynamic>{'source_plugin_id': 'tree.production.line'},
+        'scope': <String, dynamic>{'team_id': 'team_a'},
+      });
+      final Map<Object?, Map<String, dynamic>> responses = await core.waitFor(
+        <Object?>[id],
+      );
+      return asMap(asMap(responses[id]?['result'])['reply']);
+    }
+
+    if (!gitOk) {
+      check.that(true, 'git 不可用，跳过 baseline / reanalyze 自检');
+    } else {
+      final Map<String, dynamic> dryReply = await askCommand(
+        'baseline-dry',
+        'docnorm.baseline',
+        <String, dynamic>{
+          'repo': temp.path,
+          'commit': false,
+          'sections': <Map<String, dynamic>>[
+            <String, dynamic>{
+              'doc': 'README.md',
+              'heading': '## 测试',
+              'body': 'dart test',
+            },
+          ],
+        },
+      );
+      final Map<String, dynamic> dryPayload = asMap(dryReply['payload']);
+      check.check(dryPayload['dry_run'], true, 'baseline 默认 dry-run');
+      check.check(
+        (dryPayload['written'] as List<dynamic>?)?.isEmpty,
+        true,
+        'dry-run 不写目标仓库',
+      );
+      check.check(
+        (dryPayload['would_write'] as List<dynamic>?)?.length,
+        1,
+        'dry-run 出 1 个落盘计划',
+      );
+      check.check(storageWrites, 0, 'dry-run 0 存储写');
+      check.that(
+        !File('${temp.path}${Platform.pathSeparator}README.md')
+            .readAsStringSync()
+            .contains('## 测试'),
+        'dry-run 未追加章节',
+      );
+
+      final Map<String, dynamic> commitReply = await askCommand(
+        'baseline-commit',
+        'docnorm.baseline',
+        <String, dynamic>{
+          'repo': temp.path,
+          'commit': true,
+          'sections': <Map<String, dynamic>>[
+            <String, dynamic>{
+              'doc': 'README.md',
+              'heading': '## 测试',
+              'body': 'dart test',
+            },
+          ],
+        },
+      );
+      final Map<String, dynamic> commitPayload = asMap(commitReply['payload']);
+      check.that(
+        (commitPayload['written'] as List<dynamic>?)?.contains('README.md') ==
+            true,
+        'baseline --commit 追章节',
+      );
+      check.that(
+        File('${temp.path}${Platform.pathSeparator}README.md')
+            .readAsStringSync()
+            .contains('## 测试'),
+        'README 落盘包含新章节',
+      );
+      check.that(
+        (fakeDb['doc_contract'] ?? <String, Map<String, Object?>>{}).isNotEmpty,
+        'doc_contract 入库',
+      );
+      check.that(
+        (fakeDb['pkg_index'] ?? <String, Map<String, Object?>>{}).isNotEmpty,
+        'pkg_index 入库',
+      );
+      check.that(
+        (fakeDb['doc_state'] ?? <String, Map<String, Object?>>{}).isNotEmpty,
+        'doc_state 入库',
+      );
+      final int writesAfterCommit = storageWrites;
+
+      final Map<String, dynamic> againReply = await askCommand(
+        'baseline-again',
+        'docnorm.baseline',
+        <String, dynamic>{
+          'repo': temp.path,
+          'commit': true,
+          'sections': <Map<String, dynamic>>[
+            <String, dynamic>{
+              'doc': 'README.md',
+              'heading': '## 测试',
+              'body': 'dart test',
+            },
+          ],
+        },
+      );
+      final Map<String, dynamic> againPayload = asMap(againReply['payload']);
+      check.check(
+        (againPayload['written'] as List<dynamic>?)?.length,
+        0,
+        '重复运行 0 文件写',
+      );
+      check.check(storageWrites, writesAfterCommit, '重复运行 0 存储写');
+
+      final File source = File(
+        '${temp.path}${Platform.pathSeparator}lib${Platform.pathSeparator}a.dart',
+      );
+      source.writeAsStringSync(
+        'class Alpha {}\nclass Beta {}\nclass Gamma {}\n',
+      );
+      final Map<String, dynamic> reanalyzeReply = await askCommand(
+        'reanalyze',
+        'docnorm.reanalyze',
+        <String, dynamic>{'repo': temp.path, 'changed': true, 'commit': true},
+      );
+      final Map<String, dynamic> reanalyzePayload = asMap(
+        reanalyzeReply['payload'],
+      );
+      check.that(
+        (reanalyzePayload['affected_packages'] as List<dynamic>?)?.isNotEmpty ==
+            true,
+        'reanalyze 命中受影响包',
+      );
+      check.that(
+        (reanalyzePayload['recomputed'] as List<dynamic>?)?.isNotEmpty == true,
+        'reanalyze 重算受影响包',
+      );
+      check.check(
+        asMap(reanalyzePayload['storage'])['applied'],
+        true,
+        'reanalyze 写回状态',
+      );
+    }
   } catch (error) {
     check.that(false, '自检过程未抛异常', actual: '$error');
   } finally {

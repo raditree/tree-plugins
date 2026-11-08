@@ -710,8 +710,11 @@ List<LanguageAdapter> defaultAdapters() => <LanguageAdapter>[
   HttpAdapter(),
 ];
 
-Future<ScanResult> scanRepository(String repo) async {
-  final RepoIndex index = await RepoIndex.load(repo);
+Future<ScanResult> scanRepository(String repo) async =>
+    scanIndex(await RepoIndex.load(repo));
+
+/// 对已加载的索引跑全部适配器（`reanalyze --changed` 用子集索引复用同一条路）。
+Future<ScanResult> scanIndex(RepoIndex index) async {
   final List<PackageUnit> packages = <PackageUnit>[];
   final List<String> adapters = <String>[];
   final List<String> errors = <String>[];
