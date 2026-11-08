@@ -16,12 +16,13 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.docnorm';
 const String kDisplayName = 'Tree 文档归一化';
-const String kVersion = '0.2.0';
+const String kVersion = '0.3.0';
 const String kStationName = 'docnorm';
 const List<String> kDocnormCommands = <String>[
   'docnorm.scan',
   'docnorm.contract',
   'docnorm.check',
+  'docnorm.plan',
   'docnorm.baseline',
   'docnorm.reanalyze',
 ];
@@ -30,6 +31,7 @@ const String kStationReadme =
     '文档归一化：docnorm.scan 扫描目标仓库，返回包图（包/子包/行数/公开声明/API 面/依赖）；'
     'docnorm.contract 侦查文档契约（章节/索引/链接/CHANGELOG/门禁，规则按 内置→仓库自述 合成）；'
     'docnorm.check 只跑 DocPolicy 四条检查；'
+    'docnorm.plan 只读归集 git 内容变更并给出注入单元与 context_cap/stage_budget 两额度估计（stat-dirty 不产计划）；'
     'docnorm.baseline [--commit] 建 L0（doc_contract/pkg_index/doc_state 入 tree.storage）并按提案只追加缺章节（默认 dry-run）；'
     'docnorm.reanalyze --changed 只重算受影响包。六族适配器 + fallback；对目标仓库只读，'
     '写盘仅追加且必须显式 commit；缺 tree.storage 时 fail-closed。';
@@ -48,7 +50,7 @@ PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
 
 Future<void> _onReady(PluginKitServer server) async {
   _activeServer = server;
-  server.channel.log('已上线：v$kVersion（tree.docnorm，DN-6）');
+  server.channel.log('已上线：v$kVersion（tree.docnorm，DN-4/6）');
   try {
     final Map<String, dynamic> result = await server.channel.request(
       M.stationRegister,
@@ -91,6 +93,18 @@ Future<Map<String, dynamic>?> handleRequest(
       final ScanResult result = await scanRepository(repo);
       return <String, dynamic>{
         'reply': <String, dynamic>{'payload': result.toJson()},
+      };
+    }
+    if (command == 'docnorm.plan') {
+      final Map<String, Object?> result = await runPlan(
+        repo,
+        mode: asString(arguments['mode']),
+        overrides: arguments['config'] is Map
+            ? asMap(arguments['config'])
+            : const <String, Object?>{},
+      );
+      return <String, dynamic>{
+        'reply': <String, dynamic>{'payload': result},
       };
     }
     if (command == 'docnorm.baseline' || command == 'docnorm.reanalyze') {
@@ -153,6 +167,10 @@ Future<Map<String, dynamic>?> handleRequest(
       },
     };
   } on BaselineFailure catch (error) {
+    return <String, dynamic>{
+      'reply': <String, dynamic>{'error': error.message, 'code': error.code},
+    };
+  } on PlanFailure catch (error) {
     return <String, dynamic>{
       'reply': <String, dynamic>{'error': error.message, 'code': error.code},
     };
@@ -672,6 +690,22 @@ indexes:
         asMap(reanalyzePayload['storage'])['applied'],
         true,
         'reanalyze 写回状态',
+      );
+
+      final Map<String, dynamic> planReply = await askCommand(
+        'plan',
+        'docnorm.plan',
+        <String, dynamic>{'repo': temp.path},
+      );
+      final Map<String, dynamic> planPayload = asMap(planReply['payload']);
+      check.check(planPayload['dry_run'], true, 'plan 只读');
+      check.that(
+        (planPayload['units'] as List<dynamic>?)?.isNotEmpty == true,
+        'plan 出注入单元',
+      );
+      check.that(
+        (asMap(planPayload['budget'])['context_cap'] as num? ?? 0) > 0,
+        'plan 给出 context_cap',
       );
     }
   } catch (error) {

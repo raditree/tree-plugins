@@ -1,8 +1,8 @@
 {
   "id": "tree.docnorm",
   "name": "Tree 文档归一化",
-  "version": "0.2.0",
-  "description": "headless 插件：扫描目标仓库、识别包与子包、抽取公开声明与 API 面（DN-2）；侦查文档契约并按三层规则源做 DocPolicy 检查（DN-3）；baseline / reanalyze --changed 建 L0 事实（doc_contract/pkg_index/doc_state 入 tree.storage）并按提案只追加缺章节（DN-6）。对目标仓库只读，写盘必须显式 commit。",
+  "version": "0.3.0",
+  "description": "headless 插件：扫描目标仓库、识别包与子包、抽取公开声明与 API 面（DN-2）；侦查文档契约并按三层规则源做 DocPolicy 检查（DN-3）；plan 只读归集 git 内容变更并给出注入单元与 context_cap/stage_budget 两额度估计（DN-4）；baseline / reanalyze --changed 建 L0 事实（doc_contract/pkg_index/doc_state 入 tree.storage）并按提案只追加缺章节（DN-6）。对目标仓库只读，写盘必须显式 commit。",
   "runtime": "headless",
   "files": [
     "tree_docnorm.exe"

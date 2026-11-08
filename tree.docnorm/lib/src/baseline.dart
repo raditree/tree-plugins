@@ -124,7 +124,7 @@ class GitRepository {
     ]);
     if (probe.exitCode != 0 || _text(probe.stdout) != 'true') {
       throw BaselineFailure(
-        'docnorm.baseline / reanalyze 需要 git 仓库（只读 git、默认禁网）：$repo',
+        'docnorm.plan / baseline / reanalyze 需要 git 仓库（只读 git、默认禁网）：$repo',
         code: 'git_required',
       );
     }
@@ -143,14 +143,16 @@ class GitRepository {
     return result.exitCode == 0 ? _text(result.stdout) : '';
   }
 
-  /// `git diff`（tracked）+ `git ls-files --others`（显式纳入的新文件）。
+  /// 内容变更归集：`git diff --numstat`（tracked）+ `git ls-files --others`
+  /// （显式纳入的新文件）。
+  ///
+  /// 只认**内容差异**：`0 0`（纯 stat-dirty / mode-only）不进入计划；
+  /// 不用 `git status`（D: 变更判定用 `git diff`）。
   Future<GitChanges> changedFiles() async {
     final bool head = await hasHead();
-    final List<String> tracked = head
-        ? await _lines(
-            _run(root, <String>['diff', '--name-only', 'HEAD', '--']),
-          )
-        : await _lines(_run(root, <String>['ls-files']));
+    final Set<String> tracked = head
+        ? await _numstatPaths()
+        : (await _lines(_run(root, <String>['ls-files']))).toSet();
     final List<String> untracked = await _lines(
       _run(root, <String>['ls-files', '--others', '--exclude-standard']),
     );
@@ -167,6 +169,32 @@ class GitRepository {
       untracked: sortedUntracked,
       head: head ? await headSha() : '',
     );
+  }
+
+  /// `git diff --numstat` 里 added/deleted 至少一个非 0 的路径。
+  ///
+  /// 二进制文件用 `-` 表示，仍算内容变化；`0 0` 一律丢弃——那正是 stat-dirty
+  /// 不能产计划的原因。
+  Future<Set<String>> _numstatPaths() async {
+    final ProcessResult result = await _run(root, <String>[
+      'diff',
+      '--numstat',
+      '--no-renames',
+      'HEAD',
+      '--',
+    ]);
+    if (result.exitCode != 0) return <String>{};
+    final Set<String> out = <String>{};
+    for (final String line in _text(result.stdout).split('\n')) {
+      if (line.trim().isEmpty) continue;
+      final List<String> parts = line.split('\t');
+      if (parts.length < 3) continue;
+      final String added = parts[0].trim();
+      final String removed = parts[1].trim();
+      if (added == '0' && removed == '0') continue;
+      out.add(parts.sublist(2).join('\t'));
+    }
+    return out;
   }
 
   /// 工作树文件的 blob id（一次进程算一批；路径按 `/` 相对仓库根）。
