@@ -937,6 +937,7 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     for (final String id in ids.reversed) {
       runtime.registry.forgetAgent(id);
       if (runtime.store.deleteAgent(id)) removed.add(id);
+      await runtime.agentInstances.dispose(id);
     }
     await runtime.store.flush();
     // 回填存活 TOP 的成员数（与 team 工具"按实际成员数"同一口径）。

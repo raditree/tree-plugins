@@ -125,6 +125,13 @@ class CoreMessageRef {
     this.timestamp = 0,
     this.attachments,
     this.llmHidden = false,
+    this.sourceMessageId = '',
+    this.messageType = '',
+    this.messageSubtype = '',
+    this.injectMode = '',
+    this.sourceTeamId = '',
+    this.sourceAgentId = '',
+    this.sourceSessionId = '',
   });
 
   /// `user` / `agent`（存储层口径）。
@@ -183,6 +190,21 @@ class CoreMessageRef {
   /// 是否**不插进提示词**（存储层的 `llm_hidden`）：系统发言与过程提示都是这种。
   /// 与 [isNotice] 相反——那个要按 user 进上下文。见 LlmAgentEngine 的历史翻译。
   final bool llmHidden;
+
+  /// 消息机信封元数据（AC-1 加法键）：引擎按它们决定通道与注入语义。
+  /// 空串 = 老消息 / 未标注，行为与从前一致。
+  final String sourceMessageId;
+  final String messageType;
+  final String messageSubtype;
+  final String injectMode;
+  final String sourceTeamId;
+  final String sourceAgentId;
+  final String sourceSessionId;
+
+  bool get isSystemMessage => messageType == 'system_message';
+  bool get isTip => messageSubtype == 'tip';
+  bool get isTask => messageSubtype == 'task';
+  bool get isQueueInject => injectMode == 'queue';
 
   bool get isUser => role == 'user';
 }

@@ -1586,6 +1586,13 @@ class ConversationService {
     toolResultForModel: message.toolResultForModel,
     timestamp: message.timestamp,
     attachments: message.attachments,
+    sourceMessageId: message.sourceMessageId,
+    messageType: message.messageType,
+    messageSubtype: message.messageSubtype,
+    injectMode: message.injectMode,
+    sourceTeamId: message.sourceTeamId,
+    sourceAgentId: message.sourceAgentId,
+    sourceSessionId: message.sourceSessionId,
   );
 
   /// 按 **agent×会话** 串行执行：同一会话的前一个任务（含失败）结束后才启动下一个，

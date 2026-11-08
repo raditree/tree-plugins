@@ -119,6 +119,8 @@ lib/src/question_store.dart  questions.json 视图（叠加提问状态/答案/�
 lib/src/conversation_store.dart 会话历史分页（limit/before/from/at/all）+ 提问卡片叠加
 lib/src/teammates.dart     团队名册（memberView + relation + overrides/effective）
 lib/src/agent/             平移：question_store（提问记录）、question_broker（等待/作答/取消回路）
+lib/src/agent/agent_instance.dart  Agent 实例骨架（活动状态 + 按会话分区的收件箱；AC-1）
+lib/src/message/inbox_ledger.dart  会话收件箱台账（追加写 / 状态合并 / 崩溃恢复；AC-1）
 lib/src/tool/              平移：todo_store、question_channel、tool_runner、subagent_tool、
                            tool_run_registry（运行中工具登记）、hook_ledger、tool_runs_tool；
                            spec_tool（S1 原生 spec 工具：list/read/select/create/update/reset）

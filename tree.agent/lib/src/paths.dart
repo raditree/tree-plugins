@@ -60,6 +60,14 @@ class AgentDataPaths {
   String messagesFile(String agentId, String sessionId) =>
       p.join(sessionDir(agentId, sessionId), 'messages.jsonl');
 
+  /// 会话收件箱台账：`<root>/data/<agent>/<session>/inbox.jsonl`。
+  ///
+  /// AC-1 的零丢失账本：每条入站消息先追加 `pending` 再回执，崩溃后由
+  /// `inflight → pending` 重放。它与 `messages.jsonl` 分工不同——后者是会话历史，
+  /// 前者是「尚未处理完的消息状态」。
+  String inboxFile(String agentId, String sessionId) =>
+      p.join(sessionDir(agentId, sessionId), 'inbox.jsonl');
+
   /// 校验单个路径分段（防路径穿越）。与核心 `TreePaths.safeSegment` 同一口径：
   /// 只允许 `[A-Za-z0-9_.-]`，拒绝空串 / `.` / `..`。
   static String safeSegment(String raw) {

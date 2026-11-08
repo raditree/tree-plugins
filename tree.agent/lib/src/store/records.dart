@@ -402,6 +402,13 @@ class CoreMessage {
     this.subagentName = '',
     this.subagentParentId = '',
     this.subagentLevel = 0,
+    this.sourceMessageId = '',
+    this.messageType = '',
+    this.messageSubtype = '',
+    this.injectMode = '',
+    this.sourceTeamId = '',
+    this.sourceAgentId = '',
+    this.sourceSessionId = '',
   });
 
   factory CoreMessage.fromJson(Map<String, dynamic> json) {
@@ -448,6 +455,13 @@ class CoreMessage {
       subagentName: json['subagent_name'] as String? ?? '',
       subagentParentId: json['subagent_parent_id'] as String? ?? '',
       subagentLevel: (json['subagent_level'] as num?)?.toInt() ?? 0,
+      sourceMessageId: json['source_message_id'] as String? ?? '',
+      messageType: json['message_type'] as String? ?? '',
+      messageSubtype: json['message_subtype'] as String? ?? '',
+      injectMode: json['inject_mode'] as String? ?? '',
+      sourceTeamId: json['source_team_id'] as String? ?? '',
+      sourceAgentId: json['source_agent_id'] as String? ?? '',
+      sourceSessionId: json['source_session_id'] as String? ?? '',
     );
   }
 
@@ -563,6 +577,29 @@ class CoreMessage {
   /// 它在会话内树里的层级（真实 agent 的直属临时员工 = 1）。
   final int subagentLevel;
 
+  // ── 消息机信封元数据（AC-1 加法键） ───────────────────────────────────
+  //
+  // 全部可选、全部只在非空时落盘：老消息的 jsonl 一行与从前逐字一致，UI 的
+  // `ChatMessage.fromJson` 不认识这些键会安全忽略。它们不参与 `id` 语义——
+  // 入站消息的 `id` 仍由存储层生成，去重看 [sourceMessageId]。
+
+  /// 发起者给出的稳定消息 id（幂等键；空串 = 老消息 / 出站消息）。
+  final String sourceMessageId;
+
+  /// `system_message` / `common_message`；空串 = 未标注（老消息）。
+  final String messageType;
+
+  /// `tip` / `task`；空串 = 未标注。
+  final String messageSubtype;
+
+  /// `direct` / `queue`；空串 = 未标注（按 direct 处理）。
+  final String injectMode;
+
+  /// 来源坐标（特殊来源固定 `inner` / `main`；真实 agent 用真实归属）。
+  final String sourceTeamId;
+  final String sourceAgentId;
+  final String sourceSessionId;
+
   /// 是否为临时员工产出的消息。
   bool get isSubagentMessage => subagentId.isNotEmpty;
 
@@ -597,6 +634,14 @@ class CoreMessage {
       'subagent_parent_id': subagentParentId,
       'subagent_level': subagentLevel,
     },
+    // 消息机信封元数据（AC-1）：只在非空时落，老消息一行不多键。
+    if (sourceMessageId.isNotEmpty) 'source_message_id': sourceMessageId,
+    if (messageType.isNotEmpty) 'message_type': messageType,
+    if (messageSubtype.isNotEmpty) 'message_subtype': messageSubtype,
+    if (injectMode.isNotEmpty) 'inject_mode': injectMode,
+    if (sourceTeamId.isNotEmpty) 'source_team_id': sourceTeamId,
+    if (sourceAgentId.isNotEmpty) 'source_agent_id': sourceAgentId,
+    if (sourceSessionId.isNotEmpty) 'source_session_id': sourceSessionId,
     'is_streaming': false,
   };
 }

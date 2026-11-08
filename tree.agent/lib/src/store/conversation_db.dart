@@ -403,6 +403,21 @@ Map<String, dynamic> detailPayloadToJson(Map<String, dynamic> payload) {
       'subagent_parent_id': payload['subagent_parent_id'] as String? ?? '',
       'subagent_level': (payload['subagent_level'] as num?)?.toInt() ?? 0,
     },
+    // 消息机信封元数据（AC-1 加法键）：只在非空时出现，老消息形状不变。
+    if ((payload['source_message_id'] as String? ?? '').isNotEmpty)
+      'source_message_id': payload['source_message_id'],
+    if ((payload['message_type'] as String? ?? '').isNotEmpty)
+      'message_type': payload['message_type'],
+    if ((payload['message_subtype'] as String? ?? '').isNotEmpty)
+      'message_subtype': payload['message_subtype'],
+    if ((payload['inject_mode'] as String? ?? '').isNotEmpty)
+      'inject_mode': payload['inject_mode'],
+    if ((payload['source_team_id'] as String? ?? '').isNotEmpty)
+      'source_team_id': payload['source_team_id'],
+    if ((payload['source_agent_id'] as String? ?? '').isNotEmpty)
+      'source_agent_id': payload['source_agent_id'],
+    if ((payload['source_session_id'] as String? ?? '').isNotEmpty)
+      'source_session_id': payload['source_session_id'],
     'is_streaming': false,
   };
 }

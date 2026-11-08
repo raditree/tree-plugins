@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 
 import '../agent/agent_engine.dart';
+import '../agent/agent_instance.dart';
 import '../agent/compaction_service.dart';
 import '../agent/conversation_service.dart';
 import '../agent/question_broker.dart';
@@ -90,6 +91,7 @@ bool isLocalStationCommand(String command) =>
 class AgentRuntime {
   AgentRuntime({required this.paths, AgentEngine? engine})
     : store = FileTreeStore(TreePaths(paths.root)) {
+    agentInstances = AgentInstanceRegistry(paths: paths);
     settings = CoreSettings.load(paths);
     settingsSink = FileDomainSettingsSink(TreePaths(paths.root));
     settings.domain.sink = settingsSink;
@@ -216,6 +218,10 @@ class AgentRuntime {
 
   final AgentDataPaths paths;
   final FileTreeStore store;
+
+  /// **Agent 实例注册表**（AC-1 骨架）：按 agent 懒建，持有活动状态与会话收件箱。
+  /// 现有消息路径尚未使用它；AC-2 起由消息机接线。
+  late final AgentInstanceRegistry agentInstances;
   late final CoreSettings settings;
   late final FileDomainSettingsSink settingsSink;
   late final SubagentRegistry registry;
@@ -1309,6 +1315,9 @@ class AgentRuntime {
   Future<void> close() async {
     conversation.dispose();
     questions.dispose();
+    // 收件箱台账先落盘，再释放存储（AC-1 的零丢失保证）。
+    await agentInstances.flush();
+    await agentInstances.disposeAll();
     await store.close();
     _byRoot.removeWhere((String _, AgentRuntime runtime) => identical(runtime, this));
   }
