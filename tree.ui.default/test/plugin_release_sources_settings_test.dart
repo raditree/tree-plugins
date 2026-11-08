@@ -153,7 +153,14 @@ Future<void> _scrollTo(WidgetTester tester, Finder target) async {
   await tester.scrollUntilVisible(
     target,
     300,
-    scrollable: find.byType(Scrollable).first,
+    // 左目录改造后页面有两个 Scrollable（目录 + 内容）：必须显式指定内容区。
+    // 注：scrollUntilVisible 的 scrollable 参数要匹配 Scrollable 本体（Key 在 ListView 上）。
+    scrollable: find
+        .descendant(
+          of: find.byKey(const Key('settings-content-scroll-plugins')),
+          matching: find.byType(Scrollable),
+        )
+        .first,
   );
   await tester.pump();
 }
@@ -195,6 +202,9 @@ void main() {
       ),
       reason: '发布源设置加载完成',
     );
+    // 左目录改造后：发布源卡片在「插件」分类下，先切分类。
+    await tester.tap(find.byKey(const Key('settings-nav-plugins')));
+    await tester.pump();
 
     final Finder saveFinder = find.byKey(const Key('plugin-release-save'));
     final Finder giteeRadio = find.byKey(

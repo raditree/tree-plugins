@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -52,6 +51,27 @@ class SettingsPage extends StatefulWidget {
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
+}
+
+/// 设置页左侧目录的一个分类（用户 2026-11-08：IDE 式左目录 + 右内容）。
+class _SettingsCategory {
+  const _SettingsCategory({
+    required this.id,
+    required this.label,
+    required this.icon,
+    required this.sections,
+  });
+
+  /// 稳定 id（目录项 Key 与测试都用它：`settings-nav-<id>`）。
+  final String id;
+
+  /// 目录名（图标栏形态下作 Tooltip，chip 形态下作 chip 文案）。
+  final String label;
+
+  final IconData icon;
+
+  /// 右侧内容区的分区（二级标题 + 卡片），按顺序渲染。
+  final List<Widget Function()> sections;
 }
 
 class _SettingsPageState extends State<SettingsPage> {
@@ -139,10 +159,8 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 路径会把用户送到一个不存在的地方。拿不到就退回"去插件面板看"的指引。
   String? _pluginConfigPath;
 
-  /// 「自定义模型」一节的锚点（引导第 1 步要滚到它）。
-  final GlobalKey _modelsSectionKey = GlobalKey(
-    debugLabel: 'settings_models_section',
-  );
+  /// 当前选中的设置分类（`_SettingsCategory.id`，默认「外观」）。
+  String _category = 'appearance';
 
   @override
   void initState() {
@@ -153,32 +171,23 @@ class _SettingsPageState extends State<SettingsPage> {
     _loadPluginReleaseSources();
     _loadModelList();
     _loadPluginConfigPath();
-    // 引导带过来的（focusModels）：首帧之后滚到「自定义模型」——此时 ListView
-    // 还没布局完，ensureVisible 拿不到位置。
-    if (widget.focusModels) _scheduleScrollToModels();
+    // 引导带过来的（focusModels）：直接落到「模型」分类（用户 2026-11-08 左目录改造后
+    // 不再用滚动锚点，分类即导航）。
+    if (widget.focusModels) _category = 'model';
   }
 
   @override
   void didUpdateWidget(covariant SettingsPage oldWidget) {
     super.didUpdateWidget(oldWidget);
     // 嵌在右栏窗口里时本控件常挂（IndexedStack），再次收到 focusModels
-    // （引导「带我过去」又点了一次）得重新滚，不能只在 initState 里做一次。
-    if (widget.focusModels && !oldWidget.focusModels) _scheduleScrollToModels();
+    // （引导「带我过去」又点了一次）得重新切回「模型」，不能只在 initState 里做一次。
+    // 这里直接改字段：didUpdateWidget 之后紧跟一次 build，无需 setState。
+    if (widget.focusModels && !oldWidget.focusModels) _category = 'model';
   }
 
-  /// 帧后滚到「自定义模型」一节。
-  void _scheduleScrollToModels() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      final BuildContext? target = _modelsSectionKey.currentContext;
-      if (target == null) return;
-      unawaited(
-        Scrollable.ensureVisible(
-          target,
-          duration: const Duration(milliseconds: 300),
-          alignment: 0.1,
-        ),
-      );
-    });
+  void _selectCategory(String id) {
+    if (_category == id) return;
+    setState(() => _category = id);
   }
 
   /// 读插件快照，只为拿 `config.path`（插件清单的真实路径）。
@@ -577,72 +586,113 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
+  /// 设置分类表（用户 2026-11-08：左侧目录 + 右侧内容，IDE 式布局）。
+  ///
+  /// 分类顺序固定；组内分区沿用原单列顺序（「插件」「关于」按用户口径排列）。
+  List<_SettingsCategory> get _categories => <_SettingsCategory>[
+    _SettingsCategory(
+      id: 'appearance',
+      label: '外观',
+      icon: Icons.palette_outlined,
+      sections: <Widget Function()>[
+        () => _section('主题管理', _buildThemeCard()),
+        () => _section('主题色', const _AccentColorCard()),
+        () => _section('文字大小', _buildTextScaleCard()),
+        () => _section('界面字体', _buildFontCard()),
+      ],
+    ),
+    _SettingsCategory(
+      id: 'editor',
+      label: '编辑器',
+      icon: Icons.code,
+      sections: <Widget Function()>[
+        () => _section('编辑器', _buildEditorCard()),
+      ],
+    ),
+    _SettingsCategory(
+      id: 'model',
+      label: '模型',
+      icon: Icons.memory,
+      sections: <Widget Function()>[
+        () => _section('自定义模型', _buildCustomModelCard()),
+      ],
+    ),
+    _SettingsCategory(
+      id: 'runtime',
+      label: '运行与链路',
+      icon: Icons.speed,
+      sections: <Widget Function()>[
+        () => Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            _section('流式帧率', _buildTokenRateCard()),
+            const SizedBox(height: 12),
+            _buildFrameRateCard(),
+          ],
+        ),
+        () => _section('心跳判活', _buildHeartbeatCard()),
+      ],
+    ),
+    _SettingsCategory(
+      id: 'plugins',
+      label: '插件',
+      icon: Icons.extension_outlined,
+      sections: <Widget Function()>[
+        () => _section('插件发布源', _buildPluginReleaseCard()),
+        () => _section('插件开发', _buildPluginDevCard()),
+      ],
+    ),
+    _SettingsCategory(
+      id: 'window',
+      label: '窗口与托盘',
+      icon: Icons.window_outlined,
+      sections: <Widget Function()>[
+        () => _section('窗口与托盘', _buildTrayCard()),
+      ],
+    ),
+    _SettingsCategory(
+      id: 'about',
+      label: '关于',
+      icon: Icons.info_outline,
+      sections: <Widget Function()>[
+        () => _section('版本信息', _buildVersionCard()),
+        () => _section('核心日志', const CoreLogCard()),
+        () => _section('新手引导', _buildOnboardingCard()),
+      ],
+    ),
+  ];
+
   @override
   Widget build(BuildContext context) {
-    final Widget body = ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        _buildSectionTitle('流式帧率'),
-        const SizedBox(height: 8),
-        _buildTokenRateCard(),
-        const SizedBox(height: 12),
-        _buildFrameRateCard(),
-        const SizedBox(height: 24),
-        _buildSectionTitle('心跳判活'),
-        const SizedBox(height: 8),
-        _buildHeartbeatCard(),
-        const SizedBox(height: 24),
-        KeyedSubtree(
-          key: _modelsSectionKey,
-          child: _buildSectionTitle('自定义模型'),
-        ),
-        const SizedBox(height: 8),
-        _buildCustomModelCard(),
-        const SizedBox(height: 24),
-        _buildSectionTitle('主题管理'),
-        const SizedBox(height: 8),
-        _buildThemeCard(),
-        const SizedBox(height: 24),
-        _buildSectionTitle('主题色'),
-        const SizedBox(height: 8),
-        const _AccentColorCard(),
-        const SizedBox(height: 24),
-        _buildSectionTitle('文字大小'),
-        const SizedBox(height: 8),
-        _buildTextScaleCard(),
-        const SizedBox(height: 24),
-        _buildSectionTitle('界面字体'),
-        const SizedBox(height: 8),
-        _buildFontCard(),
-        const SizedBox(height: 24),
-        _buildSectionTitle('窗口与托盘'),
-        const SizedBox(height: 8),
-        _buildTrayCard(),
-        const SizedBox(height: 24),
-        _buildSectionTitle('编辑器'),
-        const SizedBox(height: 8),
-        _buildEditorCard(),
-        const SizedBox(height: 24),
-        _buildSectionTitle('插件开发'),
-        const SizedBox(height: 8),
-        _buildPluginDevCard(),
-        const SizedBox(height: 24),
-        _buildSectionTitle('插件发布源'),
-        const SizedBox(height: 8),
-        _buildPluginReleaseCard(),
-        const SizedBox(height: 24),
-        _buildSectionTitle('核心日志'),
-        const SizedBox(height: 8),
-        const CoreLogCard(),
-        const SizedBox(height: 24),
-        _buildSectionTitle('新手引导'),
-        const SizedBox(height: 8),
-        _buildOnboardingCard(),
-        const SizedBox(height: 24),
-        _buildSectionTitle('版本信息'),
-        const SizedBox(height: 8),
-        _buildVersionCard(),
-      ],
+    final List<_SettingsCategory> categories = _categories;
+    final Widget body = LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        final ColorScheme cs = Theme.of(context).colorScheme;
+        final double width = constraints.maxWidth;
+        // 窄于 420：顶部一行横向分类 chip（右栏最窄 240 时仍可用）。
+        if (width < 420) {
+          return Column(
+            children: <Widget>[
+              _buildChipNav(cs, categories),
+              const Divider(height: 1),
+              Expanded(child: _buildCategoryContent(categories)),
+            ],
+          );
+        }
+        // ≥ 620：完整 IDE 双栏（文字目录）；420~619：图标栏。
+        final bool wide = width >= 620;
+        return Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            SizedBox(
+              width: wide ? 176 : 44,
+              child: _buildNav(cs, categories, wide: wide),
+            ),
+            const VerticalDivider(width: 1),
+            Expanded(child: _buildCategoryContent(categories)),
+          ],
+        );
+      },
     );
     // 嵌入右栏窗口：不套 Scaffold/AppBar（标题由窗口 chip 承担，避免两层头）
     if (widget.embedded) {
@@ -654,6 +704,137 @@ class _SettingsPageState extends State<SettingsPage> {
     return Scaffold(
       appBar: AppBar(title: const Text('设置'), centerTitle: false),
       body: body,
+    );
+  }
+
+  /// 一个分区：二级标题 + 卡片。
+  Widget _section(String title, Widget card) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        _buildSectionTitle(title),
+        const SizedBox(height: 8),
+        card,
+      ],
+    );
+  }
+
+  /// 左侧目录（文字 / 图标两种形态共用同一份条目）。
+  Widget _buildNav(
+    ColorScheme cs,
+    List<_SettingsCategory> categories, {
+    required bool wide,
+  }) {
+    return ListView(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      children: <Widget>[
+        for (final _SettingsCategory category in categories)
+          _buildNavItem(cs, category, wide: wide),
+      ],
+    );
+  }
+
+  Widget _buildNavItem(
+    ColorScheme cs,
+    _SettingsCategory category, {
+    required bool wide,
+  }) {
+    final bool selected = category.id == _category;
+    final Color fg = selected ? cs.primary : cs.onSurfaceVariant;
+    final Widget item = Container(
+      height: 40,
+      padding: EdgeInsets.symmetric(horizontal: wide ? 12 : 0),
+      decoration: BoxDecoration(
+        color: selected ? cs.primary.withValues(alpha: 0.12) : null,
+        border: Border(
+          left: BorderSide(
+            color: selected ? cs.primary : Colors.transparent,
+            width: 2,
+          ),
+        ),
+      ),
+      child: Row(
+        mainAxisAlignment:
+            wide ? MainAxisAlignment.start : MainAxisAlignment.center,
+        children: <Widget>[
+          Icon(category.icon, size: 18, color: fg),
+          if (wide) ...<Widget>[
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                category.label,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 13,
+                  color: fg,
+                  fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+    return InkWell(
+      key: Key('settings-nav-${category.id}'),
+      onTap: () => _selectCategory(category.id),
+      child: wide
+          ? item
+          : Tooltip(message: category.label, child: item),
+    );
+  }
+
+  /// 顶部横向 chip 导航（设置页可用宽 < 420）。
+  Widget _buildChipNav(ColorScheme cs, List<_SettingsCategory> categories) {
+    return SizedBox(
+      height: 48,
+      child: ListView(
+        key: const Key('settings-nav-chips'),
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        children: <Widget>[
+          for (final _SettingsCategory category in categories)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: ChoiceChip(
+                key: Key('settings-nav-chip-${category.id}'),
+                avatar: Icon(category.icon, size: 16),
+                label: Text(category.label),
+                selected: category.id == _category,
+                onSelected: (_) => _selectCategory(category.id),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// 右侧内容区：每个分类一个 `ListView`，用 `IndexedStack` 常挂。
+  ///
+  /// 为什么不是按需重建：切分类不丢滚动位置，也不丢 `_AccentColorCard` 里
+  /// 未提交的自定义色号草稿（它是独立 StatefulWidget，销毁即清空输入）。
+  Widget _buildCategoryContent(List<_SettingsCategory> categories) {
+    int index = categories.indexWhere(
+      (_SettingsCategory c) => c.id == _category,
+    );
+    if (index < 0) index = 0;
+    return IndexedStack(
+      key: const Key('settings-category-content'),
+      index: index,
+      sizing: StackFit.expand,
+      children: <Widget>[
+        for (final _SettingsCategory category in categories)
+          ListView(
+            key: Key('settings-content-scroll-${category.id}'),
+            padding: const EdgeInsets.all(16),
+            children: <Widget>[
+              for (int i = 0; i < category.sections.length; i++) ...<Widget>[
+                if (i > 0) const SizedBox(height: 24),
+                category.sections[i](),
+              ],
+            ],
+          ),
+      ],
     );
   }
 
@@ -1712,10 +1893,10 @@ class _SettingsPageState extends State<SettingsPage> {
   Widget _buildSectionTitle(String text) {
     return Text(
       text,
-      style: const TextStyle(
+      style: TextStyle(
         fontSize: 14,
         fontWeight: FontWeight.w600,
-        color: Color(0xFF94A3B8),
+        color: Theme.of(context).colorScheme.onSurfaceVariant,
       ),
     );
   }

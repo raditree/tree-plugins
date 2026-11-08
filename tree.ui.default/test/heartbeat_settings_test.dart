@@ -174,6 +174,10 @@ void main() {
     await tester.pumpWidget(const MaterialApp(home: SettingsPage()));
     await tester.pump();
 
+    // 左目录改造后：心跳卡片在「运行与链路」分类下，先切分类。
+    await tester.tap(find.byKey(const Key('settings-nav-runtime')));
+    await tester.pump();
+
     // 权威值来自后端（默认 10s / 3 次）：等页面加载完成
     await _pumpUntil(
       tester,

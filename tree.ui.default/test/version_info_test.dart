@@ -243,12 +243,28 @@ void main() {
       await tester.pump();
     }
 
-    /// 版本卡在列表末尾，必须先滚下去（否则 find 找不到、测试假红）。
-    Future<void> scrollTo(WidgetTester tester, Finder target) async {
+    /// 切到某个设置分类（左目录改造后内容按分类分页）。
+    Future<void> selectCategory(WidgetTester tester, String id) async {
+      await tester.tap(find.byKey(Key('settings-nav-$id')));
+      await tester.pump();
+    }
+
+    /// 版本卡在分类内容列表末尾，必须先滚下去（否则 find 找不到、测试假红）。
+    Future<void> scrollTo(
+      WidgetTester tester,
+      Finder target, {
+      String category = 'about',
+    }) async {
       await tester.scrollUntilVisible(
         target,
         300,
-        scrollable: find.byType(Scrollable).first,
+        // 注：scrollUntilVisible 的 scrollable 参数要匹配 Scrollable 本体（Key 在 ListView 上）。
+        scrollable: find
+            .descendant(
+              of: find.byKey(Key('settings-content-scroll-$category')),
+              matching: find.byType(Scrollable),
+            )
+            .first,
       );
       await tester.pump();
     }
@@ -264,6 +280,7 @@ void main() {
 
     testWidgets('版本卡显示应用 / 核心 / 进程 / 契约与产物路径', (WidgetTester tester) async {
       await pumpSettings(tester, full);
+      await selectCategory(tester, 'about');
       final Finder card = find.byKey(const Key('version-copy'));
       await scrollTo(tester, card);
 
@@ -288,6 +305,7 @@ void main() {
           buildWarning: null,
         ),
       );
+      await selectCategory(tester, 'about');
       await scrollTo(tester, find.byKey(const Key('version-copy')));
 
       expect(find.text('未知（未完成握手）'), findsNWidgets(2), reason: '版本与进程各一处');
@@ -307,6 +325,7 @@ void main() {
           buildWarning: '核心进程产物比界面旧：请重建核心后重启应用',
         ),
       );
+      await selectCategory(tester, 'about');
       await scrollTo(tester, find.byKey(const Key('version-copy')));
 
       expect(find.byKey(const Key('version-build-warning')), findsOneWidget);
@@ -315,11 +334,16 @@ void main() {
 
     testWidgets('插件开发卡：文档入口 + 找不到时的可读提示', (WidgetTester tester) async {
       await pumpSettings(tester, full);
+      await selectCategory(tester, 'plugins');
       // 分区标题先看一眼：ListView 会回收滚出视口的那一项，滚到卡片之后标题就不在了
-      // （设置页又多了一节「新手引导」，同一个视口里装不下标题 + 卡片）。
-      await scrollTo(tester, find.text('插件开发'));
+      // （「插件」分类下同一视口装不下标题 + 卡片）。
+      await scrollTo(tester, find.text('插件开发'), category: 'plugins');
       expect(find.text('插件开发'), findsOneWidget, reason: '分区标题');
-      await scrollTo(tester, find.byKey(const Key('plugin-docs-open')));
+      await scrollTo(
+        tester,
+        find.byKey(const Key('plugin-docs-open')),
+        category: 'plugins',
+      );
       expect(find.text('打开插件开发说明'), findsOneWidget);
       expect(
         find.textContaining('stdio JSON-RPC'),
@@ -352,6 +376,7 @@ void main() {
       });
 
       await pumpSettings(tester, full);
+      await selectCategory(tester, 'about');
       await scrollTo(tester, find.byKey(const Key('version-copy')));
       await tester.tap(find.byKey(const Key('version-copy')));
       await tester.pump();
