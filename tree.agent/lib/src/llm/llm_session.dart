@@ -7,6 +7,7 @@ import '../settings/core_settings.dart';
 import '../tool/tool_runner.dart';
 import '../util/ids.dart';
 import '../util/tokens.dart';
+import 'llm_invoker.dart';
 import 'llm_relay.dart';
 import 'llm_result_gate.dart';
 import 'llm_transport.dart';
@@ -18,7 +19,7 @@ export 'llm_result_gate.dart';
 
 /// 「LLM 处理」**接管钩子**（中转站点位 `system.relay.llm.handle`）。
 ///
-/// 返回非 null = 这一跳交给插件：会话消费这条流而**不调用** [LlmSession.transport]；
+/// 返回非 null = 这一跳交给插件：会话消费这条流而**不调用** [LlmSession.invoker]；
 /// 返回 null = 不接管（走系统 LLM）。插件侧的错误/取消用 [LlmFailureEvent] 表达，
 /// 与传输层同一个出口——超限重试、取消、报错的路径因此完全一致。
 ///
@@ -146,7 +147,8 @@ const Duration _requestClosePollInterval = Duration(seconds: 2);
 /// 会阻塞读取、把传输层的活性看门狗（默认 30s）假触发成"心跳丢失"。
 class LlmSession {
   LlmSession({
-    required this.transport,
+    LlmTransport? transport,
+    LlmInvoker? invoker,
     required this.model,
     this.tools = const <ToolSpec>[],
     this.toolRunner = const EmptyToolRunner(),
@@ -170,10 +172,15 @@ class LlmSession {
     this.llmRelay,
     this.relayTimeout = const Duration(seconds: 30),
     this.log,
-  });
+  }) : assert(
+         transport != null || invoker != null,
+         'LlmSession 需要 transport 或 invoker',
+       ),
+       invoker = invoker ?? TransportLlmInvoker(transport!);
 
-  /// 传输层（
-  final LlmTransport transport;
+  /// **LLM 调用边界**（AC-6）：默认包住 [LlmTransport]（字节完全不变）；
+  /// 插件可以传入自己的 [LlmInvoker] 接管真实调用，而工具循环保持不变。
+  final LlmInvoker invoker;
 
   /// 发往端点的模型名。
   final String model;
@@ -449,7 +456,7 @@ class LlmSession {
         ' 工具=${toolSpecs.length}${pluginStream != null ? '（插件接管）' : ''}',
       );
       final Stream<LlmStreamEvent> events = _watchRequest(
-        pluginStream ?? transport.stream(request, isCancelled: isCancelled),
+        pluginStream ?? invoker.invoke(request, isCancelled: isCancelled),
         turn: turn,
         agentId: agentId,
         sessionId: sessionId,

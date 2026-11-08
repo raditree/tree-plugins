@@ -62,6 +62,7 @@ export 'src/agent/tool_result_repair.dart';
 export 'src/agent/workspace_prompt.dart';
 export 'src/compat/protocol_types.dart';
 export 'src/llm/llm_agent_engine.dart';
+export 'src/llm/llm_invoker.dart';
 export 'src/llm/llm_json_caller.dart';
 export 'src/llm/llm_relay.dart';
 export 'src/llm/llm_result_gate.dart';

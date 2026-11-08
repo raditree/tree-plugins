@@ -8,6 +8,7 @@ import '../agent/tool_result_repair.dart';
 import '../settings/domain_settings.dart';
 import '../store/usage_log.dart';
 import '../tool/tool_runner.dart';
+import 'llm_invoker.dart';
 import 'llm_relay.dart';
 import 'llm_session.dart';
 import 'llm_transport.dart';
@@ -74,6 +75,7 @@ class LlmAgentEngine implements AgentEngine {
     this.awaitReady,
     this.usageLog,
     this.llmRelay,
+    this.invokerFactory,
     this.log,
   });
 
@@ -148,6 +150,10 @@ class LlmAgentEngine implements AgentEngine {
 
   /// **LLM 三步中转点**（AC-4，本插件自建）；null = 未接线（三步全走内置）。
   LlmRelayHook? llmRelay;
+
+  /// **LLM 调用边界工厂**（AC-6）：每次请求用解析好的传输构造 [LlmInvoker]；
+  /// null = 默认 [TransportLlmInvoker]（请求字节与接线前完全一致）。
+  final LlmInvoker Function(LlmTransport transport)? invokerFactory;
 
   /// 外设就绪闸门（可选）：**每轮生成前**在这里有界地等一下 MCP/插件预热。
   ///
@@ -308,8 +314,12 @@ class LlmAgentEngine implements AgentEngine {
         return;
       }
     }
+    final LlmTransport transport = _transportFor(config);
     final LlmSession session = LlmSession(
-      transport: _transportFor(config),
+      transport: transport,
+      // AC-6：只有显式接线时才替换调用边界；默认仍由 transport 包一层，
+      // 请求对象原样传入，字节与接线前完全一致。
+      invoker: invokerFactory?.call(transport),
       model: config.modelId,
       tools: toolSpecs,
       toolRunner: toolRunner,
