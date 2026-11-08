@@ -1,10 +1,10 @@
-// tree.storage —— 插件集合存储（ST-1：骨架 + 单库 CRUD）。
+// tree.storage —— 插件集合存储（ST-2~ST-5：CAS/cursor/tx、导入导出、隔离审计、维护）。
 //
 // 定位（docs/pluginization/tree-storage-recon.md §1/§5）：
 // - headless 插件，对其它插件只暴露**自建执行站**命令族 `storage.*`；
 // - 每团队 × 每命名空间一个库
 //   `<data_root>/storage/<team_id>/<namespace>/data.semdb`（Sembast、纯 Dart）；
-// - 命名空间缺省 = 调用方 plugin_id，其它命名空间在 ST-1 一律拒绝（白名单在 ST-4 接）；
+// - 命名空间缺省 = 调用方 plugin_id；跨命名空间由 `TREE_STORAGE_ALLOWED_PLUGINS` 白名单控制；
 // - 本文件只做接线：命令实现在 `package:tree_storage`，生产与 `--selftest` 同一套代码。
 //
 // 依赖纪律：不得 import 任何核心包（tree_core / tree_protocol）。
@@ -27,10 +27,12 @@ const String kVersion = '0.1.0';
 const String kStationName = 'storage';
 
 const String kStationReadme =
-    '插件集合存储：storage.ensure/put/get/delete/query。每团队 × 每插件一个库 '
+    '插件集合存储：storage.ensure/put/get/delete/query/tx/export/import/stats/'
+    'compact/purge。每团队 × 每插件一个库 '
     '<data_root>/storage/<team_id>/<namespace>/data.semdb；team_id 只认核心解析的 '
-    'scope，namespace 缺省=调用方 plugin_id，ST-1 拒绝一切跨命名空间访问。'
-    '调用方身份只认核心透传的 meta.source_plugin_id。';
+    'scope，namespace 缺省=调用方 plugin_id，跨命名空间需在 '
+    'TREE_STORAGE_ALLOWED_PLUGINS 白名单中。调用方身份只认核心透传的 '
+    'meta.source_plugin_id。';
 
 /// 生产与自检共用同一个服务（自检用临时数据根，靠 meta.data_dir 切换）。
 final StorageService _service = StorageService();
@@ -46,7 +48,7 @@ PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
 );
 
 Future<void> _onReady(PluginKitServer server) async {
-  server.channel.log('已上线：v$kVersion（tree.storage，ST-1）');
+  server.channel.log('已上线：v$kVersion（tree.storage，ST-2~ST-5）');
   try {
     final Map<String, dynamic> result = await server.channel.request(
       M.stationRegister,
@@ -180,7 +182,7 @@ Future<int> selfTest() async {
     check.check(
       (registration['commands'] as List<dynamic>?)?.length,
       kStorageCommands.length,
-      '命令表长度与 ST-1 一致',
+      '命令表长度与 ST-5 一致',
     );
 
     // 身份 fail-closed：核心没带 source_plugin_id ⇒ 拒绝，不猜调用方。
@@ -344,6 +346,200 @@ Future<int> selfTest() async {
       'n': 1,
     }, '两个 team 的库互不可见');
 
+    // ST-2 / TC-ST-02：CAS；rev 冲突不覆盖，错误信息带 expected/actual。
+    reply = await call('cas-1', 'storage.put', <String, dynamic>{
+      'collection': 'cas',
+      'key': 'k',
+      'value': <String, dynamic>{'v': 1},
+    });
+    check.check(payloadOf(reply)['rev'], 1, 'CAS 首次 put rev=1');
+    reply = await call('cas-2', 'storage.put', <String, dynamic>{
+      'collection': 'cas',
+      'key': 'k',
+      'value': <String, dynamic>{'v': 2},
+      'if_rev': 1,
+    });
+    check.check(payloadOf(reply)['rev'], 2, 'CAS if_rev=1 ⇒ rev=2');
+    reply = await call('cas-conflict', 'storage.put', <String, dynamic>{
+      'collection': 'cas',
+      'key': 'k',
+      'value': <String, dynamic>{'v': 3},
+      'if_rev': 1,
+    });
+    check.check(reply['code'], 'rev_conflict', 'CAS rev 不匹配 ⇒ rev_conflict');
+    check.that(
+      '${reply['error']}'.contains('if_rev=1') &&
+          '${reply['error']}'.contains('rev=2'),
+      'rev 冲突信息带 expected/actual',
+      actual: '${reply['error']}',
+    );
+    reply = await call('cas-get', 'storage.get', <String, dynamic>{
+      'collection': 'cas',
+      'key': 'k',
+    });
+    check.check(payloadOf(reply)['value'], <String, dynamic>{
+      'v': 2,
+    }, 'CAS 冲突不覆盖已有值');
+
+    // ST-2 / TC-ST-03：tx 中途失败整批回滚；成功时返回 committed + 逐项结果。
+    reply = await call('tx-rollback', 'storage.tx', <String, dynamic>{
+      'ops': <Map<String, dynamic>>[
+        <String, dynamic>{
+          'op': 'put',
+          'collection': 'txitems',
+          'key': 'ok',
+          'value': <String, dynamic>{'v': 1},
+        },
+        <String, dynamic>{
+          'op': 'put',
+          'collection': 'txitems',
+          'key': 'bad',
+          'value': <String, dynamic>{'v': 2},
+          'if_rev': 9,
+        },
+      ],
+    });
+    check.check(reply['code'], 'tx_failed', 'tx 中途失败 ⇒ tx_failed');
+    check.that(
+      '${reply['error']}'.contains('第 1 项'),
+      'tx 失败信息带第几项',
+      actual: '${reply['error']}',
+    );
+    reply = await call('tx-after', 'storage.get', <String, dynamic>{
+      'collection': 'txitems',
+      'key': 'ok',
+    });
+    check.check(payloadOf(reply)['value'], null, 'tx 回滚后无半截数据');
+    reply = await call('tx-commit', 'storage.tx', <String, dynamic>{
+      'ops': <Map<String, dynamic>>[
+        <String, dynamic>{
+          'op': 'put',
+          'collection': 'txitems',
+          'key': 'a',
+          'value': <String, dynamic>{'n': 1},
+        },
+        <String, dynamic>{
+          'op': 'put',
+          'collection': 'txitems',
+          'key': 'b',
+          'value': <String, dynamic>{'n': 2},
+        },
+        <String, dynamic>{'op': 'delete', 'collection': 'txitems', 'key': 'a'},
+      ],
+    });
+    check.check(
+      payloadOf(reply)['committed'],
+      true,
+      'tx 全部成功 ⇒ committed=true',
+    );
+    check.check(payloadOf(reply)['count'], 3, 'tx 返回逐项结果');
+    reply = await call('tx-commit-get', 'storage.get', <String, dynamic>{
+      'collection': 'txitems',
+      'key': 'b',
+    });
+    check.check(payloadOf(reply)['value'], <String, dynamic>{
+      'n': 2,
+    }, 'tx 提交后读到写入项');
+
+    // ST-2 / TC-ST-04：cursor 翻页 + 非法游标。
+    for (int i = 0; i < 5; i++) {
+      await call('page-$i', 'storage.put', <String, dynamic>{
+        'collection': 'pages',
+        'key': 'k$i',
+        'value': <String, dynamic>{'n': i},
+      });
+    }
+    reply = await call('page-first', 'storage.query', <String, dynamic>{
+      'collection': 'pages',
+      'limit': 2,
+    });
+    final String cursor = asString(payloadOf(reply)['cursor']);
+    check.that(cursor.isNotEmpty, 'query 有下一页时回 cursor', actual: cursor);
+    reply = await call('page-second', 'storage.query', <String, dynamic>{
+      'collection': 'pages',
+      'limit': 2,
+      'cursor': cursor,
+    });
+    check.check(valuesOf(reply).length, 2, 'cursor 翻页取到第二页');
+    reply = await call('bad-cursor', 'storage.query', <String, dynamic>{
+      'collection': 'pages',
+      'limit': 2,
+      'cursor': 'not-a-cursor',
+    });
+    check.check(reply['code'], 'invalid_cursor', '非法 cursor ⇒ invalid_cursor');
+
+    // ST-3 / TC-ST-05：导出 → 删除 → 导入回来，条数与内容一致。
+    reply = await call('export', 'storage.export', <String, dynamic>{
+      'collection': 'items',
+    });
+    final String exportPath = asString(payloadOf(reply)['path']);
+    check.check(payloadOf(reply)['count'], 3, 'export 导出 3 条');
+    check.that(
+      exportPath.isNotEmpty &&
+          File('$exportPath${Platform.pathSeparator}manifest.json')
+              .existsSync(),
+      'export 落到 manifest.json',
+      actual: exportPath,
+    );
+    for (final String key in <String>['a', 'b', 'c']) {
+      await call('drop-$key', 'storage.delete', <String, dynamic>{
+        'collection': 'items',
+        'key': key,
+      });
+    }
+    reply = await call('after-drop', 'storage.query', <String, dynamic>{
+      'collection': 'items',
+    });
+    check.check(payloadOf(reply)['count'], 0, '导出后删除集合（items 已空）');
+    reply = await call('import', 'storage.import', <String, dynamic>{
+      'path': exportPath,
+      'collection': 'items',
+    });
+    check.check(payloadOf(reply)['imported'], 3, 'import 恢复 3 条');
+    reply = await call('imported-get', 'storage.get', <String, dynamic>{
+      'collection': 'items',
+      'key': 'b',
+    });
+    check.check(payloadOf(reply)['value'], <String, dynamic>{
+      'tag': 'reuse',
+      'n': 3,
+    }, 'import 内容一致');
+    reply = await call('import-nonempty', 'storage.import', <String, dynamic>{
+      'path': exportPath,
+      'collection': 'items',
+    });
+    check.check(
+      reply['code'],
+      'collection_not_empty',
+      '目标集合非空 ⇒ collection_not_empty',
+    );
+
+    // ST-5：stats / compact。
+    reply = await call('stats', 'storage.stats', <String, dynamic>{});
+    final List<dynamic> collections =
+        (payloadOf(reply)['collections'] as List<dynamic>?) ?? <dynamic>[];
+    Map<String, dynamic> itemsStats = <String, dynamic>{};
+    for (final Object? entry in collections) {
+      final Map<String, dynamic> stat = asMap(entry);
+      if (asString(stat['collection']) == 'items') {
+        itemsStats = stat;
+        break;
+      }
+    }
+    check.check(itemsStats['count'], 3, 'stats 报 items count=3');
+    check.that(
+      asString(payloadOf(reply)['path']).isNotEmpty &&
+          (payloadOf(reply)['bytes'] as num? ?? 0) > 0,
+      'stats 报库文件路径与字节数',
+      actual: '${payloadOf(reply)['path']}',
+    );
+    reply = await call('compact', 'storage.compact', <String, dynamic>{});
+    check.check(
+      payloadOf(reply)['compacted'],
+      true,
+      'compact 返回 compacted=true',
+    );
+
     // 非法名 / 保留前缀。
     reply = await call('bad-collection', 'storage.put', <String, dynamic>{
       'collection': 'bad/name',
@@ -366,6 +562,33 @@ Future<int> selfTest() async {
       File(dbPath('team_a')).existsSync() &&
           File(dbPath('team_b')).existsSync(),
       '两个 team 各自落库（路径带 team_id）',
+      actual: '${dbPath('team_a')} / ${dbPath('team_b')}',
+    );
+
+    // ST-5 / TC-ST-07：purge 必须二次确认，且只删自己的 namespace。
+    reply = await call(
+      'purge-no-confirm',
+      'storage.purge',
+      <String, dynamic>{},
+    );
+    check.check(
+      reply['code'],
+      'confirmation_required',
+      'purge 未确认 ⇒ confirmation_required',
+    );
+    reply = await call('purge-other', 'storage.purge', <String, dynamic>{
+      'namespace': 'tree.other',
+      'confirm': true,
+    });
+    check.check(reply['code'], 'namespace_denied', 'purge 别人的 namespace ⇒ 拒绝');
+    reply = await call('purge', 'storage.purge', <String, dynamic>{
+      'confirm': true,
+    });
+    check.check(payloadOf(reply)['purged'], true, 'purge 确认后执行');
+    check.that(
+      !File(dbPath('team_a')).existsSync() &&
+          File(dbPath('team_b')).existsSync(),
+      'purge 只删自己的库（team_a），不影响 team_b',
       actual: '${dbPath('team_a')} / ${dbPath('team_b')}',
     );
   } catch (error) {

@@ -185,4 +185,247 @@ void main() {
       ),
     );
   });
+
+  test('ST-4：白名单调用方可跨 namespace，未授权仍 namespace_denied', () async {
+    final StorageService allowed = StorageService(
+      environment: <String, String>{
+        'TREE_STORAGE_ALLOWED_PLUGINS': 'tree.docnorm, tree.other',
+      },
+    );
+    try {
+      final Map<String, dynamic> result = await allowed.handle(
+        'storage.put',
+        <String, dynamic>{
+          'namespace': 'tree.other',
+          'collection': 'c',
+          'key': 'k',
+          'value': <String, dynamic>{'v': 1},
+        },
+        <String, dynamic>{
+          'source_plugin_id': 'tree.docnorm',
+          'data_dir': temp.path,
+        },
+        teamScope,
+      );
+      expect(result['namespace'], 'tree.other');
+      expect(
+        File(
+          '${temp.path}${Platform.pathSeparator}storage'
+          '${Platform.pathSeparator}team_a'
+          '${Platform.pathSeparator}tree.other'
+          '${Platform.pathSeparator}data.semdb',
+        ).existsSync(),
+        isTrue,
+      );
+    } finally {
+      await allowed.close();
+    }
+
+    final StorageService listed = StorageService(
+      environment: <String, String>{
+        'TREE_STORAGE_ALLOWED_PLUGINS': 'tree.other',
+      },
+    );
+    try {
+      await expectLater(
+        listed.handle(
+          'storage.put',
+          <String, dynamic>{
+            'namespace': 'tree.other',
+            'collection': 'c',
+            'key': 'k',
+            'value': <String, dynamic>{'v': 1},
+          },
+          <String, dynamic>{
+            'source_plugin_id': 'tree.docnorm',
+            'data_dir': temp.path,
+          },
+          teamScope,
+        ),
+        throwsA(
+          isA<StorageFailure>().having(
+            (StorageFailure e) => e.code,
+            'code',
+            'namespace_denied',
+          ),
+        ),
+      );
+    } finally {
+      await listed.close();
+    }
+  });
+
+  test('ST-4：写命令留结构化审计，读命令不记', () async {
+    final List<String> logs = <String>[];
+    final StorageService audited = StorageService(
+      environment: <String, String>{},
+      log: logs.add,
+    );
+    try {
+      await audited.handle(
+        'storage.put',
+        <String, dynamic>{
+          'collection': 'c',
+          'key': 'k',
+          'value': <String, dynamic>{'v': 1},
+        },
+        <String, dynamic>{
+          'source_plugin_id': 'tree.docnorm',
+          'data_dir': temp.path,
+        },
+        teamScope,
+      );
+      final Iterable<String> audit = logs.where(
+        (String line) => line.startsWith('audit '),
+      );
+      expect(audit, isNotEmpty);
+      final String line = audit.single;
+      for (final String part in <String>[
+        'caller=tree.docnorm',
+        'namespace=tree.docnorm',
+        'collection=c',
+        'op=put',
+        'key=k',
+        'bytes=',
+        'at=',
+      ]) {
+        expect(line, contains(part));
+      }
+
+      logs.clear();
+      await audited.handle(
+        'storage.get',
+        <String, dynamic>{'collection': 'c', 'key': 'k'},
+        <String, dynamic>{
+          'source_plugin_id': 'tree.docnorm',
+          'data_dir': temp.path,
+        },
+        teamScope,
+      );
+      expect(
+        logs.where((String line) => line.startsWith('audit ')),
+        isEmpty,
+        reason: '读命令不应产生审计行',
+      );
+    } finally {
+      await audited.close();
+    }
+  });
+
+  test('ST-5：purge 必须 confirm，且白名单也不能删别人的 namespace', () async {
+    final StorageService allowed = StorageService(
+      environment: <String, String>{
+        'TREE_STORAGE_ALLOWED_PLUGINS': 'tree.docnorm',
+      },
+    );
+    final Map<String, dynamic> meta = <String, dynamic>{
+      'source_plugin_id': 'tree.docnorm',
+      'data_dir': temp.path,
+    };
+    try {
+      await allowed.handle(
+        'storage.put',
+        <String, dynamic>{
+          'namespace': 'tree.other',
+          'collection': 'c',
+          'key': 'k',
+          'value': <String, dynamic>{'v': 1},
+        },
+        meta,
+        teamScope,
+      );
+      await expectLater(
+        allowed.handle(
+          'storage.purge',
+          <String, dynamic>{'namespace': 'tree.other', 'confirm': true},
+          meta,
+          teamScope,
+        ),
+        throwsA(
+          isA<StorageFailure>().having(
+            (StorageFailure e) => e.code,
+            'code',
+            'namespace_denied',
+          ),
+        ),
+      );
+      await expectLater(
+        allowed.handle(
+          'storage.purge',
+          <String, dynamic>{'confirm': false},
+          meta,
+          teamScope,
+        ),
+        throwsA(
+          isA<StorageFailure>().having(
+            (StorageFailure e) => e.code,
+            'code',
+            'confirmation_required',
+          ),
+        ),
+      );
+      final Map<String, dynamic> purged = await allowed.handle(
+        'storage.purge',
+        <String, dynamic>{'confirm': true},
+        meta,
+        teamScope,
+      );
+      expect(purged['purged'], isTrue);
+    } finally {
+      await allowed.close();
+    }
+  });
+
+  test('ST-2/ST-3/ST-5：tx / export / import / stats / compact 路由可用', () async {
+    final Map<String, dynamic> meta = <String, dynamic>{
+      'source_plugin_id': 'tree.docnorm',
+      'data_dir': temp.path,
+    };
+    final Map<String, dynamic> tx = await service.handle(
+      'storage.tx',
+      <String, dynamic>{
+        'ops': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'op': 'put',
+            'collection': 'c',
+            'key': 'k',
+            'value': <String, dynamic>{'v': 1},
+          },
+        ],
+      },
+      meta,
+      teamScope,
+    );
+    expect(tx['committed'], isTrue);
+
+    final Map<String, dynamic> exported = await service.handle(
+      'storage.export',
+      <String, dynamic>{'collection': 'c'},
+      meta,
+      teamScope,
+    );
+    final Map<String, dynamic> imported = await service.handle(
+      'storage.import',
+      <String, dynamic>{'path': exported['path'], 'collection': 'c2'},
+      meta,
+      teamScope,
+    );
+    expect(imported['imported'], 1);
+
+    final Map<String, dynamic> stats = await service.handle(
+      'storage.stats',
+      <String, dynamic>{},
+      meta,
+      teamScope,
+    );
+    expect(stats['collections'], isNotEmpty);
+
+    final Map<String, dynamic> compacted = await service.handle(
+      'storage.compact',
+      <String, dynamic>{},
+      meta,
+      teamScope,
+    );
+    expect(compacted['compacted'], isTrue);
+  });
 }

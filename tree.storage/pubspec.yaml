@@ -7,6 +7,8 @@ environment:
   sdk: ^3.13.0
 
 dependencies:
+  # 导出 manifest 的 sha256 校验（纯 Dart）。
+  crypto: ^3.0.0
   # 数据文件布局（storage/<namespace>/data.semdb）
   path: ^1.9.0
   # 纯 Dart 嵌入式数据库，零 native 依赖；追加日志 + 检查点，崩溃最多丢末条未提交写。

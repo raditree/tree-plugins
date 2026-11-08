@@ -2,7 +2,7 @@
   "id": "tree.storage",
   "name": "Tree 集合存储",
   "version": "0.1.0",
-  "description": "headless 插件：给其它插件提供统一集合存储（Sembast、纯 Dart、零原生依赖）。实例粒度 team，每团队 × 每插件一个库 <data_root>/storage/<team_id>/<namespace>/data.semdb；对外只暴露执行站命令族 storage.*（ST-1：ensure/put/get/delete/query），不 import 核心包。",
+  "description": "headless 插件：给其它插件提供统一集合存储（Sembast、纯 Dart、零原生依赖）。实例粒度 team，每团队 × 每插件一个库 <data_root>/storage/<team_id>/<namespace>/data.semdb；对外只暴露执行站命令族 storage.*（ensure/put/get/delete/query/tx/export/import/stats/compact/purge），不 import 核心包。",
   "runtime": "headless",
   "files": [
     "tree_storage.exe"
