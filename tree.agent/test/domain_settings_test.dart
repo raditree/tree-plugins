@@ -93,19 +93,13 @@ void main() {
     int saved = 0;
     settings.sink = _RecordingSink(onSave: () => saved++);
 
-    expect(
-      m1.learnTokenScale(contextChars: 3000, promptTokens: 1000),
-      isTrue,
-    );
+    expect(m1.learnTokenScale(contextChars: 3000, promptTokens: 1000), isTrue);
     expect(m1.tokenScale, 3.0);
     expect(m1.longestSessionTokens, 1000);
     expect(saved, 1);
 
     // 更短的请求不改水位线。
-    expect(
-      m1.learnTokenScale(contextChars: 2500, promptTokens: 900),
-      isFalse,
-    );
+    expect(m1.learnTokenScale(contextChars: 2500, promptTokens: 900), isFalse);
     expect(m1.tokenScale, 3.0);
 
     // 更长但比例越界（> 20）：拒绝，且不刷新水位线。
@@ -116,10 +110,7 @@ void main() {
     expect(m1.longestSessionTokens, 1000);
 
     // 更长且合法：刷新。
-    expect(
-      m1.learnTokenScale(contextChars: 5000, promptTokens: 2000),
-      isTrue,
-    );
+    expect(m1.learnTokenScale(contextChars: 5000, promptTokens: 2000), isTrue);
     expect(m1.tokenScale, 2.5);
     expect(saved, 2);
   });
@@ -132,7 +123,10 @@ void main() {
     expect(loadDomainSettings(paths).tokenAcquisitionRate, 250);
     final File agentFile = File(paths.agentSettingsFile);
     expect(agentFile.existsSync(), isTrue);
-    expect(agentFile.readAsStringSync(), contains('token_acquisition_rate: 250'));
+    expect(
+      agentFile.readAsStringSync(),
+      contains('token_acquisition_rate: 250'),
+    );
     // 平台文件不被插件改写（帧率等键原样）。
     expect(
       File(p.join(paths.root, 'config', 'settings.yaml')).readAsStringSync(),
@@ -183,6 +177,112 @@ void main() {
     expect(settings.updateModel('nope', <String, dynamic>{}), isNull);
     expect(settings.deleteModel('m3'), isTrue);
     expect(sink.deleted, <String>['m3']);
+  });
+
+  test('MP-1：旧 YAML 无 kind ⇒ chat/openai，文件不被改写、toJson 不多键', () {
+    final File m1 = File(p.join(paths.modelsDir, 'm1.yaml'));
+    final String before = m1.readAsStringSync();
+    File(p.join(paths.modelsDir, 'emb.yaml')).writeAsStringSync(
+      'model_id: emb\n'
+      'kind: embedding\n'
+      'dimensions: 1024\n'
+      'max_input_tokens: 8192\n'
+      'base_url: https://api.example.com/v1\n',
+    );
+    File(p.join(paths.modelsDir, 'jev.yaml')).writeAsStringSync(
+      'model_id: jev\n'
+      'kind: decision\n'
+      'confidence_threshold: 0.7\n'
+      'base_url: https://api.jev.example/v1\n',
+    );
+
+    final DomainSettings settings = loadDomainSettings(paths);
+    final CoreModelConfig old = settings.model('m1')!;
+    expect(old.kind, kModelKindChat);
+    expect(old.protocol, kModelProtocolOpenai);
+    expect(old.toJson().containsKey('kind'), isFalse);
+    expect(old.toJson().containsKey('protocol'), isFalse);
+    expect(old.toApiJson()['kind'], kModelKindChat);
+    expect(old.toApiJson()['protocol'], kModelProtocolOpenai);
+    expect(old.toApiJson()['dimensions'], isNull);
+    expect(old.toApiJson()['max_input_tokens'], isNull);
+    expect(old.toApiJson()['confidence_threshold'], isNull);
+    // 装载只读：旧文件逐字节不变。
+    expect(m1.readAsStringSync(), before);
+
+    final CoreModelConfig emb = settings.model('emb')!;
+    expect(emb.kind, kModelKindEmbedding);
+    expect(emb.protocol, kModelProtocolOpenai, reason: 'embedding 缺省 openai');
+    expect(emb.dimensions, 1024);
+    expect(emb.maxInputTokens, 8192);
+    expect(emb.toJson()['kind'], kModelKindEmbedding);
+    expect(emb.toJson()['dimensions'], 1024);
+    expect(emb.toJson().containsKey('protocol'), isFalse, reason: '协议=缺省时不写');
+
+    final CoreModelConfig jev = settings.model('jev')!;
+    expect(jev.kind, kModelKindDecision);
+    expect(jev.protocol, kModelProtocolJev, reason: 'decision 缺省 jev');
+    expect(jev.confidenceThreshold, 0.7);
+    expect(jev.toJson()['kind'], kModelKindDecision);
+    expect(jev.toJson()['confidence_threshold'], 0.7);
+    expect(jev.toJson().containsKey('protocol'), isFalse, reason: '协议=缺省时不写');
+  });
+
+  test('TC-MP-13：成员级覆盖不丢 kind/protocol/维度/阈值', () {
+    final CoreModelConfig embedding = CoreModelConfig(
+      modelId: 'emb',
+      kind: kModelKindEmbedding,
+      dimensions: 1024,
+      maxInputTokens: 8192,
+    );
+    final CoreModelConfig overridden = embedding.withOverrides(
+      <String, Object?>{'max_seqlen': 32000, 'thinking': true},
+    );
+    expect(overridden.kind, kModelKindEmbedding);
+    expect(overridden.protocol, kModelProtocolOpenai);
+    expect(overridden.dimensions, 1024);
+    expect(overridden.maxInputTokens, 8192);
+
+    final CoreModelConfig decision = CoreModelConfig(
+      modelId: 'jev',
+      kind: kModelKindDecision,
+      confidenceThreshold: 0.7,
+    );
+    expect(decision.protocol, kModelProtocolJev);
+    final CoreModelConfig decisionCopy = decision.withOverrides(
+      <String, Object?>{'reasoning_effort': 'max'},
+    );
+    expect(decisionCopy.kind, kModelKindDecision);
+    expect(decisionCopy.protocol, kModelProtocolJev);
+    expect(decisionCopy.confidenceThreshold, 0.7);
+  });
+
+  test('MP-1：新建三类模型按 kind 推导协议并落盘', () {
+    final _RecordingSink sink = _RecordingSink();
+    final DomainSettings settings = DomainSettings(sink: sink);
+    final CoreModelConfig? embedding = settings.createModel(<String, dynamic>{
+      'model_id': 'emb',
+      'base_url': 'https://api.example.com',
+      'api_key': 'sk-emb',
+      'kind': 'embedding',
+      'dimensions': 1024,
+    });
+    expect(embedding!.kind, kModelKindEmbedding);
+    expect(embedding.protocol, kModelProtocolOpenai);
+    expect(sink.saved.last.toJson()['kind'], kModelKindEmbedding);
+    expect(sink.saved.last.toJson()['dimensions'], 1024);
+
+    final CoreModelConfig? decision = settings.createModel(<String, dynamic>{
+      'model_id': 'jev',
+      'base_url': 'https://api.jev.example',
+      'api_key': 'sk-jev',
+      'kind': 'decision',
+      'confidence_threshold': 0.7,
+    });
+    expect(decision!.protocol, kModelProtocolJev, reason: 'kind 驱动协议默认值');
+    expect(sink.saved.last.toJson()['kind'], kModelKindDecision);
+    expect(sink.saved.last.toJson()['confidence_threshold'], 0.7);
+    expect(sink.saved.last.toApiJson().containsKey('api_key'), isFalse);
   });
 }
 

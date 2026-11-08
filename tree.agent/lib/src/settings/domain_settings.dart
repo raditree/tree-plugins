@@ -8,6 +8,28 @@ import '../yaml_utils.dart';
 /// `token_scale` 的默认值（与核心 `defaultTokenScale` 同值）。
 const double kDefaultTokenScale = 2.0;
 
+/// 模型类型（MP 系列 / D33）：三类模型协议不同，**禁止串用**。
+const String kModelKindChat = 'chat';
+const String kModelKindEmbedding = 'embedding';
+const String kModelKindDecision = 'decision';
+const List<String> kModelKinds = <String>[
+  kModelKindChat,
+  kModelKindEmbedding,
+  kModelKindDecision,
+];
+
+/// 模型协议：chat/embedding 走 OpenAI 生态（后者用 `/embeddings`），decision 走 JEV。
+const String kModelProtocolOpenai = 'openai';
+const String kModelProtocolJev = 'jev';
+const List<String> kModelProtocols = <String>[
+  kModelProtocolOpenai,
+  kModelProtocolJev,
+];
+
+/// 某类型的默认协议（旧文件缺 `protocol` 时按它补，不回写文件）。
+String defaultProtocolFor(String kind) =>
+    kind == kModelKindDecision ? kModelProtocolJev : kModelProtocolOpenai;
+
 /// 模型没配 `max_seqlen` 时的兜底上下文长度（与核心 `CoreSettings.fallbackMaxSeqlen` 同值）。
 const int kFallbackMaxSeqlen = 128000;
 
@@ -19,6 +41,11 @@ class CoreModelConfig {
   CoreModelConfig({
     required this.modelId,
     this.name = '',
+    String kind = kModelKindChat,
+    String protocol = '',
+    this.dimensions = 0,
+    this.maxInputTokens = 0,
+    this.confidenceThreshold = 0,
     this.baseUrl = '',
     this.apiKey = '',
     this.thinking = false,
@@ -29,7 +56,9 @@ class CoreModelConfig {
     this.maxOutputTokens = 0,
     this.tokenScale = kDefaultTokenScale,
     this.longestSessionTokens = 0,
-  }) : reasoningEffortOptions =
+  }) : kind = _readKind(kind),
+       protocol = _readProtocol(protocol, kind),
+       reasoningEffortOptions =
            reasoningEffortOptions ?? List<String>.of(defaultReasoningEfforts);
 
   /// token_scale 的可接受区间（超出区间的"学习样本"一律不采纳）。
@@ -45,6 +74,22 @@ class CoreModelConfig {
 
   final String modelId;
   String name;
+
+  /// 模型类型：`chat` / `embedding` / `decision`（创建后不可改，见 MP-2）。
+  String kind;
+
+  /// 协议：`openai` / `jev`（默认由 [kind] 推导）。
+  String protocol;
+
+  /// embedding 维度（必填校验在 MP-2；这里 0 = 未设置）。
+  int dimensions;
+
+  /// embedding / decision 的输入上下文上限（**不复用** [maxSeqlen]，两者口径不同）。
+  int maxInputTokens;
+
+  /// decision 的置信度阈值（(0,1)；0 = 未设置，MP-6 用）。
+  double confidenceThreshold;
+
   String baseUrl;
   String apiKey;
   bool thinking;
@@ -76,9 +121,17 @@ class CoreModelConfig {
   }
 
   /// 持久化形态（含密钥）。
+  ///
+  /// `kind` / `protocol` 等新键**只在与缺省值不同时写**：旧 chat 模型保存后仍逐键
+  /// 保持原样（旧 YAML 无新键 ⇒ 读补默认值、不回写文件，TC-MP-01）。
   Map<String, dynamic> toJson() => <String, dynamic>{
     'model_id': modelId,
     'name': name,
+    if (kind != kModelKindChat) 'kind': kind,
+    if (protocol != defaultProtocolFor(kind)) 'protocol': protocol,
+    if (dimensions > 0) 'dimensions': dimensions,
+    if (maxInputTokens > 0) 'max_input_tokens': maxInputTokens,
+    if (confidenceThreshold > 0) 'confidence_threshold': confidenceThreshold,
     'base_url': baseUrl,
     'api_key': apiKey,
     'thinking': thinking,
@@ -91,10 +144,17 @@ class CoreModelConfig {
     'longest_session_tokens': longestSessionTokens,
   };
 
-  /// 前端形态：无密钥、base_url 脱敏。
+  /// 前端形态：无密钥、base_url 脱敏；`kind` / `protocol` 始终下发（旧 UI 忽略）。
   Map<String, dynamic> toApiJson() => <String, dynamic>{
     'model_id': modelId,
     'name': name.isEmpty ? modelId : name,
+    'kind': kind,
+    'protocol': protocol,
+    'dimensions': dimensions > 0 ? dimensions : null,
+    'max_input_tokens': maxInputTokens > 0 ? maxInputTokens : null,
+    'confidence_threshold': confidenceThreshold > 0
+        ? confidenceThreshold
+        : null,
     'base_url': maskBaseUrl(baseUrl),
     'thinking': thinking,
     'if_vision': ifVision,
@@ -110,6 +170,11 @@ class CoreModelConfig {
     return CoreModelConfig(
       modelId: json['model_id'] as String? ?? '',
       name: json['name'] as String? ?? '',
+      kind: json['kind'] as String? ?? kModelKindChat,
+      protocol: json['protocol'] as String? ?? '',
+      dimensions: (json['dimensions'] as num?)?.toInt() ?? 0,
+      maxInputTokens: (json['max_input_tokens'] as num?)?.toInt() ?? 0,
+      confidenceThreshold: _readThreshold(json['confidence_threshold']),
       baseUrl: json['base_url'] as String? ?? '',
       apiKey: json['api_key'] as String? ?? '',
       thinking: json['thinking'] as bool? ?? false,
@@ -128,8 +193,33 @@ class CoreModelConfig {
   }
 
   /// 用请求体合并字段；`base_url`/`api_key` 为空串表示保留原值。
+  ///
+  /// `kind` 变更而未同时给 `protocol` 时，协议回到新类型的默认值（创建 embedding /
+  /// decision 模型不必重复写协议）；改动是否合法由 MP-2 的 API 校验负责。
   void merge(Map<String, dynamic> payload) {
     if (payload.containsKey('name')) name = payload['name'] as String? ?? name;
+    if (payload.containsKey('kind')) {
+      final String value = _readKind(payload['kind'] as String? ?? '');
+      if (value != kind) {
+        kind = value;
+        if (!payload.containsKey('protocol')) {
+          protocol = defaultProtocolFor(kind);
+        }
+      }
+    }
+    if (payload.containsKey('protocol')) {
+      protocol = _readProtocol(payload['protocol'] as String? ?? '', kind);
+    }
+    if (payload.containsKey('dimensions')) {
+      dimensions = (payload['dimensions'] as num?)?.toInt() ?? dimensions;
+    }
+    if (payload.containsKey('max_input_tokens')) {
+      maxInputTokens =
+          (payload['max_input_tokens'] as num?)?.toInt() ?? maxInputTokens;
+    }
+    if (payload.containsKey('confidence_threshold')) {
+      confidenceThreshold = _readThreshold(payload['confidence_threshold']);
+    }
     if (payload.containsKey('base_url')) {
       final String value = (payload['base_url'] as String? ?? '').trim();
       if (value.isNotEmpty) baseUrl = value;
@@ -185,11 +275,19 @@ class CoreModelConfig {
   }
 
   /// 应用成员级模型参数覆盖（只覆盖非空项，返回副本；学习状态一起带走）。
+  ///
+  /// 新字段必须在这里逐个复制：固定字段列表漏一个，成员级覆盖后 `kind` 就会回退成
+  /// chat（TC-MP-13）。
   CoreModelConfig withOverrides(Map<String, Object?> overrides) {
     if (overrides.isEmpty) return this;
     final CoreModelConfig copy = CoreModelConfig(
       modelId: modelId,
       name: name,
+      kind: kind,
+      protocol: protocol,
+      dimensions: dimensions,
+      maxInputTokens: maxInputTokens,
+      confidenceThreshold: confidenceThreshold,
       baseUrl: baseUrl,
       apiKey: apiKey,
       thinking: thinking,
@@ -217,8 +315,31 @@ class CoreModelConfig {
   }
 
   /// 模型上下文长度（前端进度条分母）；未配置时给保守兜底。
-  int get effectiveMaxSeqlen =>
-      maxSeqlen > 0 ? maxSeqlen : kFallbackMaxSeqlen;
+  int get effectiveMaxSeqlen => maxSeqlen > 0 ? maxSeqlen : kFallbackMaxSeqlen;
+
+  /// 宽容读 kind（缺失 ⇒ chat；未知值原样保留，由 MP-2 的 API 校验拒绝）。
+  static String _readKind(Object? raw) {
+    final String value = (raw ?? '').toString().trim();
+    return value.isEmpty ? kModelKindChat : value;
+  }
+
+  /// 宽容读 protocol（缺失 ⇒ 按 kind 的默认协议）。
+  static String _readProtocol(Object? raw, Object? kindRaw) {
+    final String value = (raw ?? '').toString().trim();
+    return value.isEmpty ? defaultProtocolFor(_readKind(kindRaw)) : value;
+  }
+
+  /// 读置信度阈值（num / 数字字符串；不在 (0,1) 内 ⇒ 0 = 未设置）。
+  static double _readThreshold(Object? raw) {
+    double? value;
+    if (raw is num) {
+      value = raw.toDouble();
+    } else if (raw is String) {
+      value = double.tryParse(raw.trim());
+    }
+    if (value == null || value <= 0 || value >= 1) return 0;
+    return value;
+  }
 
   /// 宽容读取 token_scale（数字或纯数字字符串都能生效，非法值回初值）。
   static double _readScale(Object? raw) {
