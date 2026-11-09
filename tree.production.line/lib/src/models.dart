@@ -326,6 +326,8 @@ Map<String, Object?> buildTaskMap(
     'title': title,
     'kind': kind,
     'status': status.wire,
+    // 需求模板是任务的组成部分（准备阶段读取），随 task.yaml 落盘。
+    if (plainMap(input['intake']).isNotEmpty) 'intake': plainMap(input['intake']),
     'priority': intOf(input['priority'], 50),
     'depends_on': dependsOn,
     'write_scope': stringsOf(input['write_scope']),

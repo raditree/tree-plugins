@@ -21,6 +21,40 @@ const List<String> kProductionCommands = <String>[
   'production.run.list',
 ];
 
+/// 一次站请求的落点：数据根 + 团队（两者缺一都 fail-closed）。
+class ProductionTarget {
+  const ProductionTarget({required this.dataRoot, required this.teamId});
+
+  final String dataRoot;
+  final String teamId;
+}
+
+/// 解析站请求的落点；P1 与 P3 两条门面共用同一口径。
+ProductionTarget resolveProductionTarget(
+  Map<String, Object?> meta,
+  Map<String, Object?> scope,
+  Map<String, String> environment,
+) {
+  final String fromMeta = textOf(meta['data_dir']);
+  final String dataRoot = fromMeta.isNotEmpty
+      ? fromMeta
+      : textOf(environment['TREE_DATA_ROOT']);
+  if (dataRoot.isEmpty) {
+    throw ProductionFailure(
+      '缺少 data_dir（核心未在站请求的 meta 里带数据根，环境变量 TREE_DATA_ROOT 也未设置）',
+      code: 'missing_data_dir',
+    );
+  }
+  final String teamId = textOf(scope['team_id']);
+  if (teamId.isEmpty) {
+    throw ProductionFailure(
+      '核心未在站请求的 scope 里带 team_id，拒绝落到公共库',
+      code: 'team_required',
+    );
+  }
+  return ProductionTarget(dataRoot: dataRoot, teamId: teamId);
+}
+
 class ProductionService {
   ProductionService({
     Map<String, String>? environment,
@@ -37,23 +71,14 @@ class ProductionService {
     Map<String, Object?> meta,
     Map<String, Object?> scope,
   ) {
-    final String dataRoot = _dataRoot(meta);
-    if (dataRoot.isEmpty) {
-      throw ProductionFailure(
-        '缺少 data_dir（核心未在站请求的 meta 里带数据根，环境变量 TREE_DATA_ROOT 也未设置）',
-        code: 'missing_data_dir',
-      );
-    }
-    final String teamId = textOf(scope['team_id']);
-    if (teamId.isEmpty) {
-      throw ProductionFailure(
-        '核心未在站请求的 scope 里带 team_id，拒绝落到公共库',
-        code: 'team_required',
-      );
-    }
+    final ProductionTarget target = resolveProductionTarget(
+      meta,
+      scope,
+      _environment,
+    );
     final ProductionStore store = ProductionStore(
-      dataRoot: dataRoot,
-      teamId: teamId,
+      dataRoot: target.dataRoot,
+      teamId: target.teamId,
       clock: _clock,
     );
     switch (command) {
@@ -154,9 +179,4 @@ class ProductionService {
     return value;
   }
 
-  String _dataRoot(Map<String, Object?> meta) {
-    final String fromMeta = textOf(meta['data_dir']);
-    if (fromMeta.isNotEmpty) return fromMeta;
-    return textOf(_environment['TREE_DATA_ROOT']);
-  }
 }

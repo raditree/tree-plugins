@@ -399,6 +399,253 @@ class ProductionStore {
     );
   }
 
+  // ── 准备阶段（P3）：inbox / prepare.json / 项目资产 / 工作空间读取 ──
+
+  /// 写回一条任务（保留未知键；写后刷新索引）。
+  TaskRecord putTask(
+    String lineId,
+    String taskId,
+    Map<String, Object?> data,
+  ) {
+    final TaskRecord task = getTask(lineId, taskId);
+    final Map<String, Object?> next = <String, Object?>{
+      ...task.data,
+      ...data,
+    };
+    _writeText(File(_taskFile(lineId, taskId)), encodeYaml(next));
+    rebuild(lineId);
+    return TaskRecord(next);
+  }
+
+  String _prepareFile(String lineId) =>
+      p.join(lineDir(lineId), 'prepare.json');
+
+  String _inboxFile(String lineId) => p.join(lineDir(lineId), 'inbox.jsonl');
+
+  /// 读准备态（窗口 + 读取预算）；不存在 / 坏 JSON ⇒ 空表（可重建）。
+  Map<String, Object?> readPrepare(String lineId) {
+    getLine(lineId);
+    final File file = File(_prepareFile(lineId));
+    if (!file.existsSync()) return <String, Object?>{};
+    return _tryReadJson(file);
+  }
+
+  void writePrepare(String lineId, Map<String, Object?> data) {
+    getLine(lineId);
+    _writeText(
+      File(_prepareFile(lineId)),
+      '${const JsonEncoder.withIndent('  ').convert(plainMap(data))}\n',
+    );
+  }
+
+  /// 读决策台账（JSONL，坏行跳过）。
+  List<Map<String, Object?>> readInbox(String lineId) {
+    final File file = File(_inboxFile(lineId));
+    if (!file.existsSync()) return <Map<String, Object?>>[];
+    final List<Map<String, Object?>> out = <Map<String, Object?>>[];
+    for (final String line in file.readAsLinesSync()) {
+      final String text = line.trim();
+      if (text.isEmpty) continue;
+      try {
+        final Object? decoded = json.decode(text);
+        if (decoded is Map) out.add(plainMap(decoded));
+      } catch (_) {
+        // 坏行跳过：一行脏数据不许毁掉整份台账。
+      }
+    }
+    return out;
+  }
+
+  /// 追加一条决策台账事件（`inbox.jsonl`，可重放）。
+  void appendInbox(String lineId, Map<String, Object?> entry) {
+    getLine(lineId);
+    final File file = File(_inboxFile(lineId));
+    file.parent.createSync(recursive: true);
+    file.writeAsStringSync(
+      '${json.encode(plainMap(entry))}\n',
+      mode: FileMode.append,
+      flush: true,
+    );
+  }
+
+  /// 产线工作空间目录（`line.yaml.workspace_dir`）；空 / 非绝对路径 ⇒ 可读失败。
+  String workspaceDirOf(String lineId) {
+    final LineRecord line = getLine(lineId);
+    final String dir = line.workspaceDir;
+    if (dir.isEmpty) {
+      throw ProductionFailure(
+        '产线未配置 workspace_dir：无法读写项目资产',
+        code: 'workspace_required',
+      );
+    }
+    if (!p.isAbsolute(dir)) {
+      throw ProductionFailure(
+        'workspace_dir 必须是绝对路径：$dir',
+        code: 'workspace_required',
+      );
+    }
+    return p.normalize(dir);
+  }
+
+  /// 项目资产根：`<workspace>/<docs.asset_dir>/<line_id>`（§7.1）。
+  String assetRoot(String lineId) {
+    final LineRecord line = getLine(lineId);
+    final Map<String, Object?> docs = plainMap(line.data['docs']);
+    final String assetDir = textOf(docs['asset_dir']).isEmpty
+        ? 'docs/production_lines'
+        : textOf(docs['asset_dir']);
+    final String workspace = workspaceDirOf(lineId);
+    return p.normalize(
+      p.joinAll(<String>[workspace, ...assetDir.split('/'), lineId]),
+    );
+  }
+
+  /// 原子写一份项目资产；[relative] 为资产根下的相对路径。
+  String writeAsset(String lineId, String relative, String content) {
+    final String root = assetRoot(lineId);
+    final String path = _safeAssetPath(root, relative);
+    _writeText(File(path), content);
+    return path;
+  }
+
+  /// 读工作空间内的文件（供 `prepare.read` 的点状读取）。
+  String readWorkspaceFile(String lineId, String relative) {
+    final String workspace = workspaceDirOf(lineId);
+    final String path = _safeWorkspacePath(workspace, relative);
+    final File file = File(path);
+    if (!file.existsSync()) {
+      throw ProductionFailure('文件不存在：$relative', code: 'not_found');
+    }
+    if (file.lengthSync() > 1024 * 1024) {
+      throw ProductionFailure(
+        '文件超过 1 MiB，拒绝在准备阶段整读：$relative',
+        code: 'file_too_large',
+      );
+    }
+    return file.readAsStringSync();
+  }
+
+  /// 工作空间内的有界检索（准备阶段的 `grep`，每会话 ≤ 2 轮）。
+  ///
+  /// 只扫文本类扩展名、跳过构建/依赖目录、最多 300 个文件 / 50 条命中：
+  /// 这是"对齐阶段不读代码"的兜底通道，不是通用搜索。
+  List<Map<String, Object?>> grepWorkspace(
+    String lineId,
+    String pattern, {
+    String path = '',
+    bool regex = false,
+    bool ignoreCase = false,
+    int maxFiles = 300,
+    int maxMatches = 50,
+  }) {
+    final String workspace = workspaceDirOf(lineId);
+    final String root = path.trim().isEmpty
+        ? workspace
+        : _safeWorkspacePath(workspace, path);
+    final RegExp expression = RegExp(
+      regex ? pattern : RegExp.escape(pattern),
+      caseSensitive: !ignoreCase,
+    );
+    const Set<String> skipDirs = <String>{
+      '.git',
+      '.dart_tool',
+      'build',
+      'node_modules',
+      '.idea',
+      '.vscode',
+      '.docnorm',
+    };
+    const Set<String> extensions = <String>{
+      'dart',
+      'md',
+      'yaml',
+      'yml',
+      'json',
+      'txt',
+      'sh',
+      'ps1',
+      'py',
+      'ts',
+      'js',
+      'vue',
+      'html',
+      'css',
+      'java',
+      'kt',
+      'swift',
+      'c',
+      'h',
+      'cpp',
+    };
+    final List<Map<String, Object?>> matches = <Map<String, Object?>>[];
+    int scanned = 0;
+    void walk(Directory dir) {
+      if (scanned >= maxFiles || matches.length >= maxMatches) return;
+      final List<FileSystemEntity> entries = dir.listSync()
+        ..sort(
+          (FileSystemEntity a, FileSystemEntity b) => a.path.compareTo(b.path),
+        );
+      for (final FileSystemEntity entity in entries) {
+        if (scanned >= maxFiles || matches.length >= maxMatches) return;
+        if (entity is Directory) {
+          if (skipDirs.contains(p.basename(entity.path))) continue;
+          walk(entity);
+          continue;
+        }
+        if (entity is! File) continue;
+        if (!extensions.contains(p.extension(entity.path).replaceFirst('.', ''))) {
+          continue;
+        }
+        if (entity.lengthSync() > 512 * 1024) continue;
+        scanned += 1;
+        List<String> lines;
+        try {
+          lines = entity.readAsLinesSync();
+        } catch (_) {
+          continue;
+        }
+        for (int i = 0; i < lines.length; i++) {
+          if (!expression.hasMatch(lines[i])) continue;
+          matches.add(<String, Object?>{
+            'path': p.relative(entity.path, from: workspace).replaceAll('\\', '/'),
+            'line': i + 1,
+            'text': lines[i].trim(),
+          });
+          if (matches.length >= maxMatches) return;
+        }
+      }
+    }
+
+    final Directory dir = Directory(root);
+    if (!dir.existsSync()) {
+      throw ProductionFailure('目录不存在：$path', code: 'not_found');
+    }
+    walk(dir);
+    return matches;
+  }
+
+  String _safeAssetPath(String root, String relative) =>
+      _safeJoin(root, relative, what: '资产路径');
+
+  String _safeWorkspacePath(String root, String relative) =>
+      _safeJoin(root, relative, what: '工作空间路径');
+
+  String _safeJoin(String root, String relative, {required String what}) {
+    final String value = relative.trim();
+    if (value.isEmpty) {
+      throw ProductionFailure('$what不能为空', code: 'invalid_arguments');
+    }
+    if (p.isAbsolute(value)) {
+      throw ProductionFailure('$what必须是相对路径：$value', code: 'invalid_arguments');
+    }
+    final String path = p.normalize(p.join(root, value));
+    final String prefix = root.endsWith(p.separator) ? root : '$root${p.separator}';
+    if (path != root && !path.startsWith(prefix)) {
+      throw ProductionFailure('$what越出根目录：$value', code: 'invalid_arguments');
+    }
+    return path;
+  }
+
   // ── 读写工具 ──────────────────────────────────────────────────────
 
   String _segment(String raw, String what) {

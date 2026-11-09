@@ -1,9 +1,12 @@
-// tree.production.line —— 标准开发流生产线（P1：数据模型 + 队列）。
+// tree.production.line —— 标准开发流生产线（P1 数据模型 + 队列；P3 准备阶段）。
 //
-// 定位（docs/pluginization/production-line-recon.md §7/§10/§11）：
+// 定位（docs/pluginization/production-line-recon.md §7/§8/§10/§11）：
 // - headless 插件，granularity=team；数据只落 `<data_root>/production_lines/<team_id>/`；
 // - `task.yaml` 是唯一真值，`state.json` 只是可由它重建的队列索引；
 // - 状态机、队列排序、依赖判据、in-flight 崩溃恢复都在领域库，入口只做协议面；
+// - P3 准备阶段：`production.prepare.*` 走需求模板 → 侦查 → 追问 → 范围/拆任务；
+//   模型经 `llm.call`、文档检索经 `docnorm.query`（缺失即 fail-closed），
+//   追问上限读 `tree.settings`（缺省回退 line.yaml / 默认 3）；
 // - 依赖纪律：不得 import 任何核心包。
 import 'dart:async';
 import 'dart:convert';
@@ -15,21 +18,35 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.production.line';
 const String kDisplayName = 'Tree 标准开发流生产线';
-const String kVersion = '0.1.0';
+const String kVersion = '0.2.0';
 
 const String kStationName = 'production';
+
+/// 追问上限的设置键。`tree.settings` 的 key 只允许字母/数字/下划线（不能带点），
+/// 所以 §8.4 里写的 `questions.max_per_round` 落成 `questions_max_per_round`
+/// （分组仍是 `questions`，UI 标题「追问」）。
+const String kQuestionLimitKey = 'questions_max_per_round';
+
 const String kStationReadme =
     '生产线 P1：production.line.create/list/get、production.task.create/list/get/'
     'transition、production.queue.next/rebuild/recover、production.run.list。'
     '数据落 `<data_root>/production_lines/<team_id>/<line_id>/`：line.yaml / '
-    'tasks/<task_id>/task.yaml / runs/<run_id>.json / state.json；task.yaml 为唯一真值，'
-    'state.json 可由它重建。状态机：draft→recon→aligning→scoped→queued→packing→packed→'
-    'running→gating→done；aligning↔awaiting_user；gating→packed（重试）；'
-    'queued/packing/packed/running/gating→blocked；blocked→awaiting_user|queued；'
-    'cancelled 可从任意非终态进入。崩溃恢复：in-flight → queued 并追加一条 '
-    'status=interrupted 的 run，重复 recover 0 写。';
+    'tasks/<task_id>/task.yaml / runs/<run_id>.json / state.json / inbox.jsonl / '
+    'prepare.json；task.yaml 为唯一真值，state.json 可由它重建。状态机：draft→recon→'
+    'aligning→scoped→queued→packing→packed→running→gating→done；aligning↔awaiting_user；'
+    'gating→packed（重试）；queued/packing/packed/running/gating→blocked；'
+    'blocked→awaiting_user|queued；cancelled 可从任意非终态进入。崩溃恢复：in-flight → '
+    'queued 并追加一条 status=interrupted 的 run，重复 recover 0 写。'
+    'P3 准备阶段：production.prepare.intake（需求模板五栏）→ recon（侦查四块 + 追问，'
+    '经 docnorm.query 取文档上下文、llm.call 出结构）→ answer / all_recommended / '
+    'window.open|close（未答转 awaiting_user、次日续答）→ read（点状读取，文件 ≤ 8 / '
+    'grep ≤ 2 轮）→ finalize（写 recon/scope/plan/decisions/acceptance + 建 queued 任务）。'
+    '追问上限读 settings，缺省回退 line.yaml.limits 与 3（夹到 1–10）。';
 
 final ProductionService _service = ProductionService();
+PreparationService? _preparation;
+PluginKitServer? _activeServer;
+final Set<String> _settingsTeams = <String>{};
 
 PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
   channel: PluginChannel.stdio(kPluginId),
@@ -41,16 +58,25 @@ PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
 );
 
 Future<void> _onReady(PluginKitServer server) async {
-  server.channel.log('已上线：v$kVersion（tree.production.line，P1 数据模型 + 队列）');
+  _activeServer = server;
+  _preparation = PreparationService(
+    llm: _callLlm,
+    docQuery: _callDocQuery,
+    limitReader: _readQuestionLimit,
+  );
+  server.channel.log('已上线：v$kVersion（tree.production.line，P1 数据 + P3 准备阶段）');
   try {
     final Map<String, dynamic> result = await server.channel.request(
       M.stationRegister,
       <String, dynamic>{
         'kind': 'execute',
         'name': kStationName,
-        'description': '生产线数据模型与队列（production.*）',
+        'description': '生产线数据模型、队列与准备阶段（production.*）',
         'readme': kStationReadme,
-        'commands': kProductionCommands,
+        'commands': <String>[
+          ...kProductionCommands,
+          ...kPreparationCommands,
+        ],
       },
     );
     server.channel.log(
@@ -61,6 +87,147 @@ Future<void> _onReady(PluginKitServer server) async {
   }
 }
 
+/// 向 `tree.agent` 的 `llm.call` 要一份 JSON：只透传本次请求的 scope（身份/团队）。
+Future<Map<String, Object?>> _callLlm(
+  String point,
+  String system,
+  String prompt,
+  Map<String, Object?> scope,
+) async {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) {
+    throw ProductionFailure('插件尚未就绪：llm.call 通道不可用', code: 'llm_unavailable');
+  }
+  final Map<String, dynamic> payload = await server.channel.command(
+    'llm.call',
+    <String, dynamic>{
+      'messages': <Map<String, dynamic>>[
+        <String, dynamic>{'role': 'system', 'content': system},
+        <String, dynamic>{'role': 'user', 'content': prompt},
+      ],
+      'temperature': 0.2,
+    },
+    '',
+    scope,
+  );
+  final Object? json = payload['json'];
+  if (json is Map) {
+    return <String, Object?>{
+      for (final MapEntry<dynamic, dynamic> entry in json.entries)
+        entry.key.toString(): entry.value,
+    };
+  }
+  final String text = asString(payload['text']);
+  final Object? decoded = _jsonFromText(text);
+  if (decoded is Map) {
+    return <String, Object?>{
+      for (final MapEntry<dynamic, dynamic> entry in decoded.entries)
+        entry.key.toString(): entry.value,
+    };
+  }
+  throw ProductionFailure(
+    '模型没有返回 JSON（$point）：${text.length > 200 ? '${text.substring(0, 200)}…' : text}',
+    code: 'llm_bad_json',
+  );
+}
+
+/// 从正文里抠第一个 JSON 对象（模型偶尔加代码围栏 / 前置说明）。
+Object? _jsonFromText(String text) {
+  final String trimmed = text.trim();
+  if (trimmed.isEmpty) return null;
+  try {
+    return json.decode(trimmed);
+  } catch (_) {
+    final int start = trimmed.indexOf('{');
+    final int end = trimmed.lastIndexOf('}');
+    if (start < 0 || end <= start) return null;
+    try {
+      return json.decode(trimmed.substring(start, end + 1));
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+/// 文档检索（`docnorm.query`）；产线工作空间就是目标仓库。
+Future<Map<String, Object?>> _callDocQuery(
+  String repo,
+  String question,
+  Map<String, Object?> scope,
+) async {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) {
+    throw ProductionFailure(
+      '插件尚未就绪：docnorm.query 通道不可用',
+      code: 'docnorm_unavailable',
+    );
+  }
+  final Map<String, dynamic> payload = await server.channel.command(
+    'docnorm.query',
+    <String, dynamic>{
+      'repo': repo,
+      'question': question,
+      'mode': 'hybrid',
+    },
+    '',
+    scope,
+  );
+  return <String, Object?>{
+    for (final MapEntry<String, dynamic> entry in payload.entries)
+      entry.key: entry.value,
+  };
+}
+
+/// 追问上限：先确保本团队的 schema 已注册，再读值；失败交回 null（走 line.yaml）。
+Future<int?> _readQuestionLimit(Map<String, Object?> scope) async {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) return null;
+  final String teamId = asString(scope['team_id']);
+  if (teamId.isEmpty) return null;
+  try {
+    if (!_settingsTeams.contains(teamId)) {
+      await server.channel.command(
+        'settings.define',
+        <String, dynamic>{'schema': _questionSchema()},
+        '',
+        scope,
+      );
+      _settingsTeams.add(teamId);
+    }
+    final Map<String, dynamic> payload = await server.channel.command(
+      'settings.get',
+      <String, dynamic>{'key': kQuestionLimitKey},
+      '',
+      scope,
+    );
+    final Object? value = payload['value'];
+    if (value is num) return value.toInt();
+    return int.tryParse('$value');
+  } catch (_) {
+    return null;
+  }
+}
+
+/// 设置在插件设置页显示的 schema（§8.4）。
+Map<String, Object?> _questionSchema() => <String, Object?>{
+  'schema_version': 1,
+  'groups': <Map<String, Object?>>[
+    <String, Object?>{'id': 'questions', 'title': '追问', 'order': 10},
+  ],
+  'fields': <Map<String, Object?>>[
+    <String, Object?>{
+      'key': kQuestionLimitKey,
+      'group': 'questions',
+      'type': 'int',
+      'title': '每轮最多追问数',
+      'default': 3,
+      'min': 1,
+      'max': 10,
+      'help': '准备阶段每轮新提问题的上限（1–10）；已提出的问题不受影响，下一轮生效。',
+    },
+  ],
+};
+
 Future<Map<String, dynamic>?> handleRequest(
   String method,
   Map<String, dynamic> params,
@@ -68,14 +235,22 @@ Future<Map<String, dynamic>?> handleRequest(
   if (method != M.stationRequest) return null;
   final Map<String, dynamic> payload = asMap(params['payload']);
   final String command = asString(payload['command']);
-  if (!kProductionCommands.contains(command)) return null;
+  final bool isPrepare = kPreparationCommands.contains(command);
+  if (!isPrepare && !kProductionCommands.contains(command)) return null;
   try {
-    final Map<String, Object?> result = _service.handle(
-      command,
-      asMap(payload['arguments']),
-      asMap(params['meta']),
-      asMap(params['scope']),
-    );
+    final Map<String, Object?> result = isPrepare
+        ? await _preparation!.handle(
+            command,
+            asMap(payload['arguments']),
+            asMap(params['meta']),
+            asMap(params['scope']),
+          )
+        : _service.handle(
+            command,
+            asMap(payload['arguments']),
+            asMap(params['meta']),
+            asMap(params['scope']),
+          );
     return <String, dynamic>{
       'reply': <String, dynamic>{'payload': result},
     };
@@ -401,6 +576,189 @@ Future<int> selfTest() async {
       jsonDecode(stateFile.readAsStringSync())['queue'],
       <String>['B', 'C'],
       'state.queue 与 task.yaml 对齐（A 已 done）',
+    );
+
+    // ── P3 准备阶段：假 docnorm / llm / settings，跑完整窗口 → 落档 ──
+    final String ws = '${temp.path}${Platform.pathSeparator}ws';
+    Directory(ws).createSync(recursive: true);
+    core.onMethod(M.stationCommand, (Map<String, dynamic> params) {
+      final String command = asString(params['command']);
+      switch (command) {
+        case 'docnorm.query':
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'mode': 'lexical',
+              'results': <Object?>[
+                <String, Object?>{
+                  'doc': 'docs/project-status.md',
+                  'heading': 'H 车道',
+                  'snippet': '生产线 P1/P2 已完成',
+                },
+              ],
+            },
+          };
+        case 'settings.define':
+          return <String, dynamic>{'ok': true, 'payload': <String, dynamic>{}};
+        case 'settings.get':
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{'value': 2},
+          };
+        case 'llm.call':
+          final List<dynamic> messages = params['arguments'] is Map
+              ? (asMap(params['arguments'])['messages'] as List<dynamic>? ??
+                    <dynamic>[])
+              : <dynamic>[];
+          final String text = messages
+              .map((dynamic item) => asString(asMap(item)['content']))
+              .join('\n');
+          if (text.contains('侦查员')) {
+            return <String, dynamic>{
+              'ok': true,
+              'payload': <String, dynamic>{
+                'json': <String, Object?>{
+                  'regular': <Object?>[
+                    <String, Object?>{
+                      'text': '改列表',
+                      'landing': 'lib/ui/agent_list.dart',
+                    },
+                  ],
+                  'special': <Object?>[
+                    <String, Object?>{'text': '本地模型', 'why': '云端慢'},
+                  ],
+                  'questions': <Object?>[
+                    for (int i = 1; i <= 5; i++)
+                      <String, Object?>{
+                        'text': '问题 $i',
+                        'default': '默认 $i',
+                        'recommended': '推荐 $i',
+                        'consequence': '后果 $i',
+                      },
+                  ],
+                  'fallbacks': <Object?>['退回云端'],
+                  'notes': <Object?>['数据库不可动'],
+                  'flags': <String>['lib/ui/agent_list.dart'],
+                },
+                'text': '{}',
+                'model': 'fake',
+              },
+            };
+          }
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'json': <String, Object?>{
+                'in': <String>['列表过滤'],
+                'out': <String>['不动数据库'],
+                'not_doing': <String>['不做搜索'],
+                'tasks': <Object?>[
+                  <String, Object?>{
+                    'id': 'T1',
+                    'title': '改列表',
+                    'acceptance': <String>['用例全绿'],
+                    'write_scope': <String>['lib/ui/agent_list.dart'],
+                  },
+                  <String, Object?>{
+                    'id': 'T2',
+                    'title': '补测试',
+                    'depends_on': <String>['T1'],
+                    'acceptance': <String>['新用例覆盖过滤'],
+                  },
+                ],
+              },
+              'text': '{}',
+              'model': 'fake',
+            },
+          };
+        default:
+          return <String, dynamic>{
+            'ok': false,
+            'error': '假核心不认的站命令：$command',
+          };
+      }
+    });
+
+    await call('prep-line', 'production.line.create', <String, Object?>{
+      'id': 'pl_prep',
+      'name': '准备阶段',
+      'workspace_dir': ws,
+    });
+    await call('prep-intake', 'production.prepare.intake', <String, Object?>{
+      'line_id': 'pl_prep',
+      'task': <String, Object?>{
+        'id': 'T_prep',
+        'title': '列表过滤',
+        'intake': <String, Object?>{
+          'goal': '会话列表能按项目过滤',
+          'current': '只有 flat 列表',
+          'acceptance': '只剩该项目会话；有测试',
+        },
+      },
+    });
+    final Map<String, dynamic> reconReply = payloadOf(
+      await call('prep-recon', 'production.prepare.recon', <String, Object?>{
+        'line_id': 'pl_prep',
+        'task_id': 'T_prep',
+      }),
+    );
+    check.check(reconReply['open'], 2, '追问上限读 settings（=2）');
+    check.check(reconReply['dropped'], 3, '超限问题被截断且计数可见');
+    check.that(
+      File(
+        <String>[ws, 'docs', 'production_lines', 'pl_prep', 'recon.md'].join(
+          Platform.pathSeparator,
+        ),
+      ).existsSync(),
+      'recon.md 落项目资产',
+    );
+
+    await call('prep-close', 'production.prepare.window.close', <String, Object?>{
+      'line_id': 'pl_prep',
+    });
+    final Map<String, dynamic> blocked = await call(
+      'prep-finalize-blocked',
+      'production.prepare.finalize',
+      <String, Object?>{'line_id': 'pl_prep', 'task_id': 'T_prep'},
+    );
+    check.check(blocked['code'], 'questions_open', '未答不实施（finalize 被拒）');
+
+    await call('prep-open', 'production.prepare.window.open', <String, Object?>{
+      'line_id': 'pl_prep',
+    });
+    final Map<String, dynamic> recommended = payloadOf(
+      await call(
+        'prep-recommended',
+        'production.prepare.all_recommended',
+        <String, Object?>{'line_id': 'pl_prep', 'task_id': 'T_prep'},
+      ),
+    );
+    check.check(recommended['open'], 0, '全部按推荐后 0 条未答');
+    check.check(recommended['ready'], true, '答完即可落档');
+
+    final Map<String, dynamic> finalized = payloadOf(
+      await call('prep-finalize', 'production.prepare.finalize', <String, Object?>{
+        'line_id': 'pl_prep',
+        'task_id': 'T_prep',
+      }),
+    );
+    check.check(
+      asMap(finalized['task'])['status'],
+      'scoped',
+      '准备任务落档后 scoped',
+    );
+    check.check(
+      (finalized['created_tasks'] as List<dynamic>).length,
+      2,
+      '拆出 2 个 queued 任务',
+    );
+    check.that(
+      File(
+        <String>[ws, 'docs', 'production_lines', 'pl_prep', 'plan.md'].join(
+          Platform.pathSeparator,
+        ),
+      ).existsSync(),
+      'plan.md 落项目资产',
     );
   } catch (error) {
     check.that(false, '自检过程未抛异常', actual: '$error');

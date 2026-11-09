@@ -1,7 +1,10 @@
-/// tree.production.line 的领域库：P1 的数据模型 / 队列 / 存储 / 命令门面。
+/// tree.production.line 的领域库：P1 数据模型 / 队列 / 存储 / 命令门面，
+/// P3 准备阶段领域与命令门面。
 library;
 
 export 'src/models.dart';
+export 'src/preparation.dart';
+export 'src/preparation_service.dart';
 export 'src/queue.dart';
 export 'src/service.dart';
 export 'src/store.dart';
