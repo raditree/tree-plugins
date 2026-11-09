@@ -97,6 +97,8 @@ jobs:
             tests: true
           - plugin: tree.agent
             tests: true
+          - plugin: tree.docnorm
+            tests: true
           - plugin: tree.storage
             tests: true
     defaults:

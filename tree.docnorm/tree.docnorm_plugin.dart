@@ -16,7 +16,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.docnorm';
 const String kDisplayName = 'Tree 文档归一化';
-const String kVersion = '0.7.0';
+const String kVersion = '0.8.0';
 const String kStationName = 'docnorm';
 const List<String> kDocnormCommands = <String>[
   'docnorm.scan',
@@ -30,12 +30,14 @@ const List<String> kDocnormCommands = <String>[
   'docnorm.commit',
   'docnorm.graph.build',
   'docnorm.export',
+  'docnorm.query',
 ];
 
 const String kStationReadme =
     '文档归一化：docnorm.scan 扫描目标仓库，返回包图（包/子包/行数/公开声明/API 面/依赖）；'
     'docnorm.contract 侦查文档契约（章节/索引/链接/CHANGELOG/门禁，规则按 内置→仓库自述 合成）；'
-    'docnorm.check 只跑 DocPolicy 四条检查；'
+    'docnorm.check [--edges] 只跑 DocPolicy 四条检查；--edges 追加六类关联边检查'
+    '（断链 / 孤儿 / 过期引用 / 未解析提及 / 跨包引用 / 术语冲突）；'
     'docnorm.plan 只读归集 git 内容变更并给出注入单元与 context_cap/stage_budget 两额度估计（stat-dirty 不产计划）；'
     'docnorm.generate 经 llm.call 为单元 README 生成缺失章节提案（三模式×三档、context_cap 闸、只补缺、失败即 degraded）；'
     'docnorm.audit [--commit] 产四类建议（reuse/split_size/split_function/api_boundary）并补全 pkg_index 的收束事实/quality/stale（阈值读策略，默认 dry-run）；'
@@ -46,7 +48,9 @@ const String kStationReadme =
     'docnorm.graph.build [--commit] [rag] 默认只建三类确定性边（belongs_to / references / mentions），'
     'rag=true 追加 GraphRAG 索引（分块 / llm.call 抽取 / Leiden 社区 / 报告 / llm.embed 向量，'
     '无 embedding 时 mode=lexical）；docnorm.export [--commit] 把集合导成 .docnorm/export/*.jsonl '
-    '（按 key 排序，可直接 diff）。六族适配器 + fallback；对目标仓库只读，'
+    '（按 key 排序，可直接 diff）；docnorm.query --mode local|global|basic|hybrid|lexical '
+    '只读检索（BM25 + cosine / 实体链接 1~2 跳 / 社区报告 reduce，默认 auto）。'
+    '六族适配器 + fallback；对目标仓库只读，'
     '写盘仅追加且必须显式 commit；缺 tree.storage 时 fail-closed。';
 
 /// 当前握手完成的插件服务（由 [_onReady] 填入），用于向 tree.storage 下站命令。
@@ -207,6 +211,27 @@ Future<Map<String, dynamic>?> handleRequest(
         'reply': <String, dynamic>{'payload': result},
       };
     }
+    if (command == 'docnorm.query') {
+      final Map<String, dynamic> scope = asMap(params['scope']);
+      Future<Map<String, dynamic>> storage(
+        String name,
+        Map<String, dynamic> args,
+      ) => _callStorage(name, args, scope);
+      Future<RagEmbedReply> embed(RagEmbedRequest request) =>
+          _callEmbed(request, scope);
+      final Map<String, Object?> result = await runQuery(
+        repo,
+        storage: storage,
+        question: asString(arguments['question']),
+        mode: asString(arguments['mode']),
+        topK: (arguments['top_k'] as num?)?.toInt() ?? 0,
+        embed: embed,
+        embeddingModel: asString(arguments['embedding_model']),
+      );
+      return <String, dynamic>{
+        'reply': <String, dynamic>{'payload': result},
+      };
+    }
     if (command == 'docnorm.baseline' || command == 'docnorm.reanalyze') {
       final Map<String, dynamic> scope = asMap(params['scope']);
       Future<Map<String, dynamic>> storage(
@@ -248,23 +273,36 @@ Future<Map<String, dynamic>?> handleRequest(
         'reply': <String, dynamic>{'payload': contract.toJson()},
       };
     }
-    // docnorm.check：只回检查面，不重复契约明细。
+    // docnorm.check：只回检查面，不重复契约明细；--edges 追加六类关联边检查。
+    final Map<String, dynamic> checkPayload = <String, dynamic>{
+      'repo': contract.repo,
+      'ok': contract.ok,
+      'rules': contract.policy.toJson(),
+      'checks': contract.checks.map((DocCheck item) => item.toJson()).toList(),
+      'violations': contract.violations
+          .map((DocViolation item) => item.toJson())
+          .toList(),
+      'unknown': contract.unknown,
+      'degraded': contract.degraded,
+    };
+    if (arguments['edges'] == true) {
+      final Map<String, dynamic> scope = asMap(params['scope']);
+      Future<Map<String, dynamic>> storage(
+        String name,
+        Map<String, dynamic> args,
+      ) => _callStorage(name, args, scope);
+      final Map<String, Object?> edgeChecks = await runEdgeChecks(
+        repo,
+        storage: storage,
+        contract: contract,
+      );
+      checkPayload['edges'] = edgeChecks;
+      if (edgeChecks['code'] == 'graph_required') {
+        checkPayload['degraded'] = true;
+      }
+    }
     return <String, dynamic>{
-      'reply': <String, dynamic>{
-        'payload': <String, dynamic>{
-          'repo': contract.repo,
-          'ok': contract.ok,
-          'rules': contract.policy.toJson(),
-          'checks': contract.checks
-              .map((DocCheck item) => item.toJson())
-              .toList(),
-          'violations': contract.violations
-              .map((DocViolation item) => item.toJson())
-              .toList(),
-          'unknown': contract.unknown,
-          'degraded': contract.degraded,
-        },
-      },
+      'reply': <String, dynamic>{'payload': checkPayload},
     };
   } on BaselineFailure catch (error) {
     return <String, dynamic>{
@@ -1216,6 +1254,31 @@ thresholds:
         (exportAgain['written'] as List<dynamic>?)?.length ?? 0,
         0,
         'export 重复运行 0 写（内容不可变）',
+      );
+
+      final Map<String, dynamic> queryReply = await askCommand(
+        'query',
+        'docnorm.query',
+        <String, dynamic>{'repo': temp.path, 'question': 'demo 职责'},
+      );
+      final Map<String, dynamic> query = asMap(queryReply['payload']);
+      check.check(query['mode'], 'hybrid', 'query 有向量走 hybrid');
+      check.that(
+        (query['results'] as List<dynamic>?)?.isNotEmpty == true,
+        'query 返回命中分块',
+      );
+
+      final Map<String, dynamic> edgesReply = await askCommand(
+        'edges',
+        'docnorm.check',
+        <String, dynamic>{'repo': temp.path, 'edges': true},
+      );
+      final Map<String, dynamic> edgesPayload = asMap(edgesReply['payload']);
+      check.that(edgesPayload['edges'] is Map, 'check --edges 返回六类关联边检查');
+      check.check(
+        asMap(edgesPayload['edges'])['edges'],
+        true,
+        '边检查标记 edges=true',
       );
     }
   } catch (error) {

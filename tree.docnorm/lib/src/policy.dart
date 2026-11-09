@@ -13,6 +13,9 @@ const Map<String, int> kDefaultThresholds = <String, int>{
   'subpackage_count': 12,
   'one_liner_chars': 60,
   'min_one_liner_chars': 8,
+  'query_k': 10,
+  'query_local_hop': 2,
+  'query_global_reports': 8,
 };
 
 /// 规则读取 / 合并失败：稳定 [code] + 人话 [message]。

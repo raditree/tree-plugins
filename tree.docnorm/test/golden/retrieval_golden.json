@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "description": "P8 GraphRAG 评测基线：18 条 golden Q（分层 / 影响面 / 引用未同步），指标 recall@5 / recall@10 与边检查 precision。夹具由 test/golden_eval_test.dart 生成。",
+  "thresholds": {
+    "recall_at_5": 0.85,
+    "recall_at_10": 0.95,
+    "edge_precision": 0.99
+  },
+  "questions": [
+    {"id": "G01", "category": "layering", "question": "网关怎么分层？", "expect_docs": ["docs/architecture.md"]},
+    {"id": "G02", "category": "layering", "question": "服务层包含哪些模块？", "expect_docs": ["docs/architecture.md", "packages/core/README.md"]},
+    {"id": "G03", "category": "layering", "question": "UI 和核心怎么通信？", "expect_docs": ["packages/ui/README.md", "docs/architecture.md"]},
+    {"id": "G04", "category": "layering", "question": "文档总览和索引在哪里？", "expect_docs": ["README.md"]},
+    {"id": "G05", "category": "layering", "question": "核心模块的职责和入口是什么？", "expect_docs": ["packages/core/README.md"]},
+    {"id": "G06", "category": "layering", "question": "租约这个术语是什么意思？", "expect_docs": ["docs/glossary.md"]},
+    {"id": "G07", "category": "impact", "question": "改网关路由会影响哪些文档？", "expect_docs": ["docs/architecture.md", "docs/api.md"]},
+    {"id": "G08", "category": "impact", "question": "改 SSE 协议会影响哪些文档？", "expect_docs": ["docs/api.md", "docs/decisions.md", "docs/glossary.md"]},
+    {"id": "G09", "category": "impact", "question": "改限流配置会影响哪些文档？", "expect_docs": ["docs/operations.md"]},
+    {"id": "G10", "category": "impact", "question": "改核心模块入口会影响哪些文档？", "expect_docs": ["packages/core/README.md", "packages/core/docs/changes.md"]},
+    {"id": "G11", "category": "impact", "question": "改回滚流程会影响哪些文档？", "expect_docs": ["docs/operations.md"]},
+    {"id": "G12", "category": "impact", "question": "改术语表会影响哪些文档？", "expect_docs": ["docs/glossary.md", "README.md"]},
+    {"id": "G13", "category": "reference", "question": "哪些文档引用了已废弃的轮询方案？", "expect_docs": ["docs/legacy.md", "docs/decisions.md"]},
+    {"id": "G14", "category": "reference", "question": "哪些引用没有同步？", "expect_docs": ["docs/legacy.md", "packages/core/docs/changes.md"]},
+    {"id": "G15", "category": "reference", "question": "旧方案为什么被废弃？", "expect_docs": ["docs/decisions.md", "docs/legacy.md"]},
+    {"id": "G16", "category": "reference", "question": "迁移记录在哪里？", "expect_docs": ["packages/core/docs/changes.md", "docs/legacy.md"]},
+    {"id": "G17", "category": "reference", "question": "鉴权在哪里完成？", "expect_docs": ["docs/api.md", "docs/architecture.md"]},
+    {"id": "G18", "category": "reference", "question": "限流和回滚怎么配置？", "expect_docs": ["docs/operations.md"]}
+  ],
+  "edge_expectations": [
+    {"kind": "broken_link", "doc": "docs/legacy.md", "detail_contains": "missing.md"},
+    {"kind": "stale_reference", "doc": "docs/operations.md", "detail_contains": "stale"},
+    {"kind": "unresolved_mention", "doc": "docs/legacy.md", "detail_contains": "sym:ghost"},
+    {"kind": "cross_package_reference", "doc": "packages/core/README.md", "detail_contains": "packages/ui/README.md"},
+    {"kind": "term_conflict", "doc": "", "detail_contains": "租约"}
+  ]
+}
