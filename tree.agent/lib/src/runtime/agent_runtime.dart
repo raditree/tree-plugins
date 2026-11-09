@@ -46,6 +46,7 @@ import '../tool/team_tool.dart';
 import '../tool/terminal_hook_manager.dart';
 import '../tool/todo_store.dart';
 import '../tool/subagent_tool.dart';
+import '../tool/tool_policy.dart';
 import '../tool/tool_run_registry.dart';
 import '../tool/tool_runs_scope.dart';
 import '../tool/tool_runs_tool.dart';
@@ -161,6 +162,7 @@ class AgentRuntime {
       hooks: terminalHooks,
       client: _stationCommand,
       scopeFor: _stationScopeFor,
+      policyFor: toolPolicyFor,
     );
     final AgentEngine resolvedEngine =
         engine ??
@@ -1498,6 +1500,30 @@ class AgentRuntime {
       loginShell,
     ].join('|');
     return 'ssh_ws_${base64Url.encode(utf8.encode(identity)).replaceAll('=', '')}';
+  }
+
+  /// 解析 agent 当前生效的工具白名单（P2）。
+  ///
+  /// - 真实 agent：读 `agents/<id>.yaml` 的 `tool_policy`（null = 全量默认）；
+  /// - 临时员工：继承会话主人的策略，再剔除 [kSubagentBlockedTools]
+  ///   （员工不能再召员工 / 建团队 / 发消息，§9.5）。
+  ///
+  /// 名册未加载时 `ownerOf` 回 null ⇒ 按真实 agent 读 YAML；临时员工没有自己的
+  /// `agents/<id>.yaml`，因此再按 id 前缀（`sub_`）叠加 block 集——找不到主人时
+  /// 只会收紧、不会放大权限（fail-closed 方向）。
+  ToolPolicy toolPolicyFor(String agentId) {
+    final String? owner = registry.ownerOf(agentId);
+    if (owner != null && owner != agentId) {
+      return toolPolicyFor(owner).inherit(block: kSubagentBlockedTools);
+    }
+    final ToolPolicy own = ToolPolicy(
+      allowed: store.agent(agentId)?.toolPolicy?.toSet(),
+    );
+    // 名册未装载（临时员工只在本会话可见）时仍按 id 前缀兜底：宁可少给工具，
+    // 也不能因为"查不到主人"就放开员工不能用的协作类工具。
+    return agentId.startsWith('sub_')
+        ? own.inherit(block: kSubagentBlockedTools)
+        : own;
   }
 
   /// 工作空间根目录（本机绝对路径；SSH 团队返回空串）。

@@ -459,6 +459,119 @@ void main() {
     });
   });
 
+  group('工具白名单（P2）', () {
+    test('GET tool-policy：404 / 目录形状 / 未配置 = null', () async {
+      await _seedAgent(paths);
+      _expectError(
+        await _call(
+          'GET',
+          '/api/agents/ghost/tool-policy',
+          paths,
+          params: <String, String>{'agentId': 'ghost'},
+        ),
+        404,
+        'agent 不存在',
+      );
+      final Map<String, dynamic> reply = await _call(
+        'GET',
+        '/api/agents/agt/tool-policy',
+        paths,
+        params: <String, String>{'agentId': 'agt'},
+      );
+      expect(reply['status'], 200);
+      final Map<String, dynamic> body = _bodyOf(reply);
+      expect(body['agent_id'], 'agt');
+      expect(body['tool_policy'], isNull);
+      final List<dynamic> catalog = body['tool_catalog'] as List<dynamic>;
+      final List<String> names = <String>[
+        for (final dynamic entry in catalog) (entry as Map)['name'] as String,
+      ];
+      expect(
+        names,
+        containsAll(<String>['read', 'write', 'list', 'grep', 'terminal', 'edit']),
+      );
+      expect(
+        catalog.every((dynamic entry) => (entry as Map)['enabled'] == true),
+        isTrue,
+      );
+      expect((body['tool_groups'] as List<dynamic>).first, <String, dynamic>{
+        'key': 'read',
+        'label': '读',
+      });
+    });
+
+    test('PATCH：写清单 / 全关 / 未知工具 400 / null 恢复默认', () async {
+      await _seedAgent(paths);
+      Future<Map<String, dynamic>> patch(Object? policy) => _call(
+        'PATCH',
+        '/api/agents/agt',
+        paths,
+        params: <String, String>{'agentId': 'agt'},
+        body: <String, dynamic>{'tool_policy': policy},
+      );
+      Future<Map<String, dynamic>> readPolicy() async {
+        final Map<String, dynamic> reply = await _call(
+          'GET',
+          '/api/agents/agt/tool-policy',
+          paths,
+          params: <String, String>{'agentId': 'agt'},
+        );
+        expect(reply['status'], 200);
+        return _bodyOf(reply);
+      }
+
+      expect((await patch(<String>['read']))['status'], 200);
+      Map<String, dynamic> body = await readPolicy();
+      expect(body['tool_policy'], <String>['read']);
+      final List<dynamic> catalog = body['tool_catalog'] as List<dynamic>;
+      for (final dynamic entry in catalog) {
+        final Map<dynamic, dynamic> row = entry as Map;
+        expect(row['enabled'], row['name'] == 'read', reason: '${row['name']}');
+      }
+
+      // 空数组 = 显式全关（不能被当成"未配置"）。
+      expect((await patch(<String>[]))['status'], 200);
+      body = await readPolicy();
+      expect(body['tool_policy'], isEmpty);
+      expect(
+        (body['tool_catalog'] as List<dynamic>).every(
+          (dynamic entry) => (entry as Map)['enabled'] == false,
+        ),
+        isTrue,
+      );
+
+      // 未知工具名 fail-closed。
+      _expectError(await patch(<String>['no_such_tool']), 400, '未知工具：no_such_tool');
+
+      // null = 恢复全量默认。
+      expect((await patch(null))['status'], 200);
+      body = await readPolicy();
+      expect(body['tool_policy'], isNull);
+      expect(
+        (body['tool_catalog'] as List<dynamic>).every(
+          (dynamic entry) => (entry as Map)['enabled'] == true,
+        ),
+        isTrue,
+      );
+    });
+
+    test('models-info 同样带 tool_policy 与目录', () async {
+      await _seedAgent(paths);
+      final Map<String, dynamic> reply = await _call(
+        'GET',
+        '/api/agents/agt/models-info',
+        paths,
+        params: <String, String>{'agentId': 'agt'},
+      );
+      expect(reply['status'], 200);
+      final Map<String, dynamic> body = _bodyOf(reply);
+      expect(body.containsKey('tool_policy'), isTrue);
+      expect(body['tool_policy'], isNull);
+      expect(body['tool_catalog'], isA<List<dynamic>>());
+      expect(body['tool_groups'], isA<List<dynamic>>());
+    });
+  });
+
   group('DELETE /api/agents/{agentId}', () {
     test('404 / 未级联 409 / 叶→根级联删除', () async {
       // 先落团队夹具再起运行时：agent 扫描只做一次。

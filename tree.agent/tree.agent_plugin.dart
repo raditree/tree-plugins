@@ -1192,24 +1192,63 @@ Future<int> selfTest() async {
     final Map<String, dynamic> infoReply =
         (byId[9]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
     check.check(infoReply['status'], 200, 'models-info：200');
-    check.check(
-      jsonDecode('${infoReply['body'] ?? '{}'}'),
-      <String, dynamic>{
-        'agent': <String, dynamic>{
-          'id': 'agt',
-          'model_id': 'm1',
-          'system_prompt': '你是夹具',
-        },
-        'models': expectedModels,
-        'overrides': <String, dynamic>{
-          'reasoning_effort': 'high',
-          'max_seqlen': 32000,
-          'max_output_tokens': 8192,
-          'compress_threshold': 0.8,
-          'thinking': true,
-        },
-      },
-      'models-info：agent 三键 + 模型池 + 覆盖项',
+    final Map<String, dynamic> infoBody =
+        (jsonDecode('${infoReply['body'] ?? '{}'}') as Map)
+            .cast<String, dynamic>();
+    check.that(
+      jsonEncode(infoBody['agent']) ==
+          jsonEncode(<String, dynamic>{
+            'id': 'agt',
+            'model_id': 'm1',
+            'system_prompt': '你是夹具',
+          }),
+      'models-info：agent 三键',
+      actual: '${infoBody['agent']}',
+    );
+    check.that(
+      '${jsonEncode(infoBody['models'])}' == '${jsonEncode(expectedModels)}',
+      'models-info：模型池与 /api/models 同源',
+      actual: '${infoBody['models']}',
+    );
+    check.that(
+      jsonEncode(infoBody['overrides']) ==
+          jsonEncode(<String, dynamic>{
+            'reasoning_effort': 'high',
+            'max_seqlen': 32000,
+            'max_output_tokens': 8192,
+            'compress_threshold': 0.8,
+            'thinking': true,
+          }),
+      'models-info：覆盖项',
+      actual: '${infoBody['overrides']}',
+    );
+    // P2 工具白名单：未配置 = null（全量默认）；目录是内置 8 项、全部可用。
+    check.that(
+      infoBody.containsKey('tool_policy') && infoBody['tool_policy'] == null,
+      'models-info：tool_policy 缺省 = null',
+      actual: '${infoBody['tool_policy']}',
+    );
+    final List<dynamic> catalog =
+        infoBody['tool_catalog'] as List<dynamic>? ?? const <dynamic>[];
+    check.that(
+      catalog.map((dynamic e) => '${(e as Map)['name']}').join(',') ==
+          'read,write,list,grep,terminal,edit,spec,tool_runs',
+      'models-info：工具目录 = 内置 8 项',
+      actual: '${catalog.map((dynamic e) => '${(e as Map)['name']}').toList()}',
+    );
+    check.that(
+      catalog.every(
+        (dynamic e) =>
+            (e as Map)['enabled'] == true &&
+            '${e['group'] ?? ''}'.isNotEmpty,
+      ),
+      'models-info：未配置时工具全开且带分组',
+      actual: '$catalog',
+    );
+    check.that(
+      (infoBody['tool_groups'] as List<dynamic>?)?.length == 6,
+      'models-info：工具分组 6 组',
+      actual: '${infoBody['tool_groups']}',
     );
 
     final Map<String, dynamic> infoMissing =

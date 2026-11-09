@@ -41,7 +41,9 @@ class CoreAgent {
     this.maxOutputTokens = 0,
     this.compressThreshold = 0,
     this.thinkingOverride,
-  }) : scores = scores ?? <String, double>{};
+    List<String>? toolPolicy,
+  }) : scores = scores ?? <String, double>{},
+       toolPolicy = toolPolicy == null ? null : List<String>.of(toolPolicy);
 
   final String id;
   String name;
@@ -109,6 +111,12 @@ class CoreAgent {
   /// 与 [maxSeqlenOverride] 等覆盖项同一语义（0/空串 = 未覆盖）。
   bool? thinkingOverride;
 
+  /// **本 Agent 的工具白名单**（P2 加法键）。
+  ///
+  /// null = 未配置（全量默认，旧 YAML 缺键即此态）；空列表 = 显式全关。
+  /// 只影响 `specsFor` 暴露给模型的工具表与 `run()` 的兜底，不改变任何既有默认。
+  List<String>? toolPolicy;
+
   final int createdAt;
   int updatedAt;
 
@@ -144,6 +152,8 @@ class CoreAgent {
     'max_output_tokens': maxOutputTokens,
     'compress_threshold': compressThreshold,
     'thinking_override': thinkingOverride,
+    // 加法键：null（未配置）不落盘，旧文件的"全量默认"语义因此保持不变。
+    if (toolPolicy != null) 'tool_policy': toolPolicy,
     'created_at': JsonTime.encode(createdAt),
     'updated_at': JsonTime.encode(updatedAt),
   };
@@ -179,6 +189,7 @@ class CoreAgent {
       maxOutputTokens: (json['max_output_tokens'] as num?)?.toInt() ?? 0,
       compressThreshold: (json['compress_threshold'] as num?)?.toDouble() ?? 0,
       thinkingOverride: json['thinking_override'] as bool?,
+      toolPolicy: toolPolicyListOf(json['tool_policy']),
       createdAt: JsonTime.decode(json['created_at']) ?? now,
       updatedAt: JsonTime.decode(json['updated_at']) ?? now,
     );
@@ -215,6 +226,19 @@ class CoreAgent {
     'created_at': createdAt,
     'updated_at': updatedAt,
   };
+}
+
+/// 解析 `tool_policy` 持久化值。
+///
+/// - null / 非 List（脏值）⇒ null = 未配置（全量默认）；
+/// - List ⇒ 去空去重的工具名（空 List = 显式全关，必须与"未配置"区分）。
+List<String>? toolPolicyListOf(Object? raw) {
+  if (raw is! List) return null;
+  return <String>{
+    for (final Object? item in raw)
+      if (item != null && item.toString().trim().isNotEmpty)
+        item.toString().trim(),
+  }.toList();
 }
 
 Map<String, double> _scoreMap(Object? raw) {

@@ -74,6 +74,22 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
   /// 上下文压缩阈值覆盖（null = 不覆盖 = 用模型默认，通常 0.8）
   double? _compressThreshold;
 
+  /// 可选工具目录（`models-info` 下发：内置 + spec/tool_runs + 插件申报 + MCP）。
+  List<Map<String, dynamic>> _toolCatalog = <Map<String, dynamic>>[];
+
+  /// 分组顺序与显示名（后端 `tool_groups`；缺省时按目录出现顺序兜底）。
+  List<Map<String, dynamic>> _toolGroups = <Map<String, dynamic>>[];
+
+  /// 当前勾选的工具名（加载时按 `tool_catalog[].enabled` 回填）。
+  Set<String> _toolsSelected = <String>{};
+
+  /// 是否改动过勾选。没改就不下发 `tool_policy`——保持"未配置 = 全量默认"，
+  /// 这样以后新增的工具对老 agent 依然默认可用。
+  bool _toolsTouched = false;
+
+  /// 是否点过「恢复默认（全开）」：保存时显式下发 `tool_policy: null`。
+  bool _toolsResetToDefault = false;
+
   /// 是否回传历史思考的本 Agent 覆盖：'' = 不覆盖（跟随模型），'true' / 'false' = 覆盖。
   ///
   /// 用三态（而不是 bool）是因为"不设置"与"显式关掉模型默认开启"必须能区分；
@@ -190,6 +206,40 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
         _compressThreshold = ovThreshold?.toDouble();
         _thinkingInitial = (overrides['thinking'] as bool?)?.toString() ?? '';
         _thinkingOverride = _thinkingInitial;
+        // 工具目录与已选（P2）：enabled 已按生效策略算好，直接回填勾选状态。
+        _toolCatalog = <Map<String, dynamic>>[
+          for (final dynamic entry
+              in (data['tool_catalog'] as List<dynamic>?) ?? const <dynamic>[])
+            if (entry is Map)
+              entry.map(
+                (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+              ),
+        ];
+        _toolGroups = <Map<String, dynamic>>[
+          for (final dynamic entry
+              in (data['tool_groups'] as List<dynamic>?) ?? const <dynamic>[])
+            if (entry is Map)
+              entry.map(
+                (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+              ),
+        ];
+        final Set<String> catalogNames = <String>{
+          for (final Map<String, dynamic> tool in _toolCatalog) '${tool['name']}',
+        };
+        final Object? rawPolicy = data['tool_policy'];
+        _toolsSelected = <String>{
+          for (final Map<String, dynamic> tool in _toolCatalog)
+            if (tool['enabled'] == true) '${tool['name']}',
+          // 插件临时离线时目录里没有它，但清单里保存过——别在下次保存时悄悄丢掉。
+          if (rawPolicy is List)
+            for (final Object? name in rawPolicy)
+              if (name != null &&
+                  name.toString().trim().isNotEmpty &&
+                  !catalogNames.contains(name.toString().trim()))
+                name.toString().trim(),
+        };
+        _toolsTouched = false;
+        _toolsResetToDefault = false;
         _loading = false;
         _loadError = null;
       });
@@ -233,6 +283,12 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
         clearThinking:
             !clearOverrides && thinkingChanged && _thinkingOverride.isEmpty,
         clearOverrides: clearOverrides,
+        // 工具白名单：没动过 = 不下发（保持"未配置 = 全量默认"）；
+        // 点过「恢复默认」= 下 null；否则下发勾选清单（空清单 = 全关）。
+        toolPolicy: _toolsTouched && !_toolsResetToDefault
+            ? (_toolsSelected.toList()..sort())
+            : null,
+        clearToolPolicy: _toolsResetToDefault,
       );
       if (!mounted) return;
       _showSnackBar(clearOverrides ? '已恢复模型默认参数' : '保存成功');
@@ -372,6 +428,33 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
         ),
         const SizedBox(height: 6),
         _buildOverridesSection(cs),
+        const SizedBox(height: 14),
+        // 工具白名单（P2）：未勾选的工具不出现、强行调用被拒。
+        Row(
+          children: <Widget>[
+            const Expanded(
+              child: Text(
+                '工具（本 Agent）',
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+              ),
+            ),
+            TextButton(
+              onPressed: _saving ? null : _resetTools,
+              style: TextButton.styleFrom(
+                visualDensity: VisualDensity.compact,
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+              ),
+              child: const Text('恢复默认（全开）', style: TextStyle(fontSize: 12)),
+            ),
+          ],
+        ),
+        Text(
+          '未勾选的工具不会出现在模型的工具表里，强行调用也会被拒绝；'
+          '临时员工继承本清单并去掉协作类工具（不能再召员工 / 建团队 / 发消息）。',
+          style: TextStyle(fontSize: 11, color: cs.outline),
+        ),
+        const SizedBox(height: 6),
+        _buildToolSection(cs),
         const SizedBox(height: 14),
         // 当前模型信息卡片
         const Text(
@@ -554,6 +637,119 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
           '压缩阈值越小越早压缩上下文。',
           style: TextStyle(fontSize: 11, color: cs.outline),
         ),
+      ],
+    );
+  }
+
+  /// 切换一个工具的勾选状态（改过勾选才会下发 `tool_policy`）。
+  void _toggleTool(String name, bool selected) {
+    setState(() {
+      if (selected) {
+        _toolsSelected.add(name);
+      } else {
+        _toolsSelected.remove(name);
+      }
+      // 点过「恢复默认」后再勾选 = 重新进入显式清单模式。
+      _toolsResetToDefault = false;
+      _toolsTouched = true;
+    });
+  }
+
+  /// 恢复默认：保存时下发 `tool_policy: null`（未配置 = 全量默认）。
+  void _resetTools() {
+    setState(() {
+      _toolsSelected = <String>{
+        for (final Map<String, dynamic> tool in _toolCatalog)
+          tool['name'].toString(),
+      };
+      _toolsTouched = true;
+      _toolsResetToDefault = true;
+    });
+  }
+
+  /// 工具目录（按后端分组顺序渲染；每组显示"已选/总数"）。
+  Widget _buildToolSection(ColorScheme cs) {
+    if (_toolCatalog.isEmpty) {
+      return Text(
+        '暂无工具目录（由后端汇总内置、插件与 MCP）；请确认插件已启动。',
+        style: TextStyle(fontSize: 11, color: cs.outline),
+      );
+    }
+    final Map<String, List<Map<String, dynamic>>> byGroup =
+        <String, List<Map<String, dynamic>>>{};
+    for (final Map<String, dynamic> tool in _toolCatalog) {
+      final String group = '${tool['group'] ?? 'plugin'}';
+      (byGroup[group] ??= <Map<String, dynamic>>[]).add(tool);
+    }
+    final List<MapEntry<String, String>> groups = <MapEntry<String, String>>[
+      for (final Map<String, dynamic> group in _toolGroups)
+        MapEntry('${group['key']}', '${group['label'] ?? group['key']}'),
+      // 目录里出现、但后端没登记的分组（旧后端 / 新插件）按出现顺序追加。
+      for (final String key in byGroup.keys)
+        if (!_toolGroups.any((Map<String, dynamic> g) => '${g['key']}' == key))
+          MapEntry(key, key),
+    ];
+    int selectedCount(List<Map<String, dynamic>> tools) {
+      int count = 0;
+      for (final Map<String, dynamic> tool in tools) {
+        if (_toolsSelected.contains(tool['name'].toString())) count++;
+      }
+      return count;
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        for (final MapEntry<String, String> group in groups)
+          if (byGroup[group.key] != null) ...<Widget>[
+            Padding(
+              padding: const EdgeInsets.only(top: 4, bottom: 2),
+              child: Row(
+                children: <Widget>[
+                  Text(
+                    group.value,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: cs.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    '${selectedCount(byGroup[group.key]!)}/'
+                    '${byGroup[group.key]!.length}',
+                    style: TextStyle(fontSize: 11, color: cs.outline),
+                  ),
+                ],
+              ),
+            ),
+            for (final Map<String, dynamic> tool in byGroup[group.key]!)
+              CheckboxListTile(
+                value: _toolsSelected.contains(tool['name'].toString()),
+                onChanged: _saving
+                    ? null
+                    : (bool? checked) => _toggleTool(
+                        tool['name'].toString(),
+                        checked == true,
+                      ),
+                dense: true,
+                visualDensity: VisualDensity.compact,
+                contentPadding: EdgeInsets.zero,
+                controlAffinity: ListTileControlAffinity.leading,
+                title: Text(
+                  tool['name'].toString(),
+                  style: const TextStyle(fontSize: 12),
+                ),
+                subtitle: '${tool['description'] ?? ''}'.trim().isEmpty
+                    ? null
+                    : Text(
+                        '${tool['description']}'.trim(),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 10.5, color: cs.outline),
+                      ),
+              ),
+          ],
       ],
     );
   }

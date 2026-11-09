@@ -880,6 +880,8 @@ class ApiService {
     String? workspaceDir,
     Map<String, dynamic>? ssh,
     bool clearSsh = false,
+    List<String>? toolPolicy,
+    bool clearToolPolicy = false,
   }) async {
     return _patchJson(
       '/api/agents/$agentId',
@@ -899,6 +901,9 @@ class ApiService {
         'workspace_dir': ?workspaceDir,
         'ssh': ?ssh,
         if (clearSsh) 'ssh': null,
+        // 工具白名单（P2）：null = 未配置（全量默认）；[] = 显式全关。
+        if (clearToolPolicy) 'tool_policy': null,
+        'tool_policy': ?toolPolicy,
       },
     );
   }

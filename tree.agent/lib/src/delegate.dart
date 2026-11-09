@@ -23,6 +23,7 @@ import 'store/tree_paths.dart';
 import 'teammates.dart';
 import 'tool/question_channel.dart';
 import 'tool/todo_store.dart';
+import 'tool/tool_policy.dart';
 import 'tool/tool_run_registry.dart';
 import 'paths.dart';
 import 'subagent_store.dart';
@@ -53,6 +54,8 @@ const String teammatesPattern =
     '/api/agents/{agentId}/teammates'; // 团队名册 #10（团队组）
 const String agentModelsInfoPattern =
     '/api/agents/{agentId}/models-info'; // agent 定义 #6
+const String agentToolPolicyPattern =
+    '/api/agents/{agentId}/tool-policy'; // agent 工具白名单（P2 新增）
 const String messagesPattern =
     '/api/agents/{agentId}/messages'; // C-08 新增：发消息
 const String cancelPattern =
@@ -868,10 +871,55 @@ Future<Map<String, dynamic>> _dispatchDelegate(
         touched = true;
       }
     }
+    // 工具白名单（P2 加法键）：null = 恢复全量默认；数组 = 显式清单（空数组 = 全关）。
+    bool toolPolicyChanged = false;
+    if (body.containsKey('tool_policy')) {
+      final Object? raw = body['tool_policy'];
+      if (raw == null) {
+        agent.toolPolicy = null;
+        toolPolicyChanged = true;
+        touched = true;
+      } else if (raw is List) {
+        final List<String> names = <String>[];
+        for (final Object? item in raw) {
+          final String name = (item ?? '').toString().trim();
+          if (name.isNotEmpty && !names.contains(name)) names.add(name);
+        }
+        // 未知工具名 fail-closed：多半是插件已卸载或拼错。静默吞掉会让用户
+        // 以为"已开启"，实际永远不出现；已在该 agent 存量清单里的名字放行，
+        // 避免"插件临时离线时连原样保存都做不到"。
+        await runtime.refreshContributedTools();
+        final Set<String> known = <String>{
+          for (final ToolCatalogEntry entry
+              in runtime.stationToolRunner.catalogFor(agentId: agentId))
+            entry.name,
+          ...?agent.toolPolicy,
+        };
+        final List<String> unknown = <String>[
+          for (final String name in names)
+            if (!known.contains(name)) name,
+        ];
+        if (unknown.isNotEmpty) {
+          return _jsonReply(400, <String, dynamic>{
+            'detail': '未知工具：${unknown.join(', ')}',
+          });
+        }
+        agent.toolPolicy = names;
+        toolPolicyChanged = true;
+        touched = true;
+      } else {
+        return _jsonReply(400, <String, dynamic>{
+          'detail': 'tool_policy 必须是工具名数组，或 null 恢复全量默认',
+        });
+      }
+    }
     if (touched) {
       agent.updatedAt = DateTime.now().millisecondsSinceEpoch;
       runtime.store.putAgent(agent);
     }
+    // 工具表是请求前缀的一部分：策略变了必须丢弃该 agent 的工具表快照，
+    // 否则下一轮还会带着旧工具表（多付一次前缀缓存的钱、且白名单不生效）。
+    if (toolPolicyChanged) runtime.llmEngine?.invalidateToolSnapshots(agentId);
     // 目录改动 = 团队共享目录变了：与核心一样把生效目录镜像给成员。
     if (workspaceDirChanged) {
       await syncWorkspaceMirrors(
@@ -1146,6 +1194,32 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     return _jsonReply(200, <String, dynamic>{'models': readModels(paths)});
   }
 
+  // 工具白名单（P2）：已选 + 可选工具目录（内置 + spec/tool_runs + 插件申报 + MCP）。
+  if (method == 'GET' && _matches(agentToolPolicyPattern, path)) {
+    final String agentId = _str(params['agentId']);
+    final AgentRuntime runtime = _runtimeFor(paths, runtimeFor);
+    final CoreAgent? agent = runtime.store.agent(agentId);
+    if (agent == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
+    }
+    // 目录里的插件工具来自收集站：先刷新，保证"刚装的插件"这一轮就能勾选。
+    await runtime.refreshContributedTools();
+    return _jsonReply(200, <String, dynamic>{
+      'agent_id': agentId,
+      // null = 未配置（全量默认）；[] = 显式全关。UI 靠这个区分"全选"与"全不选"。
+      'tool_policy': agent.toolPolicy,
+      'tool_catalog': <Map<String, dynamic>>[
+        for (final ToolCatalogEntry entry
+            in runtime.stationToolRunner.catalogFor(agentId: agentId))
+          entry.toApiJson(),
+      ],
+      'tool_groups': <Map<String, dynamic>>[
+        for (final MapEntry<String, String> group in kToolGroupLabels.entries)
+          <String, dynamic>{'key': group.key, 'label': group.value},
+      ],
+    });
+  }
+
   if (method == 'GET' &&
       (_matches(todosPattern, path) ||
           _matches(subagentsPattern, path) ||
@@ -1184,7 +1258,11 @@ Future<Map<String, dynamic>> _dispatchDelegate(
         'subagents': roster,
       });
     }
-    // models-info：agent 三键 + 模型池 + 真正设置过的覆盖项。
+    // models-info：agent 三键 + 模型池 + 真正设置过的覆盖项 + 工具白名单（P2）。
+    // 工具目录与 `GET /tool-policy` 同源（运行时的 stationToolRunner），保证
+    // 两处看到的"可选工具"永远一致。
+    final AgentRuntime runtime = _runtimeFor(paths, runtimeFor);
+    await runtime.refreshContributedTools();
     return _jsonReply(200, <String, dynamic>{
       'agent': <String, dynamic>{
         'id': agent.id,
@@ -1193,6 +1271,16 @@ Future<Map<String, dynamic>> _dispatchDelegate(
       },
       'models': readModels(paths),
       'overrides': memberOverridesOf(agent),
+      'tool_policy': agent.toolPolicy,
+      'tool_catalog': <Map<String, dynamic>>[
+        for (final ToolCatalogEntry entry
+            in runtime.stationToolRunner.catalogFor(agentId: agentId))
+          entry.toApiJson(),
+      ],
+      'tool_groups': <Map<String, dynamic>>[
+        for (final MapEntry<String, String> group in kToolGroupLabels.entries)
+          <String, dynamic>{'key': group.key, 'label': group.value},
+      ],
     });
   }
 

@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'paths.dart';
+import 'store/records.dart';
 import 'yaml_utils.dart';
 
 /// agent 配置视图（models-info 需要的字段子集）。
@@ -18,6 +19,7 @@ class AgentConfigView {
     required this.maxOutputTokens,
     required this.compressThreshold,
     required this.thinkingOverride,
+    required this.toolPolicy,
   });
 
   final String id;
@@ -28,6 +30,9 @@ class AgentConfigView {
   final int maxOutputTokens;
   final double compressThreshold;
   final bool? thinkingOverride;
+
+  /// 工具白名单：null = 未配置（全量默认）；[] = 显式全关。
+  final List<String>? toolPolicy;
 }
 
 /// 读 `agents/<id>.yaml`。
@@ -56,6 +61,7 @@ AgentConfigView? readAgentConfig(
       compressThreshold:
           (json['compress_threshold'] as num?)?.toDouble() ?? 0,
       thinkingOverride: json['thinking_override'] as bool?,
+      toolPolicy: toolPolicyListOf(json['tool_policy']),
     );
   } catch (_) {
     return null;

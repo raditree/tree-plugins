@@ -1,5 +1,6 @@
 import 'spec_tool.dart';
 import 'terminal_hook_manager.dart';
+import 'tool_policy.dart';
 import 'tool_runner.dart';
 import '../station/tool_contributions.dart';
 import '../workspace/station_command.dart';
@@ -18,6 +19,7 @@ class StationToolRunner implements ToolRunner {
     this.toolRunsRunner,
     this.specRunner,
     this.hooks,
+    this.policyFor,
   });
 
   final StationCommandClient client;
@@ -40,9 +42,44 @@ class StationToolRunner implements ToolRunner {
   /// terminal hook 管理器（start/status/cancel + 完成唤醒）。
   final TerminalHookManager? hooks;
 
+  /// 本 agent 的工具白名单解析（临时员工在这里继承父级）。
+  ///
+  /// 未接线 ⇒ 全量默认：工具层不自己读 `agents/*.yaml`，身份到策略的映射由
+  /// 运行时决定（工具层只认 `agentId`）。
+  final ToolPolicy Function(String agentId)? policyFor;
+
+  /// [agentId] 当前生效的策略（未接线 = 全量默认）。
+  ToolPolicy policyOf(String agentId) =>
+      policyFor?.call(agentId) ?? ToolPolicy.unrestricted;
+
+  /// 本 agent 可用的工具声明（白名单里没有的工具**不出现**）。
   @override
-  List<ToolSpec> specsFor({required String agentId, required String sessionId}) =>
-      <ToolSpec>[
+  List<ToolSpec> specsFor({required String agentId, required String sessionId}) {
+    final List<ToolSpec> specs = _buildSpecs();
+    final ToolPolicy policy = policyOf(agentId);
+    if (policy.isUnrestricted) return specs;
+    return <ToolSpec>[
+      for (final ToolSpec spec in specs)
+        if (policy.allows(spec.name)) spec,
+    ];
+  }
+
+  /// 可选工具目录（**不过滤**）：模型配置页要同时看到已选与未选的工具。
+  List<ToolCatalogEntry> catalogFor({required String agentId}) {
+    final ToolPolicy policy = policyOf(agentId);
+    return <ToolCatalogEntry>[
+      for (final ToolSpec spec in _buildSpecs())
+        ToolCatalogEntry(
+          name: spec.name,
+          description: spec.description,
+          group: toolGroupOf(spec.name),
+          enabled: policy.allows(spec.name),
+        ),
+    ];
+  }
+
+  /// 全部工具声明（内置 + spec / tool_runs + 贡献工具），不做白名单过滤。
+  List<ToolSpec> _buildSpecs() => <ToolSpec>[
         ToolSpec(
           name: 'read',
           description: '读取工作空间内的文件（相对路径；可指定起始行与行数）。',
@@ -156,6 +193,18 @@ class StationToolRunner implements ToolRunner {
     ToolInvocation invocation, {
     bool Function()? isCancelled,
   }) async {
+    // 二次兜底：模型可能记住旧工具名（工具表本轮已过滤，它仍按历史消息发起调用）。
+    // 只拦"目录里确实存在、但本 agent 未勾选"的工具；不存在的工具仍走原有未知分支。
+    final ToolPolicy policy = policyOf(invocation.agentId);
+    if (!policy.isUnrestricted &&
+        !policy.allows(invocation.name) &&
+        _buildSpecs().any((ToolSpec spec) => spec.name == invocation.name)) {
+      return ToolOutcome(
+        '工具「${invocation.name}」未在该 agent 的工具白名单中，已拒绝执行'
+        '（需要时可在模型配置页勾选）。',
+        isError: true,
+      );
+    }
     final Map<String, dynamic> scope =
         scopeFor(invocation.agentId, invocation.sessionId);
     try {
