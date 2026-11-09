@@ -13,12 +13,14 @@ import '../agent/question_store.dart';
 import '../agent/subagent_service.dart';
 import '../agent_store.dart';
 import '../compat/protocol_types.dart';
+import '../llm/embedding_client.dart';
 import '../llm/llm_agent_engine.dart';
 import '../llm/llm_json_caller.dart';
 import '../llm/llm_relay.dart';
 import '../llm/llm_summarizer.dart';
 import '../paths.dart';
 import '../settings/core_settings.dart';
+import '../settings/domain_settings.dart';
 import '../settings/file_settings_sink.dart';
 import '../settings/ssh_config.dart';
 import '../spec/spec_service.dart';
@@ -256,6 +258,9 @@ class AgentRuntime {
 
   /// 运行中工具登记表（与核心同一实现；工具编排接线后由工具执行器登记）。
   late final ToolRunRegistry toolRuns = ToolRunRegistry();
+
+  /// 模型池 embedding 客户端（MP-5）：`llm.embed` 宿主命令的唯一出口。
+  late final EmbeddingClient _embeddingClient = EmbeddingClient();
 
   /// 已广播的帧（有上限，测试/排障用；运行期真正出口是 A4 的站内主题）。
   final List<Map<String, dynamic>> frames = <Map<String, dynamic>>[];
@@ -718,6 +723,7 @@ class AgentRuntime {
         final ToolOutcome r = await MessageTool.run(invocation, messageDispatcher);
         return <String, dynamic>{'text': r.content, 'is_error': r.isError};
       case 'llm.call':
+      case 'llm.embed':
       case 'fs.read':
       case 'tool.call':
       case 'agent.compact':
@@ -902,6 +908,8 @@ class AgentRuntime {
     switch (command) {
       case 'llm.call':
         return _llmCall(arguments, invocation.agentId, invocation.sessionId);
+      case 'llm.embed':
+        return _llmEmbed(arguments);
       case 'fs.read':
         return _fsRead(arguments, invocation.agentId, invocation.sessionId);
       case 'tool.call':
@@ -951,6 +959,77 @@ class AgentRuntime {
   static String? _responseFormatOf(Object? raw) {
     final String value = raw is Map ? _text(raw['type']) : _text(raw);
     return value.toLowerCase() == 'text' ? 'text' : null;
+  }
+
+  /// 模型池 embedding（MP-5 / DN-9）：`inputs` + 可选 `model`。
+  ///
+  /// 不绑定 agent：显式 `model` 只认 `kind=embedding`；未显式指定时按 model_id
+  /// 排序取第一个 embedding 模型。`inputs` 为空**不发 HTTP**，只回模型与维度，
+  /// 供调用方在建索引前判断"有没有 embedding 可用"（无则降级 lexical）。
+  Future<Map<String, dynamic>> _llmEmbed(Map<String, dynamic> arguments) async {
+    final List<String> inputs = <String>[
+      for (final Object? item in (arguments['inputs'] as List<dynamic>? ??
+          const <dynamic>[]))
+        if (item != null && item.toString().isNotEmpty) item.toString(),
+    ];
+    final String requested = _text(arguments['model']);
+    CoreModelConfig? model = requested.isEmpty
+        ? null
+        : settings.domain.model(requested);
+    if (model == null && requested.isEmpty) {
+      final List<CoreModelConfig> models = settings.domain.models();
+      for (final CoreModelConfig item in models) {
+        if (item.kind == kModelKindEmbedding) {
+          model = item;
+          break;
+        }
+      }
+    }
+    if (model == null) {
+      return <String, dynamic>{
+        'error': requested.isEmpty
+            ? '没有可用的 embedding 模型（请在模型池创建 kind=embedding 的模型）'
+            : '模型不存在：$requested',
+        'code': 'no_embedding_model',
+      };
+    }
+    if (model.kind != kModelKindEmbedding) {
+      return <String, dynamic>{
+        'error': '模型 ${model.modelId} 是 ${model.kind}，不是 embedding 模型',
+        'code': 'not_embedding_model',
+        'model': model.modelId,
+      };
+    }
+    try {
+      final EmbeddingResult result = await _embeddingClient.embed(
+        model: model,
+        inputs: inputs,
+      );
+      return <String, dynamic>{
+        'ok': true,
+        'model': result.modelId,
+        'dimensions': result.dimensions > 0
+            ? result.dimensions
+            : model.dimensions,
+        'count': result.vectors.length,
+        'vectors': result.vectors,
+        'usage': <String, Object?>{'prompt_tokens': result.promptTokens},
+      };
+    } on EmbeddingFailure catch (error) {
+      return <String, dynamic>{
+        'error': error.message,
+        'code': error.code,
+        'model': model.modelId,
+        'dimensions': model.dimensions,
+      };
+    } catch (error) {
+      return <String, dynamic>{
+        'error': 'embedding 调用异常：$error',
+        'code': 'embedding_error',
+        'model': model.modelId,
+        'dimensions': model.dimensions,
+      };
+    }
   }
 
   /// 读目标 agent 工作空间里的文件（目录解析只在 tree.agent 里做一份）。

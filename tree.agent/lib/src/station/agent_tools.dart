@@ -27,6 +27,7 @@ const List<String> kAgentToolCommands = <String>[
 /// 命令名**逐字沿用**旧口径，所以 compact / sample 等调用方一行都不用改。
 const List<String> kAgentHostCommands = <String>[
   'llm.call',
+  'llm.embed',
   'fs.read',
   'tool.call',
   'agent.compact',
@@ -37,6 +38,7 @@ const String kAgentToolsReadme =
     'tree.agent 的领域工具原语：todo.* / question.ask / subagent.run / team.run / '
     'message.run。extra-tools 插件把模型工具调用转到这里；核心只路由，不实现语义。 '
     '宿主能力：llm.call（复用目标 agent 的模型，缺省 JSON / 显式 text）/ '
+    'llm.embed（模型池 kind=embedding，OpenAI 兼容 /embeddings，空 inputs 只回模型与维度）/ '
     'fs.read（按 agent 工作空间解析后读文件）/ tool.call（内置或贡献工具同一入口）/ '
     'agent.compact（与 REST /compact 同一实现）/ session.rename（改会话标题并广播）。 '
     '失败回包是 {error, payload}：llm.call 的失败也带模型正文原文（可抢救，不白花）。';

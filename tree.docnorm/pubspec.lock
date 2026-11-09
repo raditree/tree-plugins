@@ -401,5 +401,13 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "3.1.4"
+  yograph:
+    dependency: "direct main"
+    description:
+      name: yograph
+      sha256: ff370ebf8d8ff932a9009d3487905c99da49ca38d067f09e343ebfdffc0e2ab8
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.5.1"
 sdks:
   dart: ">=3.13.0 <4.0.0"

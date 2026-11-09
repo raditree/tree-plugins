@@ -4,23 +4,37 @@ import 'package:path/path.dart' as p;
 
 import 'baseline.dart';
 import 'contract.dart';
+import 'generate.dart';
+import 'plan.dart';
 import 'policy.dart';
+import 'rag.dart';
 import 'scan.dart';
 
-/// `docnorm.graph.build [--commit]`：只建文档的**三类确定性边**（DN-8）。
+/// `docnorm.graph.build [--commit] [rag]`：建文档图。
 ///
+/// DN-8（默认）：只建**三类确定性边**：
 /// - `belongs_to`：文档 → 所属包（按最具体包 root）；
 /// - `references`：文档 → 文档（仓内可解析的相对链接，复用契约链接解析与
 ///   `link_fallbacks`）；
 /// - `mentions`：文档 → 符号（策略 `mentions` 点名 + 包公开声明名在文档中出现）。
 ///
-/// 全程确定性、无 LLM；默认 dry-run，`commit` 才写 `graph_nodes` / `graph_edges`
-/// （只删本仓前缀内本次不再生成的记录）。
+/// DN-9（`rag: true`）：在确定性图之上追加 GraphRAG 索引——分块、LLM 实体/关系
+/// 抽取（按 chunkHash 缓存）、Leiden 社区、社区报告、embedding 向量；无 embedding
+/// 模型时索引跳过并标 `mode: lexical`。
+///
+/// 默认 dry-run，`commit` 才写 `graph_nodes` / `graph_edges` 与四个 RAG 集合；
+/// 只删本仓前缀内本次不再生成的记录；重复运行 0 写。
 Future<Map<String, Object?>> runGraphBuild(
   String repo, {
   required StorageCall storage,
   bool commit = false,
   String runId = '',
+  bool rag = false,
+  LlmCall? llm,
+  RagEmbedCall? embed,
+  Map<String, Object?> overrides = const <String, Object?>{},
+  Map<String, String>? environment,
+  String embeddingModel = '',
 }) async {
   final GitRepository git = await GitRepository.open(repo);
   final RepoIndex index = await RepoIndex.load(repo);
@@ -47,18 +61,21 @@ Future<Map<String, Object?>> runGraphBuild(
 
   void addEdge(String kind, String from, String to, {String source = ''}) {
     final String id = 'e-${_fnv1a('$kind|$from|$to')}';
-    edges.putIfAbsent(id, () => <String, Object?>{
-      'schema': 1,
-      'repo': repoKey,
-      'id': id,
-      'kind': kind,
-      'from': from,
-      'to': to,
-      'from_kind': from.split(':').first,
-      'to_kind': to.split(':').first,
-      if (source.isNotEmpty) 'source': source,
-      'confidence': 1.0,
-    });
+    edges.putIfAbsent(
+      id,
+      () => <String, Object?>{
+        'schema': 1,
+        'repo': repoKey,
+        'id': id,
+        'kind': kind,
+        'from': from,
+        'to': to,
+        'from_kind': from.split(':').first,
+        'to_kind': to.split(':').first,
+        if (source.isNotEmpty) 'source': source,
+        'confidence': 1.0,
+      },
+    );
   }
 
   for (final PackageUnit unit in scan.packages) {
@@ -174,6 +191,42 @@ Future<Map<String, Object?>> runGraphBuild(
     });
   }
 
+  RagBuildResult? ragResult;
+  final Map<String, Map<String, Map<String, Object?>>> ragDesired =
+      <String, Map<String, Map<String, Object?>>>{};
+  final Map<String, Map<String, Map<String, Object?>>> ragExisting =
+      <String, Map<String, Map<String, Object?>>>{};
+  if (rag) {
+    if (llm == null || embed == null) {
+      throw BaselineFailure(
+        'graph.build 的 rag=true 需要 llm 与 embed 通道（llm.call / llm.embed）',
+        code: 'rag_unavailable',
+      );
+    }
+    final DocnormConfig config = DocnormConfig.load(
+      index,
+      environment: environment,
+      overrides: overrides,
+    );
+    ragResult = await buildRagIndex(
+      index,
+      contract: contract,
+      repoKey: repoKey,
+      store: store,
+      config: config,
+      llm: llm,
+      embed: embed,
+      baseNodes: nodes,
+      baseEdges: edges,
+      commit: commit,
+      embeddingModel: embeddingModel,
+    );
+    nodes.addAll(ragResult.nodes);
+    edges.addAll(ragResult.edges);
+    ragDesired.addAll(ragResult.desired);
+    ragExisting.addAll(ragResult.existing);
+  }
+
   final Map<String, Map<String, Object?>> desiredNodes =
       <String, Map<String, Object?>>{
         for (final MapEntry<String, Map<String, Object?>> entry
@@ -189,20 +242,32 @@ Future<Map<String, Object?>> runGraphBuild(
 
   final Map<String, Map<String, Object?>> existingNodes =
       <String, Map<String, Object?>>{
-        for (final StoredRecord record
-            in await store.scan('graph_nodes', '$repoKey#'))
+        for (final StoredRecord record in await store.listAll(
+          'graph_nodes',
+          '$repoKey#',
+        ))
           record.key: record.value,
       };
   final Map<String, Map<String, Object?>> existingEdges =
       <String, Map<String, Object?>>{
-        for (final StoredRecord record
-            in await store.scan('graph_edges', '$repoKey#'))
+        for (final StoredRecord record in await store.listAll(
+          'graph_edges',
+          '$repoKey#',
+        ))
           record.key: record.value,
       };
 
   final List<Map<String, Object?>> writes = <Map<String, Object?>>[];
   _collectWrites('graph_nodes', existingNodes, desiredNodes, writes);
   _collectWrites('graph_edges', existingEdges, desiredEdges, writes);
+  for (final String collection in kRagCollections) {
+    _collectWrites(
+      collection,
+      ragExisting[collection] ?? <String, Map<String, Object?>>{},
+      ragDesired[collection] ?? <String, Map<String, Object?>>{},
+      writes,
+    );
+  }
 
   bool applied = false;
   if (commit && writes.isNotEmpty) {
@@ -213,10 +278,7 @@ Future<Map<String, Object?>> runGraphBuild(
           'op': write['op'],
           'collection': write['collection'],
           'key': write['key'],
-          if (write['op'] == 'put')
-            'value': write['collection'] == 'graph_nodes'
-                ? desiredNodes[write['key']]
-                : desiredEdges[write['key']],
+          if (write['op'] == 'put') 'value': write['value'],
         },
     ]);
     applied = true;
@@ -254,7 +316,10 @@ Future<Map<String, Object?>> runGraphBuild(
     'repo': index.root,
     'repo_key': repoKey,
     'run_id': runId.trim().isEmpty ? 'graph-$digest' : runId.trim(),
-    'mode': 'deterministic',
+    'mode': ragResult == null
+        ? 'deterministic'
+        : '${ragResult.summary['mode'] ?? 'lexical'}',
+    'link_mode': 'deterministic',
     'dry_run': !commit,
     'committed': commit,
     'git': changes.toJson(),
@@ -268,13 +333,18 @@ Future<Map<String, Object?>> runGraphBuild(
       'docs': contract.docs.length,
       'packages': scan.packages.length,
     },
+    if (ragResult != null) 'rag': ragResult.summary,
     'writes': writes,
     'storage': <String, Object?>{'applied': applied, 'ops': writes.length},
     'notes': <String>[
-      '只做三类确定性边：belongs_to / references / mentions；无 LLM、无分块',
+      if (ragResult == null)
+        '只做三类确定性边：belongs_to / references / mentions；无 LLM、无分块'
+      else
+        'rag=true：确定性边 + 分块/LLM 抽取/Leiden 社区/报告/embedding 向量',
       'references 只认可解析到文档集合的相对链接（含 link_fallbacks）',
       'mentions 来自策略点名与包公开声明名，按标识符边界匹配，每篇文档最多 50 条',
-      '默认 dry-run；--commit 才写 graph_nodes / graph_edges，重复运行 0 写',
+      '默认 dry-run；--commit 才写图集合，重复运行 0 写',
+      if (ragResult == null) 'RAG 默认关闭（避免默认烧 token）：rag=true 才建 GraphRAG 索引',
     ],
   };
 }
@@ -291,6 +361,7 @@ void _collectWrites(
       'op': 'put',
       'collection': collection,
       'key': entry.key,
+      'value': entry.value,
     });
   }
   for (final String key in existing.keys) {

@@ -45,6 +45,10 @@ class DocStore {
     'suggestions',
     'graph_nodes',
     'graph_edges',
+    'graph_chunks',
+    'graph_communities',
+    'graph_reports',
+    'graph_vectors',
   ];
 
   Future<Map<String, dynamic>> call(
@@ -91,6 +95,63 @@ class DocStore {
       );
     }
     return out;
+  }
+
+  /// 读全量（按 key 前缀）：`storage.scan` 单次上限 5000，超限时改用
+  /// `storage.query(sort: id)` + cursor 分页，避免把"没扫到"误判成"该删除"。
+  ///
+  /// 只有带顶层 `id` 的图集合需要走分页（DN-9 的全部记录都带 `id`）。
+  Future<List<StoredRecord>> listAll(String collection, String prefix) async {
+    final Map<String, dynamic> first = await call(
+      'storage.scan',
+      <String, dynamic>{
+        'collection': collection,
+        'prefix': prefix,
+        'limit': 5000,
+      },
+    );
+    final List<StoredRecord> scanned = _recordsOf(first);
+    if (first['has_more'] != true) {
+      return <StoredRecord>[
+        for (final StoredRecord record in scanned)
+          if (record.key.startsWith(prefix)) record,
+      ];
+    }
+    final Map<String, StoredRecord> byKey = <String, StoredRecord>{};
+    String cursor = '';
+    while (true) {
+      final Map<String, dynamic> page = await call(
+        'storage.query',
+        <String, dynamic>{
+          'collection': collection,
+          'sort': 'id',
+          'limit': 500,
+          'cursor': cursor,
+        },
+      );
+      for (final StoredRecord record in _recordsOf(page)) {
+        if (!record.key.startsWith(prefix)) continue;
+        byKey[record.key] = record;
+      }
+      final String next = _str(page['cursor']);
+      if (next.isEmpty) break;
+      cursor = next;
+    }
+    final List<String> keys = byKey.keys.toList()..sort();
+    return <StoredRecord>[for (final String key in keys) byKey[key]!];
+  }
+
+  List<StoredRecord> _recordsOf(Map<String, dynamic> result) {
+    final Object? raw = result['values'];
+    if (raw is! List) return const <StoredRecord>[];
+    return <StoredRecord>[
+      for (final Object? item in raw)
+        if (item is Map)
+          StoredRecord(
+            key: _str(_map(item)['key']),
+            value: _map(_map(item)['value']),
+          ),
+    ];
   }
 
   Future<void> tx(List<Map<String, Object?>> ops) async {

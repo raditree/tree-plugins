@@ -16,7 +16,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.docnorm';
 const String kDisplayName = 'Tree 文档归一化';
-const String kVersion = '0.6.0';
+const String kVersion = '0.7.0';
 const String kStationName = 'docnorm';
 const List<String> kDocnormCommands = <String>[
   'docnorm.scan',
@@ -29,6 +29,7 @@ const List<String> kDocnormCommands = <String>[
   'docnorm.reanalyze',
   'docnorm.commit',
   'docnorm.graph.build',
+  'docnorm.export',
 ];
 
 const String kStationReadme =
@@ -42,8 +43,10 @@ const String kStationReadme =
     'docnorm.reanalyze --changed 只重算受影响包；'
     'docnorm.commit [--commit] [--run-gates] 按 docs 域 / 最具体包 / unmatched 分批提交'
     '（风格探测；门禁默认只列，--run-gates 才执行且失败整批不提交；不 push / amend）；'
-    'docnorm.graph.build [--commit] 只建三类确定性边（belongs_to / references / mentions）'
-    '到 graph_nodes / graph_edges。六族适配器 + fallback；对目标仓库只读，'
+    'docnorm.graph.build [--commit] [rag] 默认只建三类确定性边（belongs_to / references / mentions），'
+    'rag=true 追加 GraphRAG 索引（分块 / llm.call 抽取 / Leiden 社区 / 报告 / llm.embed 向量，'
+    '无 embedding 时 mode=lexical）；docnorm.export [--commit] 把集合导成 .docnorm/export/*.jsonl '
+    '（按 key 排序，可直接 diff）。六族适配器 + fallback；对目标仓库只读，'
     '写盘仅追加且必须显式 commit；缺 tree.storage 时 fail-closed。';
 
 /// 当前握手完成的插件服务（由 [_onReady] 填入），用于向 tree.storage 下站命令。
@@ -166,11 +169,39 @@ Future<Map<String, dynamic>?> handleRequest(
         String name,
         Map<String, dynamic> args,
       ) => _callStorage(name, args, scope);
+      Future<GenerateReply> llm(GenerateRequest request) =>
+          _callLlm(request, scope);
+      Future<RagEmbedReply> embed(RagEmbedRequest request) =>
+          _callEmbed(request, scope);
       final Map<String, Object?> result = await runGraphBuild(
         repo,
         storage: storage,
         commit: arguments['commit'] == true,
         runId: asString(arguments['run_id']),
+        rag: arguments['rag'] == true,
+        llm: llm,
+        embed: embed,
+        overrides: arguments['config'] is Map
+            ? asMap(arguments['config'])
+            : const <String, Object?>{},
+        embeddingModel: asString(arguments['embedding_model']),
+      );
+      return <String, dynamic>{
+        'reply': <String, dynamic>{'payload': result},
+      };
+    }
+    if (command == 'docnorm.export') {
+      final Map<String, dynamic> scope = asMap(params['scope']);
+      Future<Map<String, dynamic>> storage(
+        String name,
+        Map<String, dynamic> args,
+      ) => _callStorage(name, args, scope);
+      final Map<String, Object?> result = await runExport(
+        repo,
+        storage: storage,
+        commit: arguments['commit'] == true,
+        runId: asString(arguments['run_id']),
+        collections: _stringsOf(arguments['collections']),
       );
       return <String, dynamic>{
         'reply': <String, dynamic>{'payload': result},
@@ -320,6 +351,63 @@ Future<GenerateReply> _callLlm(
   }
 }
 
+/// 向 `tree.agent` 的宿主能力站下 `llm.embed`：模型池 kind=embedding。
+///
+/// 空 `inputs` 不发 HTTP，只回模型与维度（用于建索引前判断是否降级 lexical）。
+Future<RagEmbedReply> _callEmbed(
+  RagEmbedRequest request,
+  Map<String, dynamic> scope,
+) async {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) {
+    return const RagEmbedReply(
+      error: '插件尚未就绪：llm.embed 通道不可用',
+      code: 'embed_unavailable',
+    );
+  }
+  try {
+    final Map<String, dynamic> payload = await server.channel.command(
+      'llm.embed',
+      <String, dynamic>{
+        'inputs': request.inputs,
+        if (request.model.isNotEmpty) 'model': request.model,
+      },
+      '',
+      scope,
+    );
+    final String reason = asString(payload['error']);
+    return RagEmbedReply(
+      vectors: _vectorsOf(payload['vectors']),
+      model: asString(payload['model']),
+      dimensions: (payload['dimensions'] as num?)?.toInt() ?? 0,
+      error: reason,
+      code: asString(payload['code']),
+    );
+  } on CmdFailureException catch (error) {
+    return RagEmbedReply(
+      vectors: _vectorsOf(error.payload['vectors']),
+      model: asString(error.payload['model']),
+      dimensions: (error.payload['dimensions'] as num?)?.toInt() ?? 0,
+      error: error.message,
+      code: asString(error.payload['code']),
+    );
+  } catch (error) {
+    return RagEmbedReply(error: 'llm.embed 异常：$error');
+  }
+}
+
+List<List<double>> _vectorsOf(Object? raw) {
+  if (raw is! List) return const <List<double>>[];
+  return <List<double>>[
+    for (final Object? row in raw)
+      if (row is List)
+        <double>[
+          for (final Object? value in row)
+            if (value is num) value.toDouble(),
+        ],
+  ];
+}
+
 List<Map<String, Object?>> _mapsOf(Object? value) {
   if (value is! List) return const <Map<String, Object?>>[];
   return <Map<String, Object?>>[
@@ -445,6 +533,8 @@ thresholds:
     Map<String, Map<String, Object?>> collectionOf(String name) =>
         fakeDb.putIfAbsent(name, () => <String, Map<String, Object?>>{});
     int storageWrites = 0;
+    int llmCalls = 0;
+    int embedCalls = 0;
     core.onMethod(M.stationCommand, (Map<String, dynamic> params) {
       final String command = asString(params['command']);
       final Map<String, dynamic> args = asMap(params['arguments']);
@@ -454,9 +544,45 @@ thresholds:
       );
       switch (command) {
         case 'llm.call':
+          llmCalls += 1;
           final List<dynamic> messages = args['messages'] is List
               ? args['messages'] as List<dynamic>
               : <dynamic>[];
+          final String userText = messages.isEmpty
+              ? ''
+              : asString(asMap(messages.last)['content']);
+          if (userText.contains('知识图谱抽取器')) {
+            return <String, dynamic>{
+              'ok': true,
+              'payload': <String, dynamic>{
+                'ok': true,
+                'json': <String, dynamic>{
+                  'entities': <Map<String, dynamic>>[
+                    <String, dynamic>{'kind': 'concept', 'name': 'Alpha'},
+                  ],
+                  'relations': <Map<String, dynamic>>[],
+                },
+                'text': '{}',
+                'model': 'fake',
+                'usage': <String, dynamic>{'total_tokens': 8},
+              },
+            };
+          }
+          if (userText.contains('社区摘要')) {
+            return <String, dynamic>{
+              'ok': true,
+              'payload': <String, dynamic>{
+                'ok': true,
+                'json': <String, dynamic>{
+                  'title': '示例社区',
+                  'summary': '这个社区围绕 Alpha 概念展开，包含文档与实体节点，边界清晰可检索。',
+                },
+                'text': '{}',
+                'model': 'fake',
+                'usage': <String, dynamic>{'total_tokens': 8},
+              },
+            };
+          }
           return <String, dynamic>{
             'ok': true,
             'payload': <String, dynamic>{
@@ -464,14 +590,42 @@ thresholds:
               'json': <String, dynamic>{
                 'sections': <Map<String, dynamic>>[
                   <String, dynamic>{'heading': '职责', 'body': '示例包负责单一职责的演示。'},
-                  <String, dynamic>{'heading': '入口', 'body': '从 lib/a.dart 的 Alpha 进入。'},
-                  <String, dynamic>{'heading': '边界', 'body': '不处理网络与持久化，只做类型定义。'},
-                  <String, dynamic>{'heading': '测试', 'body': '运行 dart test 覆盖声明与边界。'},
+                  <String, dynamic>{
+                    'heading': '入口',
+                    'body': '从 lib/a.dart 的 Alpha 进入。',
+                  },
+                  <String, dynamic>{
+                    'heading': '边界',
+                    'body': '不处理网络与持久化，只做类型定义。',
+                  },
+                  <String, dynamic>{
+                    'heading': '测试',
+                    'body': '运行 dart test 覆盖声明与边界。',
+                  },
                 ],
               },
               'text': '{}',
               'model': 'fake',
               'usage': <String, dynamic>{'total_tokens': 10},
+            },
+          };
+        case 'llm.embed':
+          embedCalls += 1;
+          final List<dynamic> inputs = args['inputs'] is List
+              ? args['inputs'] as List<dynamic>
+              : <dynamic>[];
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'ok': true,
+              'model': 'fake-embed',
+              'dimensions': 4,
+              'count': inputs.length,
+              'vectors': <List<double>>[
+                for (int i = 0; i < inputs.length; i++)
+                  <double>[1.0, 0.0, 0.0, 0.0],
+              ],
+              'usage': <String, dynamic>{'prompt_tokens': inputs.length},
             },
           };
         case 'storage.ensure':
@@ -903,9 +1057,7 @@ thresholds:
         'docnorm.audit',
         <String, dynamic>{'repo': temp.path, 'commit': true},
       );
-      final Map<String, dynamic> auditAgain = asMap(
-        auditAgainReply['payload'],
-      );
+      final Map<String, dynamic> auditAgain = asMap(auditAgainReply['payload']);
       check.check(
         (auditAgain['storage'] as Map<String, dynamic>)['ops'],
         0,
@@ -928,11 +1080,7 @@ thresholds:
         'plain',
         'commit 风格探测：fixture 提交是 plain',
       );
-      check.check(
-        asMap(commitDry['gates'])['mode'],
-        'listed',
-        '门禁默认只列不跑',
-      );
+      check.check(asMap(commitDry['gates'])['mode'], 'listed', '门禁默认只列不跑');
       check.check(
         asMap(commitDry['counts'])['committed'],
         0,
@@ -967,12 +1115,108 @@ thresholds:
         <String, dynamic>{'repo': temp.path, 'commit': true},
       );
       final Map<String, dynamic> graphAgain = asMap(graphAgainReply['payload']);
-      check.check(
-        asMap(graphAgain['storage'])['ops'],
-        0,
-        'graph 重复运行 0 写',
-      );
+      check.check(asMap(graphAgain['storage'])['ops'], 0, 'graph 重复运行 0 写');
       check.check(storageWrites, graphWrites, 'graph 重复运行 0 存储写');
+
+      final Map<String, dynamic> ragDryReply = await askCommand(
+        'rag-dry',
+        'docnorm.graph.build',
+        <String, dynamic>{'repo': temp.path, 'rag': true},
+      );
+      final Map<String, dynamic> ragDry = asMap(ragDryReply['payload']);
+      check.check(ragDry['mode'], 'hybrid', 'rag 有 embedding ⇒ mode=hybrid');
+      check.check(
+        asMap(ragDry['rag'])['vector_mode'],
+        'planned',
+        'rag dry-run 不发 LLM / embedding',
+      );
+      check.check(
+        asMap(ragDry['storage'])['applied'],
+        false,
+        'rag dry-run 0 写',
+      );
+      final int ragLlmBefore = llmCalls;
+      final Map<String, dynamic> ragCommitReply = await askCommand(
+        'rag-commit',
+        'docnorm.graph.build',
+        <String, dynamic>{'repo': temp.path, 'commit': true, 'rag': true},
+      );
+      final Map<String, dynamic> ragCommit = asMap(ragCommitReply['payload']);
+      check.check(ragCommit['mode'], 'hybrid', 'rag commit 建向量索引');
+      final num ragChunkTotal =
+          ((asMap(ragCommit['rag'])['chunks'] as Map<String, dynamic>)['total']
+              as num?) ??
+          0;
+      check.that(ragChunkTotal > 0, 'rag 产出分块');
+      check.that(
+        (fakeDb['graph_chunks'] ?? <String, Map<String, Object?>>{}).isNotEmpty,
+        'graph_chunks 入库',
+      );
+      check.that(
+        (fakeDb['graph_communities'] ?? <String, Map<String, Object?>>{})
+            .isNotEmpty,
+        'graph_communities 入库',
+      );
+      check.that(
+        (fakeDb['graph_reports'] ?? <String, Map<String, Object?>>{})
+            .isNotEmpty,
+        'graph_reports 入库',
+      );
+      check.that(
+        (fakeDb['graph_vectors'] ?? <String, Map<String, Object?>>{})
+            .isNotEmpty,
+        'graph_vectors 入库',
+      );
+      check.that(llmCalls > ragLlmBefore, 'rag 抽取 / 报告经 llm.call');
+      check.that(embedCalls > 0, 'rag 向量经 llm.embed');
+      final int ragWrites = storageWrites;
+      final int ragLlmCalls = llmCalls;
+      final Map<String, dynamic> ragAgainReply = await askCommand(
+        'rag-again',
+        'docnorm.graph.build',
+        <String, dynamic>{'repo': temp.path, 'commit': true, 'rag': true},
+      );
+      final Map<String, dynamic> ragAgain = asMap(ragAgainReply['payload']);
+      check.check(asMap(ragAgain['storage'])['ops'], 0, 'rag 重复运行 0 写');
+      check.check(storageWrites, ragWrites, 'rag 重复运行 0 存储写');
+      check.check(llmCalls, ragLlmCalls, 'rag 重复运行 0 LLM 调用');
+
+      final Map<String, dynamic> exportDryReply = await askCommand(
+        'export-dry',
+        'docnorm.export',
+        <String, dynamic>{'repo': temp.path},
+      );
+      final Map<String, dynamic> exportDry = asMap(exportDryReply['payload']);
+      check.check(exportDry['dry_run'], true, 'export 默认 dry-run');
+      check.that(
+        (exportDry['would_write'] as List<dynamic>?)?.isNotEmpty == true,
+        'export 出待写快照',
+      );
+      final Map<String, dynamic> exportCommitReply = await askCommand(
+        'export-commit',
+        'docnorm.export',
+        <String, dynamic>{'repo': temp.path, 'commit': true},
+      );
+      final Map<String, dynamic> exportCommit = asMap(
+        exportCommitReply['payload'],
+      );
+      check.that(
+        (exportCommit['written'] as List<dynamic>?)?.isNotEmpty == true,
+        'export --commit 写 JSONL 快照',
+      );
+      final Map<String, dynamic> exportAgainReply = await askCommand(
+        'export-again',
+        'docnorm.export',
+        <String, dynamic>{'repo': temp.path, 'commit': true},
+      );
+      final Map<String, dynamic> exportAgain = asMap(
+        exportAgainReply['payload'],
+      );
+      check.check(
+        (exportAgain['written'] as List<dynamic>?)?.length ?? 0,
+        0,
+        'export 重复运行 0 写（内容不可变）',
+      );
     }
   } catch (error) {
     check.that(false, '自检过程未抛异常', actual: '$error');
