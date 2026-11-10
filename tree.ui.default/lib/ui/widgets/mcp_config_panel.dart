@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
 import '../../io/mcp_trust_store.dart';
+import '../app_radius.dart';
 
 /// MCP 配置面板（右栏「MCP 配置」Tab）
 ///
@@ -440,7 +441,7 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
         color: cs.surfaceContainerHighest.withValues(alpha: 0.4),
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadius.md),
         border: Border.all(color: cs.outlineVariant, width: 0.5),
       ),
       child: Column(
@@ -603,7 +604,7 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
       decoration: BoxDecoration(
         color: cs.surface,
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadius.md),
         border: Border.all(color: cs.outlineVariant, width: 0.5),
       ),
       child: Row(
@@ -638,7 +639,7 @@ class _McpConfigPanelState extends State<McpConfigPanel> {
                             horizontal: 4, vertical: 1),
                         decoration: BoxDecoration(
                           color: cs.primaryContainer.withValues(alpha: 0.6),
-                          borderRadius: BorderRadius.circular(4),
+                          borderRadius: BorderRadius.circular(AppRadius.sm),
                         ),
                         child: Text(
                           '内置',

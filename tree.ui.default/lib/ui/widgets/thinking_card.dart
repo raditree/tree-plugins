@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
+import '../app_radius.dart';
 import '../models/message.dart';
 import '../services/detail_selection.dart';
 
@@ -45,9 +46,9 @@ class _ThinkingCardState extends State<ThinkingCard> {
             color: isSelected
                 ? cs.primary.withValues(alpha: 0.12)
                 : Colors.transparent,
-            borderRadius: BorderRadius.circular(6),
+            borderRadius: BorderRadius.circular(AppRadius.sm),
             child: InkWell(
-              borderRadius: BorderRadius.circular(6),
+              borderRadius: BorderRadius.circular(AppRadius.sm),
               hoverColor: cs.primary.withValues(alpha: 0.07),
               // 与工具行同一口径：点一下选中、再点一下取消
       onTap: () => DetailSelection.instance.toggle(m),

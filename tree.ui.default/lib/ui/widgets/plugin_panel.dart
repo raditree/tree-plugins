@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
 import '../../io/plugin_monitor_service.dart';
+import '../app_radius.dart';
 import '../services/detail_selection.dart';
 import 'plugin_detail_page.dart';
 import 'plugin_editor_dialog.dart';
@@ -1022,7 +1023,7 @@ class _PluginPanelState extends State<PluginPanel> {
           foregroundColor: selected ? cs.primary : cs.onSurfaceVariant,
           backgroundColor: selected ? cs.primaryContainer : Colors.transparent,
           padding: const EdgeInsets.symmetric(vertical: 6),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppRadius.sm)),
         ),
         child: Text(
           label,
@@ -1091,7 +1092,7 @@ class _PluginPanelState extends State<PluginPanel> {
             horizontal: 8,
             vertical: 8,
           ),
-          border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(AppRadius.sm)),
         ),
       ),
     );
@@ -1104,7 +1105,7 @@ class _PluginPanelState extends State<PluginPanel> {
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
         border: Border.all(color: Theme.of(context).dividerColor),
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadius.md),
       ),
       child: Row(
         children: <Widget>[
@@ -1252,7 +1253,7 @@ class _PluginPanelState extends State<PluginPanel> {
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
         border: Border.all(color: Theme.of(context).dividerColor),
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadius.md),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1620,7 +1621,7 @@ class _PluginPanelState extends State<PluginPanel> {
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
         border: Border.all(color: Theme.of(context).dividerColor),
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadius.md),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1723,7 +1724,7 @@ class _PluginPanelState extends State<PluginPanel> {
               ? Colors.orange.withValues(alpha: 0.7)
               : Theme.of(context).dividerColor,
         ),
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadius.md),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1989,7 +1990,7 @@ class _PluginPanelState extends State<PluginPanel> {
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
         border: Border.all(color: Theme.of(context).dividerColor),
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadius.md),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -2108,7 +2109,7 @@ class _PluginPanelState extends State<PluginPanel> {
       decoration: BoxDecoration(
         color: emphasize ? cs.primaryContainer : null,
         border: emphasize ? null : Border.all(color: cs.outlineVariant),
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(AppRadius.pill),
       ),
       child: Text(
         text,

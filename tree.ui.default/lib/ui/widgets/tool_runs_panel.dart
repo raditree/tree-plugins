@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
+import '../app_radius.dart';
 import '../models/agent.dart';
 import '../models/session.dart';
 import '../models/tool_run.dart';
@@ -383,7 +384,7 @@ class _ToolRunRow extends StatelessWidget {
         onTap: canNavigate
             ? () => onNavigate!(agentId: run.agentId, sessionId: run.sessionId)
             : null,
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(AppRadius.sm),
         child: Container(
           key: Key('tool-run-row-${run.handle}'),
           margin: const EdgeInsets.symmetric(vertical: 2),
@@ -391,7 +392,7 @@ class _ToolRunRow extends StatelessWidget {
           decoration: over
               ? BoxDecoration(
                   color: cs.errorContainer.withValues(alpha: 0.25),
-                  borderRadius: BorderRadius.circular(6),
+                  borderRadius: BorderRadius.circular(AppRadius.sm),
                 )
               : null,
           child: Row(
@@ -435,7 +436,7 @@ class _ToolRunRow extends StatelessWidget {
                               ),
                               decoration: BoxDecoration(
                                 color: cs.errorContainer,
-                                borderRadius: BorderRadius.circular(4),
+                                borderRadius: BorderRadius.circular(AppRadius.pill),
                               ),
                               child: Text(
                                 '已超时',

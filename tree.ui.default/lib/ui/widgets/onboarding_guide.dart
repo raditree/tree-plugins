@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../app_radius.dart';
 import '../services/onboarding_steps.dart';
 
 /// 新手引导的**浮层卡片**（非模态：盖在中栏上方一小块，用户照样能点后面的界面）。
@@ -49,7 +50,7 @@ class OnboardingGuide extends StatelessWidget {
       elevation: 8,
       color: cs.surfaceContainerHighest,
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(AppRadius.md),
         side: BorderSide(color: cs.primary.withValues(alpha: 0.4)),
       ),
       child: Container(

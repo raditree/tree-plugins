@@ -3,11 +3,13 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
+import '../app_radius.dart';
 import '../services/download_center.dart';
 import '../services/editor_buffer.dart';
 import '../services/workspace_paths.dart';
@@ -84,6 +86,12 @@ class _FilePanelState extends State<FilePanel> {
   /// 非分屏时，每个已打开文件那个查看器的 key：换文件 / 关 tab 前问它「未保存怎么办」。
   final Map<String, GlobalKey<FileViewerState>> _fileKeys =
       <String, GlobalKey<FileViewerState>>{};
+
+  /// tab 条的水平滚动控制器：常显滑块 + 滚轮横滚 + 活动 tab 自动滚入视野。
+  final ScrollController _tabScroll = ScrollController();
+
+  /// 每个 tab 的 key：切到远处的 tab 时 `Scrollable.ensureVisible` 用它。
+  final Map<String, GlobalKey> _tabKeys = <String, GlobalKey>{};
 
   /// 分屏时两格的 key（两格都看**当前文件**，共用同一份缓冲）。
   ///
@@ -193,6 +201,7 @@ class _FilePanelState extends State<FilePanel> {
       buffer.dispose();
     }
     _buffers.clear();
+    _tabScroll.dispose();
     super.dispose();
   }
 
@@ -220,6 +229,8 @@ class _FilePanelState extends State<FilePanel> {
       if (buffer != null) _buffers[next] = buffer;
       final GlobalKey<FileViewerState>? key = _fileKeys.remove(old);
       if (key != null) _fileKeys[next] = key;
+      final GlobalKey? tabKey = _tabKeys.remove(old);
+      if (tabKey != null) _tabKeys[next] = tabKey;
       if (_activeFile == old) _activeFile = next;
       changed = true;
     }
@@ -244,6 +255,7 @@ class _FilePanelState extends State<FilePanel> {
         final EditorBuffer? buffer = _buffers.remove(p);
         if (buffer != null) released.add(buffer);
         _fileKeys.remove(p);
+        _tabKeys.remove(p);
       }
       if (_activeFile == null || !_openFiles.contains(_activeFile)) {
         _activeFile = _openFiles.isEmpty ? null : _openFiles.last;
@@ -251,6 +263,7 @@ class _FilePanelState extends State<FilePanel> {
       if (_openFiles.length < 2) _split = false;
       _activePane = 0;
     });
+    if (_activeFile != null) _ensureTabVisible(_activeFile!);
     for (final EditorBuffer buffer in released) {
       _releaseBuffer(buffer);
     }
@@ -273,6 +286,7 @@ class _FilePanelState extends State<FilePanel> {
       _activeFile = path;
       _activePane = 0;
     });
+    _ensureTabVisible(path);
   }
 
   /// 某个文件此刻**挂载着**的查看器 state（分屏时取第一格；非活动文件没挂载）。
@@ -310,6 +324,7 @@ class _FilePanelState extends State<FilePanel> {
     setState(() {
       _openFiles.removeAt(index);
       _fileKeys.remove(path);
+      _tabKeys.remove(path);
       if (_activeFile == path) {
         _activeFile = _openFiles.isEmpty
             ? null
@@ -318,6 +333,7 @@ class _FilePanelState extends State<FilePanel> {
       if (_openFiles.length < 2) _split = false;
       _activePane = 0;
     });
+    if (_activeFile != null) _ensureTabVisible(_activeFile!);
     if (buffer != null) _releaseBuffer(buffer);
     return true;
   }
@@ -481,35 +497,23 @@ class _FilePanelState extends State<FilePanel> {
     );
   }
 
-  /// 顶部**单行**：文件 tab 条（无 tab 时退回标题）+ 工作空间动作 + 视图动作。
+  /// 查看器上方那条：文件 tab 条 + 视图动作（不再有横贯面板的顶栏）。
   ///
-  /// 用户 2026-10-19 的两条反馈在这里一并落地：
-  /// - 「文件标签在中间也不合理」：旧实现把 tab 条塞进**查看器那一格**（只占右半格，
-  ///   于是标签看起来悬在中间），现在 tab 条铺满**整块顶部**（[Expanded] 占满整宽）；
-  /// - 「各类框格导致大量空间被浪费」：旧实现叠了四条横条（标题 36 + tab 30 +
-  ///   工具条 32 + 两条分隔线）≈100px，现在**收敛成一条**（32px）——tab / 标题、
-  ///   工作空间动作（重置系统提示词 / 重置 Spec / 同步到本地）、视图动作（收起目录 /
-  ///   分屏 / 切方向 / 关窗格 / 关查看器）同处一行，纵向空间还给正文。
+  /// IDE 口径（用户 2026-11-10）：tab 属于**编辑器组**，只贴在查看器上方，
+  /// 不横跨左侧目录树；工作空间动作挂到目录树头部，视图动作留在这里。
   ///
   /// 「目录」这颗键（用户 2026-10-04）：目录在左时一键收起、收起后一键叫回来；
   /// 面板窄到放不下并排两栏时，这里**如实写出原因**（而不是让用户对着一个看起来
   /// 没反应的按钮猜）。
-  Widget _buildTopBar(ColorScheme cs) {
+  Widget _buildViewerTabBar(ColorScheme cs) {
     final bool twoPanes = _split;
-    return Container(
-      height: 32,
-      color: cs.surface,
+    return SizedBox(
+      height: 28,
       child: Row(
         children: <Widget>[
-          // 左：有打开文件就是整条 tab 条（铺满整宽）；没打开文件就退回标题。
-          Expanded(
-            child: _openFiles.isEmpty
-                ? _buildTitleBar(cs)
-                : _buildFileTabStrip(),
-          ),
-          // 目录在左但**这一刻显示不出来**（面板太窄被 SplitPanes 降级）：如实说原因，
-          // 否则用户会觉得这颗按钮点了没反应。
-          if (_viewerOpen && _treeWanted && _treeAreaTooNarrow)
+          Expanded(child: _buildFileTabStrip()),
+          // 目录在左但**这一刻显示不出来**（面板太窄被 SplitPanes 降级）：如实说原因。
+          if (_treeWanted && _treeAreaTooNarrow)
             Flexible(
               child: Padding(
                 padding: const EdgeInsets.only(left: 6),
@@ -522,102 +526,100 @@ class _FilePanelState extends State<FilePanel> {
                 ),
               ),
             ),
-          // 工作空间动作：一键重置（备份 .bak.<n> 后还原默认）+ 同步到本地。
-          // 原先挂在「文件浏览」标题行上，标题行随重排撤掉后落到这一行，功能不丢。
-          IconButton(
-            tooltip: '重置系统提示词（备份 .bak.<n>）',
-            visualDensity: VisualDensity.compact,
-            padding: const EdgeInsets.all(4),
-            constraints: const BoxConstraints(minWidth: 26, minHeight: 26),
-            icon: const Icon(Icons.assignment_return_outlined, size: 16),
-            onPressed: () => _resetWorkspace('system_prompt'),
+          // 视图动作：目录收放 / 分屏 / 关闭查看器。
+          _toolbarAction(
+            // 目录在左：收起 = 箭头朝左、显示 = 箭头朝右（`left_panel_*` 这套图标
+            // 在当前的 Flutter 版本里不存在，别用）
+            icon: _treeWanted
+                ? Icons.keyboard_double_arrow_left
+                : Icons.keyboard_double_arrow_right,
+            tooltip: _treeWanted ? '收起文件树（查看器占满）' : '显示文件树（目录在左）',
+            color: cs.onSurfaceVariant,
+            onPressed: () {
+              setState(() {
+                _treeWanted = !_treeWanted;
+              });
+            },
           ),
-          IconButton(
-            tooltip: '重置 Spec（备份 .bak.<n>）',
-            visualDensity: VisualDensity.compact,
-            padding: const EdgeInsets.all(4),
-            constraints: const BoxConstraints(minWidth: 26, minHeight: 26),
-            icon: const Icon(Icons.rule_folder_outlined, size: 16),
-            onPressed: () => _resetWorkspace('spec'),
-          ),
-          FileSyncButton(
-            workspaceId: widget.workspaceId,
-            teamId: widget.teamId ?? '',
-            currentPath: _treePath,
-            onUploaded: _refreshFileTree,
-          ),
-          // 视图动作：只在查看器打开时出现（查看器关着时没有可视图可收放）。
-          if (_viewerOpen) ...<Widget>[
+          if (twoPanes)
             _toolbarAction(
-              // 目录在左：收起 = 箭头朝左、显示 = 箭头朝右（`left_panel_*` 这套图标
-              // 在当前的 Flutter 版本里不存在，别用）
-              icon: _treeWanted
-                  ? Icons.keyboard_double_arrow_left
-                  : Icons.keyboard_double_arrow_right,
-              tooltip: _treeWanted ? '收起文件树（查看器占满）' : '显示文件树（目录在左）',
+              icon: _splitAxis == Axis.horizontal
+                  ? Icons.splitscreen_outlined
+                  : Icons.view_agenda_outlined,
+              tooltip: _splitAxis == Axis.horizontal ? '切成上下分屏' : '切成左右分屏',
               color: cs.onSurfaceVariant,
               onPressed: () {
                 setState(() {
-                  _treeWanted = !_treeWanted;
+                  _splitAxis = _splitAxis == Axis.horizontal
+                      ? Axis.vertical
+                      : Axis.horizontal;
                 });
               },
             ),
-            if (twoPanes)
-              _toolbarAction(
-                icon: _splitAxis == Axis.horizontal
-                    ? Icons.splitscreen_outlined
-                    : Icons.view_agenda_outlined,
-                tooltip: _splitAxis == Axis.horizontal ? '切成上下分屏' : '切成左右分屏',
-                color: cs.onSurfaceVariant,
-                onPressed: () {
-                  setState(() {
-                    _splitAxis = _splitAxis == Axis.horizontal
-                        ? Axis.vertical
-                        : Axis.horizontal;
-                  });
-                },
-              ),
-            if (!twoPanes)
-              _toolbarAction(
-                icon: Icons.vertical_split_outlined,
-                tooltip: '分屏：同一个文件再开一个窗格（两侧共享同一份缓冲）',
-                color: cs.onSurfaceVariant,
-                onPressed: _splitViewer,
-              ),
-            if (twoPanes)
-              _toolbarAction(
-                icon: Icons.close_fullscreen,
-                tooltip: '关闭当前窗格',
-                color: cs.onSurfaceVariant,
-                onPressed: _unsplitViewer,
-              ),
+          if (!twoPanes)
             _toolbarAction(
-              icon: Icons.close,
-              tooltip: '关闭查看器',
+              icon: Icons.vertical_split_outlined,
+              tooltip: '分屏：同一个文件再开一个窗格（两侧共享同一份缓冲）',
               color: cs.onSurfaceVariant,
-              onPressed: () => unawaited(_closeViewer()),
+              onPressed: _splitViewer,
             ),
-          ],
+          if (twoPanes)
+            _toolbarAction(
+              icon: Icons.close_fullscreen,
+              tooltip: '关闭当前窗格',
+              color: cs.onSurfaceVariant,
+              onPressed: _unsplitViewer,
+            ),
+          _toolbarAction(
+            icon: Icons.close,
+            tooltip: '关闭查看器',
+            color: cs.onSurfaceVariant,
+            onPressed: () => unawaited(_closeViewer()),
+          ),
         ],
       ),
     );
   }
 
-  /// 没有打开文件时顶栏左侧的标题（有 tab 时它让位给整条 tab 条）。
-  Widget _buildTitleBar(ColorScheme cs) {
-    return Padding(
-      padding: const EdgeInsets.only(left: 10),
-      child: Row(
-        children: <Widget>[
-          Icon(Icons.folder_outlined, size: 16, color: cs.onSurfaceVariant),
-          const SizedBox(width: 6),
-          Text(
-            '文件浏览',
-            style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-          ),
-        ],
+  /// 工作空间动作挂到目录树头部（IDE 的「资源管理器 ···」位置），
+  /// 不再单独占一条横贯面板的顶栏。
+  List<Widget> _workspaceActions() {
+    return <Widget>[
+      // 固定 22×22：IconButton 的默认 tap target 会撑到 40+，把目录头撑高/撑宽。
+      SizedBox(
+        width: 22,
+        height: 22,
+        child: IconButton(
+          tooltip: '重置系统提示词（备份 .bak.<n>）',
+          visualDensity: VisualDensity.compact,
+          padding: EdgeInsets.zero,
+          icon: const Icon(Icons.assignment_return_outlined, size: 16),
+          onPressed: () => _resetWorkspace('system_prompt'),
+        ),
       ),
-    );
+      SizedBox(
+        width: 22,
+        height: 22,
+        child: IconButton(
+          tooltip: '重置 Spec（备份 .bak.<n>）',
+          visualDensity: VisualDensity.compact,
+          padding: EdgeInsets.zero,
+          icon: const Icon(Icons.rule_folder_outlined, size: 16),
+          onPressed: () => _resetWorkspace('spec'),
+        ),
+      ),
+      // 同步按钮自带菜单，压到与头部图标同高，别把目录头撑高。
+      SizedBox(
+        width: 22,
+        height: 22,
+        child: FileSyncButton(
+          workspaceId: widget.workspaceId,
+          teamId: widget.teamId ?? '',
+          currentPath: _treePath,
+          onUploaded: _refreshFileTree,
+        ),
+      ),
+    ];
   }
 
   /// 面板太窄、目录**这一刻**显示不出来（[SplitPanes] 会把并排两栏降级成只显示查看器）。
@@ -628,7 +630,7 @@ class _FilePanelState extends State<FilePanel> {
       (_lastTreeAreaWidth - _paneDividerWidth) < _treeSplitDegradeBelow;
 
   /// 工具条上的紧凑图标键：默认 IconButton 是 48×48，五颗键在 240px 的面板里会溢出
-  /// （黄条警告）；这里与文件树头部同一种口径（26×26、内边距 4）。
+  /// （黄条警告）；这里与文件树头部同一种口径（22×22、内边距 2）。
   Widget _toolbarAction({
     required IconData icon,
     required String tooltip,
@@ -639,8 +641,8 @@ class _FilePanelState extends State<FilePanel> {
     tooltip: tooltip,
     color: color,
     visualDensity: VisualDensity.compact,
-    padding: const EdgeInsets.all(4),
-    constraints: const BoxConstraints(minWidth: 26, minHeight: 26),
+    padding: const EdgeInsets.all(2),
+    constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
     onPressed: onPressed,
   );
 
@@ -650,18 +652,42 @@ class _FilePanelState extends State<FilePanel> {
   /// 这一排 tab 就是"同时开着"的可见形态（与 VS Code 同一套心智）；一个文档一份
   /// 缓冲，切 tab 不丢改动，只有**关闭 tab** 才问未保存。
   ///
-  /// 这一条挂在顶栏 [Expanded] 里，因此**铺满整块宽度**（不再是只占查看器那半格）。
+  /// 这条只占**查看器那一格**的宽度（IDE 口径）；tab 装不下时底部常显滑块，
+  /// 滚轮落在上面也能横向翻。
   Widget _buildFileTabStrip() {
     final ColorScheme cs = Theme.of(context).colorScheme;
-    return SingleChildScrollView(
-      scrollDirection: Axis.horizontal,
-      child: Row(
-        children: <Widget>[
-          for (final String path in _openFiles) _buildFileTab(cs, path),
-        ],
+    return Listener(
+      // 桌面端滚轮是竖直的：落在 tab 条上时转成横向滚动。
+      onPointerSignal: _onTabPointerSignal,
+      child: Scrollbar(
+        key: const ValueKey<String>('file-tab-scrollbar'),
+        controller: _tabScroll,
+        // tab 多到装不下时，底部常显滑块——否则用户不知道右边还有 tab。
+        thumbVisibility: true,
+        scrollbarOrientation: ScrollbarOrientation.bottom,
+        thickness: 4,
+        radius: Radius.circular(AppRadius.pill),
+        child: SingleChildScrollView(
+          controller: _tabScroll,
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            children: <Widget>[
+              for (final String path in _openFiles)
+                KeyedSubtree(
+                  key: _tabKeyFor(path),
+                  child: _buildFileTab(cs, path),
+                ),
+            ],
+          ),
+        ),
       ),
     );
   }
+
+  GlobalKey _tabKeyFor(String path) => _tabKeys.putIfAbsent(
+        path,
+        () => GlobalKey(debugLabel: 'file_panel_tab_$path'),
+      );
 
   /// 一个文件 tab：图标 + 文件名 + 未保存圆点 + 关闭；**右键**弹菜单——旧头部的
   /// 文件级动作（预览/源码、复制、下载、重新加载、关闭）都收在这里。
@@ -683,7 +709,7 @@ class _FilePanelState extends State<FilePanel> {
         onSecondaryTapUp: (TapUpDetails details) =>
             unawaited(_showTabMenu(path, details.globalPosition)),
         child: Container(
-          height: 32,
+          height: 28,
           decoration: BoxDecoration(
             border: Border(
               // 活动 tab 顶部那条主色细条（VS Code 口径：活动文档一眼可辨）
@@ -732,7 +758,7 @@ class _FilePanelState extends State<FilePanel> {
                 const SizedBox(width: 2),
                 InkWell(
                   key: ValueKey<String>('file-tab-close-$path'),
-                  borderRadius: BorderRadius.circular(9),
+                  borderRadius: BorderRadius.circular(AppRadius.xs),
                   onTap: () => unawaited(_closeFile(path)),
                   child: Padding(
                     padding: const EdgeInsets.all(3),
@@ -758,6 +784,35 @@ class _FilePanelState extends State<FilePanel> {
       _activeFile = path;
       _activePane = 0;
     });
+    _ensureTabVisible(path);
+  }
+
+  /// 把某个 tab 滚进视野（tab 多到超出面板宽度时，点树里的文件也能看到它）。
+  void _ensureTabVisible(String path) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final BuildContext? context = _tabKeys[path]?.currentContext;
+      if (context == null) return;
+      // 直接跳到位：tab 切换是高频动作，不要额外动画抢注意力，
+      // 也让"打开远处文件后 tab 立刻可见"在测试里可断言。
+      Scrollable.ensureVisible(
+        context,
+        alignment: 0.5,
+        duration: Duration.zero,
+      );
+    });
+  }
+
+  /// 鼠标滚轮落在 tab 条上：竖直增量转成横向滚动（与右栏 chip 行同口径）。
+  void _onTabPointerSignal(PointerSignalEvent event) {
+    if (event is! PointerScrollEvent) return;
+    if (!_tabScroll.hasClients) return;
+    final double delta =
+        event.scrollDelta.dy != 0 ? event.scrollDelta.dy : event.scrollDelta.dx;
+    if (delta == 0) return;
+    final double next = (_tabScroll.offset + delta)
+        .clamp(0.0, _tabScroll.position.maxScrollExtent);
+    if (next == _tabScroll.offset) return;
+    _tabScroll.jumpTo(next);
   }
 
   /// tab 右键菜单：旧头部退场后，文件级动作的入口（用户 2026-10-19：
@@ -900,47 +955,44 @@ class _FilePanelState extends State<FilePanel> {
   ///
   /// 内容区两种形态：没打开文件 = 文件树独占；打开文件 = 左右分栏（目录在左、查看器在右）。
   Widget _buildFileSection() {
-    return Column(
-      children: [
-        // 顶栏收敛成**一条**（用户 2026-10-19：各类框格浪费空间）：tab 条铺满整宽，
-        // 工作空间动作与视图动作同处一行；不再有叠罗汉式的标题行 + tab 行 + 工具条。
-        _buildTopBar(Theme.of(context).colorScheme),
-        Divider(height: 1, thickness: 1, color: Theme.of(context).dividerColor),
-        // 内容区域：**目录在左、查看器在右**（用户 2026-10-04 二改）。
-        //
-        // 为什么不再用覆盖层：覆盖层让"打开文件后树就点不到"——新建 / 重命名 / 删除
-        // 这些树里的动作在开着文件时根本用不上（用户 2026-10-03 定夺改同屏）。
-        // 为什么从上下改成左右（口径变化，2026-10-04）：上下分栏把查看器**压扁**
-        // （代码是按行看的，高度比宽度更吃紧），而面板宽度是用户能拖的；目录当左侧栏
-        // 更接近 VS Code，也允许一键收起把整格让给查看器。
+    // IDE 口径（用户 2026-11-10）：tab 只贴在查看器上方，目录树保留自己的头部；
+    // 不再有横跨整块面板的 tab / 工具条。
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        _lastTreeAreaWidth = constraints.maxWidth;
+        if (!_viewerOpen) return _buildFileTree();
+        final Widget viewer = _buildViewerArea();
+        if (!_treeWanted) return viewer;
+        // 为什么左右而不是上下（2026-10-04）：上下分栏把查看器压扁（代码按行看，
+        // 高度比宽度更吃紧）；目录当左侧栏也更接近 VS Code。
         // 面板太窄（< [_treeSplitDegradeBelow]）时按 [SplitPanes] 的既有口径降级成
-        // **只显示查看器**——此时顶栏上写着原因，拖宽右栏目录自己回来。
-        Expanded(
-          child: LayoutBuilder(
-            builder: (BuildContext context, BoxConstraints constraints) {
-              _lastTreeAreaWidth = constraints.maxWidth;
-              if (!_viewerOpen) return _buildFileTree();
-              if (!_treeWanted) return _buildPanes();
-              return SplitPanes(
-                axis: Axis.horizontal,
-                ratio: _treeSplitRatio,
-                minExtent: _treeSplitMinExtent,
-                degradeBelow: _treeSplitDegradeBelow,
-                dividerWidth: _paneDividerWidth,
-                onRatioChanged: (double next) {
-                  setState(() {
-                    _treeSplitRatio = next;
-                  });
-                },
-                first: _buildFileTree(),
-                second: _buildPanes(),
-                // 太窄时只留查看器：顶栏上的「显示文件树」把目录叫回来
-                // （用户的意愿不被清掉，拖宽右栏目录自己回来）
-                degraded: _buildPanes(),
-              );
-            },
-          ),
-        ),
+        // **只显示查看器**——查看器 tab 条上写着原因，拖宽右栏目录自己回来。
+        return SplitPanes(
+          axis: Axis.horizontal,
+          ratio: _treeSplitRatio,
+          minExtent: _treeSplitMinExtent,
+          degradeBelow: _treeSplitDegradeBelow,
+          dividerWidth: _paneDividerWidth,
+          onRatioChanged: (double next) {
+            setState(() {
+              _treeSplitRatio = next;
+            });
+          },
+          first: _buildFileTree(),
+          second: viewer,
+          degraded: viewer,
+        );
+      },
+    );
+  }
+
+  /// 查看器一格：tab 条 + 分隔线 + 窗格。
+  Widget _buildViewerArea() {
+    return Column(
+      children: <Widget>[
+        _buildViewerTabBar(Theme.of(context).colorScheme),
+        Divider(height: 1, thickness: 1, color: Theme.of(context).dividerColor),
+        Expanded(child: _buildPanes()),
       ],
     );
   }
@@ -955,6 +1007,7 @@ class _FilePanelState extends State<FilePanel> {
       child: FileTree(
         workspaceId: widget.workspaceId,
         teamId: widget.teamId,
+        trailingActions: _workspaceActions(),
         refreshTrigger: _fileRefreshTrigger + widget.fileRefreshTrigger,
         onDownload: _handleDownload,
         onPathChanged: (String path) {

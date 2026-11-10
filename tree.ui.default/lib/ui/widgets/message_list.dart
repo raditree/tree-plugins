@@ -7,6 +7,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
+import '../app_radius.dart';
 import '../app_theme.dart';
 import '../models/message.dart';
 import '../services/message_window.dart';
@@ -1006,7 +1007,7 @@ class _MessageListViewState extends State<_MessageListView> {
           margin: const EdgeInsets.only(left: 6),
           decoration: BoxDecoration(
             color: cs.onSurface.withValues(alpha: 0.05),
-            borderRadius: BorderRadius.circular(5),
+            borderRadius: BorderRadius.circular(AppRadius.md),
           ),
         ),
       ),
@@ -1199,7 +1200,7 @@ class _MessageListViewState extends State<_MessageListView> {
       key: key,
       decoration: BoxDecoration(
         color: cs.primary.withValues(alpha: 0.10),
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(AppRadius.md),
         border: Border.all(color: cs.primary, width: 2),
       ),
       child: child,
@@ -1317,7 +1318,7 @@ class _MessageListViewState extends State<_MessageListView> {
                     margin: const EdgeInsets.only(bottom: 12),
                     decoration: BoxDecoration(
                       color: bar,
-                      borderRadius: BorderRadius.circular(10),
+                      borderRadius: BorderRadius.circular(AppRadius.md),
                     ),
                   ),
                 ),
@@ -1453,7 +1454,7 @@ class _MessageBubbleState extends State<_MessageBubble>
   bool _hoverCopy = false;
 
   /// 气泡圆角
-  static const double _radius = 12;
+  static const double _radius = AppRadius.md;
 
   /// 揭示保底速度（字/秒）：增量再少，正文也至少以这个速率逐帧生长
   static const double _minRevealSpeed = 12;
@@ -1751,9 +1752,9 @@ class _MessageBubbleState extends State<_MessageBubble>
     return Material(
       color: cs.surface,
       elevation: 2,
-      borderRadius: BorderRadius.circular(6),
+      borderRadius: BorderRadius.circular(AppRadius.sm),
       child: InkWell(
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(AppRadius.sm),
         onTap: _copyFullText,
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
@@ -1821,7 +1822,7 @@ class _MessageBubbleState extends State<_MessageBubble>
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
           decoration: BoxDecoration(
             color: cs.surface,
-            borderRadius: BorderRadius.circular(6),
+            borderRadius: BorderRadius.circular(AppRadius.sm),
             border: Border.all(color: borderColor),
           ),
           child: Row(
@@ -1962,7 +1963,7 @@ class _AskQuestionCardState extends State<_AskQuestionCard> {
         padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
           color: cs.surface,
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(AppRadius.md),
           border: Border.all(color: cs.primary, width: 1),
         ),
         child: Column(

@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../app_radius.dart';
+
 /// 折叠组的一行控制条（规格 §3.2.2）。
 ///
 /// 文案：「折叠 n 次工具调用（读取×3 · 编辑×2 · …）· 含 m 段思考，点击展开 ›」；
@@ -70,9 +72,9 @@ class CollapsedRunRow extends StatelessWidget {
     final ColorScheme cs = Theme.of(context).colorScheme;
     return Material(
       color: Colors.transparent,
-      borderRadius: BorderRadius.circular(6),
+      borderRadius: BorderRadius.circular(AppRadius.sm),
       child: InkWell(
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(AppRadius.sm),
         hoverColor: cs.primary.withValues(alpha: 0.07),
         onTap: onTap,
         child: Padding(

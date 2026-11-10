@@ -891,6 +891,36 @@ testWidgets('换文件（可编辑 → 只读）后行号槽仍在，滚动控�
       expect(find.text('a.txt'), findsOneWidget, reason: '回到文件树');
     });
 
+    testWidgets('tab 多到装不下：底部常显滑块，新 tab 自动滚进视野',
+        (WidgetTester tester) async {
+      final List<Map<String, dynamic>> many = <Map<String, dynamic>>[
+        for (int i = 0; i < 8; i++)
+          <String, dynamic>{
+            'name': 'very_long_file_name_$i.txt',
+            'path': 'very_long_file_name_$i.txt',
+            'type': 'file',
+            'size': 6,
+            'modified': '',
+          },
+      ];
+      await pumpTwoFiles(tester, files: many);
+      for (int i = 0; i < many.length; i++) {
+        await tester.tap(find.text('very_long_file_name_$i.txt'));
+        await settleIo(tester);
+      }
+
+      final Finder bar =
+          find.byKey(const ValueKey<String>('file-tab-scrollbar'));
+      expect(bar, findsOneWidget, reason: 'tab 条要有常显滑块');
+      final ScrollableState scrollable = tester.state<ScrollableState>(
+        find.descendant(of: bar, matching: find.byType(Scrollable)),
+      );
+      expect(scrollable.position.maxScrollExtent, greaterThan(0),
+          reason: '8 个长 tab 应超出查看器宽度');
+      expect(scrollable.position.pixels, greaterThan(0),
+          reason: '打开最后一个 tab 后应自动滚到它');
+    });
+
     testWidgets('未保存的改动在 tab 上亮小圆点，保存后熄灭', (WidgetTester tester) async {
       await pumpTwoFiles(tester);
       await tester.tap(find.text('a.txt'));

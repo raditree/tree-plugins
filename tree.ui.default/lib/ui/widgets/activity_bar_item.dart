@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../app_radius.dart';
+
 /// 左侧活动栏的**面板切换项**（选中态带左侧高亮指示条 + 主色图标）。
 ///
 /// 从 main_page.dart 抽出为公共控件（Q12）：既有的「Agent 列表 / 插件 / 下载」
@@ -36,26 +38,30 @@ class ActivityBarItem extends StatelessWidget {
     final ColorScheme cs = Theme.of(context).colorScheme;
     return Tooltip(
       message: tooltip,
-      child: InkWell(
-        onTap: onTap,
-        child: SizedBox(
-          height: 44,
-          child: Row(
-            children: <Widget>[
-              // 选中指示条
-              Container(
-                width: 2,
-                height: 44,
-                color: selected ? cs.primary : Colors.transparent,
-              ),
-              Expanded(
-                child: Icon(
-                  selected ? selectedIcon : icon,
-                  size: 22,
-                  color: selected ? cs.primary : cs.onSurfaceVariant,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(AppRadius.sm),
+          child: SizedBox(
+            height: 44,
+            child: Row(
+              children: <Widget>[
+                // 选中指示条
+                Container(
+                  width: 2,
+                  height: 44,
+                  color: selected ? cs.primary : Colors.transparent,
                 ),
-              ),
-            ],
+                Expanded(
+                  child: Icon(
+                    selected ? selectedIcon : icon,
+                    size: 22,
+                    color: selected ? cs.primary : cs.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -90,18 +96,22 @@ class ActivityBarAction extends StatelessWidget {
     final ColorScheme cs = Theme.of(context).colorScheme;
     return Tooltip(
       message: tooltip,
-      child: InkWell(
-        onTap: onTap,
-        child: SizedBox(
-          height: 44,
-          child: Row(
-            children: <Widget>[
-              // 与面板项对齐的占位（无选中色）
-              const SizedBox(width: 2),
-              Expanded(
-                child: Icon(icon, size: 22, color: cs.onSurfaceVariant),
-              ),
-            ],
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(AppRadius.sm),
+          child: SizedBox(
+            height: 44,
+            child: Row(
+              children: <Widget>[
+                // 与面板项对齐的占位（无选中色）
+                const SizedBox(width: 2),
+                Expanded(
+                  child: Icon(icon, size: 22, color: cs.onSurfaceVariant),
+                ),
+              ],
+            ),
           ),
         ),
       ),

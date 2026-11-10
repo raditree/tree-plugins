@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../io/plugin_monitor_service.dart';
+import '../app_radius.dart';
 import '../services/detail_selection.dart';
 import 'plugin_panel.dart';
 
@@ -108,7 +109,7 @@ class _Card extends StatelessWidget {
         border: Border.all(
           color: borderColor ?? Theme.of(context).dividerColor,
         ),
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadius.md),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,

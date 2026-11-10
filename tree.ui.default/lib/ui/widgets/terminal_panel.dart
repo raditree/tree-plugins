@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:tree_ui_default/io/protocol_contract.dart';
 
+import '../app_radius.dart';
 import '../services/terminal_ime_input.dart';
 import '../services/terminal_output_notice.dart';
 import '../services/terminal_selection.dart';
@@ -747,7 +748,10 @@ class TerminalPanelState extends State<TerminalPanel> {
   Widget build(BuildContext context) {
     final ColorScheme cs = Theme.of(context).colorScheme;
     return Container(
-      color: cs.surface,
+      decoration: BoxDecoration(
+        color: cs.surface,
+        borderRadius: BorderRadius.circular(AppRadius.xxs),
+      ),
       child: Column(
         children: <Widget>[
           _buildToolbar(cs),
@@ -900,13 +904,13 @@ class TerminalPanelState extends State<TerminalPanel> {
       message: '已往上翻 $_scrollOffset 行（鼠标滚轮继续翻）· 点这里回到最新',
       child: InkWell(
         onTap: () => _scrollTo(0),
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(AppRadius.pill),
         child: Container(
           margin: const EdgeInsets.only(right: 6),
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
           decoration: BoxDecoration(
             color: cs.primary.withValues(alpha: 0.12),
-            borderRadius: BorderRadius.circular(10),
+            borderRadius: BorderRadius.circular(AppRadius.pill),
             border: Border.all(color: cs.primary.withValues(alpha: 0.35)),
           ),
           child: Text(

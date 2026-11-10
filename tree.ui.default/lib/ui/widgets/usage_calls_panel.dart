@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../app_radius.dart';
+
 /// 一次 LLM 调用的用量读数（**纯数据**：把两种来源形态归一到同一个模型上）。
 ///
 /// 为什么要有它：核心每次调用 LLM 都会产出一条用量，但这块数据有**两种形态**，
@@ -344,7 +346,7 @@ class _UsageCallRow extends StatelessWidget {
                   ),
                   decoration: BoxDecoration(
                     color: cs.tertiaryContainer,
-                    borderRadius: BorderRadius.circular(4),
+                    borderRadius: BorderRadius.circular(AppRadius.pill),
                   ),
                   child: Text(
                     '估算',

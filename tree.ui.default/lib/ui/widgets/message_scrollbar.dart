@@ -26,6 +26,7 @@ library;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import '../app_radius.dart';
 import '../services/message_window.dart';
 
 /// 滑块几何（纯函数，单测直接钉它）。
@@ -311,7 +312,7 @@ class _MessageScrollbarState extends State<MessageScrollbar> {
                     child: DecoratedBox(
                       decoration: BoxDecoration(
                         color: cs.onSurface.withValues(alpha: 0.06),
-                        borderRadius: BorderRadius.circular(3),
+                        borderRadius: BorderRadius.circular(AppRadius.pill),
                       ),
                     ),
                   ),
@@ -326,7 +327,7 @@ class _MessageScrollbarState extends State<MessageScrollbar> {
                       color: cs.onSurfaceVariant.withValues(
                         alpha: _active ? 0.7 : 0.4,
                       ),
-                      borderRadius: BorderRadius.circular(3),
+                      borderRadius: BorderRadius.circular(AppRadius.pill),
                     ),
                   ),
                 ),

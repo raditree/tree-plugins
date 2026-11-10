@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../app_radius.dart';
 import '../models/message.dart';
 
 /// 「后台任务（terminal hook）完成」提示的**专用渲染**。
@@ -101,7 +102,7 @@ class _HookNoticeCardState extends State<HookNoticeCard> {
                   height: 26,
                   decoration: BoxDecoration(
                     color: accent.withValues(alpha: 0.15),
-                    borderRadius: BorderRadius.circular(6),
+                    borderRadius: BorderRadius.circular(AppRadius.sm),
                   ),
                   child: Icon(icon, size: 15, color: accent),
                 ),
@@ -199,7 +200,7 @@ class _HookNoticeCardState extends State<HookNoticeCard> {
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
       decoration: BoxDecoration(
         color: Theme.of(context).colorScheme.surface,
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(AppRadius.md),
         border: Border.all(color: accent.withValues(alpha: 0.35)),
       ),
       child: child,
@@ -225,7 +226,7 @@ class _HookNoticeCardState extends State<HookNoticeCard> {
 
   Widget _copyButton(ColorScheme cs) => InkWell(
     onTap: _copy,
-    borderRadius: BorderRadius.circular(4),
+    borderRadius: BorderRadius.circular(AppRadius.xs),
     child: Padding(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
       child: Row(
@@ -248,7 +249,7 @@ class _HookNoticeCardState extends State<HookNoticeCard> {
     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
     decoration: BoxDecoration(
       color: cs.surfaceContainerHighest.withValues(alpha: 0.4),
-      borderRadius: BorderRadius.circular(6),
+      borderRadius: BorderRadius.circular(AppRadius.sm),
       border: Border.all(color: cs.outlineVariant.withValues(alpha: 0.5)),
     ),
     child: SelectableText(

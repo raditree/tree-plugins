@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
 import '../../io/question_update_service.dart';
+import '../app_radius.dart';
 import '../models/agent.dart';
 import '../models/message.dart';
 
@@ -394,7 +395,7 @@ class _QuestionPanelState extends State<QuestionPanel> {
       elevation: 0,
       color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadius.md),
         side: BorderSide(
           color: item.isPending ? cs.primary.withValues(alpha: 0.5) : cs.outlineVariant,
         ),
@@ -502,7 +503,7 @@ class _QuestionPanelState extends State<QuestionPanel> {
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(4),
+        borderRadius: BorderRadius.circular(AppRadius.pill),
       ),
       child: Text(
         text,

@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../app_radius.dart';
 import '../services/onboarding_requests.dart';
 import 'attachment_preview.dart';
 import 'stop_button.dart';
@@ -532,7 +533,7 @@ class _MessageInputState extends State<MessageInput> {
           Container(
             decoration: BoxDecoration(
               color: Theme.of(context).cardColor,
-              borderRadius: BorderRadius.circular(14),
+              borderRadius: BorderRadius.circular(AppRadius.md),
               border: Border.all(color: borderColor, width: _isDragging ? 2 : 1),
             ),
             child: Column(
@@ -740,7 +741,7 @@ class _MessageInputState extends State<MessageInput> {
       padding: const EdgeInsets.symmetric(vertical: 8),
       decoration: BoxDecoration(
         color: cs.primary.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(AppRadius.md),
         border: Border.all(
           color: cs.primary.withValues(alpha: 0.3),
           width: 1.5,

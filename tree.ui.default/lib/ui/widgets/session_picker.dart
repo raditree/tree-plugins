@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../app_radius.dart';
 import '../models/session.dart';
 
 /// 会话选择器（中栏标题栏）
@@ -257,7 +258,7 @@ class _SessionPickerState extends State<SessionPicker> {
           offset: const Offset(0, 6),
           child: Material(
             elevation: 8,
-            borderRadius: BorderRadius.circular(8),
+            borderRadius: BorderRadius.circular(AppRadius.md),
             color: cs.surface,
             child: ConstrainedBox(
               constraints: const BoxConstraints(
@@ -388,7 +389,7 @@ class _SessionPickerState extends State<SessionPicker> {
         padding: const EdgeInsets.symmetric(horizontal: 8),
         decoration: BoxDecoration(
           color: cs.surfaceContainerHighest.withValues(alpha: 0.4),
-          borderRadius: BorderRadius.circular(6),
+          borderRadius: BorderRadius.circular(AppRadius.sm),
           border: Border.all(color: cs.outlineVariant, width: 0.5),
         ),
         child: Row(

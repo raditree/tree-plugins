@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
+import '../app_radius.dart';
 import '../services/detail_selection.dart';
 
 /// 右栏「窗口」的描述：一种可被打开的窗口（文件 / 详情 / 设置 / 插件面板槽位 …）。
@@ -273,8 +274,11 @@ class _RightPanelHostState extends State<RightPanelHost> {
   /// 因此它被放进这条横向滚动行里（标签多时跟随视图一起滚），折叠键仍钉在最右。
   Widget _buildTopBar(ColorScheme cs) {
     return Container(
-      height: 44,
-      color: cs.surface,
+      height: 34,
+      decoration: BoxDecoration(
+        color: cs.surface,
+        borderRadius: BorderRadius.circular(AppRadius.sm),
+      ),
       child: Row(
         children: <Widget>[
           Expanded(
@@ -289,7 +293,7 @@ class _RightPanelHostState extends State<RightPanelHost> {
                 thumbVisibility: true,
                 scrollbarOrientation: ScrollbarOrientation.bottom,
                 thickness: 4,
-                radius: const Radius.circular(2),
+                radius: Radius.circular(AppRadius.pill),
                 child: SingleChildScrollView(
                   controller: _chipScroll,
                   scrollDirection: Axis.horizontal,
@@ -303,10 +307,10 @@ class _RightPanelHostState extends State<RightPanelHost> {
                         key: const ValueKey<String>('right-panel-new-window'),
                         tooltip: _picking ? '关闭创建页' : '新建窗口',
                         visualDensity: VisualDensity.compact,
-                        padding: const EdgeInsets.all(6),
+                        padding: const EdgeInsets.all(4),
                         constraints: const BoxConstraints(
-                          minWidth: 30,
-                          minHeight: 30,
+                          minWidth: 26,
+                          minHeight: 26,
                         ),
                         icon: Icon(
                           _picking ? Icons.close : Icons.add,
@@ -326,7 +330,9 @@ class _RightPanelHostState extends State<RightPanelHost> {
               key: const ValueKey<String>('right-panel-collapse'),
               tooltip: '折叠右侧栏',
               visualDensity: VisualDensity.compact,
-              icon: const Icon(Icons.chevron_right),
+              padding: const EdgeInsets.all(4),
+              constraints: const BoxConstraints(minWidth: 26, minHeight: 26),
+              icon: const Icon(Icons.chevron_right, size: 18),
               onPressed: widget.onCollapse,
             ),
         ],
@@ -366,15 +372,15 @@ class _RightPanelHostState extends State<RightPanelHost> {
     final FontWeight baseWeight =
         DefaultTextStyle.of(context).style.fontWeight ?? FontWeight.w400;
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 2),
+      padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 2),
       child: Material(
         color: active
             ? cs.primary.withValues(alpha: 0.14)
             : Colors.transparent,
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(AppRadius.sm),
         child: InkWell(
           key: ValueKey<String>('right-panel-chip-${entry.id}'),
-          borderRadius: BorderRadius.circular(6),
+          borderRadius: BorderRadius.circular(AppRadius.sm),
           onTap: () => _focusWindow(entry.id),
           child: Padding(
             padding: const EdgeInsets.only(left: 8, right: 2),
@@ -401,7 +407,7 @@ class _RightPanelHostState extends State<RightPanelHost> {
                 const SizedBox(width: 2),
                 InkWell(
                   key: ValueKey<String>('right-panel-chip-close-${entry.id}'),
-                  borderRadius: BorderRadius.circular(4),
+                  borderRadius: BorderRadius.circular(AppRadius.xs),
                   onTap: () => _closeWindow(entry.id),
                   child: Padding(
                     padding: const EdgeInsets.all(3),
@@ -508,10 +514,10 @@ class _RightPanelHostState extends State<RightPanelHost> {
     final bool opened = _open.contains(entry.id);
     return Material(
       color: cs.surfaceContainerHighest.withValues(alpha: 0.35),
-      borderRadius: BorderRadius.circular(8),
+      borderRadius: BorderRadius.circular(AppRadius.md),
       child: InkWell(
         key: ValueKey<String>('right-panel-pick-${entry.id}'),
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadius.md),
         onTap: () => _openWindow(entry.id),
         child: Padding(
           padding: const EdgeInsets.all(4),

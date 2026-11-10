@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../app_radius.dart';
 import '../services/download_center.dart';
 import '../services/file_reveal.dart';
 
@@ -196,7 +197,7 @@ class DownloadPanel extends StatelessWidget {
           if (task.isRunning) ...<Widget>[
             const SizedBox(height: 6),
             ClipRRect(
-              borderRadius: BorderRadius.circular(2),
+              borderRadius: BorderRadius.circular(AppRadius.pill),
               child: LinearProgressIndicator(
                 value: task.progress,
                 minHeight: 3,

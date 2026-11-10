@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'app_radius.dart';
 import 'theme_service.dart';
 
 /// 全局主题（用户 2026-11-08：背景中性化——普通 IDE 的黑 / 深灰 / 白，
@@ -11,8 +12,16 @@ import 'theme_service.dart';
 ///
 /// 主题色（accent）仍然由 [ThemeService] 派生主色与容器色；但背景 / 表面 /
 /// 层次 / 边框 / 正文不再随主题色变化（那是"满屏绿"的根源）。
+///
+/// 圆角（用户 2026-11-10：更多圆角化）：统一走 [AppRadius] 的 2/6/8/16/999，
+/// 主题层只在这里配一次；组件层的散落字面值见 `docs/pluginization/ui-roundness-visual-upgrade-recon.md`。
 class AppTheme {
   const AppTheme._();
+
+  /// 控件档（按钮 / 菜单 / 输入框 / 面板 chip）：全主题共用同一个 shape。
+  static final RoundedRectangleBorder _controlShape = RoundedRectangleBorder(
+    borderRadius: BorderRadius.circular(AppRadius.sm),
+  );
 
   // ==================== 深色（VS Code 风格中性灰阶） ====================
   /// 窗口底色
@@ -96,9 +105,11 @@ class AppTheme {
       // 输入框常态中性描边（聚焦时转主题色）
       inputDecorationTheme: InputDecorationTheme(
         enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(AppRadius.sm),
           borderSide: const BorderSide(color: lightOutline),
         ),
         focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(AppRadius.sm),
           borderSide: BorderSide(color: deep, width: 1.5),
         ),
       ),
@@ -106,17 +117,45 @@ class AppTheme {
       cardTheme: CardThemeData(
         color: Colors.white,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: BorderRadius.circular(AppRadius.md),
           side: const BorderSide(color: lightBorder),
         ),
       ),
       dialogTheme: DialogThemeData(
         backgroundColor: Colors.white,
         shape: RoundedRectangleBorder(
-          borderRadius: const BorderRadius.all(Radius.circular(8)),
+          borderRadius: BorderRadius.circular(AppRadius.md),
           side: const BorderSide(color: lightBorder),
         ),
       ),
+      // 控件统一档（8）：三翼按钮 / 菜单 / SnackBar。FilledButton 不配，
+      // 保持它自带的 StadiumBorder（改 8 反而变方）。
+      elevatedButtonTheme: ElevatedButtonThemeData(
+        style: ElevatedButton.styleFrom(shape: _controlShape),
+      ),
+      outlinedButtonTheme: OutlinedButtonThemeData(
+        style: OutlinedButton.styleFrom(shape: _controlShape),
+      ),
+      textButtonTheme: TextButtonThemeData(
+        style: TextButton.styleFrom(shape: _controlShape),
+      ),
+      popupMenuTheme: PopupMenuThemeData(shape: _controlShape),
+      snackBarTheme: SnackBarThemeData(shape: _controlShape),
+      tooltipTheme: TooltipThemeData(
+        decoration: BoxDecoration(
+          color: Colors.grey[700],
+          borderRadius: BorderRadius.circular(AppRadius.sm),
+        ),
+      ),
+      checkboxTheme: CheckboxThemeData(
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppRadius.xs),
+        ),
+      ),
+      scrollbarTheme: ScrollbarThemeData(
+        radius: const Radius.circular(AppRadius.pill),
+      ),
+      chipTheme: ChipThemeData(shape: const StadiumBorder()),
       // 文字选区仍带主题色（属"选中"类），与用户消息块区分开。
       textSelectionTheme: TextSelectionThemeData(
         selectionColor: ThemeService.deriveContainerLight(accent),
@@ -168,26 +207,54 @@ class AppTheme {
       ),
       inputDecorationTheme: InputDecorationTheme(
         enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(AppRadius.sm),
           borderSide: const BorderSide(color: neutralOutline),
         ),
         focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(AppRadius.sm),
           borderSide: BorderSide(color: accent, width: 1.5),
         ),
       ),
       cardTheme: CardThemeData(
         color: neutralSurface,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: BorderRadius.circular(AppRadius.md),
           side: const BorderSide(color: neutralBorder),
         ),
       ),
       dialogTheme: DialogThemeData(
         backgroundColor: neutralSurface,
         shape: RoundedRectangleBorder(
-          borderRadius: const BorderRadius.all(Radius.circular(8)),
+          borderRadius: BorderRadius.circular(AppRadius.md),
           side: const BorderSide(color: neutralBorder),
         ),
       ),
+      elevatedButtonTheme: ElevatedButtonThemeData(
+        style: ElevatedButton.styleFrom(shape: _controlShape),
+      ),
+      outlinedButtonTheme: OutlinedButtonThemeData(
+        style: OutlinedButton.styleFrom(shape: _controlShape),
+      ),
+      textButtonTheme: TextButtonThemeData(
+        style: TextButton.styleFrom(shape: _controlShape),
+      ),
+      popupMenuTheme: PopupMenuThemeData(shape: _controlShape),
+      snackBarTheme: SnackBarThemeData(shape: _controlShape),
+      tooltipTheme: TooltipThemeData(
+        decoration: BoxDecoration(
+          color: Colors.grey[700],
+          borderRadius: BorderRadius.circular(AppRadius.sm),
+        ),
+      ),
+      checkboxTheme: CheckboxThemeData(
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppRadius.xs),
+        ),
+      ),
+      scrollbarTheme: ScrollbarThemeData(
+        radius: const Radius.circular(AppRadius.pill),
+      ),
+      chipTheme: ChipThemeData(shape: const StadiumBorder()),
       // 深色模式下用 cyan 选区，避免与绿色主色/深色背景隐形。
       textSelectionTheme: const TextSelectionThemeData(
         selectionColor: Color(0xFF4DD0E1),

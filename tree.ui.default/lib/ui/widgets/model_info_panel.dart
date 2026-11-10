@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
+import '../app_radius.dart';
 import '../services/model_pool.dart';
 
 /// 模型信息面板（右栏「模型信息」Tab）
@@ -869,7 +870,7 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
         color: cs.surfaceContainerHighest.withValues(alpha: 0.3),
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadius.md),
         border: Border.all(color: cs.outlineVariant, width: 0.5),
       ),
       child: Column(

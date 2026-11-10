@@ -10,6 +10,7 @@ import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
 import '../../io/api_service.dart';
 import '../../io/platform_support.dart';
+import '../app_radius.dart';
 import '../models/file_content.dart';
 import '../services/code_gutter_layout.dart';
 import '../services/code_highlight.dart';
@@ -1238,7 +1239,7 @@ class FileViewerState extends State<FileViewer> {
             ),
             codeblockDecoration: BoxDecoration(
               color: cs.surfaceContainerHighest,
-              borderRadius: BorderRadius.circular(6),
+              borderRadius: BorderRadius.circular(AppRadius.sm),
               border: Border.all(color: cs.outlineVariant),
             ),
             blockquoteDecoration: BoxDecoration(
@@ -1267,7 +1268,7 @@ class FileViewerState extends State<FileViewer> {
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
                 color: const Color(0xFFFEF3C7),
-                borderRadius: BorderRadius.circular(6),
+                borderRadius: BorderRadius.circular(AppRadius.sm),
                 border: Border.all(color: const Color(0xFFF59E0B), width: 1),
               ),
               child: Row(
@@ -1376,7 +1377,7 @@ class FileViewerState extends State<FileViewer> {
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
                 color: Theme.of(context).scaffoldBackgroundColor,
-                borderRadius: BorderRadius.circular(6),
+                borderRadius: BorderRadius.circular(AppRadius.sm),
               ),
               child: Row(
                 mainAxisSize: MainAxisSize.min,

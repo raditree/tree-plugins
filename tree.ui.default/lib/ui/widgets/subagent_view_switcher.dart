@@ -2,6 +2,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import '../app_radius.dart';
 import '../models/message.dart';
 import '../services/conversation_view.dart';
 import '../services/subagent_transcript.dart';
@@ -111,7 +112,7 @@ class SubagentViewSwitcher extends StatelessWidget {
               color: inSubagent
                   ? cs.primary.withValues(alpha: 0.14)
                   : cs.surfaceContainerHighest.withValues(alpha: 0.4),
-              borderRadius: BorderRadius.circular(14),
+              borderRadius: BorderRadius.circular(AppRadius.pill),
               border: Border.all(
                 color: inSubagent
                     ? cs.primary.withValues(alpha: 0.45)

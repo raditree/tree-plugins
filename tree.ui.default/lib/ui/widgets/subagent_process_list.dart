@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../app_radius.dart';
 import '../models/message.dart';
 import 'thinking_card.dart';
 import 'tool_call_card.dart';
@@ -65,7 +66,7 @@ class SubagentProcessList extends StatelessWidget {
           decoration: BoxDecoration(
             color: cs.surfaceContainerLowest,
             border: Border.all(color: cs.primary.withValues(alpha: 0.35)),
-            borderRadius: BorderRadius.circular(6),
+            borderRadius: BorderRadius.circular(AppRadius.sm),
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,

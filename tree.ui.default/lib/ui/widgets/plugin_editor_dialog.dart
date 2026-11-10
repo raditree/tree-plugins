@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../app_radius.dart';
+
 /// 插件编辑弹窗（M9 §4.2）：新增 / 编辑一个插件（内置插件的编辑也走这里）。
 ///
 /// 为什么单独一个文件：面板（plugin_panel.dart）已经很长，而表单 + 校验 + 安全
@@ -494,7 +496,7 @@ class _PluginEditorDialogState extends State<PluginEditorDialog> {
     padding: const EdgeInsets.all(8),
     decoration: BoxDecoration(
       color: cs.surfaceContainerHighest,
-      borderRadius: BorderRadius.circular(6),
+      borderRadius: BorderRadius.circular(AppRadius.sm),
     ),
     child: Text(
       text,

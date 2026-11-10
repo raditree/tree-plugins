@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../app_radius.dart';
 import '../models/agent.dart';
 import '../../io/api_service.dart';
 
@@ -222,7 +223,7 @@ class _SpecPanelState extends State<SpecPanel> {
       margin: const EdgeInsets.only(bottom: 10),
       // 选中态（挂 hook）高亮描边，便于识别当前生效的 Spec
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(AppRadius.md),
         side: selected
             ? BorderSide(color: _cs.primary, width: 1.5)
             : BorderSide.none,
@@ -254,7 +255,7 @@ class _SpecPanelState extends State<SpecPanel> {
                               ),
                               decoration: BoxDecoration(
                                 color: _cs.primaryContainer,
-                                borderRadius: BorderRadius.circular(4),
+                                borderRadius: BorderRadius.circular(AppRadius.pill),
                               ),
                               child: Text(
                                 builtin ? '内置' : '置顶',
@@ -392,7 +393,7 @@ class _TaskTypeBadge extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
       decoration: BoxDecoration(
         color: bg,
-        borderRadius: BorderRadius.circular(4),
+        borderRadius: BorderRadius.circular(AppRadius.pill),
       ),
       child: Text(
         label,
@@ -435,7 +436,7 @@ class _ExpandedMarkdown extends StatelessWidget {
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
         color: cs.surface,
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadius.md),
         border: Border.all(color: cs.outlineVariant),
       ),
       child: Column(

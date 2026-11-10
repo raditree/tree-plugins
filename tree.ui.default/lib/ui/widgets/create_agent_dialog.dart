@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../io/api_service.dart';
+import '../app_radius.dart';
 import '../services/model_pool.dart';
 
 /// 创建 Agent 配置对话框
@@ -331,7 +332,7 @@ class _CreateAgentDialogState extends State<CreateAgentDialog> {
         padding: const EdgeInsets.all(10),
         decoration: BoxDecoration(
           color: const Color(0xFFFEF2F2),
-          borderRadius: BorderRadius.circular(6),
+          borderRadius: BorderRadius.circular(AppRadius.sm),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,

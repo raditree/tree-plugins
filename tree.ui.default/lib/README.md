@@ -316,14 +316,14 @@
     听共享缓冲的 dirty），保存后熄灭——旧头部的状态行没了，未保存态就挂在这颗点上，保存失败**一律 SnackBar**
     （静默自动保存失败也要可见）。查看器内容区（Markdown / SVG 预览、只读正文、编辑正文）都包**常驻滚动条**
     （`Scrollbar(thumbVisibility: true)`；桌面端滚动条不自动常驻——用户 2026-10-19：「还有这个为什么又没给滑动条」）。
-    ⑪ **顶栏收敛成一条；tab 铺满整宽、对标标准代码编辑器**（用户 2026-10-19：「文件标签在中间也不合理」
-    「各类框格导致大量空间被浪费」）：旧实现把 tab 条塞进**查看器那一格**（只占右半格，标签看着悬在中间），
-    并在整块顶部叠了四条横条（标题 36 + tab 30 + 查看器工具条 32 + 两条分隔线 ≈ 100px）。现在合并成**顶部一条 32px**：
-    左段是**铺满整宽**的 tab 条（没有打开文件时退回「文件浏览」标题），右段是工作空间动作（重置系统提示词 / Spec、
-    [FileSyncButton](ui/widgets/file_sync_button.dart)）与视图动作（收起目录 / 分屏 / 切方向 / 关窗格 / 关查看器）——
-    纵向空间还给正文。tab 视觉**扁平矩形**（不再是圆角胶囊）：活动 tab 顶部一条 **2px 主色细条** + 用正文底色与
-    下方内容连成一片、非活动 tab 融进顶栏底色、相邻 tab 之间一条竖直分隔线（`file-tab-<path>` /
-    `file-tab-close-<path>` 两个 key 不变）。
+    ⑪ **tab 只属于查看器（IDE 口径），目录树头部独立**（用户 2026-11-10：「IDE 的 tab 一般不会放到目录那行上」）：
+    顶部不再横贯整块的 tab / 工具条。文件打开时：窗口 chip 行 34px；左格 = `根目录` 头 26px + 目录树；
+    右格 = tab 条 28px + 查看器。tab 条里只放文件 tab + 视图动作（收起目录 / 分屏 / 切方向 / 关窗格 / 关查看器）；
+    工作空间动作（重置系统提示词 / Spec、[FileSyncButton](ui/widgets/file_sync_button.dart)）挂到目录树头部右侧。
+    tab 视觉仍是**扁平矩形**（用户 2026-10-19 的"不是圆角胶囊"口径不变）：活动 tab 顶部一条 **2px 主色细条** +
+    用正文底色与下方内容连成一片、非活动 tab 融进表面、相邻 tab 之间一条竖直分隔线（`file-tab-<path>` /
+    `file-tab-close-<path>` 两个 key 不变）。**tab 多到装不下时底部常显滑块**（`file-tab-scrollbar`），
+    滚轮落在 tab 条上横向翻；打开 / 切到远处的 tab 会自动滚入视野（用户 2026-11-10：「文件一多 tab 就进去了，还没有滑块」）。
 
 17. **首次使用有八步新手引导，处处可跳过**（[ui/services/onboarding_steps.dart](ui/services/onboarding_steps.dart)、
     [ui/services/onboarding_state.dart](ui/services/onboarding_state.dart)、
@@ -658,6 +658,15 @@
     - 创建 Agent / 右栏「模型信息」/ 团队成员模型分配**只列 chat**；没有 chat 模型时提示
       「没有可用的对话模型，请先在设置页新增 chat 模型」。前端过滤只是体验层，
       后端绑定校验仍须拒绝非 chat（MP-2）。
+
+33. **圆角统一走 `AppRadius` 五档尺子（2 / 6 / 8 / 16 / 999）**（用户 2026-11-10：「更多圆角化」，
+    [ui/app_radius.dart](ui/app_radius.dart)、[ui/app_theme.dart](ui/app_theme.dart)）：
+    `xxs` 2 只给栏级表面收边（侧栏列 / 条 / 终端底 / 文件 tab 条、分隔线），`xs` 6 给微件（关闭键 / 小徽标 / 行 hover），
+    `sm` 8 给控件（输入框 / 三翼按钮 / 菜单 / 工具行 / 代码块 / 面板 chip），`md` 16 给容器（卡片 / 对话框 / picker / 附件 / 气泡 / composer），
+    `pill` 999 给胶囊（状态徽标 / pill / 进度条 / 滚动条）。文件 tab **项**仍是扁平矩形（不变量 16 ⑪），
+    `FilledButton` / `Chip` / `Switch` 保持自带胶囊；改档只改 [ui/app_radius.dart](ui/app_radius.dart) 的 5 个常量。
+    主题层（Card / Dialog / Input / 按钮 / 菜单 / SnackBar / Tooltip / Checkbox / Scrollbar / Chip）只在 `AppTheme` 配一次，
+    组件层不得再出现 `BorderRadius.circular(<数字>)`。
 
 ## 测试
 

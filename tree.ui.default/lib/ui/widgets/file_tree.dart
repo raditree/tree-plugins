@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../io/api_service.dart';
+import '../app_radius.dart';
 import '../../io/local_executor_service.dart';
 import '../../io/platform_support.dart';
 import '../models/file_listing.dart';
@@ -68,6 +69,10 @@ class FileTree extends StatefulWidget {
   /// 删除成功回调（被删的相对路径；查看器里指向它的窗格要关掉）
   final ValueChanged<String>? onPathDeleted;
 
+  /// 头部右侧的附加动作（文件面板把工作空间动作挂到这里：IDE 的
+  /// 「资源管理器 ···」位置；不再单独占一条横贯面板的顶栏）。
+  final List<Widget> trailingActions;
+
   const FileTree({
     super.key,
     required this.workspaceId,
@@ -77,6 +82,7 @@ class FileTree extends StatefulWidget {
     this.onPathChanged,
     this.onPathRenamed,
     this.onPathDeleted,
+    this.trailingActions = const <Widget>[],
     this.refreshTrigger = 0,
   });
 
@@ -553,8 +559,8 @@ class _FileTreeState extends State<FileTree> {
     final ColorScheme cs = Theme.of(context).colorScheme;
     final String scope = _scopePath();
     return Container(
-      height: 30,
-      color: cs.surface,
+      height: 26,
+      // 不再铺整条底色：和文件顶栏共用窗口表面，少一条矩形带。
       padding: const EdgeInsets.only(left: 8, right: 2),
       child: Row(
         children: <Widget>[
@@ -617,6 +623,10 @@ class _FileTreeState extends State<FileTree> {
             tooltip: _expanded.isEmpty ? '没有展开的目录（都收着呢）' : '全部折叠',
             onPressed: _expanded.isEmpty ? null : _collapseAll,
           ),
+          if (widget.trailingActions.isNotEmpty) ...<Widget>[
+            const SizedBox(width: 2),
+            ...widget.trailingActions,
+          ],
         ],
       ),
     );
@@ -629,13 +639,18 @@ class _FileTreeState extends State<FileTree> {
     // 比点了没反应强——用户一眼就知道不是按钮坏了。
     required VoidCallback? onPressed,
   }) {
-    return IconButton(
-      icon: Icon(icon, size: 16),
-      tooltip: tooltip,
-      visualDensity: VisualDensity.compact,
-      padding: const EdgeInsets.all(4),
-      constraints: const BoxConstraints(minWidth: 26, minHeight: 26),
-      onPressed: onPressed,
+    // 固定 22×22：IconButton 的默认 tap target 会撑到 40+，在 200px 的
+    // 树格里会把 7 颗键顶出黄条。
+    return SizedBox(
+      width: 22,
+      height: 22,
+      child: IconButton(
+        icon: Icon(icon, size: 16),
+        tooltip: tooltip,
+        visualDensity: VisualDensity.compact,
+        padding: EdgeInsets.zero,
+        onPressed: onPressed,
+      ),
     );
   }
 
@@ -802,13 +817,20 @@ class _FileTreeState extends State<FileTree> {
             children: <Widget>[
               // 整行底色：悬停浅、选中更重（VS Code 观感）
               Positioned.fill(
-                child: ColoredBox(
-                  key: FileTree.rowBackgroundKey(path),
-                  color: selected
-                      ? cs.primary.withValues(alpha: 0.16)
-                      : hovered
-                      ? cs.onSurface.withValues(alpha: 0.07)
-                      : Colors.transparent,
+                // 行底色只做 6px 收边，不换控件类型：测试按 key 取 ColoredBox。
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(AppRadius.xs),
+                    child: ColoredBox(
+                      key: FileTree.rowBackgroundKey(path),
+                      color: selected
+                          ? cs.primary.withValues(alpha: 0.16)
+                          : hovered
+                          ? cs.onSurface.withValues(alpha: 0.07)
+                          : Colors.transparent,
+                    ),
+                  ),
                 ),
               ),
               Positioned.fill(

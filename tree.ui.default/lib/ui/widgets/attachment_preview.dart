@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 
 import '../../io/attachment_upload_service.dart';
+import '../app_radius.dart';
 import '../services/file_reveal.dart';
 
 /// 附件预览（本机文件）。
@@ -216,7 +217,7 @@ class _AttachmentTileState extends State<AttachmentTile> {
     return Tooltip(
       message: widget.path,
       child: InkWell(
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadius.md),
         onTap: () => unawaited(showAttachmentPreview(context, widget.path)),
         child: tile,
       ),
@@ -233,7 +234,7 @@ class _AttachmentTileState extends State<AttachmentTile> {
         children: <Widget>[
           Positioned.fill(
             child: ClipRRect(
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: BorderRadius.circular(AppRadius.md),
               child: Image.file(
                 File(widget.path),
                 fit: BoxFit.cover,
@@ -299,7 +300,7 @@ class _AttachmentTileState extends State<AttachmentTile> {
       padding: const EdgeInsets.fromLTRB(8, 6, 4, 6),
       decoration: BoxDecoration(
         color: cs.surfaceContainerHighest.withValues(alpha: 0.45),
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadius.md),
         border: Border.all(color: Theme.of(context).dividerColor),
       ),
       child: Row(

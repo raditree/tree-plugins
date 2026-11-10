@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
+import '../app_radius.dart';
 import '../models/message.dart';
 import '../services/code_highlight.dart';
 import '../services/code_highlight_lines.dart';
@@ -54,9 +55,9 @@ class _ToolCallCardState extends State<ToolCallCard> {
             color: isSelected
                 ? cs.primary.withValues(alpha: 0.12)
                 : Colors.transparent,
-            borderRadius: BorderRadius.circular(6),
+            borderRadius: BorderRadius.circular(AppRadius.sm),
             child: InkWell(
-              borderRadius: BorderRadius.circular(6),
+              borderRadius: BorderRadius.circular(AppRadius.sm),
               hoverColor: cs.primary.withValues(alpha: 0.07),
               // 点一下选中、再点一下取消（见 DetailSelection.toggle）
         onTap: () => DetailSelection.instance.toggle(m),
@@ -873,7 +874,7 @@ class _ToolDetailState extends State<ToolDetail> {
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
         color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(AppRadius.sm),
         border: Border.all(color: Theme.of(context).dividerColor),
       ),
       child: SelectableText(
@@ -1196,7 +1197,7 @@ class _ToolDetailState extends State<ToolDetail> {
       decoration: BoxDecoration(
         color: cs.surfaceContainerLowest,
         border: Border.all(color: cs.outlineVariant),
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(AppRadius.sm),
       ),
       child: child,
     );

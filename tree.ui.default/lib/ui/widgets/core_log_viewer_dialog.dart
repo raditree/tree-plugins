@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../app_version.dart';
+import '../app_radius.dart';
 import '../services/core_log_files.dart';
 
 /// 「看最近 N 行核心日志」弹窗（设置页「核心日志」卡片调起）。
@@ -171,7 +172,7 @@ class _CoreLogViewerDialogState extends State<CoreLogViewerDialog> {
       width: double.infinity,
       decoration: BoxDecoration(
         border: Border.all(color: cs.outlineVariant),
-        borderRadius: BorderRadius.circular(4),
+        borderRadius: BorderRadius.circular(AppRadius.sm),
       ),
       padding: const EdgeInsets.all(8),
       child: Scrollbar(

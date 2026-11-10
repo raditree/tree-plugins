@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../app_radius.dart';
+
 /// 二分窗格：按 [axis] 把 [first] / [second] 排开，中间一条可拖的分隔条。
 ///
 /// 为什么单独抽出来：分屏的"布局 + 拖动比例 + 太窄降级"是纯几何，跟文件、编辑器、
@@ -113,7 +115,10 @@ class _SplitDivider extends StatelessWidget {
             child: Container(
               width: horizontal ? 1 : double.infinity,
               height: horizontal ? double.infinity : 1,
-              color: Theme.of(context).dividerColor,
+              decoration: BoxDecoration(
+                color: Theme.of(context).dividerColor,
+                borderRadius: BorderRadius.circular(AppRadius.xxs),
+              ),
             ),
           ),
         ),

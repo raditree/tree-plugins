@@ -14,6 +14,7 @@ import 'io/station_client.dart';
 import 'io/tray_service.dart';
 import 'io/ui_identity.dart';
 import 'io/websocket_service.dart';
+import 'ui/app_radius.dart';
 import 'ui/app_theme.dart';
 import 'ui/font_service.dart';
 import 'ui/pages/main_page.dart';
@@ -441,7 +442,7 @@ class CoreStartupErrorApp extends StatelessWidget {
                     decoration: BoxDecoration(
                       color: AppTheme.neutralOverlay,
                       border: Border.all(color: AppTheme.neutralBorder),
-                      borderRadius: BorderRadius.circular(8),
+                      borderRadius: BorderRadius.circular(AppRadius.md),
                     ),
                     child: SelectableText(
                       message,

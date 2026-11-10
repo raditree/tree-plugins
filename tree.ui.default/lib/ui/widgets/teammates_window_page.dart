@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../app_radius.dart';
 import '../models/agent.dart';
 import '../models/message.dart';
 import '../services/model_pool.dart';
@@ -235,7 +236,7 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
         color: cs.errorContainer,
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadius.md),
       ),
       child: Row(
         children: <Widget>[
@@ -284,7 +285,7 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
         color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(AppRadius.md),
         border: Border.all(color: cs.primary.withValues(alpha: 0.4)),
       ),
       child: Row(
@@ -341,7 +342,7 @@ class _TeammatesWindowPageState extends State<TeammatesWindowPage> {
       // 待处理成员用错误色描边，与顶部提示条呼应（一眼看出该点哪个）
       shape: needsAction
           ? RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(AppRadius.md),
               side: BorderSide(color: cs.error, width: 1),
             )
           : null,
@@ -973,7 +974,7 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
             decoration: BoxDecoration(
               color: cs.errorContainer,
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: BorderRadius.circular(AppRadius.md),
             ),
             child: Row(
               children: <Widget>[
