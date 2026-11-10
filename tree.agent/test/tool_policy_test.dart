@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:test/test.dart';
 import 'package:tree_agent_loop/src/paths.dart';
 import 'package:tree_agent_loop/src/runtime/agent_runtime.dart';
+import 'package:tree_agent_loop/src/station/tool_contributions.dart';
 import 'package:tree_agent_loop/src/store/file_store.dart';
 import 'package:tree_agent_loop/src/store/records.dart';
 import 'package:tree_agent_loop/src/store/tree_paths.dart';
@@ -52,6 +53,13 @@ void main() {
       expect(child.allows('team'), isFalse);
       // 父策略本身不被修改。
       expect(parent.allows('team'), isTrue);
+    });
+
+    test('显式勾选类工具：ask_expert 的核心名与原生名同一判定', () {
+      expect(isOptInTool('ask_expert'), isTrue);
+      expect(isOptInTool('plugin__tree.production.line__ask_expert'), isTrue);
+      expect(isOptInTool('read'), isFalse);
+      expect(isOptInTool('subagent'), isFalse);
     });
 
     test('分组：内置按语义归组，贡献工具落 plugin / collab', () {
@@ -233,6 +241,78 @@ void main() {
       );
       expect(unknown.isError, isTrue);
       expect(unknown.content, contains('未知工具'));
+    });
+
+    test('ask_expert 必须显式勾选：全量默认不出现，勾选后才出现 / 可执行', () async {
+      StationToolRunner runnerForPolicy(ToolPolicy policy) {
+        Future<Map<String, dynamic>> client(
+          String command,
+          Map<String, dynamic> arguments,
+          Map<String, dynamic> scope,
+        ) async => <String, dynamic>{'result': '专家回答', 'is_error': false};
+        return StationToolRunner(
+          client: client,
+          scopeFor: (String agentId, String sessionId) => <String, dynamic>{
+            'agent_id': agentId,
+            'session_id': sessionId,
+          },
+          policyFor: (String agentId) => policy,
+          contributed: () => <ContributedTool>[
+            const ContributedTool(
+              pluginId: 'tree.production.line',
+              name: 'ask_expert',
+              description: '问专家',
+              parameters: <String, dynamic>{'type': 'object'},
+            ),
+          ],
+        );
+      }
+
+      const String name = 'plugin__tree.production.line__ask_expert';
+      final StationToolRunner defaults = runnerForPolicy(const ToolPolicy());
+      expect(
+        defaults
+            .specsFor(agentId: 'agt', sessionId: 's')
+            .map((ToolSpec spec) => spec.name),
+        isNot(contains(name)),
+        reason: '未配置 tool_policy 时不出现（默认不能召专家）',
+      );
+      final ToolCatalogEntry off = defaults
+          .catalogFor(agentId: 'agt')
+          .firstWhere((ToolCatalogEntry entry) => entry.name == name);
+      expect(off.enabled, isFalse, reason: '目录里可见但默认未勾选');
+      final ToolOutcome rejected = await defaults.run(
+        const ToolInvocation(
+          id: 'e1',
+          name: name,
+          arguments: <String, dynamic>{'question': 'X?'},
+          agentId: 'agt',
+          sessionId: 's',
+        ),
+      );
+      expect(rejected.isError, isTrue);
+      expect(rejected.content, contains('需要显式勾选'));
+
+      final StationToolRunner picked = runnerForPolicy(
+        const ToolPolicy(allowed: <String>{'ask_expert'}),
+      );
+      expect(
+        picked
+            .specsFor(agentId: 'agt', sessionId: 's')
+            .map((ToolSpec spec) => spec.name),
+        contains(name),
+      );
+      final ToolOutcome allowed = await picked.run(
+        const ToolInvocation(
+          id: 'e2',
+          name: name,
+          arguments: <String, dynamic>{'question': 'X?'},
+          agentId: 'agt',
+          sessionId: 's',
+        ),
+      );
+      expect(allowed.isError, isFalse);
+      expect(allowed.content, '专家回答');
     });
   });
 

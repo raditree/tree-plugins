@@ -12,14 +12,16 @@ import 'dart:io';
 
 import 'models.dart';
 import 'execution.dart';
+import 'expert.dart';
 import 'preparation.dart';
 import 'service.dart';
 import 'store.dart';
 
-/// P4 对外开放的命令族（同一个执行站 `production`）。
+/// P4 / P5 对外开放的命令族（同一个执行站 `production`）。
 const List<String> kExecutionCommands = <String>[
   'production.task.pack',
   'production.task.run',
+  'production.task.expert',
   'production.task.message',
   'production.task.messages',
 ];
@@ -119,6 +121,8 @@ class ProductionExecutionService {
         return _pack(store, arguments, scope);
       case 'production.task.run':
         return _run(store, arguments, scope);
+      case 'production.task.expert':
+        return _expert(store, arguments, scope);
       case 'production.task.message':
         return _message(store, arguments);
       case 'production.task.messages':
@@ -617,6 +621,171 @@ class ProductionExecutionService {
     };
   }
 
+  // ── 专家工具（§9.4）────────────────────────────────────────────────
+
+  Future<Map<String, Object?>> _expert(
+    ProductionStore store,
+    Map<String, Object?> arguments,
+    Map<String, Object?> scope,
+  ) async {
+    final String lineId = _arg(arguments, 'line_id');
+    final String taskId = _arg(arguments, 'task_id');
+    final LineRecord line = store.getLine(lineId);
+    final TaskRecord task = store.getTask(lineId, taskId);
+    final ExpertRequest request = parseExpertArguments(arguments);
+    final Map<String, Object?> expertRole = _expertRole(line);
+    if (expertRole['enabled'] != true) {
+      throw ProductionFailure(
+        '专家未启用：line.yaml.roles.expert.enabled=false（默认关闭，模型配置页勾选后才允许）',
+        code: 'expert_disabled',
+      );
+    }
+    // 只有打包 / 执行可以召专家：专家不能再召专家，用户也不能绕过产线直接问。
+    if (request.role.isNotEmpty &&
+        request.role != 'packer' &&
+        request.role != 'executor') {
+      throw ProductionFailure(
+        '只有打包 / 执行可以召专家（当前：${request.role}；专家不能再召专家）',
+        code: 'expert_not_allowed',
+      );
+    }
+    // 单任务次数上限（台账按 role=expert 计数，失败也算一次）。
+    final int max = intOf(expertRole['max_per_task'], kExpertMaxPerTask);
+    final List<Map<String, Object?>> runs = store.listRuns(
+      lineId,
+      taskId: taskId,
+    );
+    final int used = runs
+        .where((Map<String, Object?> run) => textOf(run['role']) == 'expert')
+        .length;
+    if (max <= 0 || used >= max) {
+      throw ProductionFailure(
+        '专家调用已达上限（$used/$max）：单任务上限读 roles.expert.max_per_task',
+        code: 'expert_limit_exceeded',
+      );
+    }
+    // 专家不落盘：工具表里出现 write / edit / 再召 / 建团队一律拒绝。
+    final List<String> tools = expertToolsOf(expertRole['tools']);
+    final List<String> violations = expertToolViolations(tools);
+    if (violations.isNotEmpty) {
+      throw ProductionFailure(
+        '专家工具表含写入 / 再召工具：${violations.join('、')}（专家只读、不落盘）',
+        code: 'expert_tools_invalid',
+      );
+    }
+    final WorkerRunner? runner = workers;
+    if (runner == null) {
+      throw ProductionFailure(
+        '专家调用需要 agent.worker.run 通道，当前未接线',
+        code: 'worker_unavailable',
+      );
+    }
+    final String agentId = _agentOf(scope);
+    final String configuredModel = textOf(expertRole['model_id']);
+    final Map<String, Object?> workerScope = _workerScope(
+      scope,
+      agentId,
+      lineId,
+      taskId,
+    );
+    final String startedAt = _now;
+    final int startedMs = _clock().millisecondsSinceEpoch;
+    Map<String, Object?> result;
+    try {
+      result = await runner(
+        WorkerCall(
+          role: 'expert',
+          task: expertUserPrompt(
+            taskId: taskId,
+            title: task.title,
+            request: request,
+          ),
+          tools: tools,
+          modelId: configuredModel,
+        ),
+        workerScope,
+      );
+    } catch (error) {
+      result = <String, Object?>{
+        'status': 'failed',
+        'error': '专家运行异常：$error',
+      };
+    }
+    final int elapsed = _clock().millisecondsSinceEpoch - startedMs;
+    final String workerModel = textOf(result['model_id']).isEmpty
+        ? configuredModel
+        : textOf(result['model_id']);
+    final String workerError = _workerErrorOf(result);
+    final Map<String, Object?> run = _runMap(
+      runId: store.nextRunId(taskId, 'expert'),
+      taskId: taskId,
+      role: 'expert',
+      modelId: workerModel,
+      startedAt: startedAt,
+      elapsedMs: elapsed,
+      status: 'failed',
+      error: workerError,
+      worker: result,
+    );
+    Map<String, Object?> withQuestion(Map<String, Object?> value) =>
+        <String, Object?>{
+          ...value,
+          'asked_by': request.role,
+          'question': _clip(request.question, 2000),
+        };
+    if (workerError.isNotEmpty) {
+      final Map<String, Object?> failed = withQuestion(run);
+      store.writeRun(lineId, failed);
+      return <String, Object?>{
+        'status': 'failed',
+        'error': workerError,
+        'run': failed,
+        'used': used,
+        'max_per_task': max,
+        // 失败也落台账，所以这一次同样计数。
+        'remaining': max - used - 1,
+        'task_id': taskId,
+      };
+    }
+    final ExpertAnswer answer;
+    try {
+      answer = parseExpertAnswer(
+        jsonObjectFromText(textOf(result['report'])),
+      );
+    } on ProductionFailure catch (error) {
+      final Map<String, Object?> failed = <String, Object?>{
+        ...withQuestion(run),
+        'error': error.message,
+      };
+      store.writeRun(lineId, failed);
+      return <String, Object?>{
+        'status': 'failed',
+        'error': error.message,
+        'run': failed,
+        'used': used,
+        'max_per_task': max,
+        'remaining': max - used - 1,
+        'task_id': taskId,
+      };
+    }
+    final Map<String, Object?> okRun = <String, Object?>{
+      ...withQuestion(run),
+      'status': 'ok',
+      'answer': answer.toJson(),
+    };
+    store.writeRun(lineId, okRun);
+    return <String, Object?>{
+      'status': 'ok',
+      'answer': answer.toJson(),
+      'text': renderExpertAnswer(answer),
+      'run': okRun,
+      'used': used + 1,
+      'max_per_task': max,
+      'remaining': max - used - 1,
+      'task_id': taskId,
+    };
+  }
+
   // ── 任务内 message 线程（§9.3）──────────────────────────────────
 
   Map<String, Object?> _message(
@@ -720,12 +889,26 @@ class ProductionExecutionService {
   Map<String, Object?> _roleMap(LineRecord line, String role) =>
       plainMap(plainMap(line.data['roles'])[role]);
 
+  /// `roles.expert`（默认关闭；老产线缺键也按关闭处理）。
+  Map<String, Object?> _expertRole(LineRecord line) => _roleMap(line, 'expert');
+
   String _modelOf(LineRecord line, String role) =>
       textOf(_roleMap(line, role)['model_id']);
 
   List<String> _toolsOf(LineRecord line, String role) {
-    final List<String> tools = stringsOf(_roleMap(line, role)['tools']);
-    return tools.isEmpty ? kRoleDefaultTools[role]! : tools;
+    final List<String> configured = stringsOf(_roleMap(line, role)['tools']);
+    final List<String> tools = List<String>.of(
+      configured.isEmpty
+          ? (kRoleDefaultTools[role] ?? const <String>[])
+          : configured,
+    );
+    // P5：产线启用专家后，ask_expert 进入打包 / 执行的工具表（未启用不出现）。
+    if ((role == 'packer' || role == 'executor') &&
+        _expertRole(line)['enabled'] == true &&
+        !tools.contains(kAskExpertTool)) {
+      tools.add(kAskExpertTool);
+    }
+    return tools;
   }
 
   String _intakeText(TaskRecord task) {

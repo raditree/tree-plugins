@@ -15,6 +15,16 @@ const Set<String> kSubagentBlockedTools = <String>{
   'message',
 };
 
+/// **必须显式勾选**才出现的工具（P5）。
+///
+/// `ask_expert` 由产线插件贡献，但"默认不能召专家"（§9.4）：
+/// - 未配置 `tool_policy`（全量默认）的 agent **看不到**它；
+/// - 只有清单里显式写了 `ask_expert`（原生名或核心名）才出现在工具表里。
+const Set<String> kOptInTools = <String>{'ask_expert'};
+
+/// [toolName] 是否是必须显式勾选的工具（核心名与原生名同一判定）。
+bool isOptInTool(String toolName) => kOptInTools.contains(_nativeName(toolName));
+
 /// 工具分组（UI 勾选按组展示；未列出的工具归 [kToolGroupPlugin]）。
 const String kToolGroupRead = 'read';
 const String kToolGroupWrite = 'write';

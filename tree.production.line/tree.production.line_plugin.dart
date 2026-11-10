@@ -1,5 +1,5 @@
 // tree.production.line —— 标准开发流生产线（P1 数据模型 + 队列；P3 准备阶段；
-// P4 打包 + 执行）。
+// P4 打包 + 执行；P5 专家工具）。
 //
 // 定位（docs/pluginization/production-line-recon.md §7/§8/§9/§10/§11）：
 // - headless 插件，granularity=team；数据只落 `<data_root>/production_lines/<team_id>/`；
@@ -11,6 +11,9 @@
 // - P4 执行阶段：`production.task.pack|run|message(s)` 经 `agent.worker.run`
 //   调角色化员工（packer / executor），门控经 `local.exec.command`（本机租约）；
 //   写域越界 / 门控失败一律不得进 `done`；
+// - P5 专家工具：向 `tree.agent` 的工具收集站贡献 `ask_expert`，工具调用经
+//   本插件自己的执行站回到 `production.task.expert`（拿得到 meta.data_dir）；
+//   默认关闭、单任务次数上限、专家只读不落盘、四段回答；
 // - 依赖纪律：不得 import 任何核心包。
 import 'dart:async';
 import 'dart:convert';
@@ -22,9 +25,12 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.production.line';
 const String kDisplayName = 'Tree 标准开发流生产线';
-const String kVersion = '0.3.0';
+const String kVersion = '0.4.0';
 
 const String kStationName = 'production';
+
+/// `tree.agent` 的工具收集站（P5 贡献 `ask_expert` 的落点）。
+const String kToolCollectStation = 'plugin.tree.agent.collect.tools';
 
 /// 追问上限的设置键。`tree.settings` 的 key 只允许字母/数字/下划线（不能带点），
 /// 所以 §8.4 里写的 `questions.max_per_round` 落成 `questions_max_per_round`
@@ -50,6 +56,9 @@ const String kStationReadme =
     'production.task.run（agent.worker.run role=executor → 写域判据 → 门控 local.exec.command；'
     '失败按 limits.retries 回 packed，超限 blocked；done 只由门控通过触发）→ '
     'production.task.message|messages（任务内一对一 message 线程，打回超过 3 次自动 blocked）。'
+    'P5 专家工具：向 tree.agent 工具收集站贡献 ask_expert → production.task.expert'
+    '（roles.expert.enabled 默认 false；单任务 ≤ max_per_task；专家只读不落盘；'
+    '输出固定四段：结论 / 依据 / 建议 / 未决；每次调用落 runs 台账 role=expert）。'
     '追问上限读 settings，缺省回退 line.yaml.limits 与 3（夹到 1–10）。';
 
 final ProductionService _service = ProductionService();
@@ -67,6 +76,8 @@ PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
   displayName: kDisplayName,
   onReady: _onReady,
   onRequest: handleRequest,
+  tools: <Map<String, dynamic>>[expertToolSpec()],
+  onToolCall: _handleToolCall,
   exitOnShutdown: exitOnShutdown,
 );
 
@@ -82,8 +93,21 @@ Future<void> _onReady(PluginKitServer server) async {
     commands: _runCommand,
   );
   server.channel.log(
-    '已上线：v$kVersion（tree.production.line，P1 数据 + P3 准备阶段 + P4 打包执行）',
+    '已上线：v$kVersion（tree.production.line，P1 数据 + P3 准备阶段 + P4 打包执行 + P5 专家）',
   );
+  // P5：把 ask_expert 贡献给 tree.agent 的工具收集站（默认不在任何 agent 的工具表里，
+  // 只有显式勾选的打包 / 执行员工才拿得到）。
+  try {
+    final Map<String, dynamic> subscribed = await server.channel.request(
+      M.stationSubscribe,
+      <String, dynamic>{'station_id': kToolCollectStation},
+    );
+    server.channel.log(
+      '订阅 tree.agent 工具收集站：${subscribed['ok'] == true ? '成功' : subscribed['error']}',
+    );
+  } catch (error) {
+    server.channel.log('订阅工具收集站失败：$error');
+  }
   try {
     final Map<String, dynamic> result = await server.channel.request(
       M.stationRegister,
@@ -319,6 +343,63 @@ Future<String> _leaseFor(
   return leaseId;
 }
 
+/// `tools/call` 的落点（P5）：只认 `ask_expert`，转回本插件自己的执行站命令
+/// `production.task.expert`。
+///
+/// 为什么要多绕一跳：`tools/call` 的 scope 里没有 `data_dir`（核心只在
+/// `station/request` 的 meta 里带数据根），绕回执行站才能拿到同一个数据根。
+Future<Map<String, dynamic>> _handleToolCall(
+  String name,
+  Map<String, dynamic> arguments,
+  Map<String, dynamic> scope,
+) async {
+  final String native = name.startsWith('plugin__')
+      ? name.split('__').last
+      : name;
+  if (native != kAskExpertTool) {
+    return toolText('未知工具：$name（本插件只贡献 $kAskExpertTool）', isError: true);
+  }
+  final PluginKitServer? server = _activeServer;
+  if (server == null) {
+    return toolText('插件尚未就绪：$kAskExpertTool 暂不可用', isError: true);
+  }
+  final String sessionId = asString(scope['session_id']);
+  if (!sessionId.startsWith('pl_')) {
+    return toolText(
+      '$kAskExpertTool 只对产线员工开放（打包 / 执行的任务会话 pl_<line>_<task>）；'
+      '当前会话：${sessionId.isEmpty ? '空' : sessionId}',
+      isError: true,
+    );
+  }
+  try {
+    final Map<String, dynamic> payload = await server.channel.command(
+      'production.task.expert',
+      <String, dynamic>{...arguments},
+      '',
+      scope,
+    );
+    if (asString(payload['status']) != 'ok') {
+      final String error = asString(payload['error']);
+      return toolText(
+        error.isEmpty ? '专家调用失败（status=${asString(payload['status'])}）' : error,
+        isError: true,
+      );
+    }
+    final String text = asString(payload['text']);
+    return toolText(
+      '$text\n\n（本任务专家调用：${payload['used']}/${payload['max_per_task']}，'
+      '剩余 ${payload['remaining']} 次）',
+    );
+  } on CmdFailureException catch (error) {
+    final String message = asString(error.payload['error']).isEmpty
+        ? error.message
+        : asString(error.payload['error']);
+    return toolText(message, isError: true);
+  } catch (error) {
+    return toolText('专家调用失败：$error', isError: true);
+  }
+}
+
 /// 追问上限：先确保本团队的 schema 已注册，再读值；失败交回 null（走 line.yaml）。
 Future<int?> _readQuestionLimit(Map<String, Object?> scope) async {
   final PluginKitServer? server = _activeServer;
@@ -374,6 +455,16 @@ Future<Map<String, dynamic>?> handleRequest(
   Map<String, dynamic> params,
 ) async {
   if (method != M.stationRequest) return null;
+  // P5：工具收集站的采集请求（subscriber 回一次工具清单）。
+  if (asString(params['station_id']) == kToolCollectStation) {
+    return <String, dynamic>{
+      'reply': <String, dynamic>{
+        'payload': <String, dynamic>{
+          'tools': <Map<String, dynamic>>[expertToolSpec()],
+        },
+      },
+    };
+  }
   final Map<String, dynamic> payload = asMap(params['payload']);
   final String command = asString(payload['command']);
   final bool isPrepare = kPreparationCommands.contains(command);
@@ -447,6 +538,10 @@ Future<int> selfTest() async {
       'station_id': 'production',
     },
   );
+  core.onMethod(
+    M.stationSubscribe,
+    (Map<String, dynamic> params) => <String, dynamic>{'ok': true},
+  );
 
   Future<Map<String, dynamic>> call(
     Object id,
@@ -476,6 +571,14 @@ Future<int> selfTest() async {
 
   Map<String, dynamic> payloadOf(Map<String, dynamic> reply) =>
       asMap(reply['payload']);
+
+  String toolTextOf(Map<String, dynamic>? frame) {
+    final List<dynamic> content =
+        asMap(asMap(frame ?? <String, dynamic>{})['result'])['content']
+            as List<dynamic>? ??
+        <dynamic>[];
+    return content.isEmpty ? '' : asString(asMap(content.first)['text']);
+  }
 
   final String lineRoot = <String>[
     temp.path,
@@ -854,6 +957,24 @@ Future<int> selfTest() async {
                 },
               };
             }
+            if (role == 'expert') {
+              return <String, dynamic>{
+                'ok': true,
+                'payload': <String, dynamic>{
+                  'worker_id': 'sub_expert',
+                  'role': role,
+                  'model_id': 'lfm3',
+                  'status': 'ok',
+                  'error': '',
+                  'report': jsonEncode(<String, Object?>{
+                    'conclusion': '按 A 的公开 API 用即可',
+                    'evidence': <String>['lib/ui/agent_list.dart:1 — class 定义'],
+                    'suggestion': '先 read 再 edit',
+                    'open': <String>['旧版本行为未验证'],
+                  }),
+                },
+              };
+            }
             return <String, dynamic>{
               'ok': true,
               'payload': <String, dynamic>{
@@ -865,6 +986,18 @@ Future<int> selfTest() async {
               },
             };
           }
+        case 'production.task.expert':
+          // tools/call → 本插件执行站的自回路（假核只回形状，真核会带 meta.data_dir）。
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'status': 'ok',
+              'text': '结论：假的\n依据：\n- lib/a.dart:1\n建议：照做\n未决：\n- （无）',
+              'used': 1,
+              'max_per_task': 3,
+              'remaining': 2,
+            },
+          };
         case 'local.lease.register':
           return <String, dynamic>{
             'ok': true,
@@ -1097,6 +1230,215 @@ Future<int> selfTest() async {
       <String, Object?>{'line_id': 'pl_prep', 'task_id': 'T3'},
     );
     check.check(missingAgent['code'], 'agent_required', '缺发起者身份 fail-closed');
+
+    // ── P5 专家工具：收集站贡献 / 默认关闭 / 次数上限 / 只读 / 台账 / 工具调用 ──
+    core.ask('p5-collect', M.stationRequest, <String, dynamic>{
+      'station_id': kToolCollectStation,
+      'payload': <String, dynamic>{'action': 'list'},
+    });
+    final Map<String, dynamic> collectFrame =
+        (await core.waitFor(<Object?>['p5-collect']))['p5-collect'] ??
+        <String, dynamic>{};
+    final Map<String, dynamic> collectReply = asMap(
+      asMap(collectFrame['result'])['reply'],
+    );
+    final List<dynamic> collected =
+        asMap(collectReply['payload'])['tools'] as List<dynamic>? ??
+        <dynamic>[];
+    check.check(collected.length, 1, '向 tree.agent 收集站贡献 1 个工具');
+    check.check(asMap(collected.first)['name'], kAskExpertTool, '贡献的是 ask_expert');
+
+    // 默认关闭（pl_prep 是默认 roles.expert.enabled=false）。
+    final Map<String, dynamic> expertOff = await call(
+      'p5-off',
+      'production.task.expert',
+      <String, Object?>{
+        'line_id': 'pl_prep',
+        'task_id': 'T1',
+        'question': 'X 怎么用？',
+      },
+      agent: 'agt',
+    );
+    check.check(expertOff['code'], 'expert_disabled', '默认不能召专家');
+
+    // 启用专家：次数上限 2，成功回答落 runs 台账。
+    await call('p5-line', 'production.line.create', <String, Object?>{
+      'id': 'pl_expert',
+      'name': '专家产线',
+      'workspace_dir': ws,
+      'roles': <String, Object?>{
+        'expert': <String, Object?>{
+          'enabled': true,
+          'model_id': 'lfm3',
+          'tools': <String>['read', 'grep'],
+          'max_per_task': 2,
+        },
+      },
+    });
+    await call('p5-task', 'production.task.create', <String, Object?>{
+      'line_id': 'pl_expert',
+      'task': <String, Object?>{
+        'id': 'E1',
+        'title': '问专家',
+        'status': 'queued',
+        'write_scope': <String>['lib/a.dart'],
+      },
+    });
+    final Map<String, dynamic> expertOk = payloadOf(
+      await call('p5-expert', 'production.task.expert', <String, Object?>{
+        'line_id': 'pl_expert',
+        'task_id': 'E1',
+        'role': 'packer',
+        'question': 'X 怎么用？',
+        'context': 'lib/a.dart:1 class A {}',
+      }, agent: 'agt'),
+    );
+    check.check(expertOk['status'], 'ok', '启用后专家回答成功');
+    check.check(expertOk['remaining'], 1, '单任务次数上限计数');
+    check.that(
+      asString(expertOk['text']).contains('结论：') &&
+          asString(expertOk['text']).contains('未决：'),
+      '输出固定四段（结论 / 依据 / 建议 / 未决）',
+    );
+    final Map<String, dynamic> expertRuns = payloadOf(
+      await call('p5-runs', 'production.run.list', <String, Object?>{
+        'line_id': 'pl_expert',
+        'task_id': 'E1',
+      }),
+    );
+    check.check(expertRuns['count'], 1, '专家调用落 runs 台账');
+    check.check(
+      asMap((expertRuns['runs'] as List<dynamic>).first)['role'],
+      'expert',
+      '台账角色 = expert',
+    );
+
+    // 启用专家后，打包工具表自动含 ask_expert（专家默认关闭时不出现）。
+    await call('p5-pack', 'production.task.pack', <String, Object?>{
+      'line_id': 'pl_expert',
+      'task_id': 'E1',
+    }, agent: 'agt');
+    check.that(
+      (workerCalls.last['tools'] as List<dynamic>).contains(kAskExpertTool),
+      '打包工具表含 ask_expert',
+    );
+
+    await call('p5-expert-2', 'production.task.expert', <String, Object?>{
+      'line_id': 'pl_expert',
+      'task_id': 'E1',
+      'question': '另一个问题',
+    }, agent: 'agt');
+    final Map<String, dynamic> expertOver = await call(
+      'p5-expert-3',
+      'production.task.expert',
+      <String, Object?>{
+        'line_id': 'pl_expert',
+        'task_id': 'E1',
+        'question': '第三个问题',
+      },
+      agent: 'agt',
+    );
+    check.check(
+      expertOver['code'],
+      'expert_limit_exceeded',
+      '超限拒绝（2/2）',
+    );
+    final Map<String, dynamic> expertNested = await call(
+      'p5-nested',
+      'production.task.expert',
+      <String, Object?>{
+        'line_id': 'pl_expert',
+        'task_id': 'E1',
+        'role': 'expert',
+        'question': '专家再召专家',
+      },
+      agent: 'agt',
+    );
+    check.check(
+      expertNested['code'],
+      'expert_not_allowed',
+      '专家不能再召专家',
+    );
+
+    // 专家工具表含 write ⇒ 直接拒绝（专家不落盘）。
+    await call('p5-evil-line', 'production.line.create', <String, Object?>{
+      'id': 'pl_evil',
+      'name': '越界专家',
+      'workspace_dir': ws,
+      'roles': <String, Object?>{
+        'expert': <String, Object?>{
+          'enabled': true,
+          'tools': <String>['read', 'write'],
+        },
+      },
+    });
+    await call('p5-evil-task', 'production.task.create', <String, Object?>{
+      'line_id': 'pl_evil',
+      'task': <String, Object?>{
+        'id': 'E2',
+        'title': '越界',
+        'status': 'queued',
+        'write_scope': <String>['lib/a.dart'],
+      },
+    });
+    final Map<String, dynamic> expertEvil = await call(
+      'p5-evil',
+      'production.task.expert',
+      <String, Object?>{
+        'line_id': 'pl_evil',
+        'task_id': 'E2',
+        'question': 'X?',
+      },
+      agent: 'agt',
+    );
+    check.check(
+      expertEvil['code'],
+      'expert_tools_invalid',
+      '专家工具表不许有 write',
+    );
+
+    // tools/call：非产线会话被拒；产线会话经执行站回到本插件。
+    core.ask('p5-tool-bad', M.toolsCall, <String, dynamic>{
+      'name': 'plugin__tree.production.line__ask_expert',
+      'arguments': <String, dynamic>{
+        'line_id': 'pl_expert',
+        'task_id': 'E1',
+        'question': 'X?',
+      },
+      'scope': <String, dynamic>{
+        'agent_id': 'agt',
+        'team_id': 'team_a',
+        'session_id': 's1',
+      },
+    });
+    final Map<Object?, Map<String, dynamic>> badTool = await core.waitFor(
+      <Object?>['p5-tool-bad'],
+    );
+    check.that(
+      toolTextOf(badTool['p5-tool-bad']).contains('只对产线员工开放'),
+      'ask_expert 只对产线任务会话开放',
+    );
+    core.ask('p5-tool', M.toolsCall, <String, dynamic>{
+      'name': 'plugin__tree.production.line__ask_expert',
+      'arguments': <String, dynamic>{
+        'line_id': 'pl_expert',
+        'task_id': 'E1',
+        'question': 'X?',
+      },
+      'scope': <String, dynamic>{
+        'agent_id': 'agt',
+        'team_id': 'team_a',
+        'session_id': 'pl_pl_expert_E1',
+      },
+    });
+    final Map<Object?, Map<String, dynamic>> okTool = await core.waitFor(
+      <Object?>['p5-tool'],
+    );
+    check.that(
+      toolTextOf(okTool['p5-tool']).contains('结论：') &&
+          toolTextOf(okTool['p5-tool']).contains('剩余'),
+      'ask_expert 工具回四段 + 剩余次数',
+    );
   } catch (error) {
     check.that(false, '自检过程未抛异常', actual: '$error');
   } finally {

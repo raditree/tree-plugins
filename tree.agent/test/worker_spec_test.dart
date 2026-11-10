@@ -119,6 +119,39 @@ void main() {
     expect(spawn.tools, contains('subagent'));
   });
 
+  test('专家不能再召专家：ask_expert 只给打包 / 执行', () {
+    expect(
+      () => parseWorkerArguments(<String, Object?>{
+        'role': 'expert',
+        'task': '查 API',
+        'tools': <String>['read', 'ask_expert'],
+      }),
+      throwsA(
+        isA<WorkerSpecError>().having(
+          (WorkerSpecError e) => e.code,
+          'code',
+          'worker_tools_invalid',
+        ).having(
+          (WorkerSpecError e) => e.message,
+          'message',
+          contains('专家不能再召专家'),
+        ),
+      ),
+    );
+    final WorkerSpec packer = parseWorkerArguments(<String, Object?>{
+      'role': 'packer',
+      'task': '打片段',
+      'tools': <String>['read', 'grep', 'ask_expert'],
+    });
+    expect(packer.tools, contains('ask_expert'));
+    final WorkerSpec executor = parseWorkerArguments(<String, Object?>{
+      'role': 'executor',
+      'task': '改文件',
+      'tools': <String>['read', 'write', 'ask_expert'],
+    });
+    expect(executor.tools, contains('ask_expert'));
+  });
+
   test('工具去重、reuse / worker_id 兼容、显式空工具表合法（专家纯推理）', () {
     final WorkerSpec spec = parseWorkerArguments(<String, Object?>{
       'role': 'expert',

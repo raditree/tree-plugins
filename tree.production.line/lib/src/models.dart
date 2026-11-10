@@ -245,6 +245,8 @@ Map<String, Object?> buildLineMap(
       'expert': <String, Object?>{
         'model_id': 'lfm3',
         'tools': <String>['read', 'grep'],
+        // Q3 / §9.4：默认不能召专家，模型配置页勾选后才置 true。
+        'enabled': false,
         'max_per_task': 3,
       },
     },

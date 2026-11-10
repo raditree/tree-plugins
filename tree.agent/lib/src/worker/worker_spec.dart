@@ -35,6 +35,9 @@ const Set<String> kWorkerBlockedTools = <String>{'subagent', 'team'};
 /// 写入类工具（打包 / 专家一律不给）。
 const Set<String> kWorkerWriteTools = <String>{'write', 'edit'};
 
+/// 专家工具名（由 `tree.production.line` 贡献；专家自己不能再召专家）。
+const String kAskExpertTool = 'ask_expert';
+
 /// 参数校验失败（入口把它翻成 `{error, code}` 站级失败）。
 class WorkerSpecError implements Exception {
   WorkerSpecError(this.message, {this.code = 'invalid_arguments'});
@@ -99,6 +102,12 @@ WorkerSpec parseWorkerArguments(Map<String, Object?> arguments) {
     if (!allowSpawn) 'subagent',
   };
   for (final String tool in tools) {
+    if (role == 'expert' && tool == kAskExpertTool) {
+      throw WorkerSpecError(
+        '专家不能再召专家：$kAskExpertTool 只给打包 / 执行',
+        code: 'worker_tools_invalid',
+      );
+    }
     if (blocked.contains(tool)) {
       throw WorkerSpecError(
         allowSpawn && tool == 'subagent'

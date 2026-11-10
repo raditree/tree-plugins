@@ -53,11 +53,19 @@ class StationToolRunner implements ToolRunner {
       policyFor?.call(agentId) ?? ToolPolicy.unrestricted;
 
   /// 本 agent 可用的工具声明（白名单里没有的工具**不出现**）。
+  ///
+  /// P5：`ask_expert` 是**必须显式勾选**的工具——未配置 `tool_policy`
+  /// （全量默认）时也不出现（默认不能召专家，§9.4）。
   @override
   List<ToolSpec> specsFor({required String agentId, required String sessionId}) {
     final List<ToolSpec> specs = _buildSpecs();
     final ToolPolicy policy = policyOf(agentId);
-    if (policy.isUnrestricted) return specs;
+    if (policy.isUnrestricted) {
+      return <ToolSpec>[
+        for (final ToolSpec spec in specs)
+          if (!isOptInTool(spec.name)) spec,
+      ];
+    }
     return <ToolSpec>[
       for (final ToolSpec spec in specs)
         if (policy.allows(spec.name)) spec,
@@ -73,7 +81,9 @@ class StationToolRunner implements ToolRunner {
           name: spec.name,
           description: spec.description,
           group: toolGroupOf(spec.name),
-          enabled: policy.allows(spec.name),
+          enabled:
+              policy.allows(spec.name) &&
+              !(isOptInTool(spec.name) && policy.allowed == null),
         ),
     ];
   }
@@ -196,6 +206,15 @@ class StationToolRunner implements ToolRunner {
     // 二次兜底：模型可能记住旧工具名（工具表本轮已过滤，它仍按历史消息发起调用）。
     // 只拦"目录里确实存在、但本 agent 未勾选"的工具；不存在的工具仍走原有未知分支。
     final ToolPolicy policy = policyOf(invocation.agentId);
+    // P5：显式勾选类工具（ask_expert）在没有 tool_policy 时也不放行。
+    if (isOptInTool(invocation.name) &&
+        (policy.allowed == null || !policy.allows(invocation.name))) {
+      return ToolOutcome(
+        '工具「${invocation.name}」需要显式勾选（默认不开放）：'
+        '请在模型配置页的工具清单里加上它。',
+        isError: true,
+      );
+    }
     if (!policy.isUnrestricted &&
         !policy.allows(invocation.name) &&
         _buildSpecs().any((ToolSpec spec) => spec.name == invocation.name)) {

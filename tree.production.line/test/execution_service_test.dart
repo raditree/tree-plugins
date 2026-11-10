@@ -5,12 +5,14 @@ import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_production_line/tree_production_line.dart';
 
-/// 假员工：按角色返回报告（打包 JSON / 执行文本）。
+/// 假员工：按角色返回报告（打包 JSON / 执行文本 / 专家四段 JSON）。
 class _Workers {
   final List<WorkerCall> calls = <WorkerCall>[];
   String packReport = '';
   String runReport = '已改 lib/a.dart';
+  String expertReport = '';
   String status = 'ok';
+  String error = '';
 
   Future<Map<String, Object?>> run(
     WorkerCall call,
@@ -22,14 +24,24 @@ class _Workers {
         'worker_id': 'sub_packer',
         'status': status,
         'report': packReport,
-        'error': '',
+        'error': error,
+      };
+    }
+    if (call.role == 'expert') {
+      return <String, Object?>{
+        'worker_id': 'sub_expert',
+        'role': 'expert',
+        'model_id': call.modelId,
+        'status': status,
+        'report': expertReport,
+        'error': error,
       };
     }
     return <String, Object?>{
       'worker_id': 'sub_executor',
       'status': status,
       'report': runReport,
-      'error': '',
+      'error': error,
     };
   }
 }
@@ -90,6 +102,12 @@ void main() {
         'baseline': <Object?>['dart analyze'],
         'risks': <String>[],
         'dependencies': <String>[],
+      })
+      ..expertReport = jsonEncode(<String, Object?>{
+        'conclusion': '用 A 的公开 API',
+        'evidence': <String>['lib/a.dart:1 — class 定义'],
+        'suggestion': '先 read 再 edit',
+        'open': <String>['旧版本行为未验证'],
       });
     commands = _Commands();
     service = ProductionExecutionService(workers: workers.run, commands: commands.run);
@@ -322,6 +340,182 @@ void main() {
         ),
       ),
     );
+  });
+
+  Future<void> expertLine({
+    List<String> tools = const <String>['read', 'grep'],
+    int max = 2,
+  }) async {
+    store.createLine(<String, Object?>{
+      'id': 'pl_e',
+      'name': '专家产线',
+      'workspace_dir': workspace,
+      'roles': <String, Object?>{
+        'expert': <String, Object?>{
+          'enabled': true,
+          'model_id': 'm1',
+          'tools': tools,
+          'max_per_task': max,
+        },
+      },
+    });
+    store.createTask('pl_e', <String, Object?>{
+      'id': 'E1',
+      'title': '问专家',
+      'status': 'queued',
+      'write_scope': <String>['lib/a.dart'],
+    });
+  }
+
+  test('专家默认关闭：未启用直接拒绝，不调员工', () async {
+    queuedTask('T1');
+    await expectLater(
+      call('production.task.expert', <String, Object?>{
+        'line_id': 'pl_t',
+        'task_id': 'T1',
+        'question': 'X 怎么用？',
+      }),
+      throwsA(
+        isA<ProductionFailure>().having(
+          (ProductionFailure e) => e.code,
+          'code',
+          'expert_disabled',
+        ),
+      ),
+    );
+    expect(workers.calls, isEmpty);
+  });
+
+  test('启用后：四段回答 + expert 台账 + 工具表注入 ask_expert', () async {
+    await expertLine();
+    final Map<String, Object?> result = await call(
+      'production.task.expert',
+      <String, Object?>{
+        'line_id': 'pl_e',
+        'task_id': 'E1',
+        'role': 'packer',
+        'question': 'X 怎么用？',
+        'context': 'lib/a.dart:1 class A {}',
+      },
+    );
+    expect(result['status'], 'ok');
+    expect(result['remaining'], 1);
+    expect(result['text'], contains('结论：'));
+    expect(result['text'], contains('未决：'));
+    expect(workers.calls.single.role, 'expert');
+    expect(workers.calls.single.tools, <String>['read', 'grep']);
+    expect(workers.calls.single.modelId, 'm1');
+    final List<Map<String, Object?>> runs = store.listRuns('pl_e', taskId: 'E1');
+    expect(runs.single['role'], 'expert');
+    expect(runs.single['status'], 'ok');
+    expect(runs.single['asked_by'], 'packer');
+    expect(
+      (runs.single['answer'] as Map<String, Object?>)['conclusion'],
+      '用 A 的公开 API',
+    );
+
+    // 启用专家后，打包 / 执行的工具表里出现 ask_expert（默认关闭时不出现）。
+    await call('production.task.pack', <String, Object?>{
+      'line_id': 'pl_e',
+      'task_id': 'E1',
+    });
+    expect(workers.calls.last.role, 'packer');
+    expect(workers.calls.last.tools, contains(kAskExpertTool));
+  });
+
+  test('次数上限：到点拒绝（单任务 max_per_task）', () async {
+    await expertLine(max: 1);
+    await call('production.task.expert', <String, Object?>{
+      'line_id': 'pl_e',
+      'task_id': 'E1',
+      'question': '第一个问题',
+    });
+    await expectLater(
+      call('production.task.expert', <String, Object?>{
+        'line_id': 'pl_e',
+        'task_id': 'E1',
+        'question': '第二个问题',
+      }),
+      throwsA(
+        isA<ProductionFailure>().having(
+          (ProductionFailure e) => e.code,
+          'code',
+          'expert_limit_exceeded',
+        ),
+      ),
+    );
+    expect(workers.calls, hasLength(1));
+  });
+
+  test('专家回答不是 JSON：failed，但台账仍记（计入次数）', () async {
+    await expertLine(max: 3);
+    workers.expertReport = '好的，我查到了';
+    final Map<String, Object?> result = await call(
+      'production.task.expert',
+      <String, Object?>{
+        'line_id': 'pl_e',
+        'task_id': 'E1',
+        'question': 'X 怎么用？',
+      },
+    );
+    expect(result['status'], 'failed');
+    expect(result['error'], contains('JSON'));
+    expect(result['remaining'], 2);
+    final List<Map<String, Object?>> runs = store.listRuns('pl_e', taskId: 'E1');
+    expect(runs.single['status'], 'failed');
+    expect(runs.single['error'], contains('JSON'));
+  });
+
+  test('专家不能再召专家 / 工具表含 write 一律拒绝', () async {
+    await expertLine();
+    await expectLater(
+      call('production.task.expert', <String, Object?>{
+        'line_id': 'pl_e',
+        'task_id': 'E1',
+        'role': 'expert',
+        'question': '再问一层',
+      }),
+      throwsA(
+        isA<ProductionFailure>().having(
+          (ProductionFailure e) => e.code,
+          'code',
+          'expert_not_allowed',
+        ),
+      ),
+    );
+
+    store.createLine(<String, Object?>{
+      'id': 'pl_bad',
+      'name': '越界专家',
+      'workspace_dir': workspace,
+      'roles': <String, Object?>{
+        'expert': <String, Object?>{
+          'enabled': true,
+          'tools': <String>['read', 'write'],
+        },
+      },
+    });
+    store.createTask('pl_bad', <String, Object?>{
+      'id': 'B1',
+      'title': '越界',
+      'status': 'queued',
+      'write_scope': <String>['lib/a.dart'],
+    });
+    await expectLater(
+      call('production.task.expert', <String, Object?>{
+        'line_id': 'pl_bad',
+        'task_id': 'B1',
+        'question': 'X 怎么用？',
+      }),
+      throwsA(
+        isA<ProductionFailure>().having(
+          (ProductionFailure e) => e.code,
+          'code',
+          'expert_tools_invalid',
+        ),
+      ),
+    );
+    expect(workers.calls, isEmpty);
   });
 
   test('任务内 message：落线程；打回超过 3 次自动 blocked', () async {
