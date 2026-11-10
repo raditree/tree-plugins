@@ -1145,6 +1145,59 @@ class ApiService {
     return _getJson('/api/plugin/windows');
   }
 
+  // ── 生产线（只读，§10.2；归属插件 tree.production.line）────────────────
+  //
+  // 团队经 `team_id` 查询参数下传：核心只做原样透传，归属判据在插件侧。
+  // 写操作（新建产线 / 派发 / 决策 / 取消）留到切片 3，这里不提供。
+
+  static Future<Map<String, dynamic>> getProductionLines({
+    String teamId = '',
+  }) => _getJson('/api/production/lines', query: _teamQuery(teamId));
+
+  static Future<Map<String, dynamic>> getProductionTasks(
+    String lineId, {
+    String teamId = '',
+    String status = '',
+  }) => _getJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/tasks',
+    query: <String, String>{
+      ..._teamQuery(teamId),
+      if (status.isNotEmpty) 'status': status,
+    },
+  );
+
+  static Future<Map<String, dynamic>> getProductionRuns(
+    String lineId, {
+    String teamId = '',
+    String taskId = '',
+  }) => _getJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/runs',
+    query: <String, String>{
+      ..._teamQuery(teamId),
+      if (taskId.isNotEmpty) 'task_id': taskId,
+    },
+  );
+
+  static Future<Map<String, dynamic>> getProductionArtifacts(
+    String lineId, {
+    String teamId = '',
+  }) => _getJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/artifacts',
+    query: _teamQuery(teamId),
+  );
+
+  static Future<Map<String, dynamic>> getProductionAudit(
+    String lineId, {
+    String teamId = '',
+  }) => _getJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/audit',
+    query: _teamQuery(teamId),
+  );
+
+  static Map<String, String> _teamQuery(String teamId) => <String, String>{
+    if (teamId.trim().isNotEmpty) 'team_id': teamId.trim(),
+  };
+
   /// 再开一个窗口：`POST /api/plugin/windows`（窗口 = 核心拉起的新进程）。
   ///
   /// 返回 `{ok, plugin_id, window_id, pid}`；不是 UI / 未启用 / 依赖不满足 /

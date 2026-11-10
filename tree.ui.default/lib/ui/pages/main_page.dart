@@ -28,6 +28,7 @@ import '../widgets/message_panel.dart';
 import '../widgets/model_info_panel.dart';
 import '../widgets/onboarding_guide.dart';
 import '../widgets/plugin_panel.dart';
+import '../widgets/production_line_panel.dart';
 import '../widgets/question_panel.dart';
 import '../widgets/right_panel_host.dart';
 import '../widgets/teammates_window_page.dart';
@@ -90,8 +91,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   /// 移动端底部导航当前页（0=Agent 列表，1=消息，2=文件）
   int _mobileTab = 0;
 
-  /// 内置左栏面板数量（Agent 列表 / 插件管理 / 下载）。
-  static const int _builtinLeftPanelCount = 3;
+  /// 内置左栏面板数量（Agent 列表 / 插件管理 / 下载 / 生产线）。
+  static const int _builtinLeftPanelCount = 4;
 
   // 当前选中的 Agent（未选择时为 null）
   Agent? _selectedAgent;
@@ -1503,6 +1504,14 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             selected: _isBuiltinPanelSelected(2),
             onTap: () => _selectBuiltinPanel(2),
           ),
+          const SizedBox(height: 4),
+          ActivityBarItem(
+            icon: Icons.account_tree_outlined,
+            selectedIcon: Icons.account_tree,
+            tooltip: '生产线',
+            selected: _isBuiltinPanelSelected(3),
+            onTap: () => _selectBuiltinPanel(3),
+          ),
           // 撑开剩余空间，把设置压到底部
           const Spacer(),
           ActivityBarAction(
@@ -1664,6 +1673,16 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         ),
         // 「下载」面板（M8d）：全局任务列表，每条标来源 team
         DownloadPanel(
+          onCollapse: () {
+            setState(() {
+              _leftCollapsed = true;
+            });
+          },
+        ),
+        // 「生产线」面板（切片 2 只读）：产线列表 / 任务队列 / 运行台账。
+        ProductionLinePanel(
+          teamId: _selectedAgent?.teamScopeId ?? '',
+          visible: _leftPanel == 3 && !_leftCollapsed,
           onCollapse: () {
             setState(() {
               _leftCollapsed = true;
@@ -1953,6 +1972,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         return '插件';
       case 2:
         return '下载';
+      case 3:
+        return '产线';
       default:
         return 'Agent 列表';
     }

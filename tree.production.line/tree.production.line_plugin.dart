@@ -466,7 +466,23 @@ Future<Map<String, dynamic>?> handleRequest(
   String method,
   Map<String, dynamic> params,
 ) async {
+  // 切片 2：只读 REST 委派（§10.2 的读半边）；写操作留到切片 3。
+  if (method == M.apiDelegate) {
+    return handleProductionDelegate(
+      asMap(params),
+      service: _service,
+      audit: _audit,
+    );
+  }
   if (method != M.stationRequest) return null;
+  // 路由申报：核心据此把 `/api/production/*` 的命中请求转成 `api/delegate`。
+  if (asString(params['station_id']) == kApiRoutesStation) {
+    return <String, dynamic>{
+      'reply': <String, dynamic>{
+        'payload': <String, dynamic>{'routes': kDeclaredRoutes},
+      },
+    };
+  }
   // P5：工具收集站的采集请求（subscriber 回一次工具清单）。
   if (asString(params['station_id']) == kToolCollectStation) {
     return <String, dynamic>{
@@ -595,6 +611,41 @@ Future<int> selfTest() async {
   Map<String, dynamic> payloadOf(Map<String, dynamic> reply) =>
       asMap(reply['payload']);
 
+  /// 发一次 `api/delegate`（切片 2 只读 REST 的口径），回 `{status, json}`。
+  Future<Map<String, dynamic>> rest(
+    Object id,
+    String method,
+    String path, {
+    Map<String, Object?> query = const <String, Object?>{},
+    String? team = 'team_a',
+  }) async {
+    core.ask(id, M.apiDelegate, <String, dynamic>{
+      'method': method,
+      'path': path,
+      'params': <String, dynamic>{},
+      'query': query,
+      'headers': <String, dynamic>{},
+      'scope': <String, dynamic>{'team_id': ?team},
+      'workspace_dir': '',
+      'data_dir': temp.path,
+      'agent_id': '',
+      'team_id': ?team,
+      'request_id': 'selftest-rest-$id',
+    });
+    final Map<Object?, Map<String, dynamic>> responses = await core.waitFor(
+      <Object?>[id],
+    );
+    final Map<String, dynamic> frame = responses[id] ?? <String, dynamic>{};
+    final Map<String, dynamic> reply = asMap(frame['result']);
+    final String body = asString(reply['body']);
+    return <String, dynamic>{
+      ...reply,
+      'json': body.isEmpty
+          ? <String, dynamic>{}
+          : asMap(jsonDecode(body)),
+    };
+  }
+
   String toolTextOf(Map<String, dynamic>? frame) {
     final List<dynamic> content =
         asMap(asMap(frame ?? <String, dynamic>{})['result'])['content']
@@ -711,6 +762,93 @@ Future<int> selfTest() async {
       ).existsSync(),
       'task.yaml 落盘',
     );
+
+    // 切片 2：路由申报 + 只读 REST（lines / line / tasks / runs / artifacts）。
+    core.ask('routes', M.stationRequest, <String, dynamic>{
+      'station_id': kApiRoutesStation,
+    });
+    final Map<Object?, Map<String, dynamic>> routeResponses = await core
+        .waitFor(<Object?>['routes']);
+    final Map<String, dynamic> routeFrame =
+        routeResponses['routes'] ?? <String, dynamic>{};
+    final List<dynamic> declaredRoutes =
+        asMap(asMap(asMap(routeFrame['result'])['reply'])['payload'])['routes']
+            as List<dynamic>? ??
+        <dynamic>[];
+    check.check(
+      declaredRoutes.length,
+      kDeclaredRoutes.length,
+      '申报全部只读路由',
+    );
+    check.check(
+      declaredRoutes.every(
+        (dynamic route) => asString(asMap(route)['method']) == 'GET',
+      ),
+      true,
+      '切片 2 只申报 GET',
+    );
+
+    final Map<String, dynamic> restLines = await rest(
+      'rest-lines',
+      'GET',
+      linesPattern,
+    );
+    check.check(restLines['status'], 200, 'GET /api/production/lines 200');
+    check.check(asMap(restLines['json'])['count'], 1, 'REST 产线列表 1 条');
+    final Map<String, dynamic> restLine = await rest(
+      'rest-line',
+      'GET',
+      '/api/production/lines/pl_demo',
+    );
+    check.check(
+      asMap(asMap(restLine['json'])['line'])['name'],
+      '标准开发流',
+      'REST 产线详情',
+    );
+    final Map<String, dynamic> restTasks = await rest(
+      'rest-tasks',
+      'GET',
+      '/api/production/lines/pl_demo/tasks',
+    );
+    check.check(asMap(restTasks['json'])['count'], 3, 'REST 任务队列 3 条');
+    final Map<String, dynamic> restTask = await rest(
+      'rest-task',
+      'GET',
+      '/api/production/lines/pl_demo/tasks/A',
+    );
+    check.check(
+      asMap(asMap(restTask['json'])['task'])['title'],
+      '底座',
+      'REST 任务详情',
+    );
+    final Map<String, dynamic> restRuns = await rest(
+      'rest-runs',
+      'GET',
+      '/api/production/lines/pl_demo/runs',
+    );
+    check.check(asMap(restRuns['json'])['count'], 0, 'REST 运行台账为空');
+    final Map<String, dynamic> restArtifacts = await rest(
+      'rest-artifacts',
+      'GET',
+      '/api/production/lines/pl_demo/artifacts',
+    );
+    check.check(
+      restArtifacts['status'],
+      200,
+      'REST 产物树 200（未配工作空间也给空树）',
+    );
+    final Map<String, dynamic> restMissing = await rest(
+      'rest-missing',
+      'GET',
+      '/api/production/lines/pl_nope',
+    );
+    check.check(restMissing['status'], 404, 'REST 缺产线 404');
+    final Map<String, dynamic> restWrite = await rest(
+      'rest-write',
+      'POST',
+      linesPattern,
+    );
+    check.check(restWrite['status'], 405, 'REST 写操作 405（切片 3 再开放）');
 
     final Map<String, dynamic> nextPayload = payloadOf(
       await call('queue-next', 'production.queue.next', <String, Object?>{

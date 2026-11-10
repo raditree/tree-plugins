@@ -3,6 +3,7 @@
 /// P6 项目整理（只读审计报告），P8 并行派发与预算软停。
 library;
 
+export 'src/api.dart';
 export 'src/audit.dart';
 export 'src/audit_service.dart';
 export 'src/budget.dart';
