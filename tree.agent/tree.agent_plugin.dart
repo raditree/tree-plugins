@@ -2377,6 +2377,172 @@ Future<int> selfTest() async {
       AgentRuntime.stationClient = null;
     }
 
+    // ── P8：模型元数据探测（价格 / 思考强度档位，本地假端点）─────────────
+    final HttpServer catalogServer = await HttpServer.bind(
+      InternetAddress.loopbackIPv4,
+      0,
+    );
+    catalogServer.listen((HttpRequest request) async {
+      if (request.uri.path.endsWith('/models')) {
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode(<String, Object?>{
+            'data': <Object?>[
+              <String, Object?>{
+                'id': 'meta_probe',
+                'pricing': <String, Object?>{
+                  'prompt': '0.000003',
+                  'completion': '0.000015',
+                },
+                'supported_parameters': <String>['tools', 'reasoning'],
+                'reasoning': <String, Object?>{
+                  'supported_efforts': <String>['low', 'medium', 'high'],
+                },
+                'context_length': 32000,
+              },
+            ],
+          }),
+        );
+        await request.response.close();
+        return;
+      }
+      request.response.statusCode = 404;
+      await request.response.close();
+    });
+    Future<Map<String, dynamic>> apiCall(
+      String id,
+      Map<String, dynamic> frame,
+    ) async {
+      core.ask(id, M.apiDelegate, frame);
+      final Map<Object?, Map<String, dynamic>> replies = await core.waitFor(
+        <Object?>[id],
+      );
+      final Map<String, dynamic> result =
+          (replies[id]?['result'] as Map?)?.cast<String, dynamic>() ??
+          <String, dynamic>{};
+      final String raw = '${result['body'] ?? '{}'}';
+      return <String, dynamic>{
+        'status': result['status'],
+        'body': (jsonDecode(raw) as Map).cast<String, dynamic>(),
+      };
+    }
+
+    final String probeBase = 'http://127.0.0.1:${catalogServer.port}/v1';
+    final Map<String, dynamic> probeCreate = await apiCall(
+      'p8-model',
+      postEnvelope(modelsPattern, 'agt', <String, dynamic>{
+        'model_id': 'meta_probe',
+        'base_url': probeBase,
+        'api_key': 'sk-probe',
+      }),
+    );
+    check.check(probeCreate['status'], 200, 'P8：元数据用模型已创建');
+    final Map<String, dynamic> probed = await apiCall(
+      'p8-meta',
+      postEnvelope(
+        modelMetaPattern,
+        'agt',
+        <String, dynamic>{},
+        extraParams: <String, String>{'modelId': 'meta_probe'},
+      ),
+    );
+    check.check(probed['status'], 200, 'P8：元数据探测 200');
+    final Map<String, dynamic> probedBody = probed['body'] as Map<String, dynamic>;
+    check.check(probedBody['success'], true, 'P8：探测成功');
+    final Map<String, dynamic> probedMeta =
+        (probedBody['meta'] as Map).cast<String, dynamic>();
+    check.check(
+      probedMeta['reasoning_effort_options'],
+      <String>['low', 'medium', 'high'],
+      'P8：思考档位来自端点（替代手填）',
+    );
+    check.check(probedMeta['context_length'], 32000, 'P8：上下文长度来自端点');
+    final Map<String, dynamic> probedPricing =
+        (probedMeta['pricing'] as Map).cast<String, dynamic>();
+    check.check(probedPricing['prompt_per_million'], 3.0, 'P8：输入价格折算到每 1M');
+    check.check(
+      probedPricing['completion_per_million'],
+      15.0,
+      'P8：输出价格折算到每 1M',
+    );
+
+    final Map<String, dynamic> listedWithMeta = await apiCall(
+      'p8-models',
+      envelope(modelsPattern, 'agt'),
+    );
+    final List<dynamic> listedModels =
+        (listedWithMeta['body'] as Map)['models'] as List<dynamic>;
+    final Map<String, dynamic> listedProbe = listedModels
+        .map((dynamic item) => (item as Map).cast<String, dynamic>())
+        .firstWhere((Map<String, dynamic> item) => item['model_id'] == 'meta_probe');
+    check.check(
+      (listedProbe['meta'] as Map)['source'],
+      'openai.models',
+      'P8：/api/models 附带只读 meta',
+    );
+    check.that(
+      listedModels
+          .map((dynamic item) => (item as Map))
+          .where((Map item) => item['model_id'] != 'meta_probe')
+          .every((Map item) => !item.containsKey('meta')),
+      'P8：未探测的模型不带 meta 键',
+    );
+
+    // 端点不可达：保留上次价格，只追加可读错误（UI 可提示重试）。
+    await catalogServer.close(force: true);
+    final Map<String, dynamic> failedProbe = await apiCall(
+      'p8-meta-failed',
+      postEnvelope(
+        modelMetaPattern,
+        'agt',
+        <String, dynamic>{},
+        extraParams: <String, String>{'modelId': 'meta_probe'},
+      ),
+    );
+    final Map<String, dynamic> failedBody =
+        failedProbe['body'] as Map<String, dynamic>;
+    check.check(failedBody['success'], false, 'P8：端点不可达 ⇒ success=false');
+    check.that(
+      '${failedBody['error'] ?? ''}'.isNotEmpty,
+      'P8：探测失败给出可读原因',
+    );
+    final Map<String, dynamic> failedMeta =
+        (failedBody['meta'] as Map).cast<String, dynamic>();
+    check.check(
+      (failedMeta['pricing'] as Map)['prompt_per_million'],
+      3.0,
+      'P8：失败保留上次价格',
+    );
+    check.that(
+      '${failedMeta['error'] ?? ''}'.isNotEmpty,
+      'P8：失败原因写进缓存',
+    );
+
+    // 删除模型时清掉元数据缓存。
+    await apiCall(
+      'p8-model-delete',
+      postEnvelope(
+        modelPattern,
+        'agt',
+        <String, dynamic>{},
+        extraParams: <String, String>{'modelId': 'meta_probe'},
+        method: 'DELETE',
+      ),
+    );
+    final Map<String, dynamic> metaAfterDelete = await apiCall(
+      'p8-meta-deleted',
+      envelope(
+        modelMetaPattern,
+        'agt',
+        extraParams: <String, String>{'modelId': 'meta_probe'},
+      ),
+    );
+    check.check(metaAfterDelete['status'], 404, 'P8：删除模型后元数据路由 404');
+    check.that(
+      !readModelMetaCache(AgentDataPaths(temp.path)).containsKey('meta_probe'),
+      'P8：删除模型同时清掉元数据缓存',
+    );
+
     // 生成是异步的：等它收尾再删临时目录。
     await AgentRuntime.forDataDir(temp.path).waitIdle();
     await AgentRuntime.debugCloseAll();

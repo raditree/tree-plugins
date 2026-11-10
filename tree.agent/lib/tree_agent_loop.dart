@@ -22,6 +22,7 @@ import 'src/delegate.dart'
         conversationsPattern,
         messageDetailPattern,
         messagesPattern,
+        modelMetaPattern,
         modelPattern,
         modelsPattern,
         questionAnswerPattern,
@@ -47,6 +48,7 @@ export 'src/agent_store.dart';
 export 'src/conversation_store.dart';
 export 'src/delegate.dart';
 export 'src/model_catalog.dart';
+export 'src/model_meta.dart';
 export 'src/paths.dart';
 export 'src/agent/agent_engine.dart';
 export 'src/agent/agent_instance.dart';
@@ -72,6 +74,7 @@ export 'src/llm/llm_session.dart';
 export 'src/llm/llm_summarizer.dart';
 export 'src/llm/llm_transport.dart';
 export 'src/llm/llm_types.dart';
+export 'src/llm/model_catalog_client.dart';
 export 'src/llm/openai_codec.dart';
 export 'src/llm/sse_parser.dart';
 export 'src/llm/vision_files.dart';
@@ -113,7 +116,7 @@ export 'src/ws/ws_hub.dart';
 export 'src/yaml_utils.dart';
 
 /// 插件版本（与 `plugin.json` 的 version 同源；发布时两处一起改）。
-const String kTreeAgentVersion = '0.31.0';
+const String kTreeAgentVersion = '0.32.0';
 
 /// 收集站 id：插件经它申报自己承担的 `{method, pattern}` 委派路由。
 const String kApiRoutesStation = 'system.collect.api.routes';
@@ -151,6 +154,8 @@ const List<Map<String, String>> kDeclaredRoutes = <Map<String, String>>[
   <String, String>{'method': 'GET', 'pattern': todosPattern},
   <String, String>{'method': 'GET', 'pattern': subagentsPattern},
   <String, String>{'method': 'GET', 'pattern': modelsPattern},
+  <String, String>{'method': 'GET', 'pattern': modelMetaPattern},
+  <String, String>{'method': 'POST', 'pattern': modelMetaPattern},
   <String, String>{'method': 'GET', 'pattern': agentModelsInfoPattern},
   // agent 写接口 / 临时员工 transcript（契约 §1.1 #2/#4/#5/#9）。
   <String, String>{'method': 'POST', 'pattern': agentsPattern},

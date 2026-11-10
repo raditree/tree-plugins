@@ -54,6 +54,59 @@ void main() {
     });
   });
 
+  group('模型元数据展示（P8）', () {
+    test('端点价格标签：每 1M、USD 用美元符号，缺项显示 ?', () {
+      expect(
+        modelPricingLabel(<String, dynamic>{
+          'meta': <String, dynamic>{
+            'pricing': <String, dynamic>{
+              'prompt_per_million': 3,
+              'completion_per_million': 15,
+              'currency': 'USD',
+            },
+          },
+        }),
+        r'$3.00 / 1M 输入 · $15.00 / 1M 输出',
+      );
+      expect(
+        modelPricingLabel(<String, dynamic>{
+          'meta': <String, dynamic>{
+            'pricing': <String, dynamic>{
+              'prompt_per_million': 0.0005,
+              'completion_per_million': 0.002,
+            },
+          },
+        }),
+        r'$0.0005 / 1M 输入 · $0.0020 / 1M 输出',
+      );
+      expect(modelPricingLabel(<String, dynamic>{}), isEmpty);
+      expect(
+        modelPricingLabel(<String, dynamic>{
+          'meta': <String, dynamic>{'error': '不可达'},
+        }),
+        isEmpty,
+      );
+    });
+
+    test('端点档位：meta 优先；未探测 ⇒ 空（UI 回退兜底）', () {
+      expect(
+        modelMetaEffortsOf(<String, dynamic>{
+          'meta': <String, dynamic>{
+            'reasoning_effort_options': <String>['low', 'medium', 'high'],
+          },
+        }),
+        <String>['low', 'medium', 'high'],
+      );
+      expect(modelMetaEffortsOf(<String, dynamic>{}), isEmpty);
+      expect(
+        modelMetaEffortsOf(<String, dynamic>{
+          'meta': <String, dynamic>{'reasoning_effort_options': <String>[]},
+        }),
+        isEmpty,
+      );
+    });
+  });
+
   group('ModelEditorDraft 提交体', () {
     test('chat 新增：带 kind/protocol 与现有 chat 字段', () {
       const ModelEditorDraft draft = ModelEditorDraft(

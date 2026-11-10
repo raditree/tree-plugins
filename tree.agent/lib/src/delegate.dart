@@ -9,7 +9,9 @@ import 'compat/protocol_types.dart';
 import 'agent_config.dart';
 import 'agent_store.dart';
 import 'conversation_store.dart';
+import 'llm/model_catalog_client.dart';
 import 'model_catalog.dart';
+import 'model_meta.dart';
 import 'runtime/agent_runtime.dart';
 import 'workspace/workspace_io.dart';
 import 'settings/prompt_store.dart';
@@ -46,6 +48,8 @@ const String questionsPattern = '/api/questions'; // 提问列表
 const String questionAnswerPattern =
     '/api/questions/{qid}/answer'; // 提问作答
 const String modelsPattern = '/api/models'; // 模型池 #14
+const String modelMetaPattern =
+    '/api/models/{modelId}/meta'; // P8：端点元数据（价格 / 思考档位）
 const String conversationsPattern =
     '/api/conversations/{agentId}'; // 会话历史 #1（会话/历史组）
 const String messageDetailPattern =
@@ -125,9 +129,10 @@ Map<String, dynamic> _bodyOf(Map<String, dynamic> envelope) {
 Future<Map<String, dynamic>> handleApiDelegate(
   Map<String, dynamic> envelope, {
   AgentRuntime Function(String dataDir)? runtimeFor,
+  ModelCatalogClient? modelCatalog,
 }) async {
   try {
-    return await _dispatchDelegate(envelope, runtimeFor);
+    return await _dispatchDelegate(envelope, runtimeFor, modelCatalog);
   } catch (error) {
     // 与核心 `_dispatch` 的兜底同形：未捕获异常 ⇒ 500 + 可读原因。
     return _jsonReply(500, <String, dynamic>{
@@ -139,6 +144,7 @@ Future<Map<String, dynamic>> handleApiDelegate(
 Future<Map<String, dynamic>> _dispatchDelegate(
   Map<String, dynamic> envelope,
   AgentRuntime Function(String dataDir)? runtimeFor,
+  ModelCatalogClient? modelCatalog,
 ) async {
   final String method = _str(envelope['method']).toUpperCase();
   final String path = _str(envelope['path']);
@@ -524,6 +530,8 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     if (model == null) {
       return _jsonReply(404, <String, dynamic>{'detail': '模型不存在'});
     }
+    // 端点 / 密钥可能变了：旧的探测结果（价格、档位）不再可信，丢弃等重新探测。
+    removeModelMeta(paths, modelId);
     await runtime.settingsSink.flush();
     return _jsonReply(200, <String, dynamic>{
       'success': true,
@@ -536,6 +544,7 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     if (!runtime.settings.deleteModel(modelId)) {
       return _jsonReply(404, <String, dynamic>{'detail': '模型不存在'});
     }
+    removeModelMeta(paths, modelId);
     await runtime.settingsSink.flush();
     final List<String> bound = <String>[
       for (final AgentRecord record in readAgentRecords(paths))
@@ -545,6 +554,57 @@ Future<Map<String, dynamic>> _dispatchDelegate(
       'success': true,
       'bound_agents': bound,
     });
+  }
+
+  // ── 模型元数据（P8）：价格 / 思考强度档位探测与缓存 ────────────────
+  if (method == 'GET' && _matches(modelMetaPattern, path)) {
+    final String modelId = _str(params['modelId']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    if (runtime.settings.model(modelId) == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': '模型不存在'});
+    }
+    final ModelMeta? meta = readModelMeta(paths, modelId);
+    return _jsonReply(200, <String, dynamic>{
+      'model_id': modelId,
+      'meta': meta?.toJson(),
+    });
+  }
+  if (method == 'POST' && _matches(modelMetaPattern, path)) {
+    final String modelId = _str(params['modelId']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final CoreModelConfig? model = runtime.settings.model(modelId);
+    if (model == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': '模型不存在'});
+    }
+    final ModelCatalogClient catalog = modelCatalog ?? ModelCatalogClient();
+    final bool owns = modelCatalog == null;
+    try {
+      final ModelMeta meta = await catalog.probe(model);
+      writeModelMeta(paths, meta);
+      return _jsonReply(200, <String, dynamic>{
+        'success': true,
+        'model_id': modelId,
+        'meta': meta.toJson(),
+      });
+    } on ModelMetaFailure catch (error) {
+      final ModelMeta failed = _failedMeta(paths, modelId, error.message);
+      return _jsonReply(200, <String, dynamic>{
+        'success': false,
+        'model_id': modelId,
+        'error': error.message,
+        'meta': failed.toJson(),
+      });
+    } catch (error) {
+      final ModelMeta failed = _failedMeta(paths, modelId, '探测失败：$error');
+      return _jsonReply(200, <String, dynamic>{
+        'success': false,
+        'model_id': modelId,
+        'error': failed.error,
+        'meta': failed.toJson(),
+      });
+    } finally {
+      if (owns) catalog.close();
+    }
   }
 
   // ── token 节奏（GET/POST /api/settings/token-rate）──────────────────
@@ -1338,6 +1398,18 @@ Future<Map<String, dynamic>> _dispatchDelegate(
   return _jsonReply(501, <String, dynamic>{
     'detail': 'tree.agent 尚未实现该路由：$method $path',
   });
+}
+
+/// 探测失败时保留上次成功信息，只追加错误与时间（并落缓存）。
+ModelMeta _failedMeta(AgentDataPaths paths, String modelId, String error) {
+  final ModelMeta previous =
+      readModelMeta(paths, modelId) ?? ModelMeta(modelId: modelId);
+  final ModelMeta failed = previous.withError(
+    error,
+    at: DateTime.now().toIso8601String(),
+  );
+  writeModelMeta(paths, failed);
+  return failed;
 }
 
 /// 路径模板匹配（`{name}` 段匹配任意非空段；其余段逐字相等）。

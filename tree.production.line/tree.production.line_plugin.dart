@@ -27,7 +27,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.production.line';
 const String kDisplayName = 'Tree 标准开发流生产线';
-const String kVersion = '0.5.0';
+const String kVersion = '0.6.0';
 
 const String kStationName = 'production';
 
@@ -64,6 +64,10 @@ const String kStationReadme =
     'P6 项目整理：production.audit.run（只读扫描工作空间 → 文档审计 / TODO 台账 / '
     '重复内容与超大文件候选；报告 schema version=1 固定；唯一写入是项目资产 '
     'docs/production_lines/<line>/audit.md，write=false 时纯查询）。'
+    'P8 并行与预算：production.queue.dispatch（依赖已 done + 写域不相交 + '
+    'limits.max_parallel_tasks 决定批次；写域交叠拒绝并行，交叠对象可见；只读不改状态）'
+    '与 production.task.budget（token / 时长上限、累计用量、剩余与超限原因）；'
+    '打包/执行累计 usage，预算到点软停（保留当前产出、标 budget_exceeded 转 blocked）。'
     '追问上限读 settings，缺省回退 line.yaml.limits 与 3（夹到 1–10）。';
 
 final ProductionService _service = ProductionService();
@@ -960,6 +964,8 @@ Future<int> selfTest() async {
                   'role': role,
                   'status': 'ok',
                   'error': '',
+                  // P8：预算按累计 token 判定（P4 的产线默认不设上限）。
+                  'tokens': <String, Object?>{'prompt': 5, 'completion': 10},
                   'report': jsonEncode(<String, Object?>{
                     'files': <Object?>[
                       <String, Object?>{
@@ -1546,6 +1552,114 @@ Future<int> selfTest() async {
       todoFile.readAsStringSync(),
       todoBefore,
       '审计不改工作空间文件（只读）',
+    );
+
+    // ── P8 并行与预算：写域交叠拒绝并行 / 预算到点软停 ──
+    await call('p8-line', 'production.line.create', <String, Object?>{
+      'id': 'pl_par',
+      'name': '并行产线',
+      'workspace_dir': ws,
+      'limits': <String, Object?>{'max_parallel_tasks': 2},
+    });
+    const Map<String, String> parallelScopes = <String, String>{
+      'R1': 'lib/a',
+      // 与 R1 目录交叠（lib/a/b.dart 落在 lib/a 下）⇒ 不允许并行。
+      'R2': 'lib/a/b.dart',
+      'R3': 'lib/b',
+    };
+    for (final MapEntry<String, String> entry in parallelScopes.entries) {
+      await call('p8-task-${entry.key}', 'production.task.create', <String, Object?>{
+        'line_id': 'pl_par',
+        'task': <String, Object?>{
+          'id': entry.key,
+          'title': '并行 ${entry.key}',
+          'status': 'queued',
+          'write_scope': <String>[entry.value],
+        },
+      });
+    }
+    final Map<String, dynamic> planned = payloadOf(
+      await call('p8-dispatch', 'production.queue.dispatch', <String, Object?>{
+        'line_id': 'pl_par',
+      }),
+    );
+    check.check(
+      planned['batch_ids'],
+      <String>['R1', 'R3'],
+      '写域不相交的两个任务可并行',
+    );
+    check.check(planned['slots_free'], 2, '并行槽位读数（派发前）');
+    final Map<String, dynamic> overlapSkip = (planned['skipped'] as List<dynamic>)
+        .map((dynamic item) => asMap(item))
+        .firstWhere((Map<String, dynamic> item) => item['id'] == 'R2');
+    check.check(
+      overlapSkip['reason'],
+      'write_scope_overlap',
+      '写域交叠拒绝并行',
+    );
+    check.check(overlapSkip['with_task'], 'R1', '交叠对象可见');
+    final Map<String, dynamic> limited = payloadOf(
+      await call(
+        'p8-dispatch-limit',
+        'production.queue.dispatch',
+        <String, Object?>{'line_id': 'pl_par', 'limit': 1},
+      ),
+    );
+    check.check(limited['batch_ids'], <String>['R1'], 'limit 截断批次');
+
+    await call('p8-budget-line', 'production.line.create', <String, Object?>{
+      'id': 'pl_budget',
+      'name': '预算产线',
+      'workspace_dir': ws,
+      'limits': <String, Object?>{'max_tokens_per_task': 10},
+    });
+    await call('p8-budget-task', 'production.task.create', <String, Object?>{
+      'line_id': 'pl_budget',
+      'task': <String, Object?>{
+        'id': 'B1',
+        'title': '预算到点',
+        'status': 'queued',
+        'write_scope': <String>['lib/a.dart'],
+      },
+    });
+    final Map<String, dynamic> budgetPack = payloadOf(
+      await call('p8-budget-pack', 'production.task.pack', <String, Object?>{
+        'line_id': 'pl_budget',
+        'task_id': 'B1',
+      }, agent: 'agt'),
+    );
+    check.check(
+      budgetPack['status'],
+      'budget_exceeded',
+      '预算到点 → 软停（不进 packed）',
+    );
+    check.check(
+      asMap(budgetPack['task'])['status'],
+      'blocked',
+      '软停后任务 blocked',
+    );
+    check.check(
+      asMap(budgetPack['budget'])['exceeded'],
+      true,
+      '预算报告可见超限',
+    );
+    final Map<String, dynamic> budgetReport = payloadOf(
+      await call('p8-budget', 'production.task.budget', <String, Object?>{
+        'line_id': 'pl_budget',
+        'task_id': 'B1',
+      }),
+    );
+    check.check(budgetReport['exceeded'], true, 'production.task.budget 报告超限');
+    final Map<String, dynamic> budgetAgain = await call(
+      'p8-budget-again',
+      'production.task.pack',
+      <String, Object?>{'line_id': 'pl_budget', 'task_id': 'B1'},
+      agent: 'agt',
+    );
+    check.check(
+      budgetAgain['code'],
+      'execute_state',
+      '软停后不静默继续（blocked 不再打包）',
     );
   } catch (error) {
     check.that(false, '自检过程未抛异常', actual: '$error');

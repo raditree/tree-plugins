@@ -245,6 +245,37 @@ class ProductionStore {
     };
   }
 
+  /// P8 派发计划（§9.6）：依赖已满足 + 写域与在途任务不相交 + 并行槽位未满。
+  ///
+  /// **只读**：不改任何状态，真正的迁移仍由 `production.task.pack` 做；
+  /// 调用方按 `batch` 逐个（并发）发起打包即可，`max_parallel_tasks` 与写域
+  /// 判据都在这里一次判死。
+  Map<String, Object?> dispatch(String lineId, {int limit = 0}) {
+    final LineRecord line = getLine(lineId);
+    final Map<String, Object?> limits = plainMap(line.data['limits']);
+    final int maxParallel = intOf(limits['max_parallel_tasks'], 1);
+    final DispatchPlan plan = planDispatch(
+      listTasks(lineId),
+      maxParallel: maxParallel,
+    );
+    final List<TaskRecord> batch = limit > 0 && limit < plan.batch.length
+        ? plan.batch.take(limit).toList()
+        : plan.batch;
+    return <String, Object?>{
+      'line_id': lineId,
+      'max_parallel_tasks': plan.maxParallel,
+      'slots_used': plan.slotsUsed,
+      'slots_free': plan.slotsFree,
+      'batch': <Map<String, Object?>>[
+        for (final TaskRecord task in batch) task.toJson(),
+      ],
+      'batch_ids': <String>[for (final TaskRecord task in batch) task.id],
+      'running': <String>[for (final TaskRecord task in plan.running) task.id],
+      'skipped': plan.skipped,
+      'count': batch.length,
+    };
+  }
+
   /// 从 `task.yaml` 重建 `state.json`；内容未变时**不写盘**。
   Map<String, Object?> rebuild(String lineId) {
     getLine(lineId);

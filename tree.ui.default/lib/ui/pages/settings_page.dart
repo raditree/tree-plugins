@@ -1786,6 +1786,7 @@ class _SettingsPageState extends State<SettingsPage> {
       final num? threshold = model['confidence_threshold'] as num?;
       if (threshold != null) kindDetail = ' · 阈值 $threshold';
     }
+    final String price = modelPricingLabel(model);
     return ListTile(
       contentPadding: EdgeInsets.zero,
       dense: true,
@@ -1801,7 +1802,8 @@ class _SettingsPageState extends State<SettingsPage> {
         '$modelId$kindDetail'
         '${hasKey ? '' : ' · 未配置 API Key'}'
         '${kind == kModelKindChat && (model['thinking'] as bool? ?? false) ? ' · thinking' : ''}'
-        '${kind == kModelKindChat && (model['if_vision'] as bool? ?? false) ? ' · vision' : ''}',
+        '${kind == kModelKindChat && (model['if_vision'] as bool? ?? false) ? ' · vision' : ''}'
+        '${price.isEmpty ? '' : ' · $price'}',
         style: const TextStyle(fontSize: 12),
       ),
       trailing: Row(
@@ -2275,9 +2277,17 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
   final TextEditingController _maxInputTokens = TextEditingController();
   final TextEditingController _confidenceThreshold = TextEditingController();
 
-  /// 思考强度可选档位（逗号分隔）。留空 = 用后端默认档位
-  /// （low/high/max，见 `config.models.REASONING_EFFORT_CANONICAL`）。
-  final TextEditingController _effortOptions = TextEditingController();
+  /// 已存档位（模型 YAML 的 `reasoning_effort_options`）。
+  List<String> _storedEffortOptions = <String>[];
+
+  /// 端点探测到的档位（`GET /api/models/{id}` 的 `meta`，空 = 未声明）。
+  List<String> _metaEffortOptions = <String>[];
+
+  /// 端点元数据（价格 / 档位）；null = 还没探测过。
+  Map<String, dynamic>? _meta;
+
+  bool _metaLoading = false;
+  String _metaError = '';
 
   bool _thinking = false;
   bool _ifVision = false;
@@ -2290,7 +2300,7 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
   ///
   /// 只列**有实际区分度**的档位：端点接受的枚举全集里
   /// minimal/medium/xhigh/ultra 与服务端档位一一等价，列出来就是假选项。
-  static const List<String> _reasoningEfforts = <String>['low', 'high', 'max'];
+  static const List<String> _reasoningEfforts = kFallbackReasoningEfforts;
 
   bool get _isEdit => widget.existing != null;
 
@@ -2298,15 +2308,21 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
   String? get _originalKind =>
       widget.existing == null ? null : modelKindOf(widget.existing!);
 
-  /// 解析逗号分隔的档位输入（兼容中文逗号与空白）。
-  static List<String> _parseEffortOptions(String raw) {
-    return raw
-        .replaceAll('，', ',')
-        .split(',')
-        .map((String e) => e.trim())
-        .where((String e) => e.isNotEmpty)
-        .toList();
+  /// 档位候选：端点声明 > 已存档位 > 兜底。
+  List<String> get _candidateEfforts {
+    if (_metaEffortOptions.isNotEmpty) {
+      return List<String>.of(_metaEffortOptions);
+    }
+    if (_storedEffortOptions.isNotEmpty) {
+      return List<String>.of(_storedEffortOptions);
+    }
+    return List<String>.of(_reasoningEfforts);
   }
+
+  /// 价格标签；端点没给价格 ⇒ 空串。
+  String get _pricingLabel => modelPricingLabel(<String, dynamic>{
+    if (_meta != null) 'meta': _meta,
+  });
 
   @override
   void initState() {
@@ -2323,8 +2339,17 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
     // 后端已按"模型声明或全局回退"解析好档位列表，直接回填（不预设当前选中值：
     // 列表仅表示"哪些可被 agent 覆盖"，与模型自身默认档位是两件事）
     final List<dynamic>? opts = e['reasoning_effort_options'] as List<dynamic>?;
-    if (opts != null && opts.isNotEmpty) {
-      _effortOptions.text = opts.map((dynamic v) => v.toString()).join(', ');
+    if (opts != null) {
+      _storedEffortOptions = <String>[
+        for (final dynamic v in opts)
+          if ('$v'.trim().isNotEmpty) '$v'.trim(),
+      ];
+    }
+    final Object? meta = e['meta'];
+    if (meta is Map) {
+      _meta = Map<String, dynamic>.from(meta);
+      _metaEffortOptions = modelMetaEffortsOf(e);
+      _metaError = '${_meta!['error'] ?? ''}';
     }
     final int? seq = (e['max_seqlen'] as num?)?.toInt();
     if (seq != null) _maxSeqlen.text = '$seq';
@@ -2349,20 +2374,58 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
     _dimensions.dispose();
     _maxInputTokens.dispose();
     _confidenceThreshold.dispose();
-    _effortOptions.dispose();
     super.dispose();
   }
 
-  /// 思考强度下拉项：候选来自「可选档位」输入框，留空则用兜底档位。
+  /// 从端点探测价格与思考档位（仅编辑已保存的模型可用）。
+  Future<void> _refreshMeta() async {
+    final String modelId = widget.existing?['model_id'] as String? ?? '';
+    if (modelId.isEmpty) return;
+    setState(() {
+      _metaLoading = true;
+      _metaError = '';
+    });
+    try {
+      final Map<String, dynamic> result = await ApiService.refreshModelMeta(
+        modelId,
+      );
+      if (!mounted) return;
+      final Object? meta = result['meta'];
+      final String error = '${result['error'] ?? ''}';
+      setState(() {
+        _metaLoading = false;
+        _metaError = error;
+        if (meta is Map) {
+          _meta = Map<String, dynamic>.from(meta);
+          _metaEffortOptions = modelMetaEffortsOf(<String, dynamic>{
+            'meta': _meta,
+          });
+        }
+      });
+      if (error.isNotEmpty && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('探测失败：$error')),
+        );
+      }
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _metaLoading = false;
+        _metaError = '$error';
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('探测失败：$error')),
+      );
+    }
+  }
+
+  /// 思考强度下拉项：候选来自端点探测 / 已存档位 / 兜底。
   ///
   /// 当前 `_reasoningEffort` 若不在候选中（如文件里存的是档位声明之外的旧值，
-  /// 或用户刚把档位列表改窄）**必须补进 items**：`DropdownButtonFormField` 的
+  /// 或端点刚把档位列表改窄）**必须补进 items**：`DropdownButtonFormField` 的
   /// value 不在 items 中会直接断言失败，整个编辑弹窗打不开。
   List<DropdownMenuItem<String>> _buildEffortItems() {
-    final List<String> options = _parseEffortOptions(_effortOptions.text);
-    final List<String> candidates = options.isEmpty
-        ? List<String>.of(_reasoningEfforts)
-        : options;
+    final List<String> candidates = _candidateEfforts;
     if (_reasoningEffort.isNotEmpty && !candidates.contains(_reasoningEffort)) {
       candidates.add(_reasoningEffort);
     }
@@ -2384,7 +2447,7 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
       baseUrl: _baseUrl.text,
       apiKey: _apiKey.text,
       reasoningEffort: _reasoningEffort,
-      reasoningEffortOptions: _parseEffortOptions(_effortOptions.text),
+      reasoningEffortOptions: _candidateEfforts,
       maxSeqlen: int.tryParse(_maxSeqlen.text.trim()),
       maxOutputTokens: int.tryParse(_maxOutput.text.trim()),
       thinking: _thinking,
@@ -2404,6 +2467,68 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
       return;
     }
     Navigator.of(context).pop(draft.toPayload());
+  }
+
+  /// 档位来源（端点探测，替代手填）+ 价格行。
+  Widget _buildEffortSourceRow() {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final String source;
+    if (_metaEffortOptions.isNotEmpty) {
+      source = '端点声明档位：${_metaEffortOptions.join(' / ')}';
+    } else if (_storedEffortOptions.isNotEmpty) {
+      source = '未探测到端点档位，沿用已存档位：${_storedEffortOptions.join(' / ')}';
+    } else {
+      source = '未探测到端点档位，使用兜底：${_reasoningEfforts.join(' / ')}';
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Row(
+          children: <Widget>[
+            Expanded(
+              child: Text(
+                source,
+                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+              ),
+            ),
+            if (_isEdit)
+              IconButton(
+                tooltip: '从端点探测价格与档位',
+                visualDensity: VisualDensity.compact,
+                onPressed: _metaLoading ? null : _refreshMeta,
+                icon: _metaLoading
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.cloud_download_outlined, size: 18),
+              ),
+          ],
+        ),
+        if (!_isEdit)
+          Text(
+            '保存后可从端点探测价格与思考档位（替代手填）',
+            style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+          ),
+        if (_pricingLabel.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: Text(
+              '价格：$_pricingLabel',
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+            ),
+          ),
+        if (_metaError.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: Text(
+              '上次探测失败：$_metaError',
+              style: const TextStyle(fontSize: 11, color: Colors.orange),
+            ),
+          ),
+      ],
+    );
   }
 
   @override
@@ -2511,19 +2636,7 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
                   },
                 ),
                 const SizedBox(height: 10),
-                TextField(
-                  controller: _effortOptions,
-                  // 重建下拉项：候选档位随本输入框内容变化（见 _buildEffortItems）
-                  onChanged: (_) => setState(() {}),
-                  decoration: const InputDecoration(
-                    labelText: '可选档位（reasoning_effort_options）',
-                    hintText: '如 low, high, max',
-                    helperText:
-                        '留空 = 默认 low/high/max；'
-                        '只列该端点真正区分的档位，别名会被折叠',
-                    isDense: true,
-                  ),
-                ),
+                _buildEffortSourceRow(),
                 const SizedBox(height: 10),
                 Row(
                   children: [

@@ -69,6 +69,45 @@ ModelKindFields modelKindFieldsOf(String kind) {
   );
 }
 
+/// 思考强度档位的兜底列表（与后端 `CoreModelConfig.defaultReasoningEfforts` 一致）。
+const List<String> kFallbackReasoningEfforts = <String>['low', 'high', 'max'];
+
+/// 从模型条目的 `meta` 里取端点声明的思考档位（没探测过 / 未声明 ⇒ 空）。
+List<String> modelMetaEffortsOf(Map<String, dynamic> model) {
+  final Object? meta = model['meta'];
+  if (meta is! Map) return const <String>[];
+  final Object? raw = meta['reasoning_effort_options'];
+  if (raw is! List) return const <String>[];
+  return <String>[
+    for (final Object? item in raw)
+      if ('${item ?? ''}'.trim().isNotEmpty) '${item ?? ''}'.trim(),
+  ];
+}
+
+/// 模型价格标签（`$3 / 1M 输入 · $15 / 1M 输出`）；没有探测结果 ⇒ 空串。
+String modelPricingLabel(Map<String, dynamic> model) {
+  final Object? meta = model['meta'];
+  if (meta is! Map) return '';
+  final Object? pricing = meta['pricing'];
+  if (pricing is! Map) return '';
+  final num? prompt = pricing['prompt_per_million'] as num?;
+  final num? completion = pricing['completion_per_million'] as num?;
+  if (prompt == null && completion == null) return '';
+  final String currency = '${pricing['currency'] ?? 'USD'}';
+  final String prefix = currency == 'USD' ? r'$' : '$currency ';
+  return '$prefix${_formatPrice(prompt)} / 1M 输入 · '
+      '$prefix${_formatPrice(completion)} / 1M 输出';
+}
+
+String _formatPrice(num? value) {
+  if (value == null) return '?';
+  final double price = value.toDouble();
+  if (price == 0) return '0';
+  if (price < 0.01) return price.toStringAsFixed(4);
+  if (price < 1) return price.toStringAsFixed(3);
+  return price.toStringAsFixed(2);
+}
+
 /// 模型编辑器的纯数据草稿：负责校验与组装提交体，便于脱离界面测试。
 ///
 /// 编辑模式（[originalKind] 非空）**不下发 kind / protocol**：后端 MP-2 规定

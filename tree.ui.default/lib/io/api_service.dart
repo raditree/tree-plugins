@@ -968,6 +968,26 @@ class ApiService {
     return _deleteJson('/api/models/${Uri.encodeComponent(modelId)}');
   }
 
+  /// 读模型元数据缓存（价格 / 思考强度档位）；从未探测过 ⇒ null。
+  static Future<Map<String, dynamic>?> getModelMeta(String modelId) async {
+    final Map<String, dynamic> data = await _getJson(
+      '/api/models/${Uri.encodeComponent(modelId)}/meta',
+    );
+    final Object? meta = data['meta'];
+    return meta is Map ? Map<String, dynamic>.from(meta) : null;
+  }
+
+  /// 从 OpenAI 兼容端点探测模型元数据并落缓存。
+  ///
+  /// 返回 `{success, model_id, meta, error?}`：`success=false` 时 `meta` 仍带
+  /// 上一次成功的价格 / 档位（只追加错误原因），供 UI 提示后重试。
+  static Future<Map<String, dynamic>> refreshModelMeta(String modelId) async {
+    return _postJson(
+      '/api/models/${Uri.encodeComponent(modelId)}/meta',
+      body: const <String, dynamic>{},
+    );
+  }
+
   // ==================== 流式帧率（token 获取 + 推送刷新，均常开） ====================
 
   /// 查询推送刷新帧率设置

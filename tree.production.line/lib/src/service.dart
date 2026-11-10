@@ -16,6 +16,7 @@ const List<String> kProductionCommands = <String>[
   'production.task.get',
   'production.task.transition',
   'production.queue.next',
+  'production.queue.dispatch',
   'production.queue.rebuild',
   'production.queue.recover',
   'production.run.list',
@@ -151,6 +152,11 @@ class ProductionService {
         return store.next(
           _argument(arguments, 'line_id'),
           limit: intOf(arguments['limit'], 1),
+        );
+      case 'production.queue.dispatch':
+        return store.dispatch(
+          _argument(arguments, 'line_id'),
+          limit: intOf(arguments['limit'], 0),
         );
       case 'production.queue.rebuild':
         return store.rebuild(_argument(arguments, 'line_id'));

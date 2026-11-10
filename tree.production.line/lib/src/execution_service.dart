@@ -11,19 +11,21 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'models.dart';
+import 'budget.dart';
 import 'execution.dart';
 import 'expert.dart';
 import 'preparation.dart';
 import 'service.dart';
 import 'store.dart';
 
-/// P4 / P5 对外开放的命令族（同一个执行站 `production`）。
+/// P4 / P5 / P8 对外开放的命令族（同一个执行站 `production`）。
 const List<String> kExecutionCommands = <String>[
   'production.task.pack',
   'production.task.run',
   'production.task.expert',
   'production.task.message',
   'production.task.messages',
+  'production.task.budget',
 ];
 
 /// 角色默认工具（与 recon §9.1 / §9.2 / §9.4 一致；插件间不互相 import）。
@@ -127,6 +129,8 @@ class ProductionExecutionService {
         return _message(store, arguments);
       case 'production.task.messages':
         return _messages(store, arguments);
+      case 'production.task.budget':
+        return _taskBudget(store, arguments);
       default:
         throw ProductionFailure(
           '未知执行阶段命令：$command',
@@ -173,6 +177,19 @@ class ProductionExecutionService {
       throw ProductionFailure(
         '产线没有给 packer 配模型（line.yaml.roles.packer.model_id）',
         code: 'model_required',
+      );
+    }
+    // P8：预算到点即软停（不发起员工调用，保留当前产出）。
+    final TaskBudget budget = budgetOf(plainMap(line.data['limits']));
+    final BudgetState startBudget = budgetStateOf(budget, usageOf(task));
+    if (startBudget.exceeded) {
+      return _budgetStop(
+        store,
+        lineId,
+        taskId,
+        stage: 'pack',
+        role: 'packer',
+        state: startBudget,
       );
     }
     if (task.status == TaskStatus.queued) {
@@ -224,6 +241,17 @@ class ProductionExecutionService {
       error: workerError,
       worker: result,
     );
+    // P8：员工调用的 token / 时长一律累计（失败也算），预算按累计值判定。
+    final Map<String, Object?> packTokens = plainMap(result['tokens']);
+    task = store.putTask(lineId, taskId, <String, Object?>{
+      'usage': addUsage(
+        task,
+        promptTokens: intOf(packTokens['prompt'], 0),
+        completionTokens: intOf(packTokens['completion'], 0),
+        elapsedMs: elapsed,
+      ),
+    });
+    final BudgetState endBudget = budgetStateOf(budget, usageOf(task));
     if (workerError.isNotEmpty) {
       return _failPack(store, lineId, taskId, run, workerError);
     }
@@ -272,12 +300,24 @@ class ProductionExecutionService {
       },
       'artifacts': artifacts,
     });
-    store.transition(lineId, taskId, to: TaskStatus.packed.wire);
     run = <String, Object?>{
       ...run,
       'status': 'ok',
       'artifacts': <String>['tasks/$taskId/pack.json', packAsset],
     };
+    // P8 软停：片段已产出（当前结果保留），但预算到点 ⇒ 不继续到 packed。
+    if (endBudget.exceeded) {
+      return _budgetStop(
+        store,
+        lineId,
+        taskId,
+        stage: 'pack',
+        role: 'packer',
+        state: endBudget,
+        run: run,
+      );
+    }
+    store.transition(lineId, taskId, to: TaskStatus.packed.wire);
     store.writeRun(lineId, run);
     return <String, Object?>{
       'task': store.getTask(lineId, taskId).toJson(),
@@ -374,6 +414,19 @@ class ProductionExecutionService {
         code: 'model_required',
       );
     }
+    // P8：预算到点即软停（不发起员工调用、不跑门控）。
+    final TaskBudget budget = budgetOf(plainMap(line.data['limits']));
+    final BudgetState startBudget = budgetStateOf(budget, usageOf(task));
+    if (startBudget.exceeded) {
+      return _budgetStop(
+        store,
+        lineId,
+        taskId,
+        stage: 'run',
+        role: 'executor',
+        state: startBudget,
+      );
+    }
     final Map<String, Object?> workerScope = _workerScope(
       scope,
       agentId,
@@ -440,6 +493,17 @@ class ProductionExecutionService {
       error: workerError,
       worker: result,
     );
+    // P8：token / 时长累计（失败也算），预算判定用累计值。
+    final Map<String, Object?> runTokens = plainMap(result['tokens']);
+    task = store.putTask(lineId, taskId, <String, Object?>{
+      'usage': addUsage(
+        task,
+        promptTokens: intOf(runTokens['prompt'], 0),
+        completionTokens: intOf(runTokens['completion'], 0),
+        elapsedMs: elapsed,
+      ),
+    });
+    final BudgetState endBudget = budgetStateOf(budget, usageOf(task));
     if (workerError.isNotEmpty) {
       return _blockRun(
         store: store,
@@ -495,6 +559,22 @@ class ProductionExecutionService {
       );
     }
     store.putTask(lineId, taskId, <String, Object?>{'changed_files': changed});
+    // P8 软停：改动已落盘（当前结果保留），但预算到点 ⇒ 不跑门控、不进 done。
+    if (endBudget.exceeded) {
+      return _budgetStop(
+        store,
+        lineId,
+        taskId,
+        stage: 'run',
+        role: 'executor',
+        state: endBudget,
+        run: <String, Object?>{
+          ...run,
+          'status': 'ok',
+          'changed_files': changed,
+        },
+      );
+    }
     store.transition(lineId, taskId, to: TaskStatus.gating.wire);
 
     // 门控：任何一条失败都不得进 done。
@@ -862,6 +942,86 @@ class ProductionExecutionService {
       'messages': thread,
       'count': thread.length,
       'task_id': taskId,
+    };
+  }
+
+  // ── 预算（P8）────────────────────────────────────────────────────
+
+  /// 报告单任务预算：上限、累计用量、剩余与是否已超限（只读）。
+  Map<String, Object?> _taskBudget(
+    ProductionStore store,
+    Map<String, Object?> arguments,
+  ) {
+    final String lineId = _arg(arguments, 'line_id');
+    final String taskId = _arg(arguments, 'task_id');
+    final LineRecord line = store.getLine(lineId);
+    final TaskRecord task = store.getTask(lineId, taskId);
+    final TaskBudget budget = budgetOf(plainMap(line.data['limits']));
+    final BudgetState state = budgetStateOf(budget, usageOf(task));
+    return <String, Object?>{
+      'line_id': lineId,
+      'task_id': taskId,
+      'status': task.status.wire,
+      'budget_exceeded': task.data['budget_exceeded'] == true,
+      ...renderBudgetState(state),
+    };
+  }
+
+  /// 预算软停：保留当前产出，任务标 `budget_exceeded` 并转 `blocked`。
+  ///
+  /// [run] 为空 = 调用前就超限（没发起员工）；非空 = 本次产出照常记账，
+  /// 只是不再继续下一步（打包不进 packed / 执行不进 gating）。
+  Map<String, Object?> _budgetStop(
+    ProductionStore store,
+    String lineId,
+    String taskId, {
+    required String stage,
+    required String role,
+    required BudgetState state,
+    Map<String, Object?>? run,
+  }) {
+    final String reason = '预算到点软停（$stage）：${state.reasons.join('；')}';
+    final Map<String, Object?> finalRun = run == null
+        ? <String, Object?>{
+            'run_id': store.nextRunId(taskId, role),
+            'task_id': taskId,
+            'role': role,
+            'model_id': '',
+            'status': 'budget_exceeded',
+            'started_at': _now,
+            'elapsed_ms': 0,
+            'tokens': <String, Object?>{'prompt': 0, 'completion': 0},
+            'tool_calls': <Object?>[],
+            'gate': <Object?>[],
+            'error': reason,
+            'artifacts': <Object?>[],
+          }
+        : <String, Object?>{
+            ...run,
+            'budget_exceeded': true,
+            'error': reason,
+          };
+    store.writeRun(lineId, finalRun);
+    final TaskRecord current = store.getTask(lineId, taskId);
+    if (canTransition(current.status, TaskStatus.blocked)) {
+      store.transition(
+        lineId,
+        taskId,
+        to: TaskStatus.blocked.wire,
+        reason: reason,
+      );
+    }
+    store.putTask(lineId, taskId, <String, Object?>{
+      'budget_exceeded': true,
+      'budget': renderBudgetState(state),
+      'last_error': {'stage': stage, 'error': reason, 'at': _now},
+    });
+    return <String, Object?>{
+      'task': store.getTask(lineId, taskId).toJson(),
+      'run': finalRun,
+      'status': 'budget_exceeded',
+      'error': reason,
+      'budget': renderBudgetState(state),
     };
   }
 

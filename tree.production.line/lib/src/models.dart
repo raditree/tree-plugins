@@ -178,6 +178,8 @@ class TaskRecord {
   TaskStatus get status => taskStatusOf(data['status']);
   int get priority => intOf(data['priority'], 50);
   List<String> get dependsOn => stringsOf(data['depends_on']);
+  /// 写域：并行判据（§9.6）与执行边界（§9.2）共用。
+  List<String> get writeScope => stringsOf(data['write_scope']);
   String get createdAt => textOf(data['created_at']);
   String get updatedAt => textOf(data['updated_at']);
   String get blockedReason => textOf(data['blocked_reason']);

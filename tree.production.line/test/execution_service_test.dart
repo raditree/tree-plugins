@@ -14,6 +14,9 @@ class _Workers {
   String status = 'ok';
   String error = '';
 
+  /// 员工回包的 token 用量（P8 预算累计）。
+  Map<String, Object?> tokens = const <String, Object?>{};
+
   Future<Map<String, Object?>> run(
     WorkerCall call,
     Map<String, Object?> scope,
@@ -25,6 +28,7 @@ class _Workers {
         'status': status,
         'report': packReport,
         'error': error,
+        'tokens': tokens,
       };
     }
     if (call.role == 'expert') {
@@ -35,6 +39,7 @@ class _Workers {
         'status': status,
         'report': expertReport,
         'error': error,
+        'tokens': tokens,
       };
     }
     return <String, Object?>{
@@ -42,6 +47,7 @@ class _Workers {
       'status': status,
       'report': runReport,
       'error': error,
+      'tokens': tokens,
     };
   }
 }
@@ -565,5 +571,70 @@ void main() {
     );
     expect(listed['count'], 4);
     expect(((listed['messages'] as List<dynamic>).first as Map<String, Object?>)['text'], '缺片段 1');
+  });
+
+  test('预算到点：打包产出保留但软停 blocked，不静默继续', () async {
+    store.createLine(<String, Object?>{
+      'id': 'pl_b',
+      'name': '预算产线',
+      'workspace_dir': workspace,
+      'limits': <String, Object?>{'max_tokens_per_task': 10},
+    });
+    store.createTask('pl_b', <String, Object?>{
+      'id': 'B1',
+      'title': '预算到点',
+      'status': 'queued',
+      'write_scope': <String>['lib/a.dart'],
+    });
+    workers.tokens = <String, Object?>{'prompt': 5, 'completion': 10};
+    final Map<String, Object?> packed = await call(
+      'production.task.pack',
+      <String, Object?>{'line_id': 'pl_b', 'task_id': 'B1'},
+    );
+    expect(packed['status'], 'budget_exceeded');
+    expect((packed['task'] as Map<String, Object?>)['status'], 'blocked');
+    expect((packed['budget'] as Map<String, Object?>)['exceeded'], isTrue);
+    expect((packed['run'] as Map<String, Object?>)['status'], 'ok');
+    expect((packed['run'] as Map<String, Object?>)['budget_exceeded'], isTrue);
+    // 当前产出保留：pack.json 已落盘，用量写回 task.yaml。
+    expect(
+      File(
+        p.join(
+          temp.path,
+          'production_lines',
+          'team_a',
+          'pl_b',
+          'tasks',
+          'B1',
+          'pack.json',
+        ),
+      ).existsSync(),
+      isTrue,
+    );
+    expect(store.getTask('pl_b', 'B1').data['budget_exceeded'], isTrue);
+
+    final Map<String, Object?> report = await call(
+      'production.task.budget',
+      <String, Object?>{'line_id': 'pl_b', 'task_id': 'B1'},
+    );
+    expect(report['exceeded'], isTrue);
+    expect((report['usage'] as Map<String, Object?>)['tokens'], 15);
+
+    // 不静默继续：blocked 状态不再打包，也不会再调员工。
+    final int before = workers.calls.length;
+    await expectLater(
+      call('production.task.pack', <String, Object?>{
+        'line_id': 'pl_b',
+        'task_id': 'B1',
+      }),
+      throwsA(
+        isA<ProductionFailure>().having(
+          (ProductionFailure e) => e.code,
+          'code',
+          'execute_state',
+        ),
+      ),
+    );
+    expect(workers.calls.length, before);
   });
 }
