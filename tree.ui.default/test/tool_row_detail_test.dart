@@ -647,7 +647,13 @@ void main() {
       // 文件窗只留"看文件"这一件事，TickerProvider + TabController 一并撤掉。
       expect(panel.contains("Tab(text: 'Git 历史')"), isFalse);
       expect(panel.contains("Tab(text: 'Todo')"), isFalse);
-      expect(panel.contains('TabBar'), isFalse);
+      // 只钉「Material TabBar 组件」，不钉方法名：`_buildViewerTabBar` 是查看器
+      // 上方的自绘 tab 条容器（`_buildFileTabStrip` 的宿主），不是顶层页签。
+      expect(
+        RegExp(r'(^|[^A-Za-z0-9_])TabBar(?![A-Za-z0-9_])').hasMatch(panel),
+        isFalse,
+        reason: '顶层已不用 Material TabBar；自绘 tab 条的方法名不算',
+      );
     });
 
     test('Git 历史已下线；Todo 仍为独立窗口', () {

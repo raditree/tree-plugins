@@ -33,7 +33,7 @@ void main() {
         '第一行就是摘要',
         '\n\n  \n## 带标记的标题\n正文第二段',
         'x' * 500,
-        '短首行\n' + 'y' * 400,
+        '短首行\n${'y' * 400}',
       ]) {
         expect(thinkingSummary(t), legacySummary(t), reason: '输入: $t');
       }
@@ -64,7 +64,7 @@ void main() {
 
     List<String> bodies(WidgetTester tester) => tester
         .widgetList<MarkdownBody>(find.byType(MarkdownBody))
-        .map((MarkdownBody b) => b.data!)
+        .map((MarkdownBody b) => b.data)
         .toList();
 
     ChatMessage thinking(
@@ -84,7 +84,7 @@ void main() {
       WidgetTester tester,
     ) async {
       final String huge =
-          List<String>.generate(2000, (int i) => '第${i}行 思考内容 xoxo').join('\n');
+          List<String>.generate(2000, (int i) => '第$i行 思考内容 xoxo').join('\n');
       await pumpDetail(tester, thinking(huge, streaming: true));
       final List<String> blocks = bodies(tester);
       expect(blocks.length, greaterThan(2), reason: '3.5 万字必须定居成多块');
@@ -142,7 +142,7 @@ void main() {
           .widgetList<MarkdownBody>(find.byType(MarkdownBody))
           .toList();
       expect(first.length, greaterThan(1));
-      m.content += '\n' + 'x' * ThinkingDetail.blockChars;
+      m.content += '\n${'x' * ThinkingDetail.blockChars}';
       await pumpDetail(tester, m);
       final List<MarkdownBody> second = tester
           .widgetList<MarkdownBody>(find.byType(MarkdownBody))
@@ -162,12 +162,13 @@ void main() {
       WidgetTester tester,
     ) async {
       // 开围栏在头部，候选切点里围栏数是奇 → hold（remaining 未超 cap）
-      final String body = 'a' * 500 + '\n```\n' + 'b' * ThinkingDetail.blockChars;
+      final String body =
+          '${'a' * 500}\n```\n${'b' * ThinkingDetail.blockChars}';
       final ChatMessage m = thinking('$body\n', streaming: true);
       await pumpDetail(tester, m);
       final List<String> blocks = bodies(tester);
       expect(blocks.length, 1, reason: 'remaining ≤ cap 且开围栏 ⇒ 不许定居');
-      expect(blocks.single, '${m.content}');
+      expect(blocks.single, m.content);
     });
 
     testWidgets('巨型代码块冲破硬顶：强制定居，每块围栏数成对', (
@@ -223,7 +224,7 @@ void main() {
         expect(identical(again[i], sealed[i]), isTrue, reason: '第 $i 块被重画了');
       }
       expect(
-        again.map((MarkdownBody b) => b.data!).join(''),
+        again.map((MarkdownBody b) => b.data).join(''),
         m.content,
         reason: '全量内容都在，历史可读',
       );
