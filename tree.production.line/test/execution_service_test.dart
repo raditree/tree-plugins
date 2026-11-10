@@ -414,13 +414,23 @@ void main() {
       '用 A 的公开 API',
     );
 
-    // 启用专家后，打包 / 执行的工具表里出现 ask_expert（默认关闭时不出现）。
+    // 启用专家后，打包 / 执行的工具表里出现 ask_expert（默认关闭时不出现），
+    // 提示词里也带上 line_id / task_id 供工具调用。
     await call('production.task.pack', <String, Object?>{
       'line_id': 'pl_e',
       'task_id': 'E1',
     });
     expect(workers.calls.last.role, 'packer');
     expect(workers.calls.last.tools, contains(kAskExpertTool));
+    expect(workers.calls.last.task, contains('ask_expert'));
+    expect(workers.calls.last.task, contains('line_id=pl_e'));
+
+    await call('production.task.run', <String, Object?>{
+      'line_id': 'pl_e',
+      'task_id': 'E1',
+    });
+    expect(workers.calls.last.role, 'executor');
+    expect(workers.calls.last.task, contains('ask_expert'));
   });
 
   test('次数上限：到点拒绝（单任务 max_per_task）', () async {

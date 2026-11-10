@@ -367,6 +367,7 @@ String packerSystemPrompt() =>
     'risks 写可能踩的坑；dependencies 写任务间依赖。不许改文件、不许跑构建。';
 
 String packerUserPrompt({
+  required String lineId,
   required String lineName,
   required String taskId,
   required String title,
@@ -375,9 +376,10 @@ String packerUserPrompt({
   required String memory,
   required List<String> readScope,
   required List<String> writeScope,
+  bool expertAvailable = false,
 }) {
   final StringBuffer buffer = StringBuffer()
-    ..writeln('产线：${lineName.isEmpty ? taskId : lineName}')
+    ..writeln('产线：${lineName.isEmpty ? taskId : lineName}（line_id=$lineId）')
     ..writeln('任务：$taskId $title')
     ..writeln()
     ..writeln('需求：')
@@ -391,8 +393,17 @@ String packerUserPrompt({
     ..writeln()
     ..writeln('读域：${readScope.isEmpty ? '（不限，但仍不允许写）' : readScope.join('、')}')
     ..writeln('写域：${writeScope.join('、')}')
-    ..writeln()
-    ..writeln('请把执行模型改这一处所需的片段全部打齐；不许改文件、不许跑构建或测试。');
+    ..writeln();
+  if (expertAvailable) {
+    buffer
+      ..writeln(
+        '问专家：遇到一个具体、可独立研究的问题（API 用法 / 协议细节 / 库行为 / 方案对比），'
+        '可调用 ask_expert（line_id=$lineId，task_id=$taskId，role=packer）；'
+        'context 只放已打包片段或文件引用，不要整库。',
+      )
+      ..writeln();
+  }
+  buffer.writeln('请把执行模型改这一处所需的片段全部打齐；不许改文件、不许跑构建或测试。');
   return buffer.toString();
 }
 
@@ -403,15 +414,17 @@ String executorSystemPrompt() =>
     '**不许自报完成**——门控说了算。';
 
 String executorUserPrompt({
+  required String lineId,
   required String taskId,
   required String title,
   required String packJson,
   required List<String> writeScope,
   required List<String> acceptance,
   required String acceptanceDoc,
+  bool expertAvailable = false,
 }) {
   final StringBuffer buffer = StringBuffer()
-    ..writeln('任务：$taskId $title')
+    ..writeln('任务：$taskId $title（line_id=$lineId）')
     ..writeln('写域（越界即失败）：${writeScope.join('、')}')
     ..writeln()
     ..writeln('验收判据：')
@@ -422,7 +435,16 @@ String executorUserPrompt({
     ..writeln()
     ..writeln('验收文档：')
     ..writeln(acceptanceDoc.trim().isEmpty ? '（无）' : acceptanceDoc.trim())
-    ..writeln()
-    ..writeln('请只改上述写域内的文件；完成后如实报告改动与命令。');
+    ..writeln();
+  if (expertAvailable) {
+    buffer
+      ..writeln(
+        '问专家：遇到一个具体、可独立研究的问题（API 用法 / 协议细节 / 库行为 / 方案对比），'
+        '可调用 ask_expert（line_id=$lineId，task_id=$taskId，role=executor）；'
+        'context 只放已打包片段或文件引用，不要整库。',
+      )
+      ..writeln();
+  }
+  buffer.writeln('请只改上述写域内的文件；完成后如实报告改动与命令。');
   return buffer.toString();
 }

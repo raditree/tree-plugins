@@ -188,6 +188,7 @@ class ProductionExecutionService {
         WorkerCall(
           role: 'packer',
           task: packerUserPrompt(
+            lineId: lineId,
             lineName: line.name,
             taskId: taskId,
             title: task.title,
@@ -196,6 +197,7 @@ class ProductionExecutionService {
             memory: _memoryText(store, lineId, line),
             readScope: stringsOf(task.data['read_scope']),
             writeScope: writeScope,
+            expertAvailable: _expertRole(line)['enabled'] == true,
           ),
           tools: _toolsOf(line, 'packer'),
           modelId: modelId,
@@ -405,12 +407,14 @@ class ProductionExecutionService {
         WorkerCall(
           role: 'executor',
           task: executorUserPrompt(
+            lineId: lineId,
             taskId: taskId,
             title: task.title,
             packJson: const JsonEncoder.withIndent('  ').convert(pack),
             writeScope: writeScope,
             acceptance: stringsOf(task.data['acceptance']),
             acceptanceDoc: _readAsset(store, lineId, task, 'acceptance'),
+            expertAvailable: _expertRole(line)['enabled'] == true,
           ),
           tools: _toolsOf(line, 'executor'),
           modelId: modelId,
