@@ -1,5 +1,5 @@
 // tree.production.line —— 标准开发流生产线（P1 数据模型 + 队列；P3 准备阶段；
-// P4 打包 + 执行；P5 专家工具）。
+// P4 打包 + 执行；P5 专家工具；P6 项目整理）。
 //
 // 定位（docs/pluginization/production-line-recon.md §7/§8/§9/§10/§11）：
 // - headless 插件，granularity=team；数据只落 `<data_root>/production_lines/<team_id>/`；
@@ -14,6 +14,8 @@
 // - P5 专家工具：向 `tree.agent` 的工具收集站贡献 `ask_expert`，工具调用经
 //   本插件自己的执行站回到 `production.task.expert`（拿得到 meta.data_dir）；
 //   默认关闭、单任务次数上限、专家只读不落盘、四段回答；
+// - P6 项目整理：`production.audit.run` 只读扫描工作空间（文档审计 / TODO 台账 /
+//   冗余候选），固定 schema，唯一写入是项目资产目录里的 `audit.md`；
 // - 依赖纪律：不得 import 任何核心包。
 import 'dart:async';
 import 'dart:convert';
@@ -25,7 +27,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.production.line';
 const String kDisplayName = 'Tree 标准开发流生产线';
-const String kVersion = '0.4.0';
+const String kVersion = '0.5.0';
 
 const String kStationName = 'production';
 
@@ -59,11 +61,15 @@ const String kStationReadme =
     'P5 专家工具：向 tree.agent 工具收集站贡献 ask_expert → production.task.expert'
     '（roles.expert.enabled 默认 false；单任务 ≤ max_per_task；专家只读不落盘；'
     '输出固定四段：结论 / 依据 / 建议 / 未决；每次调用落 runs 台账 role=expert）。'
+    'P6 项目整理：production.audit.run（只读扫描工作空间 → 文档审计 / TODO 台账 / '
+    '重复内容与超大文件候选；报告 schema version=1 固定；唯一写入是项目资产 '
+    'docs/production_lines/<line>/audit.md，write=false 时纯查询）。'
     '追问上限读 settings，缺省回退 line.yaml.limits 与 3（夹到 1–10）。';
 
 final ProductionService _service = ProductionService();
 PreparationService? _preparation;
 ProductionExecutionService? _execution;
+ProductionAuditService? _audit;
 PluginKitServer? _activeServer;
 final Set<String> _settingsTeams = <String>{};
 
@@ -92,8 +98,9 @@ Future<void> _onReady(PluginKitServer server) async {
     workers: _callWorker,
     commands: _runCommand,
   );
+  _audit = ProductionAuditService();
   server.channel.log(
-    '已上线：v$kVersion（tree.production.line，P1 数据 + P3 准备阶段 + P4 打包执行 + P5 专家）',
+    '已上线：v$kVersion（tree.production.line，P1 数据 + P3 准备阶段 + P4 打包执行 + P5 专家 + P6 项目整理）',
   );
   // P5：把 ask_expert 贡献给 tree.agent 的工具收集站（默认不在任何 agent 的工具表里，
   // 只有显式勾选的打包 / 执行员工才拿得到）。
@@ -114,12 +121,13 @@ Future<void> _onReady(PluginKitServer server) async {
       <String, dynamic>{
         'kind': 'execute',
         'name': kStationName,
-        'description': '生产线数据模型、队列、准备阶段与打包执行（production.*）',
+        'description': '生产线数据模型、队列、准备阶段、打包执行、专家与项目整理（production.*）',
         'readme': kStationReadme,
         'commands': <String>[
           ...kProductionCommands,
           ...kPreparationCommands,
           ...kExecutionCommands,
+          ...kAuditCommands,
         ],
       },
     );
@@ -469,7 +477,11 @@ Future<Map<String, dynamic>?> handleRequest(
   final String command = asString(payload['command']);
   final bool isPrepare = kPreparationCommands.contains(command);
   final bool isExecute = kExecutionCommands.contains(command);
-  if (!isPrepare && !isExecute && !kProductionCommands.contains(command)) {
+  final bool isAudit = kAuditCommands.contains(command);
+  if (!isPrepare &&
+      !isExecute &&
+      !isAudit &&
+      !kProductionCommands.contains(command)) {
     return null;
   }
   try {
@@ -482,6 +494,13 @@ Future<Map<String, dynamic>?> handleRequest(
           )
         : isExecute
         ? await _execution!.handle(
+            command,
+            asMap(payload['arguments']),
+            asMap(params['meta']),
+            asMap(params['scope']),
+          )
+        : isAudit
+        ? await _audit!.handle(
             command,
             asMap(payload['arguments']),
             asMap(params['meta']),
@@ -1438,6 +1457,95 @@ Future<int> selfTest() async {
       toolTextOf(okTool['p5-tool']).contains('结论：') &&
           toolTextOf(okTool['p5-tool']).contains('剩余'),
       'ask_expert 工具回四段 + 剩余次数',
+    );
+
+    // ── P6 项目整理：只读扫描 / 固定 schema / 只写 audit.md ──
+    final String auditRoot = ws;
+    final File todoFile = File(
+      <String>[auditRoot, 'lib', 'todo.dart'].join(Platform.pathSeparator),
+    );
+    todoFile.parent.createSync(recursive: true);
+    todoFile.writeAsStringSync('// TODO: 收尾\nclass X {}\n// FIXME: 边界\n');
+    final String duplicateBody = 'x' * 2048;
+    File(
+      <String>[auditRoot, 'lib', 'dup_a.txt'].join(Platform.pathSeparator),
+    ).writeAsStringSync(duplicateBody);
+    File(
+      <String>[auditRoot, 'lib', 'dup_b.txt'].join(Platform.pathSeparator),
+    ).writeAsStringSync(duplicateBody);
+    File(
+      <String>[auditRoot, 'lib', 'big.txt'].join(Platform.pathSeparator),
+    ).writeAsStringSync('y' * 300000);
+    await call('audit-line', 'production.line.create', <String, Object?>{
+      'id': 'pl_audit',
+      'name': '项目整理',
+      'workspace_dir': ws,
+    });
+    final File auditAsset = File(
+      <String>[
+        auditRoot,
+        'docs',
+        'production_lines',
+        'pl_audit',
+        'audit.md',
+      ].join(Platform.pathSeparator),
+    );
+    final Map<String, dynamic> auditDry = payloadOf(
+      await call('audit-dry', 'production.audit.run', <String, Object?>{
+        'line_id': 'pl_audit',
+        'write': false,
+      }),
+    );
+    check.that(!auditAsset.existsSync(), 'write=false 不写产物');
+    final Map<String, dynamic> auditReport = asMap(auditDry['report']);
+    check.check(auditReport['version'], 1, '审计报告 schema version=1');
+    final List<dynamic> auditTodos =
+        auditReport['todos'] as List<dynamic>? ?? <dynamic>[];
+    check.that(
+      auditTodos.any(
+        (dynamic item) =>
+            asMap(item)['path'] == 'lib/todo.dart' &&
+            asMap(item)['marker'] == 'TODO',
+      ),
+      'TODO 台账识别（path / line / marker）',
+    );
+    check.check(
+      (asMap(auditReport['docs'])['missing'] as List<dynamic>? ?? <dynamic>[])
+          .length,
+      4,
+      '文档审计：缺 4 份项目记忆文档',
+    );
+    final Map<String, dynamic> redundancy = asMap(
+      auditReport['redundancy'],
+    );
+    check.check(
+      (redundancy['duplicates'] as List<dynamic>? ?? <dynamic>[]).length,
+      1,
+      '冗余候选：重复内容 1 组',
+    );
+    check.that(
+      (redundancy['large_files'] as List<dynamic>? ?? <dynamic>[]).any(
+        (dynamic item) => asMap(item)['path'] == 'lib/big.txt',
+      ),
+      '冗余候选：超大文件',
+    );
+    final String todoBefore = todoFile.readAsStringSync();
+    final Map<String, dynamic> auditWritten = payloadOf(
+      await call('audit-run', 'production.audit.run', <String, Object?>{
+        'line_id': 'pl_audit',
+      }),
+    );
+    check.check(auditWritten['written'], true, '默认写 audit.md');
+    check.that(auditAsset.existsSync(), 'audit.md 落项目资产');
+    check.check(
+      auditAsset.readAsStringSync().contains('## TODO 台账'),
+      true,
+      'audit.md 含 TODO 台账',
+    );
+    check.check(
+      todoFile.readAsStringSync(),
+      todoBefore,
+      '审计不改工作空间文件（只读）',
     );
   } catch (error) {
     check.that(false, '自检过程未抛异常', actual: '$error');
