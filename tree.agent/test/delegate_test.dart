@@ -12,6 +12,7 @@ import 'package:tree_agent_loop/src/model_meta.dart';
 import 'package:tree_agent_loop/src/paths.dart';
 import 'package:tree_agent_loop/src/settings/domain_settings.dart';
 import 'package:tree_agent_loop/src/runtime/agent_runtime.dart';
+import 'package:tree_agent_loop/src/store/conversation_db.dart';
 import 'package:tree_agent_loop/src/store/file_store.dart';
 import 'package:tree_agent_loop/src/store/records.dart';
 import 'package:tree_agent_loop/src/store/tree_paths.dart';
@@ -1080,6 +1081,53 @@ void main() {
         ),
         404,
         '模型不存在',
+      );
+    });
+  });
+
+  group('委派回包字节预算', () {
+    test('超过 768 KiB 的 body 落盘走 result_path，路径在插件命名空间内', () async {
+      await _seedAgent(paths);
+      final ConversationDb db = await ConversationDbRegistry.open(
+        TreePaths(paths.root),
+        'agt',
+      );
+      await db.appendMessage(
+        CoreMessage(
+          id: 'huge',
+          agentId: 'agt',
+          sessionId: 'session_default',
+          role: 'agent',
+          content: 'z' * 900000,
+          timestamp: 1,
+        ),
+      );
+
+      final Map<String, dynamic> reply = await _call(
+        'GET',
+        '/api/conversations/agt',
+        paths,
+        params: <String, String>{'agentId': 'agt'},
+      );
+      expect(reply['status'], 200);
+      expect(reply['body'], isNull);
+      final String resultPath = '${reply['result_path'] ?? ''}';
+      expect(resultPath, isNotEmpty);
+      final File file = File(resultPath);
+      expect(file.existsSync(), isTrue);
+      expect(
+        p.normalize(resultPath),
+        startsWith(
+          p.normalize(
+            p.join(paths.root, 'plugin-data', kDelegateOutPluginId),
+          ),
+        ),
+      );
+      final Map<String, dynamic> body =
+          (jsonDecode(file.readAsStringSync()) as Map).cast<String, dynamic>();
+      expect((body['messages'] as List<dynamic>).length, 1);
+      await ConversationDbRegistry.close(
+        ConversationDbRegistry.pathFor(TreePaths(paths.root), 'agt'),
       );
     });
   });

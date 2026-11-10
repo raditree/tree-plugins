@@ -104,11 +104,28 @@ class _PluginSettingsCardState extends State<PluginSettingsCard> {
       });
     } catch (error) {
       if (!mounted) return;
+      final String text = '$error';
       setState(() {
         _loading = false;
-        _loadError = '$error';
+        _loadError = _looksLikeMissingSettingsPlugin(text)
+            ? '未安装 tree.settings 插件：插件参数页需要它提供 schema 与读写。'
+                  '在「插件管理」里安装（或升级）tree.settings 后重启核心即可出现。'
+            : text;
       });
     }
+  }
+
+  /// 路由 404 / 503 且点名 `tree.settings` ⇒ 归属插件没装（或没启用）。
+  ///
+  /// 核心对"归属插件不可用"回 503，老核心回 404；两种都按"未安装"降级成可读说明，
+  /// 而不是把 `HTTP 404` 摊给用户。
+  static bool _looksLikeMissingSettingsPlugin(String text) {
+    if (!text.contains('tree.settings')) return false;
+    return text.contains('未安装') ||
+        text.contains('未启用') ||
+        text.contains('不可用') ||
+        text.contains('503') ||
+        text.contains('404');
   }
 
   Map<String, dynamic> _draftOf(

@@ -49,6 +49,9 @@ class _FakeCore {
   /// 假核心的一页大小 = 面板的窗口半径（51）：请求带的 limit 优先，这里只做兜底/上限。
   int pageSize = 51;
 
+  /// 历史端点的失败状态码（0 = 正常）：验证"失败可见 + 可重试"。
+  int historyFailure = 0;
+
   /// **到达顺序**的请求日志（`req sessions a2` / `resp history a2` …）
   final List<String> log = <String>[];
 
@@ -139,6 +142,15 @@ class _FakeCore {
       historyQueries.add(request.uri.query);
       await _through(_historyGateOpen, _historyWaiters);
       log.add('resp history $agentId');
+      if (historyFailure != 0) {
+        request.response.statusCode = historyFailure;
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(jsonEncode(<String, dynamic>{
+          'detail': 'bad_gateway',
+        }));
+        await request.response.close();
+        return;
+      }
       final int limit = int.tryParse(q['limit'] ?? '') ?? pageSize;
       final int? from = int.tryParse(q['from'] ?? '');
       final int start = (from ?? (total - limit)).clamp(0, total);
@@ -445,6 +457,25 @@ void main() {
     expect(loadedOf(tester).length, greaterThanOrEqualTo(core.pageSize),
         reason: '历史没到位：${core.log}');
     expect(reads, isNotEmpty, reason: '末尾页落地后要把账本读数补上');
+    await closePanel(tester);
+  });
+
+  testWidgets('⑤ 历史加载失败：显示原因与重试，不许退回欢迎空态',
+      (WidgetTester tester) async {
+    core.historyFailure = 502;
+    await pumpAgent(tester, 'a1');
+    expect(find.textContaining('bad_gateway'), findsOneWidget,
+        reason: '失败原因必须可见（以前静默 catch，用户只看到空会话）');
+    expect(find.text('重试'), findsOneWidget);
+    expect(welcomeShown(tester), isFalse,
+        reason: '失败不是"没有消息"：不许显示欢迎空态');
+
+    // 恢复后点重试：错误态消失、历史正常装入
+    core.historyFailure = 0;
+    await tester.tap(find.text('重试'));
+    await flyIO(tester, rounds: 12);
+    expect(find.text('重试'), findsNothing);
+    expect(loadedOf(tester), isNotEmpty, reason: '重试后历史没装入：${core.log}');
     await closePanel(tester);
   });
 }

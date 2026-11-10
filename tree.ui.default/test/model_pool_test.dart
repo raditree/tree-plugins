@@ -27,6 +27,26 @@ void main() {
       expect(protocolForKind(kModelKindDecision), 'jev');
     });
 
+    test('展示三态：缺 kind / has_api_key 时如实标未知', () {
+      expect(
+        modelKindDisplayOf(<String, dynamic>{'model_id': 'a'}),
+        kModelKindUnknown,
+      );
+      expect(
+        modelKindDisplayOf(<String, dynamic>{'model_id': 'a', 'kind': 'chat'}),
+        kModelKindChat,
+      );
+      expect(
+        modelKeyStateOf(<String, dynamic>{'has_api_key': true}),
+        ModelKeyState.configured,
+      );
+      expect(
+        modelKeyStateOf(<String, dynamic>{'has_api_key': false}),
+        ModelKeyState.missing,
+      );
+      expect(modelKeyStateOf(<String, dynamic>{}), ModelKeyState.unknown);
+    });
+
     test('条件字段组：三组互斥', () {
       final ModelKindFields chat = modelKindFieldsOf(kModelKindChat);
       expect(<bool>[chat.chat, chat.embedding, chat.decision],
@@ -291,6 +311,25 @@ void main() {
         findsOneWidget,
       );
       expect(find.byKey(const Key('model-editor-dimensions')), findsNothing);
+    });
+
+    testWidgets('旧插件模型（缺 kind / has_api_key）：编辑器可用并提示未知', (
+      WidgetTester tester,
+    ) async {
+      await tester.pumpWidget(
+        wrap(
+          const ModelEditorDialog(
+            existing: <String, dynamic>{'model_id': 'old', 'name': '旧模型'},
+          ),
+        ),
+      );
+      expect(find.textContaining('旧版插件未返回 kind'), findsOneWidget);
+      expect(find.textContaining('当前状态未知'), findsOneWidget);
+      final DropdownButtonFormField<String> kind =
+          tester.widget<DropdownButtonFormField<String>>(
+        find.byKey(const Key('model-editor-kind')),
+      );
+      expect(kind.onChanged, isNull, reason: '编辑时不允许改 kind（回到 chat 兜底）');
     });
 
     testWidgets('编辑模式 kind 下拉禁用（类型不可改）', (WidgetTester tester) async {

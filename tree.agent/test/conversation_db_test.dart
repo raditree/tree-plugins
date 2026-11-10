@@ -238,6 +238,52 @@ void main() {
     });
   });
 
+  group('conversationPage 字节预算', () {
+    test('超预算从页首丢行：offset 前移、has_more 保持真', () async {
+      final ConversationDb db = await openDb();
+      final String big = 'x' * 400000;
+      for (int i = 1; i <= 3; i++) {
+        await db.appendMessage(msg('big_$i', sessionId: 'ses1', content: big));
+      }
+
+      final Map<String, dynamic> tail = await conversationPage(
+        db,
+        AgentDataPaths(temp.path),
+        'agt',
+        sessionId: 'ses1',
+      );
+      final List<Map<String, dynamic>> page =
+          (tail['messages'] as List<dynamic>).cast<Map<String, dynamic>>();
+      // 两条就超 768 KiB ⇒ 末尾页只留最后一条，offset 前移到它的下标。
+      expect(page.map((Map<String, dynamic> m) => m['id']), <String>['big_3']);
+      expect(tail['total'], 3);
+      expect(tail['offset'], 2);
+      expect(tail['has_more'], isTrue);
+      await db.close();
+    });
+
+    test('单条自己超预算时保留这一条（交给 result_path 回写）', () async {
+      final ConversationDb db = await openDb();
+      await db.appendMessage(msg('small', sessionId: 'ses1', content: '短'));
+      await db.appendMessage(
+        msg('huge', sessionId: 'ses1', content: 'y' * 900000),
+      );
+
+      final Map<String, dynamic> tail = await conversationPage(
+        db,
+        AgentDataPaths(temp.path),
+        'agt',
+        sessionId: 'ses1',
+      );
+      final List<Map<String, dynamic>> page =
+          (tail['messages'] as List<dynamic>).cast<Map<String, dynamic>>();
+      expect(page.map((Map<String, dynamic> m) => m['id']), <String>['huge']);
+      expect(tail['offset'], 1);
+      expect(tail['has_more'], isTrue);
+      await db.close();
+    });
+  });
+
   group('jsonl 迁移（注册表首开顺带）', () {
     test('导入 + 改名 .migrated；重开不重复；seq 接库尾', () async {
       final TreePaths treePaths = TreePaths(temp.path);

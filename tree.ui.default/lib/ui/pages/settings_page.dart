@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../app_version.dart';
+import '../app_radius.dart';
 import '../font_service.dart';
 import '../text_scale_service.dart';
 import '../../io/api_service.dart';
@@ -1782,17 +1783,25 @@ class _SettingsPageState extends State<SettingsPage> {
   Widget _buildModelRow(Map<String, dynamic> model, ColorScheme cs) {
     final String modelId = model['model_id'] as String? ?? '';
     final String name = model['name'] as String? ?? modelId;
-    final bool hasKey = model['has_api_key'] as bool? ?? false;
-    final String kind = modelKindOf(model);
+    // 展示口径 vs 行为口径：旧插件不回 kind 时徽标如实标 unknown，
+    // 但字段组（thinking/vision/维度等）仍按 chat 兜底，免得整行信息消失。
+    final ModelKeyState keyState = modelKeyStateOf(model);
+    final String kind = modelKindDisplayOf(model);
+    final String effectiveKind = modelKindOf(model);
     // 非 chat 模型只显示各自的定义性参数；chat 仍显示 thinking / vision。
     String kindDetail = '';
-    if (kind == kModelKindEmbedding) {
+    if (effectiveKind == kModelKindEmbedding) {
       final num? dim = model['dimensions'] as num?;
       if (dim != null) kindDetail = ' · ${dim.toInt()} 维';
-    } else if (kind == kModelKindDecision) {
+    } else if (effectiveKind == kModelKindDecision) {
       final num? threshold = model['confidence_threshold'] as num?;
       if (threshold != null) kindDetail = ' · 阈值 $threshold';
     }
+    final String keyDetail = switch (keyState) {
+      ModelKeyState.configured => '',
+      ModelKeyState.missing => ' · 未配置 API Key',
+      ModelKeyState.unknown => ' · API Key 状态未知（插件版本过旧）',
+    };
     final String price = modelPricingLabel(model);
     return ListTile(
       contentPadding: EdgeInsets.zero,
@@ -1807,9 +1816,9 @@ class _SettingsPageState extends State<SettingsPage> {
       ),
       subtitle: Text(
         '$modelId$kindDetail'
-        '${hasKey ? '' : ' · 未配置 API Key'}'
-        '${kind == kModelKindChat && (model['thinking'] as bool? ?? false) ? ' · thinking' : ''}'
-        '${kind == kModelKindChat && (model['if_vision'] as bool? ?? false) ? ' · vision' : ''}'
+        '$keyDetail'
+        '${effectiveKind == kModelKindChat && (model['thinking'] as bool? ?? false) ? ' · thinking' : ''}'
+        '${effectiveKind == kModelKindChat && (model['if_vision'] as bool? ?? false) ? ' · vision' : ''}'
         '${price.isEmpty ? '' : ' · $price'}',
         style: const TextStyle(fontSize: 12),
       ),
@@ -1833,18 +1842,19 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  /// 模型类型徽标（chat / embedding / decision）。
+  /// 模型类型徽标（chat / embedding / decision；旧插件缺 kind ⇒ unknown）。
   Widget _buildKindBadge(String kind, ColorScheme cs) {
     final Color color = switch (kind) {
       kModelKindEmbedding => Colors.blue,
       kModelKindDecision => Colors.orange,
+      kModelKindUnknown => cs.outline,
       _ => cs.primary,
     };
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(4),
+        borderRadius: BorderRadius.circular(AppRadius.pill),
       ),
       child: Text(
         kind,
@@ -1855,6 +1865,35 @@ class _SettingsPageState extends State<SettingsPage> {
         ),
       ),
     );
+  }
+
+  /// 新增后回读一次 kind/protocol：旧版 tree.agent 不认这两个字段时会把它们丢掉，
+  /// 这里对不上就明确提示"插件版本过旧"，避免用户以为模型类型已经生效。
+  ///
+  /// 返回 null = 一致（或回读失败，不盖过"已保存"主结果）；否则是可读提示。
+  Future<String?> _verifyModelKind(Map<String, dynamic> payload) async {
+    final String modelId = '${payload['model_id'] ?? ''}';
+    final String wantKind = '${payload['kind'] ?? ''}';
+    final String wantProtocol = '${payload['protocol'] ?? ''}';
+    try {
+      final List<Map<String, dynamic>> models = await ApiService.getModels();
+      Map<String, dynamic>? saved;
+      for (final Map<String, dynamic> m in models) {
+        if ('${m['model_id'] ?? ''}' == modelId) {
+          saved = m;
+          break;
+        }
+      }
+      if (saved == null) return null;
+      final String gotKind = modelKindDisplayOf(saved);
+      final String gotProtocol = '${saved['protocol'] ?? ''}'.trim();
+      if (gotKind == wantKind && gotProtocol == wantProtocol) return null;
+      return '模型已保存，但回读的类型不一致（期望 $wantKind/$wantProtocol，'
+          '实际 $gotKind/${gotProtocol.isEmpty ? '空' : gotProtocol}）：'
+          '当前 tree.agent 版本可能过旧，请升级后重试';
+    } catch (_) {
+      return null;
+    }
   }
 
   /// 打开模型编辑对话框（[existing] 为 null 表示新增）
@@ -1874,10 +1913,16 @@ class _SettingsPageState extends State<SettingsPage> {
         await ApiService.updateModel(modelId, payload);
       }
       if (!mounted) return;
+      final String? mismatch = existing == null
+          ? await _verifyModelKind(payload)
+          : null;
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(existing == null ? '模型已新增' : '模型已更新'),
-          duration: const Duration(seconds: 2),
+          content: Text(
+            mismatch ?? (existing == null ? '模型已新增' : '模型已更新'),
+          ),
+          duration: Duration(seconds: mismatch == null ? 2 : 5),
         ),
       );
       await _loadModelList();
@@ -2296,6 +2341,9 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
   bool _metaLoading = false;
   String _metaError = '';
 
+  /// 旧插件不支持端点探测（路由 404 / 501）：把探测入口收起来，别反复点。
+  bool _metaUnsupported = false;
+
   bool _thinking = false;
   bool _ifVision = false;
   String _reasoningEffort = '';
@@ -2399,9 +2447,13 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
       if (!mounted) return;
       final Object? meta = result['meta'];
       final String error = '${result['error'] ?? ''}';
+      final bool unsupported = _looksLikeRouteMissing(error);
       setState(() {
         _metaLoading = false;
-        _metaError = error;
+        _metaUnsupported = _metaUnsupported || unsupported;
+        _metaError = unsupported
+            ? '当前 tree.agent 插件版本不支持端点探测（升级后可用）'
+            : error;
         if (meta is Map) {
           _meta = Map<String, dynamic>.from(meta);
           _metaEffortOptions = modelMetaEffortsOf(<String, dynamic>{
@@ -2411,19 +2463,46 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
       });
       if (error.isNotEmpty && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('探测失败：$error')),
+          SnackBar(
+            content: Text(
+              unsupported ? '当前 tree.agent 插件版本不支持端点探测（升级后可用）' : '探测失败：$error',
+            ),
+          ),
         );
       }
     } catch (error) {
       if (!mounted) return;
+      final String text = '$error';
+      final bool unsupported = _looksLikeRouteMissing(text);
       setState(() {
         _metaLoading = false;
-        _metaError = '$error';
+        _metaUnsupported = _metaUnsupported || unsupported;
+        _metaError = unsupported
+            ? '当前 tree.agent 插件版本不支持端点探测（升级后可用）'
+            : text;
       });
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('探测失败：$error')),
+        SnackBar(
+          content: Text(
+            unsupported
+                ? '当前 tree.agent 插件版本不支持端点探测（升级后可用）'
+                : '探测失败：$text',
+          ),
+        ),
       );
     }
+  }
+
+  /// 路由不存在（旧插件未实现 / 核心没注册）的可读判定。
+  ///
+  /// 委派语义里 404 = 核心没这个接口、501 = 插件还没搬；两种都不该当成
+  /// "探测失败"，而是"这个版本没有探测能力"。
+  static bool _looksLikeRouteMissing(String text) {
+    return text.contains('404') ||
+        text.contains('501') ||
+        text.contains('尚未实现') ||
+        text.contains('未安装') ||
+        text.contains('不可用');
   }
 
   /// 思考强度下拉项：候选来自端点探测 / 已存档位 / 兜底。
@@ -2498,7 +2577,7 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
                 style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
               ),
             ),
-            if (_isEdit)
+            if (_isEdit && !_metaUnsupported)
               IconButton(
                 tooltip: '从端点探测价格与档位',
                 visualDensity: VisualDensity.compact,
@@ -2541,7 +2620,9 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
   @override
   Widget build(BuildContext context) {
     final ColorScheme cs = Theme.of(context).colorScheme;
-    final bool hasKey = widget.existing?['has_api_key'] as bool? ?? false;
+    final ModelKeyState keyState = widget.existing == null
+        ? ModelKeyState.missing
+        : modelKeyStateOf(widget.existing!);
     final ModelKindFields fields = modelKindFieldsOf(_kind);
     return AlertDialog(
       title: Text(_isEdit ? '编辑模型' : '新增模型'),
@@ -2577,7 +2658,10 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
                 decoration: InputDecoration(
                   labelText: '模型类型（kind）',
                   helperText: _isEdit
-                      ? '类型创建后不可修改'
+                      ? (modelKindDisplayOf(widget.existing!) ==
+                              kModelKindUnknown
+                          ? '旧版插件未返回 kind：按 chat 处理，升级 tree.agent 后可识别'
+                          : '类型创建后不可修改')
                       : 'chat 对话 / embedding 检索 / decision 决策',
                   isDense: true,
                 ),
@@ -2622,7 +2706,12 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
                 decoration: InputDecoration(
                   labelText: 'api_key',
                   helperText: _isEdit
-                      ? (hasKey ? '已配置；留空 = 不修改' : '当前未配置')
+                      ? switch (keyState) {
+                          ModelKeyState.configured => '已配置；留空 = 不修改',
+                          ModelKeyState.missing => '当前未配置',
+                          ModelKeyState.unknown =>
+                            '当前状态未知（旧版插件不回 has_api_key）；留空 = 不修改',
+                        }
                       : '必填',
                   isDense: true,
                 ),
@@ -2966,7 +3055,7 @@ class _SwatchChip extends StatelessWidget {
       height: 22,
       decoration: BoxDecoration(
         color: color,
-        borderRadius: BorderRadius.circular(4),
+        borderRadius: BorderRadius.circular(AppRadius.xs),
         border: Border.all(color: cs.outlineVariant),
       ),
     );

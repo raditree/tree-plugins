@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:tree_ui_default/io/protocol_contract.dart';
 
+import '../app_radius.dart';
 import '../models/agent.dart';
 import '../models/message.dart';
 import '../models/session.dart';
@@ -170,6 +171,16 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 消息"时出现（用户 2026-10-03 症状 1：切 agent 先闪一下空窗口再载入历史）。
   /// 它同时是"窗口还没就位"的判据：这期间的视口坐标一律不作数（见 [_onWindowChanged]）。
   bool _historyLoading = false;
+
+  /// 历史页加载失败的可读原因（空串 = 没出问题）。
+  ///
+  /// 以前这里是静默 catch：旧 agent 的会话大回包被核心 502 拒掉，UI 直接落到
+  /// 「你好，欢迎使用 Tree」空态，用户以为会话被清空（2026-11-10 报告）。
+  /// 现在失败必须可见、可重试，且与"真的没有消息"分开。
+  String _historyError = '';
+
+  /// 会话列表加载失败的可读原因（空串 = 没出问题）：标题栏给一颗可重试的警示键。
+  String _sessionsError = '';
 
   /// 窗口内容**代次**：整表作废（[_clearWindow]）时递增。
   ///
@@ -694,6 +705,7 @@ class _MessagePanelState extends State<MessagePanel> {
       if (widget.selectedAgent?.id != agentId) return;
       setState(() {
         _sessions = sessions;
+        _sessionsError = '';
         // 运行模式按顶部 agent 级锁定：该 agent 任一历史会话有消息
         // 即视为「已开始过对话」，切换会话不解除锁定
         _modeLocked = sessions.any((s) => s.messageCount > 0);
@@ -739,7 +751,11 @@ class _MessagePanelState extends State<MessagePanel> {
         widget.onSessionChanged?.call(_currentSessionId);
       }
     } catch (e) {
-      // 拉取失败时保持默认会话
+      // 拉取失败时保持默认会话，但必须让用户看见：标题栏给可重试的警示键。
+      if (!mounted) return;
+      setState(() {
+        _sessionsError = _readableError(e);
+      });
     }
   }
 
@@ -769,6 +785,8 @@ class _MessagePanelState extends State<MessagePanel> {
     _tailApplied = '';
     // 清空之后马上会有一发加载：这期间不许渲染空态（见 [_historyLoading]）
     _historyLoading = true;
+    // 上一份内容的失败原因不跟到新会话里（新一代重新判定）
+    _historyError = '';
     _replayGuard.clear();
     _barrenGaps.clear();
     _loadingGaps.clear();
@@ -849,6 +867,52 @@ class _MessagePanelState extends State<MessagePanel> {
     return last.isEmpty ? 'session_default' : last;
   }
 
+  /// 从异常里取可读原因（`Exception:` / `ApiException:` 前缀剥掉，只留正文）。
+  static String _readableError(Object error) {
+    String text = error.toString().trim();
+    for (final String prefix in <String>['Exception: ', 'ApiException: ']) {
+      if (text.startsWith(prefix)) {
+        text = text.substring(prefix.length).trim();
+        break;
+      }
+    }
+    return text.isEmpty ? '未知错误' : text;
+  }
+
+  /// 历史页失败态：原因 + 重试（替代欢迎空态，避免被读成"会话没了"）。
+  Widget _buildHistoryError() {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Icon(Icons.cloud_off, size: 40, color: cs.error),
+            const SizedBox(height: 12),
+            Text(
+              _historyError,
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 13, color: cs.onSurfaceVariant),
+            ),
+            const SizedBox(height: 12),
+            FilledButton.tonalIcon(
+              onPressed: () {
+                setState(() {
+                  _historyError = '';
+                  _historyLoading = true;
+                });
+                unawaited(_loadHistory());
+              },
+              icon: const Icon(Icons.refresh, size: 18),
+              label: const Text('重试'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   /// 从后端拉取当前 agent/会话的**显示行整段**，作为窗口的起点。
   ///
   /// 显示/详细两分（规格 §3.1.4）：列表端点回的是轻量显示行（preview + 小字段），
@@ -884,6 +948,8 @@ class _MessagePanelState extends State<MessagePanel> {
           .map(ChatMessage.fromJson)
           .toList(growable: false);
       final String? pendingScroll = _pendingScrollId;
+      // 成功即摘掉上一轮的失败态（同一次 setState 由 _applyTailPage 承担）
+      _historyError = '';
       _applyTailPage(page, tail, sessionId: sid, agent: agent);
       // 临时员工的**入口列表**取自**落盘名册**（用户 2026-10-03）：它是权威来源，
       // 不随消息窗口的加载 / 淘汰抖动（见 [SubagentTranscript.setRoster]）。
@@ -897,7 +963,13 @@ class _MessagePanelState extends State<MessagePanel> {
         unawaited(_locateMessage(pendingScroll));
       }
     } catch (e) {
-      // 拉取失败时静默处理（保持空列表）
+      // 失败必须可见：留原因给 MessageList 位置上的错误态（带重试），
+      // 绝不退回"欢迎页"——那会被读成"会话没了"。
+      if (mounted && epoch == _windowEpoch) {
+        setState(() {
+          _historyError = _readableError(e);
+        });
+      }
     } finally {
       if (_tailInFlight != null && _tailInFlight!.key == key) {
         _tailInFlight = null;
@@ -2289,6 +2361,8 @@ class _MessagePanelState extends State<MessagePanel> {
                       // 临时员工的消息**不进主消息流**（用户 2026-10-04：「subagent 的输出跟主 agent
                       // 的输出混杂，根本没法分辨，subagent 的工具调用就在 subagent 的调用工具详情里看」）：
                       // 它们按 subagent_id 收进 [SubagentTranscript]，在"那次 subagent 工具调用的详情页"里看。
+                      // 历史页失败：显示原因 + 重试（不许退回欢迎空态——那是"真的没消息"的语义）。
+                      if (_historyError.isNotEmpty) return _buildHistoryError();
                       return MessageList(
                         // **加载中**（切 agent / 首载 / 切会话）：窗口本来就是空的，
                         // 但这不是"没有消息"——列表据此渲染静态骨架而不是欢迎空态
@@ -2461,7 +2535,7 @@ class _MessagePanelState extends State<MessagePanel> {
           if (maxTokens > 0)
             Expanded(
               child: ClipRRect(
-                borderRadius: BorderRadius.circular(2),
+                borderRadius: BorderRadius.circular(AppRadius.pill),
                 child: LinearProgressIndicator(
                   value: (promptTokens / maxTokens).clamp(0.0, 1.0),
                   backgroundColor: cs.surfaceContainerHighest.withValues(
@@ -2658,6 +2732,16 @@ class _MessagePanelState extends State<MessagePanel> {
               ),
             ),
           ),
+          if (agent != null && _sessionsError.isNotEmpty)
+            IconButton(
+              tooltip: '会话列表加载失败：$_sessionsError\n点击重试',
+              icon: Icon(
+                Icons.error_outline,
+                size: 18,
+                color: Theme.of(context).colorScheme.error,
+              ),
+              onPressed: () => unawaited(_loadSessions()),
+            ),
           if (agent != null)
             Padding(
               padding: const EdgeInsets.only(left: 8),
@@ -2994,7 +3078,7 @@ class _MessagePanelState extends State<MessagePanel> {
               padding: const EdgeInsets.all(10),
               decoration: BoxDecoration(
                 color: cs.surfaceContainerHighest.withValues(alpha: 0.35),
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: BorderRadius.circular(AppRadius.md),
                 border: Border.all(color: cs.primary.withValues(alpha: 0.35)),
               ),
               child: Column(

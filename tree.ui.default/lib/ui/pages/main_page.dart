@@ -11,6 +11,7 @@ import '../../io/service_availability.dart';
 import '../../io/ssh_executor_service.dart';
 import '../../io/station_client.dart';
 import '../../io/workspace_refresh_service.dart';
+import '../app_radius.dart';
 import '../services/detail_selection.dart';
 import '../services/onboarding_requests.dart';
 import '../services/onboarding_state.dart';
@@ -468,6 +469,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   /// 活动栏里「插件管理」的位置（引导第 5 步）。
   static const int _pluginPanelIndex = 1;
 
+  /// 运行中的 tree.agent 版本低于 UI 期望时的顶部横幅文案（空串 = 没问题）。
+  String _agentVersionWarning = '';
+
   @override
   void initState() {
     super.initState();
@@ -479,6 +483,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     WorkspaceRefreshService.instance.addListener(_onWorkspaceChanged);
     _loadAgents();
     unawaited(_maybeShowGuide());
+    unawaited(_checkAgentPluginVersion());
   }
 
   @override
@@ -615,6 +620,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
               return _buildServiceUnavailableBanner(context, reason);
             },
           ),
+          if (_agentVersionWarning.isNotEmpty)
+            _buildAgentVersionBanner(context),
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) {
@@ -648,6 +655,88 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
           ),
         ],
       ),
+        ),
+      ),
+    );
+  }
+
+  /// 读插件清单里的 `tree.agent` 版本，低于 UI 期望就亮顶部横幅。
+  ///
+  /// 为什么不能只靠依赖闸门：`requires.plugins` 里 tree.agent 标了 optional
+  /// （核心跳过闸门），旧版 agent 照样能起——于是"字段缺失 / 会话大回包 502"
+  /// 全变成静默失败。这里显式提示"该升级了"，读不到清单则不提示。
+  Future<void> _checkAgentPluginVersion() async {
+    try {
+      final Map<String, dynamic> data = await ApiService.getPluginConfigs();
+      final List<dynamic> configs =
+          data['configs'] as List<dynamic>? ?? <dynamic>[];
+      for (final dynamic raw in configs) {
+        if (raw is! Map) continue;
+        if ('${raw['id'] ?? ''}' != 'tree.agent') continue;
+        final String version = '${raw['version'] ?? ''}'.trim();
+        if (version.isEmpty) return;
+        if (_versionAtLeast(version, 0, 32, 0)) return;
+        if (!mounted) return;
+        setState(() {
+          _agentVersionWarning =
+              '当前 tree.agent 插件版本过低（$version < 0.32.0）：会话历史可能加载失败、'
+              '模型类型等字段可能显示为未知。请在「插件管理」升级后重启核心。';
+        });
+        return;
+      }
+    } catch (_) {
+      // 读不到清单 ≠ 版本过低：不提示。
+    }
+  }
+
+  /// 版本比较（只比前三段数字，预发布 / 构建号忽略）。
+  static bool _versionAtLeast(
+    String version,
+    int major,
+    int minor,
+    int patch,
+  ) {
+    final List<int> parts = version
+        .split(RegExp(r'[.+-]'))
+        .take(3)
+        .map((String part) => int.tryParse(part) ?? 0)
+        .toList();
+    while (parts.length < 3) {
+      parts.add(0);
+    }
+    final int got = parts[0] * 1000000 + parts[1] * 1000 + parts[2];
+    return got >= major * 1000000 + minor * 1000 + patch;
+  }
+
+  /// 旧版 tree.agent 提示条（可关闭；升级后重进页面不再出现）。
+  Widget _buildAgentVersionBanner(BuildContext context) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.errorContainer,
+      child: Padding(
+        padding: const EdgeInsets.only(left: 12, right: 4, top: 4, bottom: 4),
+        child: Row(
+          children: <Widget>[
+            Icon(
+              Icons.system_update_alt,
+              size: 16,
+              color: scheme.onErrorContainer,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                _agentVersionWarning,
+                style: TextStyle(
+                  color: scheme.onErrorContainer,
+                  fontSize: 12.5,
+                ),
+              ),
+            ),
+            TextButton(
+              onPressed: () => setState(() => _agentVersionWarning = ''),
+              child: const Text('知道了'),
+            ),
+          ],
         ),
       ),
     );
@@ -1051,7 +1140,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     final cs = Theme.of(context).colorScheme;
     return Container(
       width: _collapsedWidth,
-      color: Theme.of(context).scaffoldBackgroundColor,
+      decoration: BoxDecoration(
+        color: Theme.of(context).scaffoldBackgroundColor,
+        borderRadius: BorderRadius.circular(AppRadius.xxs),
+      ),
       child: Column(
         children: [
           Container(
@@ -1324,7 +1416,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       width: collapsed
           ? _collapsedWidth
           : (fill ? double.infinity : expandedWidth),
-      child: ClipRect(
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(AppRadius.xxs),
         clipBehavior: Clip.hardEdge,
         child: Stack(
           children: [
@@ -1380,7 +1473,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   Widget _buildActivityBar() {
     return Container(
       width: _activityBarWidth,
-      color: Theme.of(context).scaffoldBackgroundColor,
+      decoration: BoxDecoration(
+        color: Theme.of(context).scaffoldBackgroundColor,
+        borderRadius: BorderRadius.circular(AppRadius.xxs),
+      ),
       child: Column(
         children: [
           const SizedBox(height: 8),
@@ -1867,7 +1963,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     final cs = Theme.of(context).colorScheme;
     return Container(
       width: _collapsedWidth,
-      color: Theme.of(context).scaffoldBackgroundColor,
+      decoration: BoxDecoration(
+        color: Theme.of(context).scaffoldBackgroundColor,
+        borderRadius: BorderRadius.circular(AppRadius.xxs),
+      ),
       child: Column(
         children: [
           Container(
@@ -1924,7 +2023,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     final cs = Theme.of(context).colorScheme;
     return Container(
       width: _collapsedWidth,
-      color: Theme.of(context).scaffoldBackgroundColor,
+      decoration: BoxDecoration(
+        color: Theme.of(context).scaffoldBackgroundColor,
+        borderRadius: BorderRadius.circular(AppRadius.xxs),
+      ),
       child: Column(
         children: [
           Container(
@@ -2080,7 +2182,13 @@ class _DraggableDividerState extends State<DraggableDivider> {
           });
           widget.onDragEnd?.call();
         },
-        child: Container(width: 6, color: _getColor(context)),
+        child: Container(
+          width: 6,
+          decoration: BoxDecoration(
+            color: _getColor(context),
+            borderRadius: BorderRadius.circular(AppRadius.xxs),
+          ),
+        ),
       ),
     );
   }

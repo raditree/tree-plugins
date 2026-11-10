@@ -22,9 +22,31 @@ const List<String> kModelKinds = <String>[
 ];
 
 /// 读取模型的 kind；缺省 / 空串按 `chat` 处理。
+///
+/// 这是**行为口径**（过滤、字段组、绑定校验都用它）；展示口径用
+/// [modelKindDisplayOf]——旧插件没回 kind 时不能假装它是 chat。
 String modelKindOf(Map<String, dynamic> model) {
   final String kind = (model['kind'] as String? ?? '').trim();
   return kind.isEmpty ? kModelKindChat : kind;
+}
+
+/// 展示用的"未知类型"标记（旧插件不回 `kind` 字段）。
+const String kModelKindUnknown = 'unknown';
+
+/// 读取模型的 kind，**字段缺失如实标成 `unknown`**（列表徽标 / 编辑器提示用）。
+String modelKindDisplayOf(Map<String, dynamic> model) {
+  final String kind = (model['kind'] as String? ?? '').trim();
+  return kind.isEmpty ? kModelKindUnknown : kind;
+}
+
+/// 模型 API Key 的配置状态三态：旧插件不回 `has_api_key` 时是 [unknown]，
+/// 不能默认按"未配置"误导用户去重填。
+enum ModelKeyState { configured, missing, unknown }
+
+ModelKeyState modelKeyStateOf(Map<String, dynamic> model) {
+  final Object? raw = model['has_api_key'];
+  if (raw is! bool) return ModelKeyState.unknown;
+  return raw ? ModelKeyState.configured : ModelKeyState.missing;
 }
 
 /// kind → protocol 推导（后端 MP-2 规定创建后不可修改）。

@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'agent/question_store.dart';
 import 'paths.dart';
 import 'store/conversation_db.dart';
@@ -6,6 +8,14 @@ import 'tool/question_channel.dart';
 
 /// 会话历史单页上限（与核心 `CoreServer._historyPageMax` 同值）。
 const int kHistoryPageMax = 2000;
+
+/// 会话历史单页的**JSON 字节预算**（按行累加）。
+///
+/// 一页最多 2000 条显示行，长会话的正文足以把回包顶到核心 1 MiB 硬上限
+/// （`delegateInlineBodyLimit`）。超预算就从页首丢行——`offset` 随之前移、
+/// `has_more` 保持真，UI 的 `before` 补页不受影响；单条自己就超预算时保留它，
+/// 由委派层走 `result_path` 流式回写。
+const int kHistoryPageByteBudget = 768 * 1024;
 
 /// `GET /api/conversations/{agentId}` 的分页实现。
 ///
@@ -78,10 +88,22 @@ Future<Map<String, dynamic>> conversationPage(
     for (final Map<String, dynamic> message in ordered.sublist(start, end))
       _withQuestionOverlay(message, questions),
   ];
+  // 字节预算：从**末尾**往前累加（末尾一页才是默认口径），超预算丢页首。
+  int keepFrom = page.length;
+  int bytes = 0;
+  while (keepFrom > 0) {
+    final int size = utf8.encode(jsonEncode(page[keepFrom - 1])).length;
+    if (bytes + size > kHistoryPageByteBudget && keepFrom < page.length) break;
+    bytes += size;
+    keepFrom--;
+  }
+  final List<Map<String, dynamic>> visible =
+      keepFrom == 0 ? page : page.sublist(keepFrom);
+  start += keepFrom;
   return <String, dynamic>{
     'agent_id': agentId,
     'session_id': sessionId,
-    'messages': page,
+    'messages': visible,
     'total': total,
     'offset': start,
     'has_more': start > 0,

@@ -132,12 +132,79 @@ Future<Map<String, dynamic>> handleApiDelegate(
   ModelCatalogClient? modelCatalog,
 }) async {
   try {
-    return await _dispatchDelegate(envelope, runtimeFor, modelCatalog);
+    final Map<String, dynamic> reply = await _dispatchDelegate(
+      envelope,
+      runtimeFor,
+      modelCatalog,
+    );
+    return _offloadLargeReply(reply, _str(envelope['data_dir']));
   } catch (error) {
     // 与核心 `_dispatch` 的兜底同形：未捕获异常 ⇒ 500 + 可读原因。
     return _jsonReply(500, <String, dynamic>{
       'detail': '核心进程内部错误：$error',
     });
+  }
+}
+
+/// 委派回包的内联字节预算。
+///
+/// 核心硬上限是 1 MiB（`CoreServer.delegateInlineBodyLimit`，超了直接 502
+/// `bad_gateway`）。这里留 1/4 余量：会话一长，历史页（一页最多 2000 条全文）
+/// 很容易越线——越线就落盘走 `result_path`，由核心流式回写并删除临时文件。
+const int kDelegateInlineBodyBudget = 768 * 1024;
+
+/// 落盘命名空间（核心只允许 `<data_dir>/plugin-data/<pluginId>` 或它自己的
+/// 委派临时根；取前者：插件自有命名空间，跨版本稳定）。
+const String kDelegateOutPluginId = 'tree.agent';
+
+/// 落盘文件的保鲜期：核心读到后立即删除；这里只兜底"写成功但回包没走通"的
+/// 残留（下一次写入顺手清掉）。
+const Duration kDelegateOutTtl = Duration(hours: 1);
+
+/// 超过 [kDelegateInlineBodyBudget] 时把 body 落到插件数据目录并改回
+/// `result_path`；其余情况原样返回。
+///
+/// 落盘失败只能回内联——核心会以 502 明确报出"超限"，总比把这次回包吞掉强。
+Map<String, dynamic> _offloadLargeReply(
+  Map<String, dynamic> reply,
+  String dataDir,
+) {
+  final Object? raw = reply['body'];
+  if (raw is! String || raw.isEmpty) return reply;
+  if (utf8.encode(raw).length <= kDelegateInlineBodyBudget) return reply;
+  if (dataDir.isEmpty) return reply;
+  try {
+    final Directory dir = Directory(
+      p.join(dataDir, 'plugin-data', kDelegateOutPluginId, 'delegate-out'),
+    )..createSync(recursive: true);
+    _pruneDelegateOut(dir);
+    final File file = File(
+      p.join(dir.path, 'reply-${DateTime.now().microsecondsSinceEpoch}.json'),
+    );
+    file.writeAsStringSync(raw, flush: true);
+    return <String, dynamic>{
+      'status': reply['status'] ?? 200,
+      if (reply['headers'] != null) 'headers': reply['headers'],
+      'result_path': file.path,
+    };
+  } catch (_) {
+    return reply;
+  }
+}
+
+void _pruneDelegateOut(Directory dir) {
+  final DateTime deadline = DateTime.now().subtract(kDelegateOutTtl);
+  try {
+    for (final FileSystemEntity entity in dir.listSync()) {
+      if (entity is! File) continue;
+      try {
+        if (entity.statSync().modified.isBefore(deadline)) entity.deleteSync();
+      } catch (_) {
+        // 单个文件删不掉不影响这次回包。
+      }
+    }
+  } catch (_) {
+    // 目录列不出来也不影响这次回包。
   }
 }
 

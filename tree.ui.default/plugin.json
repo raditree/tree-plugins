@@ -1,7 +1,7 @@
 {
   "id": "tree.ui.default",
   "name": "Tree 默认界面",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Tree 的默认图形界面（runtime: ui）。零依赖：契约由 lib/io/protocol_contract.dart 自持，不 import 核心包。",
   "runtime": "ui",
   "command": "tree_ui.exe",
@@ -13,7 +13,7 @@
     "plugins": [
       {
         "id": "tree.agent",
-        "version": ">=0.28.0",
+        "version": ">=0.32.0",
         "optional": true
       }
     ]
