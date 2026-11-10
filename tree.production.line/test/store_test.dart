@@ -303,4 +303,62 @@ void main() {
       expect(store.listRuns('pl_1', taskId: 'Y').length, 1);
     });
   });
+
+  group('P8 派发计划', () {
+    setUp(() {
+      store.createLine(<String, Object?>{
+        'id': 'pl_q',
+        'name': '并行',
+        'limits': <String, Object?>{'max_parallel_tasks': 2},
+      });
+    });
+
+    test('limit 截断的批次成员也出现在 skipped（reason=limit）', () {
+      for (final String id in <String>['A', 'B']) {
+        store.createTask('pl_q', <String, Object?>{
+          'id': id,
+          'title': id,
+          'status': 'queued',
+          'write_scope': <String>['lib/$id'],
+        });
+      }
+      final Map<String, Object?> plan = store.dispatch('pl_q', limit: 1);
+      expect(plan['batch_ids'], <String>['A']);
+      expect(plan['slots_free'], 2, reason: '派发前空闲槽位');
+      final List<Map<String, Object?>> skipped = (plan['skipped'] as List<dynamic>)
+          .cast<Map<String, Object?>>();
+      expect(skipped.single['id'], 'B');
+      expect(skipped.single['reason'], 'limit');
+    });
+
+    test('写域交叠 / 缺写域都给出可读原因，且不改状态', () {
+      store.createTask('pl_q', <String, Object?>{
+        'id': 'A',
+        'title': 'A',
+        'status': 'queued',
+        'write_scope': <String>['lib/a'],
+      });
+      store.createTask('pl_q', <String, Object?>{
+        'id': 'B',
+        'title': 'B',
+        'status': 'queued',
+        'write_scope': <String>['lib/a/x.dart'],
+      });
+      store.createTask('pl_q', <String, Object?>{
+        'id': 'C',
+        'title': 'C',
+        'status': 'queued',
+      });
+      final Map<String, Object?> plan = store.dispatch('pl_q');
+      expect(plan['batch_ids'], <String>['A']);
+      final List<Map<String, Object?>> skipped = (plan['skipped'] as List<dynamic>)
+          .cast<Map<String, Object?>>();
+      expect(
+        skipped.map((Map<String, Object?> item) => item['reason']),
+        <String>['write_scope_overlap', 'write_scope_missing'],
+      );
+      expect(store.getTask('pl_q', 'A').status, TaskStatus.queued);
+      expect(store.getTask('pl_q', 'B').status, TaskStatus.queued);
+    });
+  });
 }

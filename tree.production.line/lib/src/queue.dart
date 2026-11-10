@@ -100,7 +100,8 @@ class DispatchPlan {
   /// 本轮可以同时派发的任务（写域两两不相交、依赖已满足）。
   final List<TaskRecord> batch;
 
-  /// 不能派发的任务与原因（`depends_on` / `write_scope_overlap` / `max_parallel`）。
+  /// 不能派发的任务与原因（`depends_on` / `write_scope_missing` /
+  /// `write_scope_overlap` / `max_parallel`）。
   final List<Map<String, Object?>> skipped;
 
   /// 已占用并行槽位的在途任务（packing / packed / running / gating）。
@@ -143,6 +144,14 @@ DispatchPlan planDispatch(
         'id': task.id,
         'reason': 'depends_on',
         'waiting_on': waiting,
+      });
+      continue;
+    }
+    // 空写域无法打包（`production.task.pack` 会拒绝），派发阶段就不该入选。
+    if (task.writeScope.isEmpty) {
+      skipped.add(<String, Object?>{
+        'id': task.id,
+        'reason': 'write_scope_missing',
       });
       continue;
     }

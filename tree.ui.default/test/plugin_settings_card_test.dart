@@ -150,7 +150,9 @@ void main() {
     await tester.pumpWidget(
       const MaterialApp(
         home: Scaffold(
-          body: SingleChildScrollView(child: PluginSettingsCard()),
+          body: SingleChildScrollView(
+            child: PluginSettingsCard(teamId: 'team_a'),
+          ),
         ),
       ),
     );

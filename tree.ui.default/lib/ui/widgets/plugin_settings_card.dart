@@ -11,7 +11,12 @@ import '../../io/api_service.dart';
 /// - secret 只写不回显，留空 = 保持原值；
 /// - 保存只提交脏字段；reset 回到 schema 默认。
 class PluginSettingsCard extends StatefulWidget {
-  const PluginSettingsCard({super.key});
+  const PluginSettingsCard({super.key, this.teamId = ''});
+
+  /// 设置库归属（= 当前选中的 Agent / 团队 id）。
+  ///
+  /// `tree.settings` 是 team 粒度：核心只从 query 透传 team_id，空值会被拒绝。
+  final String teamId;
 
   @override
   State<PluginSettingsCard> createState() => _PluginSettingsCardState();
@@ -35,7 +40,24 @@ class _PluginSettingsCardState extends State<PluginSettingsCard> {
     _load();
   }
 
+  @override
+  void didUpdateWidget(covariant PluginSettingsCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.teamId != widget.teamId) _load();
+  }
+
   Future<void> _load() async {
+    final String teamId = widget.teamId.trim();
+    if (teamId.isEmpty) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _loadError = null;
+          _schemas = <Map<String, dynamic>>[];
+        });
+      }
+      return;
+    }
     if (mounted) {
       setState(() {
         _loading = true;
@@ -43,7 +65,9 @@ class _PluginSettingsCardState extends State<PluginSettingsCard> {
       });
     }
     try {
-      final Map<String, dynamic> data = await ApiService.getPluginSettingsSchema();
+      final Map<String, dynamic> data = await ApiService.getPluginSettingsSchema(
+        teamId: teamId,
+      );
       final List<Map<String, dynamic>> schemas =
           (data['schemas'] as List<dynamic>? ?? <dynamic>[])
               .whereType<Map>()
@@ -60,7 +84,7 @@ class _PluginSettingsCardState extends State<PluginSettingsCard> {
         final String pluginId = (schema['plugin_id'] ?? '').toString();
         if (pluginId.isEmpty) continue;
         final Map<String, dynamic> result =
-            await ApiService.getPluginSettingsValues(pluginId);
+            await ApiService.getPluginSettingsValues(pluginId, teamId: teamId);
         values[pluginId] = _map(result['values']);
       }
       if (!mounted) return;
@@ -136,7 +160,11 @@ class _PluginSettingsCardState extends State<PluginSettingsCard> {
       _errors.remove(pluginId);
     });
     try {
-      await ApiService.updatePluginSettings(pluginId, payload);
+      await ApiService.updatePluginSettings(
+        pluginId,
+        payload,
+        teamId: widget.teamId,
+      );
       await _load();
     } catch (error) {
       if (!mounted) return;
@@ -158,7 +186,11 @@ class _PluginSettingsCardState extends State<PluginSettingsCard> {
       _errors.remove(pluginId);
     });
     try {
-      await ApiService.resetPluginSettings(pluginId, keys);
+      await ApiService.resetPluginSettings(
+        pluginId,
+        keys,
+        teamId: widget.teamId,
+      );
       await _load();
     } catch (error) {
       if (!mounted) return;
@@ -173,6 +205,15 @@ class _PluginSettingsCardState extends State<PluginSettingsCard> {
 
   @override
   Widget build(BuildContext context) {
+    if (widget.teamId.trim().isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.all(16),
+        child: Text(
+          '先在左侧选择一个 Agent（团队），再配置插件参数。',
+          style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
+        ),
+      );
+    }
     if (_loading) {
       return const Padding(
         padding: EdgeInsets.all(16),

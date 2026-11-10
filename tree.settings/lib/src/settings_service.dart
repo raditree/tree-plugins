@@ -20,6 +20,7 @@ class SettingsChange {
     required this.pluginId,
     required this.keys,
     required this.generation,
+    this.at = 0,
   });
 
   final String teamId;
@@ -27,10 +28,14 @@ class SettingsChange {
   final List<String> keys;
   final int generation;
 
+  /// 广播时刻（epoch ms；订阅方只做排序 / 日志，不做判活）。
+  final int at;
+
   Map<String, Object?> toPayload() => <String, Object?>{
     'plugin_id': pluginId,
     'keys': keys,
     'generation': generation,
+    'at': at,
   };
 }
 
@@ -160,6 +165,9 @@ class SettingsService {
           if (pluginId.isEmpty) {
             return _error(400, 'invalid_arguments', '缺少 plugin_id');
           }
+          if (!await _schemaExists(engine, teamId, pluginId)) {
+            return _error(404, 'unknown_plugin', '插件 $pluginId 未注册设置 schema');
+          }
           final Map<String, dynamic> values = _map(body['values']);
           final Map<String, dynamic> result = await engine.set(
             teamId: teamId,
@@ -173,6 +181,9 @@ class SettingsService {
           final String pluginId = _str(body['plugin_id']);
           if (pluginId.isEmpty) {
             return _error(400, 'invalid_arguments', '缺少 plugin_id');
+          }
+          if (!await _schemaExists(engine, teamId, pluginId)) {
+            return _error(404, 'unknown_plugin', '插件 $pluginId 未注册设置 schema');
           }
           final Map<String, dynamic> result = await engine.reset(
             teamId: teamId,
@@ -219,6 +230,7 @@ class SettingsService {
         pluginId: pluginId,
         keys: keys,
         generation: generation,
+        at: DateTime.now().millisecondsSinceEpoch,
       ),
     ).catchError((Object error) {
       log?.call('settings.changed 广播失败：$error');
@@ -292,10 +304,23 @@ class SettingsService {
         'message': message,
       });
 
+  /// REST 写入前确认目标插件真的注册过 schema（没注册就不接受覆盖值）。
+  static Future<bool> _schemaExists(
+    SettingsEngine engine,
+    String teamId,
+    String pluginId,
+  ) async {
+    final List<Map<String, dynamic>> schemas = await engine.listSchemas(teamId);
+    return schemas.any(
+      (Map<String, dynamic> item) => _str(item['plugin_id']) == pluginId,
+    );
+  }
+
   static int _statusOf(String code) {
     switch (code) {
       case 'schema_not_found':
       case 'unknown_key':
+      case 'unknown_plugin':
         return 404;
       case 'schema_version_conflict':
         return 409;

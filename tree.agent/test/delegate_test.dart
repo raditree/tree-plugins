@@ -7,7 +7,10 @@ import 'package:test/test.dart';
 import 'package:tree_agent_loop/src/agent/agent_engine.dart';
 import 'package:tree_agent_loop/src/agent/question_store.dart';
 import 'package:tree_agent_loop/src/delegate.dart';
+import 'package:tree_agent_loop/src/llm/model_catalog_client.dart';
+import 'package:tree_agent_loop/src/model_meta.dart';
 import 'package:tree_agent_loop/src/paths.dart';
+import 'package:tree_agent_loop/src/settings/domain_settings.dart';
 import 'package:tree_agent_loop/src/runtime/agent_runtime.dart';
 import 'package:tree_agent_loop/src/store/file_store.dart';
 import 'package:tree_agent_loop/src/store/records.dart';
@@ -967,6 +970,150 @@ void main() {
       );
     });
   });
+
+  group('P8 模型元数据路由', () {
+    test('GET 无缓存 ⇒ meta:null；POST 成功写缓存并出现在 /api/models', () async {
+      final Map<String, dynamic> empty = await _call(
+        'GET',
+        '/api/models/m1/meta',
+        paths,
+        params: <String, String>{'modelId': 'm1'},
+      );
+      expect(empty['status'], 200);
+      expect(_bodyOf(empty)['meta'], isNull);
+
+      final Map<String, dynamic> probed = await _call(
+        'POST',
+        '/api/models/m1/meta',
+        paths,
+        params: <String, String>{'modelId': 'm1'},
+        modelCatalog: _FakeCatalog.success(_meta()),
+      );
+      expect(probed['status'], 200);
+      expect(_bodyOf(probed)['success'], isTrue);
+      expect(
+        ((_bodyOf(probed)['meta'] as Map)['pricing'] as Map)['prompt_per_million'],
+        3,
+      );
+
+      final Map<String, dynamic> listed = await _call('GET', '/api/models', paths);
+      final List<dynamic> models = _bodyOf(listed)['models'] as List<dynamic>;
+      final Map<String, dynamic> m1 = models
+          .cast<Map<String, dynamic>>()
+          .firstWhere((Map<String, dynamic> item) => item['model_id'] == 'm1');
+      expect(
+        ((m1['meta'] as Map)['pricing'] as Map)['prompt_per_million'],
+        3,
+      );
+    });
+
+    test('POST 失败 ⇒ 200 success:false，保留上次价格只追加 error', () async {
+      writeModelMeta(paths, _meta());
+      final Map<String, dynamic> reply = await _call(
+        'POST',
+        '/api/models/m1/meta',
+        paths,
+        params: <String, String>{'modelId': 'm1'},
+        modelCatalog: _FakeCatalog.failure('端点不可达'),
+      );
+      expect(reply['status'], 200);
+      expect(_bodyOf(reply)['success'], isFalse);
+      expect(_bodyOf(reply)['error'], '端点不可达');
+      expect(
+        ((_bodyOf(reply)['meta'] as Map)['pricing'] as Map)['prompt_per_million'],
+        3,
+      );
+      expect(readModelMeta(paths, 'm1')!.error, '端点不可达');
+    });
+
+    test('PATCH 只改 name 不清缓存；改 base_url / DELETE 清缓存', () async {
+      writeModelMeta(paths, _meta());
+      final Map<String, dynamic> renamed = await _call(
+        'PATCH',
+        '/api/models/m1',
+        paths,
+        params: <String, String>{'modelId': 'm1'},
+        body: <String, dynamic>{'name': '改名'},
+      );
+      expect(renamed['status'], 200);
+      expect(readModelMeta(paths, 'm1'), isNotNull);
+
+      final Map<String, dynamic> moved = await _call(
+        'PATCH',
+        '/api/models/m1',
+        paths,
+        params: <String, String>{'modelId': 'm1'},
+        body: <String, dynamic>{'base_url': 'https://new.example/v1'},
+      );
+      expect(moved['status'], 200);
+      expect(readModelMeta(paths, 'm1'), isNull);
+
+      writeModelMeta(paths, _meta(modelId: 'm2'));
+      final Map<String, dynamic> deleted = await _call(
+        'DELETE',
+        '/api/models/m2',
+        paths,
+        params: <String, String>{'modelId': 'm2'},
+      );
+      expect(deleted['status'], 200);
+      expect(readModelMeta(paths, 'm2'), isNull);
+    });
+
+    test('模型不存在 ⇒ 404（GET / POST 都不猜）', () async {
+      _expectError(
+        await _call(
+          'GET',
+          '/api/models/nope/meta',
+          paths,
+          params: <String, String>{'modelId': 'nope'},
+        ),
+        404,
+        '模型不存在',
+      );
+      _expectError(
+        await _call(
+          'POST',
+          '/api/models/nope/meta',
+          paths,
+          params: <String, String>{'modelId': 'nope'},
+          modelCatalog: _FakeCatalog.failure('不会被调用'),
+        ),
+        404,
+        '模型不存在',
+      );
+    });
+  });
+}
+
+ModelMeta _meta({String modelId = 'm1'}) => ModelMeta(
+  modelId: modelId,
+  pricing: const ModelPricing(
+    promptPerMillion: 3,
+    completionPerMillion: 15,
+  ),
+  reasoningEffortOptions: const <String>['low', 'high'],
+  reasoningSupported: true,
+  contextLength: 128000,
+  source: 'openai.models',
+  fetchedAt: '2026-11-10T10:00:00',
+);
+
+class _FakeCatalog extends ModelCatalogClient {
+  _FakeCatalog.success(this.meta) : failure = null;
+  _FakeCatalog.failure(this.failure) : meta = null;
+
+  final ModelMeta? meta;
+  final String? failure;
+
+  @override
+  Future<ModelMeta> probe(
+    CoreModelConfig model, {
+    DateTime Function()? clock,
+  }) async {
+    final String? error = failure;
+    if (error != null) throw ModelMetaFailure(error);
+    return meta!;
+  }
 }
 
 Future<Map<String, dynamic>> _call(
@@ -977,6 +1124,7 @@ Future<Map<String, dynamic>> _call(
   Map<String, String> query = const <String, String>{},
   Map<String, dynamic>? body,
   AgentRuntime Function(String dataDir)? runtimeFor,
+  ModelCatalogClient? modelCatalog,
 }) => handleApiDelegate(
   <String, dynamic>{
     'method': method,
@@ -993,6 +1141,7 @@ Future<Map<String, dynamic>> _call(
     'body': ?body,
   },
   runtimeFor: runtimeFor,
+  modelCatalog: modelCatalog,
 );
 
 Map<String, dynamic> _bodyOf(Map<String, dynamic> reply) =>

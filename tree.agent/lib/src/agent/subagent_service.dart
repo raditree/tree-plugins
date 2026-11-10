@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import '../settings/core_settings.dart';
+import '../settings/domain_settings.dart';
 import '../store/subagent_registry.dart';
 import '../store/tree_store.dart';
 import '../team/team_workspace.dart';
@@ -340,11 +341,20 @@ class SubagentService implements SubagentChannel {
         code: 'model_required',
       );
     }
-    if (settings.model(modelId) == null) {
+    final CoreModelConfig? workerModel = settings.model(modelId);
+    if (workerModel == null) {
       return _workerError(
         '模型「$modelId」不在模型池里：请到「设置 → 自定义模型」补上',
         code: 'model_not_found',
       );
+    }
+    // MP-4：产线员工只允许对话模型（打包 / 执行 / 专家都是 chat 用途）。
+    final String? kindError = DomainSettings.modelKindError(
+      workerModel,
+      role: '产线员工模型',
+    );
+    if (kindError != null) {
+      return _workerError(kindError, code: 'model_kind_invalid');
     }
     final Future<String?> Function(String agentId)? probe = probeWorkspace;
     if (probe != null) {

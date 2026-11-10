@@ -54,12 +54,14 @@ void main() {
     expect(m1.tokenScale, 2.5);
     expect(m1.toApiJson()['base_url'], 'https://api.example.com');
     expect(m1.toApiJson().containsKey('api_key'), isFalse);
+    expect(m1.toApiJson()['has_api_key'], isTrue);
 
     final CoreModelConfig m2 = settings.model('m2')!;
     expect(m2.reasoningEffortOptions, <String>['low', 'high', 'max']);
     expect(m2.tokenScale, kDefaultTokenScale);
     expect(m2.effectiveMaxSeqlen, kFallbackMaxSeqlen);
     expect(m2.toApiJson()['base_url'], 'http://127.0.0.1:8080');
+    expect(m2.toApiJson()['has_api_key'], isFalse);
 
     // 单一来源：A2 的只读视图必须与领域设置逐条一致。
     expect(readModels(paths), <Map<String, dynamic>>[
@@ -177,6 +179,31 @@ void main() {
     expect(settings.updateModel('nope', <String, dynamic>{}), isNull);
     expect(settings.deleteModel('m3'), isTrue);
     expect(sink.deleted, <String>['m3']);
+  });
+
+  test('MP-2：存量未知 kind/protocol 的 PATCH 拒绝；同值 kind 放行', () {
+    final CoreModelConfig weird = CoreModelConfig(
+      modelId: 'w',
+      kind: 'weird',
+      baseUrl: 'https://x',
+    );
+    expect(
+      DomainSettings.validateModelChange(weird, <String, dynamic>{'name': 'x'}),
+      contains('模型类型未知'),
+    );
+    final CoreModelConfig chat = CoreModelConfig(
+      modelId: 'c',
+      baseUrl: 'https://x',
+      apiKey: 'k',
+    );
+    expect(
+      DomainSettings.validateModelChange(chat, <String, dynamic>{
+        'kind': 'chat',
+        'name': '改名',
+      }),
+      isNull,
+      reason: '同值 kind 不视为修改',
+    );
   });
 
   test('MP-1：旧 YAML 无 kind ⇒ chat/openai，文件不被改写、toJson 不多键', () {

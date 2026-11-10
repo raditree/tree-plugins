@@ -202,6 +202,12 @@ class ProductionStore {
     } else {
       data.remove('blocked_reason');
     }
+    // 重新入队 = 用户已处理阻塞（加预算 / 改计划），旧的软停标记不再代表当前口径；
+    // 历史仍保留在 runs 台账（status=budget_exceeded）。
+    if (target == TaskStatus.queued) {
+      data.remove('budget_exceeded');
+      data.remove('budget');
+    }
     _writeText(File(_taskFile(lineId, taskId)), encodeYaml(data));
     rebuild(lineId);
     return <String, Object?>{
@@ -261,17 +267,25 @@ class ProductionStore {
     final List<TaskRecord> batch = limit > 0 && limit < plan.batch.length
         ? plan.batch.take(limit).toList()
         : plan.batch;
+    // 被 `limit` 截断的任务也要给出原因，避免"既不在 batch 也不在 skipped"黑洞。
+    final List<Map<String, Object?>> skipped = <Map<String, Object?>>[
+      ...plan.skipped,
+      if (limit > 0 && limit < plan.batch.length)
+        for (final TaskRecord task in plan.batch.skip(limit))
+          <String, Object?>{'id': task.id, 'reason': 'limit', 'limit': limit},
+    ];
     return <String, Object?>{
       'line_id': lineId,
       'max_parallel_tasks': plan.maxParallel,
       'slots_used': plan.slotsUsed,
+      // 派发前的空闲槽位；不扣除本批（本批尚未迁移到 packing）。
       'slots_free': plan.slotsFree,
       'batch': <Map<String, Object?>>[
         for (final TaskRecord task in batch) task.toJson(),
       ],
       'batch_ids': <String>[for (final TaskRecord task in batch) task.id],
       'running': <String>[for (final TaskRecord task in plan.running) task.id],
-      'skipped': plan.skipped,
+      'skipped': skipped,
       'count': batch.length,
     };
   }

@@ -5,6 +5,7 @@ import 'package:test/test.dart';
 import 'package:tree_agent_loop/src/llm/model_catalog_client.dart';
 import 'package:tree_agent_loop/src/model_meta.dart';
 import 'package:tree_agent_loop/src/paths.dart';
+import 'package:tree_agent_loop/src/settings/domain_settings.dart';
 
 void main() {
   group('模型目录端点（P8）', () {
@@ -101,6 +102,77 @@ void main() {
         fetchedAt: '2026-11-10T10:00:00',
       );
       expect(meta.pricing!.promptPerMillion, 2.5);
+    });
+  });
+
+  group('端点 HTTP 错误分支（P8）', () {
+    /// 起一个只回固定回包的本地端点，跑一次 `fetchModelEntry`。
+    Future<Object?> fetch(
+      int status,
+      String body, {
+      String apiKey = 'k',
+      String modelId = 'm',
+    }) async {
+      final HttpServer server = await HttpServer.bind(
+        InternetAddress.loopbackIPv4,
+        0,
+      );
+      server.listen((HttpRequest request) {
+        request.response.statusCode = status;
+        request.response.write(body);
+        request.response.close();
+      });
+      final ModelCatalogClient client = ModelCatalogClient();
+      try {
+        return await client.fetchModelEntry(
+          baseUrl: 'http://127.0.0.1:${server.port}/v1',
+          apiKey: apiKey,
+          modelId: modelId,
+        );
+      } finally {
+        client.close();
+        await server.close(force: true);
+      }
+    }
+
+    Matcher failure(String code) => throwsA(
+      isA<ModelMetaFailure>().having(
+        (ModelMetaFailure error) => error.code,
+        'code',
+        code,
+      ),
+    );
+
+    test('401 / 非 JSON / 条目缺失 / 缺密钥都给可读错误码', () async {
+      await expectLater(fetch(401, '{"error":"unauthorized"}'), failure('model_meta_http'));
+      await expectLater(fetch(200, '<html>not json</html>'), failure('model_meta_shape'));
+      await expectLater(
+        fetch(200, '{"data":[{"id":"other"}]}'),
+        failure('model_not_in_catalog'),
+      );
+      await expectLater(
+        fetch(200, '{"data":[]}', apiKey: '  '),
+        failure('invalid_model'),
+      );
+    });
+
+    test('非 OpenAI 协议不探测（可读拒绝）', () async {
+      final ModelCatalogClient client = ModelCatalogClient();
+      try {
+        await expectLater(
+          client.probe(
+            CoreModelConfig(
+              modelId: 'jev',
+              kind: kModelKindDecision,
+              baseUrl: 'https://api.example.com/v1',
+              apiKey: 'k',
+            ),
+          ),
+          failure('model_meta_unsupported'),
+        );
+      } finally {
+        client.close();
+      }
     });
   });
 

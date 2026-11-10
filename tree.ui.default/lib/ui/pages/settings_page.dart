@@ -36,6 +36,7 @@ class SettingsPage extends StatefulWidget {
     this.focusModels = false,
     this.embedded = false,
     this.onReplayRequested,
+    this.teamId = '',
   });
 
   /// 版本信息数据源（**测试注入用**；null = 从核心启动器读当前运行态）。
@@ -50,6 +51,9 @@ class SettingsPage extends StatefulWidget {
 
   /// [embedded] 下点「重新显示新手引导」时的回调（非嵌入模式仍走 `pop(true)`）。
   final VoidCallback? onReplayRequested;
+
+  /// 当前选中的 Agent / 团队 id（`tree.settings` 的库归属；空 = 未选择）。
+  final String teamId;
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -640,7 +644,10 @@ class _SettingsPageState extends State<SettingsPage> {
       label: '插件',
       icon: Icons.extension_outlined,
       sections: <Widget Function()>[
-        () => _section('插件设置', const PluginSettingsCard()),
+        () => _section(
+          '插件设置',
+          PluginSettingsCard(teamId: widget.teamId),
+        ),
         () => _section('插件发布源', _buildPluginReleaseCard()),
         () => _section('插件开发', _buildPluginDevCard()),
       ],

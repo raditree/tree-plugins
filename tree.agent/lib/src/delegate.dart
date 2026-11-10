@@ -530,8 +530,11 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     if (model == null) {
       return _jsonReply(404, <String, dynamic>{'detail': '模型不存在'});
     }
-    // 端点 / 密钥可能变了：旧的探测结果（价格、档位）不再可信，丢弃等重新探测。
-    removeModelMeta(paths, modelId);
+    // 端点 / 密钥变了：旧的探测结果（价格、档位）不再可信，丢弃等重新探测。
+    // 只改 name / thinking 等展示字段不清缓存（否则改个名字就要重新探测）。
+    if (body.containsKey('base_url') || body.containsKey('api_key')) {
+      removeModelMeta(paths, modelId);
+    }
     await runtime.settingsSink.flush();
     return _jsonReply(200, <String, dynamic>{
       'success': true,

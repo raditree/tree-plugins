@@ -574,7 +574,13 @@ class SettingsEngine {
         }
         return _checkRange(field, key, raw.toDouble());
       case 'enum':
-        final String value = raw is String ? raw : '';
+        if (raw is! String) {
+          throw SettingsFailure(
+            '字段 $key 需要 string（enum），收到 ${raw.runtimeType}',
+            code: 'value_type_mismatch',
+          );
+        }
+        final String value = raw;
         final List<Object?> options = _list(field['options']);
         if (!options.map(_str).contains(value)) {
           throw SettingsFailure(

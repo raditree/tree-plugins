@@ -95,8 +95,8 @@ void main() {
   group('DAG 派发计划（P8）', () {
     test('依赖未完成的任务不进批次', () {
       final DispatchPlan plan = planDispatch(<TaskRecord>[
-        task('A', status: TaskStatus.queued),
-        task('B', dependsOn: <String>['A']),
+        task('A', status: TaskStatus.queued, writeScope: <String>['lib/a']),
+        task('B', dependsOn: <String>['A'], writeScope: <String>['lib/b']),
       ], maxParallel: 4);
       expect(plan.batch.map((TaskRecord item) => item.id), <String>['A']);
       expect(
@@ -130,6 +130,16 @@ void main() {
         plan.skipped.map((Map<String, Object?> item) => item['reason']),
         <String>['write_scope_overlap', 'max_parallel'],
       );
+    });
+
+    test('空写域不入选（先补计划再打包）', () {
+      final DispatchPlan plan = planDispatch(<TaskRecord>[
+        task('A', writeScope: <String>['lib/a']),
+        task('B'),
+      ], maxParallel: 4);
+      expect(plan.batch.map((TaskRecord item) => item.id), <String>['A']);
+      expect(plan.skipped.single['id'], 'B');
+      expect(plan.skipped.single['reason'], 'write_scope_missing');
     });
 
     test('槽位被在途任务占用时不再派发', () {

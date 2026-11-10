@@ -24,6 +24,10 @@ void main() {
     File(p.join(paths.modelsDir, 'm1.yaml')).writeAsStringSync(
       'model_id: m1\nbase_url: https://api.example.com\napi_key: k\n',
     );
+    File(p.join(paths.modelsDir, 'm_emb.yaml')).writeAsStringSync(
+      'model_id: m_emb\nkind: embedding\ndimensions: 8\n'
+      'base_url: https://api.example.com\napi_key: k\n',
+    );
     settings = CoreSettings.load(paths);
     memory = MemoryStore();
     registry = SubagentRegistry(persistence: memory);
@@ -117,6 +121,17 @@ void main() {
       sessionId: 's1',
     );
     expect(none['code'], 'model_required');
+  });
+
+  test('非 chat 模型不能当产线员工（MP-4）', () async {
+    final Map<String, Object?> rejected = await service.runWorker(
+      spec('packer', modelId: 'm_emb'),
+      callerId: 'agt',
+      sessionId: 's1',
+    );
+    expect(rejected['code'], 'model_kind_invalid');
+    expect('${rejected['error']}', contains('embedding'));
+    expect(turns, isEmpty);
   });
 
   test('复用：同角色可复用（换模型 / 工具），跨角色拒绝', () async {

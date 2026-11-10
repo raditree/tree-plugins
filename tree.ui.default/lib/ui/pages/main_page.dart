@@ -740,7 +740,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             onPressed: () {
               Navigator.of(context).push(
                 MaterialPageRoute<void>(
-                  builder: (BuildContext context) => const SettingsPage(),
+                  builder: (BuildContext context) =>
+                      SettingsPage(teamId: _selectedAgent?.id ?? ''),
                 ),
               );
             },
@@ -1735,6 +1736,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
           embedded: true,
           focusModels: _settingsFocusModels,
           onReplayRequested: _replayOnboarding,
+          teamId: _selectedAgent?.id ?? '',
         ),
       ),
     ];

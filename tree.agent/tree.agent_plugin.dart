@@ -1151,6 +1151,7 @@ Future<int> selfTest() async {
         'max_input_tokens': null,
         'confidence_threshold': null,
         'base_url': 'https://api.example.com',
+        'has_api_key': true,
         'thinking': true,
         'if_vision': false,
         'reasoning_effort': 'high',
@@ -1169,6 +1170,7 @@ Future<int> selfTest() async {
         'max_input_tokens': null,
         'confidence_threshold': null,
         'base_url': 'http://127.0.0.1:8080',
+        'has_api_key': false,
         'thinking': false,
         'if_vision': false,
         'reasoning_effort': '',
@@ -1186,7 +1188,7 @@ Future<int> selfTest() async {
     check.check(
       jsonDecode('${modelsReply['body'] ?? '{}'}'),
       <String, dynamic>{'models': expectedModels},
-      'models：11 键 / 排序 / 脱敏 / 默认值',
+      'models：17 键 / 排序 / 脱敏 / 默认值',
     );
 
     final Map<String, dynamic> infoReply =
@@ -1206,7 +1208,7 @@ Future<int> selfTest() async {
       actual: '${infoBody['agent']}',
     );
     check.that(
-      '${jsonEncode(infoBody['models'])}' == '${jsonEncode(expectedModels)}',
+      jsonEncode(infoBody['models']) == jsonEncode(expectedModels),
       'models-info：模型池与 /api/models 同源',
       actual: '${infoBody['models']}',
     );

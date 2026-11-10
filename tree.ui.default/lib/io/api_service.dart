@@ -968,15 +968,6 @@ class ApiService {
     return _deleteJson('/api/models/${Uri.encodeComponent(modelId)}');
   }
 
-  /// 读模型元数据缓存（价格 / 思考强度档位）；从未探测过 ⇒ null。
-  static Future<Map<String, dynamic>?> getModelMeta(String modelId) async {
-    final Map<String, dynamic> data = await _getJson(
-      '/api/models/${Uri.encodeComponent(modelId)}/meta',
-    );
-    final Object? meta = data['meta'];
-    return meta is Map ? Map<String, dynamic>.from(meta) : null;
-  }
-
   /// 从 OpenAI 兼容端点探测模型元数据并落缓存。
   ///
   /// 返回 `{success, model_id, meta, error?}`：`success=false` 时 `meta` 仍带
@@ -1073,39 +1064,59 @@ class ApiService {
   ///
   /// 调用 `GET /api/plugin-settings/schema`，返回 `{schemas: [...]}`；路由由
   /// `tree.settings` 插件承接，前缀刻意避开核心的 `/api/settings/*`。
-  static Future<Map<String, dynamic>> getPluginSettingsSchema() async {
-    return _getJson('/api/plugin-settings/schema');
+  /// [teamId] 是设置库的归属（核心只从 query 透传）；缺省会被设置服务拒绝。
+  static Future<Map<String, dynamic>> getPluginSettingsSchema({
+    String teamId = '',
+  }) async {
+    return _getJson(
+      '/api/plugin-settings/schema',
+      query: <String, String>{
+        if (teamId.trim().isNotEmpty) 'team_id': teamId.trim(),
+      },
+    );
   }
 
   /// 取某个插件的设置值（secret 只回 `has_value`）。
   static Future<Map<String, dynamic>> getPluginSettingsValues(
-    String pluginId,
-  ) async {
+    String pluginId, {
+    String teamId = '',
+  }) async {
     return _getJson(
       '/api/plugin-settings/values',
-      query: <String, String>{'plugin_id': pluginId},
+      query: <String, String>{
+        'plugin_id': pluginId,
+        if (teamId.trim().isNotEmpty) 'team_id': teamId.trim(),
+      },
     );
   }
 
   /// 写入用户覆盖值（只提交脏字段）。
   static Future<Map<String, dynamic>> updatePluginSettings(
     String pluginId,
-    Map<String, dynamic> values,
-  ) async {
+    Map<String, dynamic> values, {
+    String teamId = '',
+  }) async {
     return _patchJson(
       '/api/plugin-settings/values',
       body: <String, dynamic>{'plugin_id': pluginId, 'values': values},
+      query: <String, String>{
+        if (teamId.trim().isNotEmpty) 'team_id': teamId.trim(),
+      },
     );
   }
 
   /// 清空覆盖值（回到 schema 默认）。
   static Future<Map<String, dynamic>> resetPluginSettings(
     String pluginId,
-    List<String> keys,
-  ) async {
+    List<String> keys, {
+    String teamId = '',
+  }) async {
     return _postJson(
       '/api/plugin-settings/reset',
       body: <String, dynamic>{'plugin_id': pluginId, 'keys': keys},
+      query: <String, String>{
+        if (teamId.trim().isNotEmpty) 'team_id': teamId.trim(),
+      },
     );
   }
 
@@ -2153,8 +2164,9 @@ class ApiService {
   static Future<Map<String, dynamic>> _patchJson(
     String path, {
     Map<String, dynamic>? body,
+    Map<String, String>? query,
   }) async {
-    final Uri uri = Uri.parse('$baseUrl$path');
+    final Uri uri = Uri.parse('$baseUrl$path').replace(queryParameters: query);
     try {
       final http.Response response = await http.patch(
         uri,

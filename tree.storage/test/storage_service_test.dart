@@ -376,6 +376,54 @@ void main() {
     }
   });
 
+  test('TC-ST-08/12：payload 自报身份被忽略，只认 meta.source_plugin_id', () async {
+    final Map<String, dynamic> meta = <String, dynamic>{
+      'source_plugin_id': 'tree.docnorm',
+      'data_dir': temp.path,
+    };
+    // 自报是别人 ⇒ 不能借此写别人的 namespace。
+    await expectLater(
+      service.handle(
+        'storage.put',
+        <String, dynamic>{
+          'plugin_id': 'tree.other',
+          'namespace': 'tree.other',
+          'collection': 'c',
+          'key': 'k',
+          'value': <String, dynamic>{'v': 1},
+        },
+        meta,
+        teamScope,
+      ),
+      throwsA(
+        isA<StorageFailure>().having(
+          (StorageFailure e) => e.code,
+          'code',
+          'namespace_denied',
+        ),
+      ),
+    );
+    // 自报是别人但没指定 namespace ⇒ 仍落到调用方自己的 namespace。
+    await service.handle(
+      'storage.put',
+      <String, dynamic>{
+        'plugin_id': 'tree.other',
+        'collection': 'c',
+        'key': 'k',
+        'value': <String, dynamic>{'v': 1},
+      },
+      meta,
+      teamScope,
+    );
+    final Map<String, dynamic> stats = await service.handle(
+      'storage.stats',
+      <String, dynamic>{},
+      meta,
+      teamScope,
+    );
+    expect(stats['namespace'], 'tree.docnorm');
+  });
+
   test('ST-2/ST-3/ST-5：tx / export / import / stats / compact 路由可用', () async {
     final Map<String, dynamic> meta = <String, dynamic>{
       'source_plugin_id': 'tree.docnorm',

@@ -156,6 +156,8 @@ class CoreModelConfig {
         ? confidenceThreshold
         : null,
     'base_url': maskBaseUrl(baseUrl),
+    // 只回"是否配置"，密钥本身永不出插件。
+    'has_api_key': apiKey.trim().isNotEmpty,
     'thinking': thinking,
     'if_vision': ifVision,
     'reasoning_effort': reasoningEffort,
@@ -443,10 +445,21 @@ class DomainSettings {
   }
 
   /// 校验 PATCH 后的模型形态：kind/protocol 不可改，组合与类型必填项仍成立（MP-2）。
+  ///
+  /// 存量条目若被手改成未知 kind/protocol，PATCH 其他字段也拒绝（不替用户猜），
+  /// 用户应删除后按合法类型重建。
   static String? validateModelChange(
     CoreModelConfig existing,
     Map<String, dynamic> payload,
-  ) => validateModelKindFields(payload, base: existing);
+  ) {
+    if (!kModelKinds.contains(existing.kind)) {
+      return '模型类型未知：${existing.kind}（请删除后按合法类型重建）';
+    }
+    if (!kModelProtocols.contains(existing.protocol)) {
+      return '模型协议未知：${existing.protocol}（请删除后按合法类型重建）';
+    }
+    return validateModelKindFields(payload, base: existing);
+  }
 
   /// `kind` / `protocol` 组合与类型必填字段（MP-2 的唯一判据）。
   ///

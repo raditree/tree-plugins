@@ -636,5 +636,97 @@ void main() {
       ),
     );
     expect(workers.calls.length, before);
+
+    // 重新入队 = 用户已处理阻塞：旧软停标记清掉（历史仍在 runs 台账）。
+    store.transition('pl_b', 'B1', to: 'queued', reason: '用户加预算');
+    expect(
+      store.getTask('pl_b', 'B1').data.containsKey('budget_exceeded'),
+      isFalse,
+    );
+  });
+
+  test('调用前已超限：不发起员工、不出 pack.json，直接软停 blocked', () async {
+    store.createLine(<String, Object?>{
+      'id': 'pl_pre',
+      'name': '预算前置',
+      'workspace_dir': workspace,
+      'limits': <String, Object?>{'max_tokens_per_task': 10},
+    });
+    store.createTask('pl_pre', <String, Object?>{
+      'id': 'P1',
+      'title': '已用满',
+      'status': 'queued',
+      'write_scope': <String>['lib/a.dart'],
+    });
+    // usage 是运行期字段（createTask 不接收），按真实路径写回。
+    store.putTask('pl_pre', 'P1', <String, Object?>{
+      'usage': <String, Object?>{
+        'prompt_tokens': 6,
+        'completion_tokens': 4,
+      },
+    });
+    final int before = workers.calls.length;
+    final Map<String, Object?> result = await call(
+      'production.task.pack',
+      <String, Object?>{'line_id': 'pl_pre', 'task_id': 'P1'},
+    );
+    expect(result['status'], 'budget_exceeded');
+    expect((result['task'] as Map<String, Object?>)['status'], 'blocked');
+    expect((result['run'] as Map<String, Object?>)['status'], 'budget_exceeded');
+    expect(workers.calls.length, before, reason: '到点不再发起员工调用');
+    expect(
+      File(
+        p.join(
+          temp.path,
+          'production_lines',
+          'team_a',
+          'pl_pre',
+          'tasks',
+          'P1',
+          'pack.json',
+        ),
+      ).existsSync(),
+      isFalse,
+    );
+  });
+
+  test('执行后到点：改动保留但不跑门控，任务 blocked', () async {
+    store.createLine(<String, Object?>{
+      'id': 'pl_run',
+      'name': '执行预算',
+      'workspace_dir': workspace,
+      'limits': <String, Object?>{'max_tokens_per_task': 10},
+    });
+    store.createTask('pl_run', <String, Object?>{
+      'id': 'R1',
+      'title': '执行到点',
+      'status': 'queued',
+      'write_scope': <String>['lib/a.dart'],
+      'read_scope': <String>['lib/'],
+    });
+    final Map<String, Object?> packed = await call(
+      'production.task.pack',
+      <String, Object?>{'line_id': 'pl_run', 'task_id': 'R1'},
+    );
+    expect(packed['status'], 'packed');
+
+    workers.tokens = <String, Object?>{'prompt': 8, 'completion': 8};
+    final int ranBefore = commands.ran.length;
+    final Map<String, Object?> result = await call(
+      'production.task.run',
+      <String, Object?>{'line_id': 'pl_run', 'task_id': 'R1'},
+    );
+    expect(result['status'], 'budget_exceeded');
+    expect((result['task'] as Map<String, Object?>)['status'], 'blocked');
+    expect(
+      (result['run'] as Map<String, Object?>)['changed_files'],
+      <String>['lib/a.dart'],
+    );
+    final List<String> after = commands.ran.skip(ranBefore).toList();
+    expect(
+      after.where((String command) => !command.contains('git status')),
+      isEmpty,
+      reason: '预算到点不跑门控',
+    );
   });
 }

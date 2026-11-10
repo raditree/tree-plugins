@@ -776,6 +776,47 @@ void main() {
     );
   });
 
+  test('TC-ST-05：跨命名空间 / 跨团队的导出物拒绝导入', () async {
+    await engine.put(
+      teamId: team,
+      namespace: 'other',
+      collection: 'items',
+      key: 'a',
+      value: <String, dynamic>{'n': 1},
+    );
+    final String path =
+        (await engine.export(
+              teamId: team,
+              namespace: 'other',
+              collection: 'items',
+            ))['path']
+            as String;
+    await expectLater(
+      engine.importData(teamId: team, namespace: 'ns', path: path),
+      throwsA(
+        isA<StorageFailure>()
+            .having((StorageFailure e) => e.code, 'code', 'import_invalid')
+            .having(
+              (StorageFailure e) => e.message,
+              'message',
+              contains('命名空间 other'),
+            ),
+      ),
+    );
+    await expectLater(
+      engine.importData(teamId: 'team_b', namespace: 'other', path: path),
+      throwsA(
+        isA<StorageFailure>()
+            .having((StorageFailure e) => e.code, 'code', 'import_invalid')
+            .having(
+              (StorageFailure e) => e.message,
+              'message',
+              contains('团队 $team'),
+            ),
+      ),
+    );
+  });
+
   test('TC-ST-11：单条 >1 MiB / 整批 >8 MiB / >200 ops ⇒ 整批拒绝', () async {
     await expectLater(
       engine.tx(

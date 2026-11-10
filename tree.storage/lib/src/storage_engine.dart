@@ -636,6 +636,22 @@ class StorageEngine {
         code: 'import_invalid',
       );
     }
+    // 只允许导入本团队 × 本命名空间的导出物：否则被 allowlist 放行的调用方
+    // 可以拿别人的导出快照复制到自己集合里（绕过 namespace 隔离）。
+    final String manifestTeam = _text(manifest['team_id']);
+    final String manifestNamespace = _text(manifest['namespace']);
+    if (manifestTeam.isNotEmpty && manifestTeam != teamId) {
+      throw StorageFailure(
+        '导出物属于团队 $manifestTeam，不能导入到 $teamId',
+        code: 'import_invalid',
+      );
+    }
+    if (manifestNamespace.isNotEmpty && manifestNamespace != namespace) {
+      throw StorageFailure(
+        '导出物属于命名空间 $manifestNamespace，不能导入到 $namespace',
+        code: 'import_invalid',
+      );
+    }
     final String manifestCollection = _text(manifest['collection']);
     if (manifestCollection.isEmpty) {
       throw StorageFailure('manifest 缺 collection', code: 'import_invalid');
