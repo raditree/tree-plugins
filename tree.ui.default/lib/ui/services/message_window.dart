@@ -229,13 +229,15 @@ List<MessageRange> splitGapAtViewportTop(MessageRange gap, int first) {
 /// 像素↔下标换算的误差来源越多），代价是往回滑更早触发补页。
 const int kMessageWindowRadius = 51;
 
-/// **显示行缓存上限**（规格 §3.1.4：「显示数据缓存（仍设上限<一万条）」）。
+/// **首屏一次拉多少条显示行**（只热末尾这一小段，更早段由窗口机制补拉）。
 ///
-/// 列表端点已是轻量显示行（preview + 小字段，无 tool_arguments / tool_result /
-/// usage / attachments 重负载），≤9999 行整段缓存代价很小：首屏一次拉满，
-/// 槽位表不再有 88px 占位空洞，窗口机制（gapsFor/evict）只在**超过上限**时
-/// 才接管更早段的补拉与淘汰。
-const int kDisplayCacheLimit = 9999;
+/// 为什么不是"整份会话一次拉满"（规格 §3.1.4 原口径 9999）：槽位表里全是**真消息**时，
+/// 列表要跳到末尾（首帧贴底 / 拖滑块）必须从下标 0 **顺序布局**到落点
+/// （`RenderSliverList` 只能逐个累加实测高度），几千条真消息 = 每条都要建
+/// Markdown/工具卡 → 主线程被占住几十秒，Windows 直接判 AppHang 关掉进程
+/// （现场：7,578 条会话打开即挂死）。占位槽是固定 88px 的极轻量格子，
+/// 同一条路径快两个数量级；所以首屏**只拉末尾一段**，更早段滑到哪补哪。
+const int kInitialDisplayRows = 200;
 
 /// 见文件头：按全局下标寻址的消息窗口。
 class MessageWindow {

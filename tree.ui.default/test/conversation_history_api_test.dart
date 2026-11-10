@@ -184,38 +184,37 @@ void main() {
 
   // ---- F3 显示/详细两分（规格 §3.1.3 / §3.1.4）----
 
-  test('首屏显示行整段：total ≤ 上限时一发 limit=9999 拉满，不翻页', () async {
+  test('首屏只拉末尾一段：一发 limit=200，不把整份会话装进槽位表', () async {
     final HistoryPage page = await ApiService.getConversationDisplayRows('a1');
-    expect(core.queries.single, contains('limit=9999'));
-    expect(core.queries.single, isNot(contains('from=')));
-    expect(page.offset, 0);
-    expect(page.hasMore, isFalse, reason: '1000 条装得进缓存上限 ⇒ 没有更早段');
-    expect(page.messages, hasLength(1000));
+    expect(core.queries.single, contains('limit=200'));
+    expect(core.queries.single, isNot(contains('before=')));
+    expect(page.offset, 800);
+    expect(page.hasMore, isTrue, reason: '更早段留给窗口机制（gapsFor 补拉）');
+    expect(page.messages, hasLength(200));
     expect(page.total, 1000);
   });
 
-  test('首屏显示行整段：核心有单页上限时用 before=<最旧 id> 逐页补拉到 offset=0', () async {
+  test('首屏显示行整段：核心回不满一页时用 before=<最旧 id> 补到常量级预算', () async {
     core.total = 500;
-    core.pageCap = 200; // 模拟核心 kHistoryPageMax：单页封顶，UI 侧逐页往前补
+    core.pageCap = 50; // 模拟核心的字节预算/单页上限：回的比要的少
     final HistoryPage page = await ApiService.getConversationDisplayRows('a1');
-    expect(core.queries, hasLength(3), reason: '末尾 200 + 200 + 100');
-    expect(core.queries.first, contains('limit=9999'));
-    expect(core.queries[1], contains('before=m300'));
-    expect(core.queries[2], contains('before=m100'));
-    expect(page.offset, 0);
-    expect(page.hasMore, isFalse);
-    expect(page.messages, hasLength(500));
-    expect(page.messages.first['id'], 'm0');
+    expect(core.queries, hasLength(4), reason: '4 × 50 = 200（首屏预算）');
+    expect(core.queries.first, contains('limit=200'));
+    expect(core.queries[1], contains('before=m450'));
+    expect(core.queries[3], contains('before=m350'));
+    expect(page.offset, 300);
+    expect(page.hasMore, isTrue);
+    expect(page.messages, hasLength(200));
+    expect(page.messages.first['id'], 'm300');
     expect(page.messages.last['id'], 'm499');
   });
 
-  test('首屏显示行整段：超过上限只留最近 9999，更早段留给窗口机制（hasMore）', () async {
+  test('超长会话：首屏也只留末尾 200，更早段留给窗口机制（hasMore）', () async {
     core.total = 12000;
     final HistoryPage page = await ApiService.getConversationDisplayRows('a1');
-    expect(core.queries.single, contains('limit=9999'),
-        reason: '一发就攒满 9999 ⇒ 补拉循环不触发');
-    expect(page.messages, hasLength(9999));
-    expect(page.offset, 2001);
+    expect(core.queries.single, contains('limit=200'));
+    expect(page.messages, hasLength(200));
+    expect(page.offset, 11800);
     expect(page.hasMore, isTrue, reason: '更早段存在：由 gapsFor 窗口补拉');
   });
 

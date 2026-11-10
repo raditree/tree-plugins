@@ -913,13 +913,13 @@ class _MessagePanelState extends State<MessagePanel> {
     );
   }
 
-  /// 从后端拉取当前 agent/会话的**显示行整段**，作为窗口的起点。
+  /// 从后端拉取当前 agent/会话的**显示行末尾段**，作为窗口的起点。
   ///
   /// 显示/详细两分（规格 §3.1.4）：列表端点回的是轻量显示行（preview + 小字段），
-  /// 首屏一次拉满 [kDisplayCacheLimit] 条（更早段由 api 层逐页补拉），槽位表
-  /// 整段缓存、不再有 88px 占位空洞；详细数据**不随列表回**，点卡片时按 id
-  /// 即查详情端点（见 [DetailSelection.toggle]）。超过上限的超长会话才退回
-  /// 窗口机制：滑到哪由 [_onWindowChanged] 按**全局下标**补哪一段。
+  /// 首屏只拉末尾 [kInitialDisplayRows] 条（整份会话一次拉满会让"贴底"从下标 0
+  /// 顺序布局几千条真消息，主线程被占死）；更早段由窗口机制按**全局下标**补拉
+  /// （见 [_onWindowChanged]），离得远的再淘汰回占位槽（[_evictFarSlots]）。
+  /// 详细数据**不随列表回**，点卡片时按 id 即查详情端点（见 [DetailSelection.toggle]）。
   Future<void> _loadHistory({String? sessionId}) async {
     final Agent? agent = widget.selectedAgent;
     if (agent == null) return;
@@ -1243,24 +1243,19 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 末尾一段与"正在流式 / 正在跑工具"的消息由 [MessageWindow.evict] 自己保；
   /// [_locateKeep]（刚定位过的那一页）也留着——它可能离视口很远，但用户正看着它。
   ///
-  /// **显示行整段缓存时不淘汰**（规格 §3.1.4）：会话不超过
-  /// [kDisplayCacheLimit] 条时槽位表本来就整段装着轻量显示行，淘汰只会
-  /// 重新挖出 88px 占位空洞；窗口淘汰只在超限的超长会话里生效。
+  /// **长会话必须真的淘汰**：首屏只热末尾一段（[kInitialDisplayRows]），滑旧内容
+  /// 会一段段补进槽位表；若把这些真消息一直留着，列表任何一次"跳到远处"（首帧贴底 /
+  /// 拖滑块）都要从下标 0 顺序布局整片真消息 ⇒ 主线程被占死（现场 AppHang）。
+  /// 淘汰回 88px 占位槽后，同一条路径只过轻量格子。
   void _evictFarSlots() {
     if (_visibleFrom < 0) return;
-    if (_window.total <= kDisplayCacheLimit) return;
     final MessageRange? locate = _locateKeep;
-    // 首屏装进来的**最近 [kDisplayCacheLimit] 条显示行**是缓存本体（规格 §3.1.4
-    // 的衔接规则："超限直接截断只留最近 9999 + 更早段窗口补拉"）：淘汰只清
-    // **更早段**里离视口远的补拉页，不许把这份缓存自己挖回 88px 空洞。
-    final MessageRange cachedTail =
-        MessageRange(_window.total - kDisplayCacheLimit, _window.total);
     final int removed = _window.evict(
       keep: MessageRange(
         _visibleFrom - _cacheMargin,
         _visibleTo + 1 + _cacheMargin,
       ),
-      keepAlso: <MessageRange>[?locate, cachedTail],
+      keepAlso: <MessageRange>[?locate],
     );
     if (removed == 0) return;
     setState(() {

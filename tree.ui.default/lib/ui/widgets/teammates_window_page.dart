@@ -6,6 +6,7 @@ import '../app_radius.dart';
 import '../models/agent.dart';
 import '../models/message.dart';
 import '../services/model_pool.dart';
+import '../services/message_window.dart' show kInitialDisplayRows;
 import '../services/teammates_view.dart';
 import '../../io/api_service.dart';
 import '../../io/legacy_frame_bus.dart';
@@ -618,15 +619,27 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
 
   /// 加载该成员当前会话的历史进度（对话历史 + 实时 WS 增量合并）
   ///
-  /// 显示/详细两分（规格 §3.1.4，队友窗口同规则）：拉的是轻量**显示行**整段
-  /// （上限 [kDisplayCacheLimit] 条），工具参数 / 结果 / 思考正文不随列表回，
-  /// 点卡片时按 id 即查详情端点（见 [DetailSelection.toggle]）。
+  /// 显示/详细两分（规格 §3.1.4，队友窗口同规则）：拉的是轻量**显示行**，
+  /// **只拉末尾一段**（[kInitialDisplayRows]）——整份会话一次装进真消息槽位时，
+  /// 列表贴底/定位都要从下标 0 顺序布局几千条，主线程会被占死（现场 AppHang）。
+  /// 工具参数 / 结果 / 思考正文不随列表回，点卡片时按 id 即查详情端点。
+  ///
+  /// 带定位目标（从提问卡片跳进来）时改拉**含该条的那一段**（`at=` 寻址），
+  /// 目标在末尾段之外也能跳到。
   Future<void> _loadHistory() async {
     try {
-      final HistoryPage page = await ApiService.getConversationDisplayRows(
-        widget.memberId,
-        sessionId: widget.sessionId,
-      );
+      final String? target = widget.scrollToMessageId;
+      final HistoryPage page = (target != null && target.isNotEmpty)
+          ? await ApiService.getConversationHistoryPage(
+              widget.memberId,
+              sessionId: widget.sessionId,
+              atId: target,
+              limit: kInitialDisplayRows,
+            )
+          : await ApiService.getConversationDisplayRows(
+              widget.memberId,
+              sessionId: widget.sessionId,
+            );
       if (!mounted) return;
       setState(() {
         _liveMessages.clear();
@@ -635,7 +648,6 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
         }
         // 定位导航：历史加载后直接触发 MessageList 定位滚动（而非滚底，
         // 避免「先滚底再跳位」的闪烁）；否则按原逻辑滚动到底部
-        final String? target = widget.scrollToMessageId;
         if (target != null && target.isNotEmpty) {
           _scrollToMessageId = target;
           _scrollToRevision++;
@@ -944,7 +956,8 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
       case 'progress':
       default:
         return MessageList(
-          // 成员窗口是"实时流"（不是可翻页的历史窗口）：全部槽位都已加载
+          // 成员窗口是"实时流"（末尾一段 + 增量），不接窗口化补页：
+          // 历史只在末尾一段（或定位目标那一段）内展示
           slots: _liveMessages,
           revision: _scrollRevision,
           scrollToMessageId: _scrollToMessageId,
