@@ -399,6 +399,98 @@ class ProductionStore {
     );
   }
 
+  /// 落一条运行台账（P4：打包 / 执行 / 专家调用）。
+  Map<String, Object?> writeRun(String lineId, Map<String, Object?> run) {
+    getLine(lineId);
+    _writeRun(lineId, run);
+    return plainMap(run);
+  }
+
+  /// 生成运行 id（同一任务 / 角色下毫秒级唯一）。
+  String nextRunId(String taskId, String role) =>
+      'run_${_segment(taskId, 'task_id')}_${_segment(role, 'role')}_'
+      '${_clock().millisecondsSinceEpoch}';
+
+  // ── 片段包（P4）：tasks/<task_id>/pack.json ───────────────────────
+
+  String _packFile(String lineId, String taskId) => p.join(
+    _tasksDir(lineId),
+    _segment(taskId, 'task_id'),
+    'pack.json',
+  );
+
+  /// 写 `pack.json`（机读真值；人读版 `pack.md` 走项目资产）。
+  Map<String, Object?> writePack(
+    String lineId,
+    String taskId,
+    Map<String, Object?> pack,
+  ) {
+    getTask(lineId, taskId);
+    final Map<String, Object?> data = plainMap(pack);
+    _writeText(
+      File(_packFile(lineId, taskId)),
+      '${const JsonEncoder.withIndent('  ').convert(data)}\n',
+    );
+    return data;
+  }
+
+  /// 读 `pack.json`（不存在 / 坏 JSON ⇒ 空表，由调用方判 `pack_required`）。
+  Map<String, Object?> readPack(String lineId, String taskId) {
+    final File file = File(_packFile(lineId, taskId));
+    if (!file.existsSync()) return <String, Object?>{};
+    return _tryReadJson(file);
+  }
+
+  // ── 任务内 message 线程（§9.3）：runs/messages.jsonl ─────────────
+
+  String _messagesFile(String lineId) =>
+      p.join(_runsDir(lineId), 'messages.jsonl');
+
+  /// 读某个任务的 message 线程（按落盘顺序）。
+  List<Map<String, Object?>> readMessages(String lineId, String taskId) {
+    final File file = File(_messagesFile(lineId));
+    if (!file.existsSync()) return <Map<String, Object?>>[];
+    final List<Map<String, Object?>> out = <Map<String, Object?>>[];
+    for (final String line in file.readAsLinesSync()) {
+      final String text = line.trim();
+      if (text.isEmpty) continue;
+      try {
+        final Object? decoded = json.decode(text);
+        if (decoded is Map) {
+          final Map<String, Object?> entry = plainMap(decoded);
+          if (textOf(entry['task_id']) != taskId) continue;
+          out.add(entry);
+        }
+      } catch (_) {
+        // 坏行跳过：不让一行脏数据毁掉整条线程。
+      }
+    }
+    return out;
+  }
+
+  /// 追加一条任务内 message（打包 / 执行 / 用户，一对一）。
+  Map<String, Object?> appendMessage(
+    String lineId,
+    String taskId,
+    Map<String, Object?> entry,
+  ) {
+    getLine(lineId);
+    final File file = File(_messagesFile(lineId));
+    file.parent.createSync(recursive: true);
+    final Map<String, Object?> data = <String, Object?>{
+      ...plainMap(entry),
+      'line_id': lineId,
+      'task_id': taskId,
+      'at': nowText(),
+    };
+    file.writeAsStringSync(
+      '${json.encode(data)}\n',
+      mode: FileMode.append,
+      flush: true,
+    );
+    return data;
+  }
+
   // ── 准备阶段（P3）：inbox / prepare.json / 项目资产 / 工作空间读取 ──
 
   /// 写回一条任务（保留未知键；写后刷新索引）。

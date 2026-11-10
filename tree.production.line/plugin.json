@@ -1,8 +1,8 @@
 {
   "id": "tree.production.line",
   "name": "Tree 标准开发流生产线",
-  "version": "0.2.0",
-  "description": "headless 插件：标准开发流生产线。P1 —— 产线 / 任务 / 运行台账的数据模型与队列（line.yaml / task.yaml / runs / state.json：task.yaml 为唯一真值，state.json 可重建；有限状态机、队列排序与依赖判据、in-flight 崩溃恢复）。P3 —— 准备阶段：需求模板五栏 → 侦查四块（经 docnorm.query 取文档上下文、llm.call 出结构）→ 追问协议（上限读 tree.settings，默认 3，可配 1–10；未答转 awaiting_user、次日续答、未答不实施）→ 范围与拆任务 → 落档 recon/scope/plan/decisions/acceptance 到工作空间项目资产并建 queued 任务；点状读取按会话限额（文件 ≤ 8、grep ≤ 2 轮）。不 import 核心包，不改目标仓库。",
+  "version": "0.3.0",
+  "description": "headless 插件：标准开发流生产线。P1 —— 产线 / 任务 / 运行台账的数据模型与队列（line.yaml / task.yaml / runs / state.json：task.yaml 为唯一真值，state.json 可重建；有限状态机、队列排序与依赖判据、in-flight 崩溃恢复）。P3 —— 准备阶段：需求模板五栏 → 侦查四块（经 docnorm.query 取文档上下文、llm.call 出结构）→ 追问协议（上限读 tree.settings，默认 3，可配 1–10；未答转 awaiting_user、次日续答、未答不实施）→ 范围与拆任务 → 落档 recon/scope/plan/decisions/acceptance 到工作空间项目资产并建 queued 任务；点状读取按会话限额（文件 ≤ 8、grep ≤ 2 轮）。P4 —— 打包与执行：production.task.pack 经 agent.worker.run（role=packer，只读）产出 tasks/<id>/pack.json + pack.md 并落 runs 台账；production.task.run 经 role=executor 改文件，先以 git status 差集判写域（越界/命中禁区直接 blocked），再经 local.exec.command 跑门控，失败按 limits.retries 回 packed，超限 blocked，done 只由门控通过触发；任务内 message 线程（runs/messages.jsonl，打回超过 3 次自动 blocked）。不 import 核心包，不改目标仓库。",
   "runtime": "headless",
   "files": [
     "tree_production_line.exe"
@@ -15,7 +15,7 @@
     "plugins": [
       {
         "id": "tree.agent",
-        "version": ">=0.29.0"
+        "version": ">=0.30.0"
       },
       {
         "id": "tree.docnorm",

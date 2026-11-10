@@ -16,7 +16,7 @@ const List<String> kAgentToolCommands = <String>[
   'message.run',
 ];
 
-/// **宿主能力命令**：Q-5 A 让名之后由 tree.agent 认领的五个领域族名。
+/// **宿主能力命令**：Q-5 A 让名之后由 tree.agent 认领的领域族名。
 ///
 /// 这些名字原来由核心内置实现（A5 起核心不再执行任何领域语义），片 1 把它们从
 /// `StationPoints.executes` 摘掉、族名让给真正的实现方（`exec_station_contract.md`
@@ -25,6 +25,7 @@ const List<String> kAgentToolCommands = <String>[
 /// 复制一份 `agents/*.yaml` 解析逻辑（Q-7 的 (b) 就是这样被否掉的）。
 ///
 /// 命令名**逐字沿用**旧口径，所以 compact / sample 等调用方一行都不用改。
+/// `agent.worker.run` 是 P4 新增（产线员工：显式角色 / 工具 / 模型）。
 const List<String> kAgentHostCommands = <String>[
   'llm.call',
   'llm.embed',
@@ -32,6 +33,8 @@ const List<String> kAgentHostCommands = <String>[
   'tool.call',
   'agent.compact',
   'session.rename',
+  // P4：产线调角色化员工（packer / executor / expert），工具与模型显式下发。
+  'agent.worker.run',
 ];
 
 const String kAgentToolsReadme =
@@ -40,5 +43,6 @@ const String kAgentToolsReadme =
     '宿主能力：llm.call（复用目标 agent 的模型，缺省 JSON / 显式 text）/ '
     'llm.embed（模型池 kind=embedding，OpenAI 兼容 /embeddings，空 inputs 只回模型与维度）/ '
     'fs.read（按 agent 工作空间解析后读文件）/ tool.call（内置或贡献工具同一入口）/ '
-    'agent.compact（与 REST /compact 同一实现）/ session.rename（改会话标题并广播）。 '
+    'agent.compact（与 REST /compact 同一实现）/ session.rename（改会话标题并广播）/ '
+    'agent.worker.run（产线员工：role + task + tools + model_id + reuse，回 worker_id 与最终报告）。 '
     '失败回包是 {error, payload}：llm.call 的失败也带模型正文原文（可抢救，不白花）。';

@@ -6,6 +6,7 @@ import '../store/tree_store.dart';
 import '../team/team_workspace.dart';
 import '../tool/subagent_tool.dart';
 import '../tool/tool_runner.dart';
+import '../worker/worker_spec.dart';
 
 /// 一次临时员工运行的请求（[SubagentTurnRunner] 的入参）。
 class SubagentTurnRequest {
@@ -297,6 +298,263 @@ class SubagentService implements SubagentChannel {
     return _blockingOutcome(target, result, reused: reused);
   }
 
+  // ── 产线员工（agent.worker.run）──────────────────────────────────────
+
+  /// 跑一个**角色化员工**（P4）：工具白名单与模型由调用方显式给出。
+  ///
+  /// 与 [run] 的区别（recon §9.5）：
+  /// - 工具取自 [WorkerSpec.tools]（不是"继承父的全部"）；
+  /// - 模型可覆盖（`model_id` 为空才继承发起者）；
+  /// - 复用要求**同一个角色**（打包/执行/专家不混用）；
+  /// - 员工默认仍不能再召员工、也不能建团队（Q3）。
+  ///
+  /// 回包是站级载荷：成功 `{worker_id, role, status, report, ...}`；
+  /// 校验失败 `{error, code}`（入口按站级失败带回，不静默）。
+  Future<Map<String, Object?>> runWorker(
+    WorkerSpec spec, {
+    required String callerId,
+    required String sessionId,
+  }) async {
+    final String sid = sessionId.trim();
+    if (sid.isEmpty) {
+      return _workerError(
+        '缺少会话上下文：员工的活动要留在某个会话里（agent.worker.run 的 scope 需带 session_id）',
+      );
+    }
+    final CoreAgent? caller = store.agent(callerId);
+    if (caller == null) {
+      return _workerError('未知 agent：$callerId（无法以它的身份召员工）', code: 'unknown_agent');
+    }
+    final CoreSubagent? callerRecord = registry.isSubagent(callerId)
+        ? registry.handle(callerId)
+        : null;
+    final String ownerAgentId = callerRecord?.ownerAgentId ?? callerId;
+    registry.ensureSession(ownerAgentId, sid);
+
+    final String modelId = spec.modelId.isNotEmpty
+        ? spec.modelId
+        : caller.modelId.trim();
+    if (modelId.isEmpty) {
+      return _workerError(
+        '员工没有可用模型：请给 model_id，或先给发起者「${_nameOf(caller)}」配一个模型',
+        code: 'model_required',
+      );
+    }
+    if (settings.model(modelId) == null) {
+      return _workerError(
+        '模型「$modelId」不在模型池里：请到「设置 → 自定义模型」补上',
+        code: 'model_not_found',
+      );
+    }
+    final Future<String?> Function(String agentId)? probe = probeWorkspace;
+    if (probe != null) {
+      final String? reason = await probe(ownerAgentId);
+      if (reason != null && reason.trim().isNotEmpty) {
+        return _workerError(reason, code: 'workspace_unavailable');
+      }
+    }
+
+    final ({CoreSubagent? record, String? error}) found = _resolveWorkerReuse(
+      ownerAgentId: ownerAgentId,
+      sessionId: sid,
+      ref: spec.reuse,
+      role: spec.role,
+    );
+    if (found.error != null) return _workerError(found.error!);
+    CoreSubagent? reuse = found.record;
+
+    final int callerLevel = callerRecord?.level ?? 0;
+    final int level = callerLevel + 1;
+    if (reuse == null && level > SubagentLimits.maxDepth) {
+      return _workerError(
+        '员工层级上限 ${SubagentLimits.maxDepth}：你已经在第 $callerLevel 层，不能再往下派',
+        code: 'worker_depth_exceeded',
+      );
+    }
+
+    final CoreSubagent target;
+    final bool reused = reuse != null;
+    if (reuse != null) {
+      // 复用只换运行配置（模型 / 工具），职责与层级不变。
+      reuse.agent
+        ..modelId = modelId
+        ..toolPolicy = List<String>.of(spec.tools)
+        ..updatedAt = DateTime.now().millisecondsSinceEpoch;
+      reuse.updatedAt = DateTime.now().millisecondsSinceEpoch;
+      registry.put(reuse);
+      target = reuse;
+    } else {
+      final String id = registry.nextId();
+      final String scope = _scopeOf(spec.task);
+      final CoreAgent agent = _buildWorkerAgent(
+        id: id,
+        name: spec.name,
+        spec: spec,
+        caller: caller,
+        ownerAgentId: ownerAgentId,
+        level: level,
+        modelId: modelId,
+      );
+      final CoreSubagent record = CoreSubagent(
+        id: id,
+        name: spec.name,
+        ownerAgentId: ownerAgentId,
+        sessionId: sid,
+        parentId: callerId,
+        level: level,
+        scope: scope,
+        agent: agent,
+        createdAt: DateTime.now().millisecondsSinceEpoch,
+        updatedAt: DateTime.now().millisecondsSinceEpoch,
+      );
+      registry.put(record);
+      target = record;
+      log?.call(
+        '新召 ${spec.role} ${record.id}（${record.name}，层级 ${record.level}，'
+        '会话 $ownerAgentId/$sid）',
+      );
+    }
+
+    final SubagentTurnRunner? turnRunner = runner;
+    if (turnRunner == null) {
+      return _workerError(
+        '员工运行器未接线（核心尚未启动完成）：请稍后重试',
+        code: 'worker_runner_unavailable',
+      );
+    }
+    registry.markRun(target.id);
+    final SubagentTag tag = SubagentTag(
+      id: target.id,
+      name: target.name,
+      parentId: target.parentId,
+      level: target.level,
+    );
+    SubagentTurnResult result;
+    try {
+      result = await turnRunner(
+        SubagentTurnRequest(
+          tag: tag,
+          ownerAgentId: ownerAgentId,
+          sessionId: sid,
+          task: spec.task,
+        ),
+      );
+    } catch (error) {
+      result = SubagentTurnResult(error: '员工运行异常：$error');
+    }
+    return <String, Object?>{
+      'worker_id': target.id,
+      'role': spec.role,
+      'model_id': modelId,
+      'tools': spec.tools,
+      'reused': reused,
+      'status': result.error.isNotEmpty
+          ? 'failed'
+          : (result.report.trim().isEmpty ? 'empty' : 'ok'),
+      'report': result.report,
+      'error': result.error,
+    };
+  }
+
+  /// 复用入口：**只在同一会话内、同一角色**有效（id 或显示名）。
+  ({CoreSubagent? record, String? error}) _resolveWorkerReuse({
+    required String ownerAgentId,
+    required String sessionId,
+    required String ref,
+    required String role,
+  }) {
+    if (ref.trim().isEmpty) return (record: null, error: null);
+    final String key = ref.trim();
+    final List<CoreSubagent> here = registry.records(ownerAgentId, sessionId);
+    final List<CoreSubagent> byId = here
+        .where((CoreSubagent s) => s.id == key)
+        .toList(growable: false);
+    if (byId.isNotEmpty) {
+      if (byId.first.agent.role.trim() != role) {
+        return (
+          record: null,
+          error:
+              '员工 ${byId.first.id} 的角色是 ${byId.first.agent.role}，'
+              '不能拿来跑 $role（角色不混用）',
+        );
+      }
+      return (record: byId.first, error: null);
+    }
+    final List<CoreSubagent> byName = here
+        .where(
+          (CoreSubagent s) => s.name == key && s.agent.role.trim() == role,
+        )
+        .toList(growable: false);
+    if (byName.length == 1) return (record: byName.first, error: null);
+    if (byName.length > 1) {
+      return (
+        record: null,
+        error:
+            '本会话有多个 $role 叫「$key」：'
+            '${byName.map((CoreSubagent s) => '${s.id}（层级 ${s.level}）').join('、')}'
+            '—— 请改用 worker_id 复用。',
+      );
+    }
+    return (
+      record: null,
+      error: '找不到可复用的 $role 员工：$key（员工只在它被召来的会话里有效）',
+    );
+  }
+
+  /// 员工的运行配置：工具白名单与模型**显式**给出，其余继承发起者。
+  CoreAgent _buildWorkerAgent({
+    required String id,
+    required String name,
+    required WorkerSpec spec,
+    required CoreAgent caller,
+    required String ownerAgentId,
+    required int level,
+    required String modelId,
+  }) {
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    final String team = caller.teamId.trim().isNotEmpty
+        ? caller.teamId.trim()
+        : ownerAgentId;
+    return CoreAgent(
+      id: id,
+      name: name,
+      systemPrompt: workerSystemPrompt(
+        name: name,
+        callerName: _nameOf(caller),
+        role: spec.role,
+        tools: spec.tools,
+        level: level,
+        scope: _scopeOf(spec.task),
+      ),
+      modelId: modelId,
+      workspaceId: caller.workspaceId,
+      sshConfig: teamSshConfigFor(caller, store.agent),
+      teamId: team,
+      parentAgentId: caller.id,
+      level: level,
+      role: spec.role,
+      duty: _scopeOf(spec.task),
+      canLeadTeam: false,
+      reviewStatus: ReviewStatus.approved,
+      reasoningEffort: caller.reasoningEffort,
+      maxSeqlenOverride: caller.maxSeqlenOverride,
+      maxOutputTokens: caller.maxOutputTokens,
+      compressThreshold: caller.compressThreshold,
+      thinkingOverride: caller.thinkingOverride,
+      toolPolicy: List<String>.of(spec.tools),
+      createdAt: now,
+      updatedAt: now,
+    );
+  }
+
+  static Map<String, Object?> _workerError(
+    String message, {
+    String code = 'invalid_arguments',
+  }) => <String, Object?>{'error': message, 'code': code};
+
+  static String _nameOf(CoreAgent agent) =>
+      agent.name.trim().isEmpty ? agent.id : agent.name.trim();
+
   // ── 后台 ─────────────────────────────────────────────────────────────
 
   Future<void> _runBackground(
@@ -525,6 +783,46 @@ class SubagentService implements SubagentChannel {
     final String text = task.replaceAll(RegExp(r'\s+'), ' ').trim();
     return text.length <= 200 ? text : '${text.substring(0, 200)}…';
   }
+}
+
+/// 产线员工的系统提示词（P4）：按角色写清边界与产出格式。
+///
+/// 与 [subagentSystemPrompt] 的区别：员工**有** `message`（任务内一对一沟通），
+/// 但**不能**再召员工 / 建团队；打包只读、执行可写、专家不落盘。
+String workerSystemPrompt({
+  required String name,
+  required String callerName,
+  required String role,
+  required List<String> tools,
+  required int level,
+  required String scope,
+}) {
+  final String toolList = tools.isEmpty ? '（无）' : tools.join('、');
+  final String boundary = switch (role) {
+    'packer' =>
+      '- **你不许改文件**（工具表里没有 write/edit）：只读、只搜、只跑只读命令；\n'
+          '- 产出必须是一份可直接交给执行模型的**完整片段包**：文件路径 + 行区间 + 原片段 + 基线命令 + 风险点；\n'
+          '- 任何疑问先 `message` 打回发起者，**不要猜**（猜错会让执行模型白跑一轮）。',
+    'executor' =>
+      '- **只改写在范围内的文件**：越出写域等于失败，门控会拒收；\n'
+          '- 拿到的片段包就是全部上下文，不要重新整库搜索；缺片段就 `message` 打回打包模型；\n'
+          '- 改完必须如实报告改了哪些文件、跑了哪些命令；**不许自报完成**（门控说了算）。',
+    'expert' =>
+      '- **你不写文件**：只回答一个具体问题（API 用法 / 协议细节 / 库行为 / 方案对比）；\n'
+          '- 输出固定四段：结论 / 依据（文件:行） / 建议 / 未决；\n'
+          '- 依据只能引用给到你的片段或你读到的文件，不要凭空断言。',
+    _ => '- 按发起者的指令干活，干完给最终报告。',
+  };
+  return '''
+你是「$name」——由「$callerName」为**标准开发流**召来的$role员工（第 $level 层）。
+
+- 本次职责/范围：$scope
+- 你的工具白名单：$toolList
+$boundary
+- **干完必须给出一段最终报告**：做了什么、结论/产物在哪、还有什么没做完。
+  不要只调工具不说话，也不要谎报完成；受阻就如实说清卡在哪。
+- 你不能再召员工、也不能建团队（角色硬边界）；需要用户拍板时如实报告，不要替用户决定。
+''';
 }
 
 /// 临时员工的**系统提示词**（用户明确要求写清复用与再派发的边界）。

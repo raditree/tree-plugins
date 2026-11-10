@@ -51,6 +51,7 @@ import '../tool/tool_run_registry.dart';
 import '../tool/tool_runs_scope.dart';
 import '../tool/tool_runs_tool.dart';
 import '../tool/tool_runner.dart';
+import '../worker/worker_spec.dart';
 import '../workspace/station_command.dart';
 import '../workspace/station_compat_io.dart';
 import '../workspace/station_workspace_io.dart';
@@ -718,6 +719,8 @@ class AgentRuntime {
       case 'subagent.run':
         final ToolOutcome r = await SubagentTool.run(invocation, subagentService);
         return <String, dynamic>{'text': r.content, 'is_error': r.isError};
+      case 'agent.worker.run':
+        return _runWorker(arguments, agentId, sessionId);
       case 'team.run':
         final ToolOutcome r = await TeamTool.run(invocation, teamService);
         return <String, dynamic>{'text': r.content, 'is_error': r.isError};
@@ -895,6 +898,28 @@ class AgentRuntime {
       'agents': agents,
       'count': agents.length,
     };
+  }
+
+  /// `agent.worker.run`：产线调员工（P4）。
+  ///
+  /// 参数 `{role, task, tools, model_id, reuse}`；回包 `{worker_id, role, status,
+  /// report, ...}`。参数校验失败按站级失败回 `{error, code}`，不静默降级。
+  Future<Map<String, dynamic>> _runWorker(
+    Map<String, dynamic> arguments,
+    String agentId,
+    String sessionId,
+  ) async {
+    final WorkerSpec spec;
+    try {
+      spec = parseWorkerArguments(arguments);
+    } on WorkerSpecError catch (error) {
+      return <String, dynamic>{'error': error.message, 'code': error.code};
+    }
+    return await subagentService.runWorker(
+      spec,
+      callerId: agentId,
+      sessionId: sessionId,
+    );
   }
 
   /// **宿主能力命令**（`kAgentHostCommands`）：Q-5 A 让名后由 tree.agent 认领。
@@ -1502,19 +1527,31 @@ class AgentRuntime {
     return 'ssh_ws_${base64Url.encode(utf8.encode(identity)).replaceAll('=', '')}';
   }
 
-  /// 解析 agent 当前生效的工具白名单（P2）。
+  /// 解析 agent 当前生效的工具白名单（P2 / P4）。
   ///
   /// - 真实 agent：读 `agents/<id>.yaml` 的 `tool_policy`（null = 全量默认）；
+  /// - 产线员工（`role` 为 packer / executor / expert）：用 `agent.worker.run`
+  ///   显式下发的工具表，只保留 [kWorkerBlockedTools] 这条硬边界；
   /// - 临时员工：继承会话主人的策略，再剔除 [kSubagentBlockedTools]
   ///   （员工不能再召员工 / 建团队 / 发消息，§9.5）。
   ///
-  /// 名册未加载时 `ownerOf` 回 null ⇒ 按真实 agent 读 YAML；临时员工没有自己的
+  /// 名册未加载时 `handle` 回 null ⇒ 按真实 agent 读 YAML；临时员工没有自己的
   /// `agents/<id>.yaml`，因此再按 id 前缀（`sub_`）叠加 block 集——找不到主人时
   /// 只会收紧、不会放大权限（fail-closed 方向）。
   ToolPolicy toolPolicyFor(String agentId) {
-    final String? owner = registry.ownerOf(agentId);
-    if (owner != null && owner != agentId) {
-      return toolPolicyFor(owner).inherit(block: kSubagentBlockedTools);
+    final CoreSubagent? record = registry.handle(agentId);
+    if (record != null && record.ownerAgentId != agentId) {
+      // 产线员工（P4）：工具白名单由 `agent.worker.run` 显式给出——**不再继承
+      // 父级全量**；但仍不能建团队 / 再召员工（角色硬边界，Q3）。
+      if (kWorkerRoles.contains(record.agent.role.trim())) {
+        return ToolPolicy(
+          allowed: record.agent.toolPolicy?.toSet(),
+          blocked: kWorkerBlockedTools,
+        );
+      }
+      return toolPolicyFor(record.ownerAgentId).inherit(
+        block: kSubagentBlockedTools,
+      );
     }
     final ToolPolicy own = ToolPolicy(
       allowed: store.agent(agentId)?.toolPolicy?.toSet(),

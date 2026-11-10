@@ -1,12 +1,16 @@
-// tree.production.line —— 标准开发流生产线（P1 数据模型 + 队列；P3 准备阶段）。
+// tree.production.line —— 标准开发流生产线（P1 数据模型 + 队列；P3 准备阶段；
+// P4 打包 + 执行）。
 //
-// 定位（docs/pluginization/production-line-recon.md §7/§8/§10/§11）：
+// 定位（docs/pluginization/production-line-recon.md §7/§8/§9/§10/§11）：
 // - headless 插件，granularity=team；数据只落 `<data_root>/production_lines/<team_id>/`；
 // - `task.yaml` 是唯一真值，`state.json` 只是可由它重建的队列索引；
 // - 状态机、队列排序、依赖判据、in-flight 崩溃恢复都在领域库，入口只做协议面；
 // - P3 准备阶段：`production.prepare.*` 走需求模板 → 侦查 → 追问 → 范围/拆任务；
 //   模型经 `llm.call`、文档检索经 `docnorm.query`（缺失即 fail-closed），
 //   追问上限读 `tree.settings`（缺省回退 line.yaml / 默认 3）；
+// - P4 执行阶段：`production.task.pack|run|message(s)` 经 `agent.worker.run`
+//   调角色化员工（packer / executor），门控经 `local.exec.command`（本机租约）；
+//   写域越界 / 门控失败一律不得进 `done`；
 // - 依赖纪律：不得 import 任何核心包。
 import 'dart:async';
 import 'dart:convert';
@@ -18,7 +22,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.production.line';
 const String kDisplayName = 'Tree 标准开发流生产线';
-const String kVersion = '0.2.0';
+const String kVersion = '0.3.0';
 
 const String kStationName = 'production';
 
@@ -28,25 +32,34 @@ const String kStationName = 'production';
 const String kQuestionLimitKey = 'questions_max_per_round';
 
 const String kStationReadme =
-    '生产线 P1：production.line.create/list/get、production.task.create/list/get/'
+    '生产线：P1 production.line.create/list/get、production.task.create/list/get/'
     'transition、production.queue.next/rebuild/recover、production.run.list。'
     '数据落 `<data_root>/production_lines/<team_id>/<line_id>/`：line.yaml / '
-    'tasks/<task_id>/task.yaml / runs/<run_id>.json / state.json / inbox.jsonl / '
-    'prepare.json；task.yaml 为唯一真值，state.json 可由它重建。状态机：draft→recon→'
-    'aligning→scoped→queued→packing→packed→running→gating→done；aligning↔awaiting_user；'
-    'gating→packed（重试）；queued/packing/packed/running/gating→blocked；'
-    'blocked→awaiting_user|queued；cancelled 可从任意非终态进入。崩溃恢复：in-flight → '
-    'queued 并追加一条 status=interrupted 的 run，重复 recover 0 写。'
+    'tasks/<task_id>/task.yaml / tasks/<task_id>/pack.json / runs/<run_id>.json / '
+    'runs/messages.jsonl / state.json / inbox.jsonl / prepare.json；task.yaml 为唯一真值，'
+    'state.json 可由它重建。状态机：draft→recon→aligning→scoped→queued→packing→'
+    'packed→running→gating→done；aligning↔awaiting_user；gating→packed（重试）；'
+    'queued/packing/packed/running/gating→blocked；blocked→awaiting_user|queued；'
+    'cancelled 可从任意非终态进入。崩溃恢复：in-flight → queued 并追加一条 '
+    'status=interrupted 的 run，重复 recover 0 写。'
     'P3 准备阶段：production.prepare.intake（需求模板五栏）→ recon（侦查四块 + 追问，'
     '经 docnorm.query 取文档上下文、llm.call 出结构）→ answer / all_recommended / '
     'window.open|close（未答转 awaiting_user、次日续答）→ read（点状读取，文件 ≤ 8 / '
     'grep ≤ 2 轮）→ finalize（写 recon/scope/plan/decisions/acceptance + 建 queued 任务）。'
+    'P4 执行阶段：production.task.pack（agent.worker.run role=packer → pack.json + pack.md）→ '
+    'production.task.run（agent.worker.run role=executor → 写域判据 → 门控 local.exec.command；'
+    '失败按 limits.retries 回 packed，超限 blocked；done 只由门控通过触发）→ '
+    'production.task.message|messages（任务内一对一 message 线程，打回超过 3 次自动 blocked）。'
     '追问上限读 settings，缺省回退 line.yaml.limits 与 3（夹到 1–10）。';
 
 final ProductionService _service = ProductionService();
 PreparationService? _preparation;
+ProductionExecutionService? _execution;
 PluginKitServer? _activeServer;
 final Set<String> _settingsTeams = <String>{};
+
+/// 工作空间 → 本插件登记的本机租约（`local.lease.register` 的返回值）。
+final Map<String, String> _leases = <String, String>{};
 
 PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
   channel: PluginChannel.stdio(kPluginId),
@@ -64,18 +77,25 @@ Future<void> _onReady(PluginKitServer server) async {
     docQuery: _callDocQuery,
     limitReader: _readQuestionLimit,
   );
-  server.channel.log('已上线：v$kVersion（tree.production.line，P1 数据 + P3 准备阶段）');
+  _execution = ProductionExecutionService(
+    workers: _callWorker,
+    commands: _runCommand,
+  );
+  server.channel.log(
+    '已上线：v$kVersion（tree.production.line，P1 数据 + P3 准备阶段 + P4 打包执行）',
+  );
   try {
     final Map<String, dynamic> result = await server.channel.request(
       M.stationRegister,
       <String, dynamic>{
         'kind': 'execute',
         'name': kStationName,
-        'description': '生产线数据模型、队列与准备阶段（production.*）',
+        'description': '生产线数据模型、队列、准备阶段与打包执行（production.*）',
         'readme': kStationReadme,
         'commands': <String>[
           ...kProductionCommands,
           ...kPreparationCommands,
+          ...kExecutionCommands,
         ],
       },
     );
@@ -178,6 +198,127 @@ Future<Map<String, Object?>> _callDocQuery(
   };
 }
 
+/// 产线调员工（`agent.worker.run`）：工具与模型由角色配置显式下发。
+Future<Map<String, Object?>> _callWorker(
+  WorkerCall call,
+  Map<String, Object?> scope,
+) async {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) {
+    throw ProductionFailure(
+      '插件尚未就绪：agent.worker.run 通道不可用',
+      code: 'worker_unavailable',
+    );
+  }
+  try {
+    final Map<String, dynamic> payload = await server.channel.command(
+      'agent.worker.run',
+      call.toArguments(),
+      '',
+      scope,
+    );
+    return <String, Object?>{
+      for (final MapEntry<String, dynamic> entry in payload.entries)
+        entry.key: entry.value,
+    };
+  } on CmdFailureException catch (error) {
+    final String message = asString(error.payload['error']).isEmpty
+        ? error.message
+        : asString(error.payload['error']);
+    return <String, Object?>{
+      ...error.payload,
+      'status': 'failed',
+      'error': message,
+    };
+  } catch (error) {
+    throw ProductionFailure(
+      '员工调用失败（agent.worker.run）：$error',
+      code: 'worker_failed',
+    );
+  }
+}
+
+/// 在工作空间执行一条命令（`local.exec.command`）：先登记本插件自己的租约。
+///
+/// 租约只在本插件名下有效（`local_executor` 的 fail-closed 口径）；
+/// `lease_unknown`（插件重启过）时丢弃缓存、重新登记并重试一次。
+Future<CommandResult> _runCommand(
+  String command, {
+  required String workspace,
+  required Map<String, Object?> scope,
+}) async {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) {
+    throw ProductionFailure(
+      '插件尚未就绪：local.exec.command 通道不可用',
+      code: 'command_unavailable',
+    );
+  }
+  Map<String, dynamic> payload;
+  try {
+    payload = await server.channel.command(
+      'local.exec.command',
+      <String, dynamic>{
+        'local_lease_id': await _leaseFor(server, workspace, scope),
+        'command': command,
+        'timeout_seconds': 300,
+      },
+      '',
+      scope,
+    );
+  } on CmdFailureException catch (error) {
+    if (error.code != 'lease_unknown') {
+      return CommandResult(ok: false, exitCode: -1, output: error.message);
+    }
+    _leases.remove(workspace);
+    try {
+      payload = await server.channel.command(
+        'local.exec.command',
+        <String, dynamic>{
+          'local_lease_id': await _leaseFor(server, workspace, scope),
+          'command': command,
+          'timeout_seconds': 300,
+        },
+        '',
+        scope,
+      );
+    } on CmdFailureException catch (retryError) {
+      return CommandResult(ok: false, exitCode: -1, output: retryError.message);
+    }
+  }
+  return CommandResult(
+    ok: payload['is_error'] != true,
+    exitCode: intOf(payload['exit_code'], 0),
+    // **不能 trim**：`git status --porcelain` 的行首空格是状态位的一部分
+    // （`asString` 会 trim，解析出的路径就会少一个字符）。
+    output: (payload['text'] ?? '').toString(),
+  );
+}
+
+Future<String> _leaseFor(
+  PluginKitServer server,
+  String workspace,
+  Map<String, Object?> scope,
+) async {
+  final String? existing = _leases[workspace];
+  if (existing != null && existing.isNotEmpty) return existing;
+  final Map<String, dynamic> payload = await server.channel.command(
+    'local.lease.register',
+    <String, dynamic>{'dir': workspace},
+    '',
+    scope,
+  );
+  final String leaseId = asString(payload['lease_id']);
+  if (leaseId.isEmpty) {
+    throw ProductionFailure(
+      '本机执行器没有返回租约（local.lease.register）：$workspace',
+      code: 'command_unavailable',
+    );
+  }
+  _leases[workspace] = leaseId;
+  return leaseId;
+}
+
 /// 追问上限：先确保本团队的 schema 已注册，再读值；失败交回 null（走 line.yaml）。
 Future<int?> _readQuestionLimit(Map<String, Object?> scope) async {
   final PluginKitServer? server = _activeServer;
@@ -236,10 +377,20 @@ Future<Map<String, dynamic>?> handleRequest(
   final Map<String, dynamic> payload = asMap(params['payload']);
   final String command = asString(payload['command']);
   final bool isPrepare = kPreparationCommands.contains(command);
-  if (!isPrepare && !kProductionCommands.contains(command)) return null;
+  final bool isExecute = kExecutionCommands.contains(command);
+  if (!isPrepare && !isExecute && !kProductionCommands.contains(command)) {
+    return null;
+  }
   try {
     final Map<String, Object?> result = isPrepare
         ? await _preparation!.handle(
+            command,
+            asMap(payload['arguments']),
+            asMap(params['meta']),
+            asMap(params['scope']),
+          )
+        : isExecute
+        ? await _execution!.handle(
             command,
             asMap(payload['arguments']),
             asMap(params['meta']),
@@ -303,6 +454,7 @@ Future<int> selfTest() async {
     Map<String, Object?> arguments, {
     String? team = 'team_a',
     bool withData = true,
+    String? agent,
   }) async {
     core.ask(id, M.stationRequest, <String, dynamic>{
       'payload': <String, dynamic>{
@@ -313,7 +465,7 @@ Future<int> selfTest() async {
         'source_plugin_id': kPluginId,
         if (withData) 'data_dir': temp.path,
       },
-      'scope': <String, dynamic>{'team_id': ?team},
+      'scope': <String, dynamic>{'team_id': ?team, 'agent_id': ?agent},
     });
     final Map<Object?, Map<String, dynamic>> responses = await core.waitFor(
       <Object?>[id],
@@ -581,6 +733,8 @@ Future<int> selfTest() async {
     // ── P3 准备阶段：假 docnorm / llm / settings，跑完整窗口 → 落档 ──
     final String ws = '${temp.path}${Platform.pathSeparator}ws';
     Directory(ws).createSync(recursive: true);
+    final List<Map<String, dynamic>> workerCalls = <Map<String, dynamic>>[];
+    int gitCalls = 0;
     core.onMethod(M.stationCommand, (Map<String, dynamic> params) {
       final String command = asString(params['command']);
       switch (command) {
@@ -671,6 +825,79 @@ Future<int> selfTest() async {
               'model': 'fake',
             },
           };
+        case 'agent.worker.run':
+          {
+            final Map<String, dynamic> workerArgs = asMap(params['arguments']);
+            workerCalls.add(workerArgs);
+            final String role = asString(workerArgs['role']);
+            if (role == 'packer') {
+              return <String, dynamic>{
+                'ok': true,
+                'payload': <String, dynamic>{
+                  'worker_id': 'sub_packer',
+                  'role': role,
+                  'status': 'ok',
+                  'error': '',
+                  'report': jsonEncode(<String, Object?>{
+                    'files': <Object?>[
+                      <String, Object?>{
+                        'path': 'lib/ui/agent_list.dart',
+                        'start_line': 1,
+                        'end_line': 3,
+                        'content': 'class AgentList {}',
+                      },
+                    ],
+                    'baseline': <Object?>['dart analyze'],
+                    'risks': <String>[],
+                    'dependencies': <String>[],
+                  }),
+                },
+              };
+            }
+            return <String, dynamic>{
+              'ok': true,
+              'payload': <String, dynamic>{
+                'worker_id': 'sub_executor',
+                'role': role,
+                'status': 'ok',
+                'error': '',
+                'report': '已改 lib/ui/agent_list.dart',
+              },
+            };
+          }
+        case 'local.lease.register':
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'lease_id': 'lease_selftest',
+              'root': ws,
+            },
+          };
+        case 'local.exec.command':
+          {
+            final String cmd = asString(asMap(params['arguments'])['command']);
+            if (cmd.contains('git status')) {
+              gitCalls += 1;
+              return <String, dynamic>{
+                'ok': true,
+                'payload': <String, dynamic>{
+                  'text': gitCalls.isOdd
+                      ? ''
+                      : ' M lib/ui/agent_list.dart',
+                  'is_error': false,
+                  'exit_code': 0,
+                },
+              };
+            }
+            return <String, dynamic>{
+              'ok': true,
+              'payload': <String, dynamic>{
+                'text': 'ok',
+                'is_error': false,
+                'exit_code': 0,
+              },
+            };
+          }
         default:
           return <String, dynamic>{
             'ok': false,
@@ -760,6 +987,116 @@ Future<int> selfTest() async {
       ).existsSync(),
       'plan.md 落项目资产',
     );
+
+    // ── P4 执行阶段：假员工 + 假本机命令，打包 → 执行 → 门控 → done ──
+    final Map<String, dynamic> packed = payloadOf(
+      await call(
+        'p4-pack',
+        'production.task.pack',
+        <String, Object?>{'line_id': 'pl_prep', 'task_id': 'T1'},
+        agent: 'agt',
+      ),
+    );
+    check.check(packed['status'], 'packed', 'P4 打包 → packed');
+    check.check(
+      asMap(packed['task'])['status'],
+      'packed',
+      'T1 状态 = packed',
+    );
+    check.that(
+      File(
+        <String>[
+          temp.path,
+          'production_lines',
+          'team_a',
+          'pl_prep',
+          'tasks',
+          'T1',
+          'pack.json',
+        ].join(Platform.pathSeparator),
+      ).existsSync(),
+      'pack.json 落插件数据',
+    );
+    check.that(
+      File(
+        <String>[
+          ws,
+          'docs',
+          'production_lines',
+          'pl_prep',
+          'tasks',
+          'T1',
+          'pack.md',
+        ].join(Platform.pathSeparator),
+      ).existsSync(),
+      'pack.md 落项目资产',
+    );
+    check.check(
+      workerCalls.length,
+      1,
+      '打包调用一次员工',
+    );
+    check.check(workerCalls.first['role'], 'packer', '打包角色 = packer');
+    check.that(
+      (workerCalls.first['tools'] as List<dynamic>).contains('read') &&
+          !(workerCalls.first['tools'] as List<dynamic>).contains('write'),
+      '打包工具只读（无 write）',
+    );
+
+    final Map<String, dynamic> executed = payloadOf(
+      await call(
+        'p4-run',
+        'production.task.run',
+        <String, Object?>{'line_id': 'pl_prep', 'task_id': 'T1'},
+        agent: 'agt',
+      ),
+    );
+    check.check(executed['status'], 'done', 'P4 门控通过 → done');
+    check.check(
+      asMap(executed['task'])['status'],
+      'done',
+      'T1 状态 = done',
+    );
+    check.check(
+      asMap((executed['gate'] as List<dynamic>).single)['exit_code'],
+      0,
+      '门控退出码 0',
+    );
+    check.check(workerCalls.length, 2, '执行再调用一次员工');
+    check.check(workerCalls.last['role'], 'executor', '执行角色 = executor');
+    final Map<String, dynamic> taskRuns = payloadOf(
+      await call('p4-runs', 'production.run.list', <String, Object?>{
+        'line_id': 'pl_prep',
+        'task_id': 'T1',
+      }),
+    );
+    check.check(taskRuns['count'], 2, 'packer + executor 两条运行台账');
+    final Map<String, dynamic> message = payloadOf(
+      await call('p4-message', 'production.task.message', <String, Object?>{
+        'line_id': 'pl_prep',
+        'task_id': 'T1',
+        'from': 'executor',
+        'to': 'packer',
+        'kind': 'note',
+        'text': '已按片段改完',
+      }),
+    );
+    check.check(message['count'], 1, '任务内 message 线程落盘');
+    await call('p4-task-d', 'production.task.create', <String, Object?>{
+      'line_id': 'pl_prep',
+      'task': <String, Object?>{
+        'id': 'T3',
+        'title': '身份校验用',
+        'status': 'queued',
+        'write_scope': <String>['lib/x.dart'],
+      },
+    });
+    final Map<String, dynamic> missingAgent = await call(
+      'p4-no-agent',
+      'production.task.pack',
+      <String, Object?>{'line_id': 'pl_prep', 'task_id': 'T3'},
+    );
+    check.check(missingAgent['code'], 'agent_required', '缺发起者身份 fail-closed');
   } catch (error) {
     check.that(false, '自检过程未抛异常', actual: '$error');
   } finally {

@@ -2168,6 +2168,11 @@ Future<int> selfTest() async {
       'agent_tools：申报 spec.* 命令',
       actual: '${AgentRuntime.agentToolCommands}',
     );
+    check.that(
+      AgentRuntime.agentToolCommands.contains('agent.worker.run'),
+      'agent_tools：申报 agent.worker.run（P4 产线员工）',
+      actual: '${AgentRuntime.agentToolCommands}',
+    );
     final Directory specWorkspace = Directory(
       p.join(temp.path, 'workspaces', 'agt'),
     )..createSync(recursive: true);

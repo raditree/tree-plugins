@@ -321,5 +321,44 @@ void main() {
       expect(unknown.allows('read'), isTrue);
       expect(unknown.allows('team'), isFalse);
     });
+
+    test('产线员工用显式工具表：message 放行，团队 / 再召仍禁用', () async {
+      final FileTreeStore store = FileTreeStore(TreePaths(paths.root));
+      final CoreAgent parent = store.createAgent(name: '主控', modelId: 'm1');
+      await store.flush();
+      await store.close();
+
+      final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+      runtime.registry.ensureSession(parent.id, 's1');
+      runtime.registry.put(
+        CoreSubagent(
+          id: 'sub_worker',
+          name: '执行模型',
+          ownerAgentId: parent.id,
+          sessionId: 's1',
+          parentId: parent.id,
+          level: 1,
+          agent: CoreAgent(
+            id: 'sub_worker',
+            name: '执行模型',
+            createdAt: 1,
+            updatedAt: 1,
+            modelId: 'm1',
+            role: 'executor',
+            toolPolicy: <String>['read', 'write', 'edit', 'message', 'team'],
+          ),
+          createdAt: 1,
+          updatedAt: 1,
+        ),
+      );
+      final ToolPolicy worker = runtime.toolPolicyFor('sub_worker');
+      expect(worker.allows('write'), isTrue);
+      expect(worker.allows('message'), isTrue);
+      expect(worker.allows('team'), isFalse);
+      expect(worker.allows('subagent'), isFalse);
+      expect(worker.allows('read'), isTrue);
+      // 白名单外的工具不出现（不再是"继承父级全量"）。
+      expect(worker.allows('tool_runs'), isFalse);
+    });
   });
 }
