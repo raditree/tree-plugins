@@ -4,9 +4,10 @@ import '../../io/api_service.dart';
 
 /// 左栏「产线」面板（活动栏第 4 项）。
 ///
-/// 切片 2 只读：产线列表 → 展开看任务队列 / 运行台账，再按需拉产物树与项目
-/// 整理报告。数据全部走 REST（`/api/production/*`，由 `tree.production.line`
-/// 插件承接）；UI 不直连插件、不读写插件数据。
+/// 读：产线列表 → 展开看任务队列 / 运行台账，再按需拉产物树与项目整理报告。
+/// 写（切片 3）：新建 / 删除产线、建任务、派发（打包 / 执行）、拍板回答、取消。
+/// 数据全部走 REST（`/api/production/*`，由 `tree.production.line` 插件承接）；
+/// UI 不直连插件、不读写插件数据。
 ///
 /// 依赖缺失（插件未安装 / 停用 ⇒ 503）必须给出可读说明，而不是把
 /// `HTTP 404` 摊在空列表上。
@@ -14,12 +15,16 @@ class ProductionLinePanel extends StatefulWidget {
   const ProductionLinePanel({
     super.key,
     required this.teamId,
+    this.agentId = '',
     this.visible = true,
     this.onCollapse,
   });
 
   /// 团队归属（= 顶部 Agent 的 `teamScopeId`）；空串时提示先选 Agent。
   final String teamId;
+
+  /// 发起者身份：派发时员工按它继承工作空间与团队（缺省不能派发）。
+  final String agentId;
 
   /// 面板是否露脸：由隐藏变可见时重拉清单（与插件面板同一口径）。
   final bool visible;
@@ -106,7 +111,7 @@ class _ProductionLinePanelState extends State<ProductionLinePanel> {
         _loading = false;
         _lines = lines;
         _emptyHint = lines.isEmpty
-            ? '还没有产线：新建入口在切片 3 开放（当前只读列表 / 队列 / 台账）。'
+            ? '还没有产线：点右上角「+」新建一条（生产数据落插件数据根）。'
             : '';
       });
     } catch (error) {
@@ -198,6 +203,351 @@ class _ProductionLinePanelState extends State<ProductionLinePanel> {
     }
   }
 
+  /// 单条产线 / 任务的写操作进行中（按钮转圈、防重复提交）。
+  final Set<String> _actionBusy = <String>{};
+
+  String get _teamId => widget.teamId.trim();
+
+  String get _agentId => widget.agentId.trim();
+
+  /// 统一收口：忙碌标记 + 可读错误（SnackBar，不打断面板状态）。
+  Future<void> _act(String key, Future<void> Function() action) async {
+    if (_actionBusy.contains(key)) return;
+    setState(() => _actionBusy.add(key));
+    try {
+      await action();
+    } catch (error) {
+      _notify(_readable(error, '操作失败'));
+    } finally {
+      if (mounted) setState(() => _actionBusy.remove(key));
+    }
+  }
+
+  void _notify(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.maybeOf(
+      context,
+    )?.showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  /// 写操作后重拉某条产线的明细（清缓存，避免停在旧状态）。
+  Future<void> _reloadDetails(String lineId) async {
+    setState(() {
+      _tasks.remove(lineId);
+      _runs.remove(lineId);
+      _detailErrors.remove(lineId);
+    });
+    await _loadDetails(lineId);
+  }
+
+  Future<void> _createLine() async {
+    String nameText = '';
+    String workspaceText = '';
+    final String? confirmed = await showDialog<String>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        title: const Text('新建产线'),
+        content: SizedBox(
+          width: 420,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              TextFormField(
+                key: const Key('production-line-name'),
+                autofocus: true,
+                decoration: const InputDecoration(
+                  labelText: '名称',
+                  hintText: '标准开发流',
+                ),
+                onChanged: (String value) => nameText = value.trim(),
+              ),
+              TextFormField(
+                key: const Key('production-line-workspace'),
+                decoration: const InputDecoration(
+                  labelText: '工作空间（可空）',
+                  hintText: 'E:/work/project',
+                  helperText: '准备阶段与门控都在这个目录里执行',
+                ),
+                onChanged: (String value) => workspaceText = value.trim(),
+              ),
+            ],
+          ),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(nameText),
+            child: const Text('创建'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == null || confirmed.isEmpty) return;
+    await _act('create-line', () async {
+      await ApiService.createProductionLine(
+        name: confirmed,
+        workspaceDir: workspaceText,
+        teamId: _teamId,
+      );
+      await _load();
+      _notify('已创建产线：$confirmed');
+    });
+  }
+
+  Future<void> _deleteLine(String lineId) async {
+    if (!await _confirm('删除产线 $lineId？', '插件数据会删除，项目资产（docs/ 下）保留。')) {
+      return;
+    }
+    await _act('$lineId/delete', () async {
+      final Map<String, dynamic> result = await ApiService.deleteProductionLine(
+        lineId,
+        teamId: _teamId,
+      );
+      if (_expanded == lineId) setState(() => _expanded = '');
+      await _load();
+      _notify(
+        '${result['note'] is String && '${result['note']}'.isNotEmpty ? result['note'] : '已删除产线：$lineId'}',
+      );
+    });
+  }
+
+  Future<void> _createTask(String lineId) async {
+    String titleText = '';
+    String scopeText = '';
+    final String? confirmed = await showDialog<String>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        title: Text('新建任务 · $lineId'),
+        content: SizedBox(
+          width: 420,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              TextFormField(
+                key: const Key('production-task-title'),
+                autofocus: true,
+                decoration: const InputDecoration(labelText: '标题'),
+                onChanged: (String value) => titleText = value.trim(),
+              ),
+              TextFormField(
+                key: const Key('production-task-scope'),
+                decoration: const InputDecoration(
+                  labelText: '写域（逗号分隔，可空）',
+                  hintText: 'lib/ui/widgets/agent_list.dart',
+                  helperText: '执行阶段只允许改这些路径；留空则不能打包',
+                ),
+                onChanged: (String value) => scopeText = value.trim(),
+              ),
+            ],
+          ),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(titleText),
+            child: const Text('创建'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == null || confirmed.isEmpty) return;
+    await _act('$lineId/create-task', () async {
+      await ApiService.createProductionTask(
+        lineId,
+        <String, dynamic>{
+          'title': confirmed,
+          'status': 'queued',
+          'priority': 50,
+          'write_scope': <String>[
+            for (final String item in scopeText.split(','))
+              if (item.trim().isNotEmpty) item.trim(),
+          ],
+        },
+        teamId: _teamId,
+      );
+      await _reloadDetails(lineId);
+      _notify('已建任务：$confirmed');
+    });
+  }
+
+  Future<void> _dispatch(String lineId, String taskId, String stage) async {
+    if (_agentId.isEmpty) {
+      _notify('先在左侧选择一个 Agent：派发要用它的身份跑员工');
+      return;
+    }
+    await _act('$lineId/$taskId/dispatch', () async {
+      final Map<String, dynamic> result = await ApiService.dispatchProductionTask(
+        lineId,
+        taskId,
+        stage: stage,
+        agentId: _agentId,
+        teamId: _teamId,
+      );
+      await _reloadDetails(lineId);
+      _notify(
+        result['accepted'] == true
+            ? '已受理${stage == 'run' ? '执行' : '打包'}：进度看任务状态与运行台账'
+            : '${result['status'] ?? '已完成'}：$taskId',
+      );
+    });
+  }
+
+  Future<void> _cancelTask(String lineId, String taskId) async {
+    if (!await _confirm('取消任务 $taskId？', '取消后不可再迁移（保留在队列里可追溯）。')) {
+      return;
+    }
+    await _act('$lineId/$taskId/cancel', () async {
+      await ApiService.cancelProductionTask(
+        lineId,
+        taskId,
+        teamId: _teamId,
+      );
+      await _reloadDetails(lineId);
+      _notify('已取消：$taskId');
+    });
+  }
+
+  /// 拍板：先拉待答问题，再让用户逐条回答或「全部按推荐」。
+  Future<void> _decide(String lineId, String taskId) async {
+    await _act('$lineId/$taskId/decide', () async {
+      final Map<String, dynamic> data = await ApiService.getProductionQuestions(
+        lineId,
+        taskId,
+        teamId: _teamId,
+      );
+      final List<Map<String, dynamic>> open =
+          (data['open'] as List<dynamic>? ?? <dynamic>[])
+              .whereType<Map>()
+              .map(_map)
+              .toList();
+      if (open.isEmpty) {
+        _notify('任务 $taskId 没有待答问题');
+        return;
+      }
+      if (!mounted) return;
+      final Map<String, String> values = <String, String>{
+        for (final Map<String, dynamic> question in open)
+          '${question['qid'] ?? ''}':
+              '${question['recommended'] ?? question['default'] ?? ''}',
+      };
+      String? choice;
+      await showDialog<void>(
+        context: context,
+        builder: (BuildContext context) => AlertDialog(
+          title: Text('拍板 · $taskId'),
+          content: SizedBox(
+            width: 460,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  for (final Map<String, dynamic> question in open) ...<Widget>[
+                    Text(
+                      '${question['qid'] ?? ''}  ${question['text'] ?? ''}',
+                      style: const TextStyle(fontSize: 12.5),
+                    ),
+                    if ('${question['consequence'] ?? ''}'.isNotEmpty)
+                      Text(
+                        '后果：${question['consequence']}',
+                        style: const TextStyle(fontSize: 11),
+                      ),
+                    TextFormField(
+                      key: Key('production-answer-${question['qid'] ?? ''}'),
+                      initialValue: values['${question['qid'] ?? ''}'],
+                      decoration: InputDecoration(
+                        helperText:
+                            '默认：${question['default'] ?? '（无）'} · '
+                            '推荐：${question['recommended'] ?? '（无）'}',
+                      ),
+                      onChanged: (String value) =>
+                          values['${question['qid'] ?? ''}'] = value.trim(),
+                    ),
+                    const SizedBox(height: 8),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              key: const Key('production-decide-recommended'),
+              onPressed: () {
+                choice = 'recommended';
+                Navigator.of(context).pop();
+              },
+              child: const Text('全部按推荐'),
+            ),
+            FilledButton(
+              key: const Key('production-decide-submit'),
+              onPressed: () {
+                choice = 'submit';
+                Navigator.of(context).pop();
+              },
+              child: const Text('提交回答'),
+            ),
+          ],
+        ),
+      );
+      final String? submitted = choice;
+      if (submitted == null) return;
+      final Map<String, dynamic> result = submitted == 'recommended'
+          ? await ApiService.decideProductionTask(
+              lineId,
+              taskId,
+              allRecommended: true,
+              teamId: _teamId,
+            )
+          : await ApiService.decideProductionTask(
+              lineId,
+              taskId,
+              answers: <Map<String, String>>[
+                for (final Map<String, dynamic> question in open)
+                  <String, String>{
+                    'qid': '${question['qid'] ?? ''}',
+                    'value': values['${question['qid'] ?? ''}'] ?? '',
+                  },
+              ],
+              teamId: _teamId,
+            );
+      await _reloadDetails(lineId);
+      _notify('已记录拍板：剩余 ${result['open'] ?? 0} 条未答');
+    });
+  }
+
+  Future<bool> _confirm(String title, String body) async {
+    if (!mounted) return false;
+    final bool? ok = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        title: Text(title),
+        content: Text(body),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            key: const Key('production-confirm'),
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('确定'),
+          ),
+        ],
+      ),
+    );
+    return ok == true;
+  }
+
   @override
   Widget build(BuildContext context) {
     final ColorScheme cs = Theme.of(context).colorScheme;
@@ -217,6 +567,13 @@ class _ProductionLinePanelState extends State<ProductionLinePanel> {
                 ),
               ),
               const Spacer(),
+              IconButton(
+                tooltip: '新建产线',
+                key: const Key('production-line-create'),
+                visualDensity: VisualDensity.compact,
+                onPressed: _teamId.isEmpty ? null : _createLine,
+                icon: const Icon(Icons.add, size: 18),
+              ),
               IconButton(
                 tooltip: '刷新产线列表',
                 visualDensity: VisualDensity.compact,
@@ -400,7 +757,7 @@ class _ProductionLinePanelState extends State<ProductionLinePanel> {
       else
         for (final Map<String, dynamic> task in tasks.take(20))
           Padding(
-            padding: const EdgeInsets.fromLTRB(28, 1, 12, 1),
+            padding: const EdgeInsets.fromLTRB(28, 1, 4, 1),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
@@ -417,6 +774,46 @@ class _ProductionLinePanelState extends State<ProductionLinePanel> {
                     color: _statusColor(cs, '${task['status'] ?? ''}'),
                   ),
                 ),
+                if (_actionBusy.contains(
+                  '$lineId/${task['id'] ?? ''}/dispatch',
+                ) ||
+                    _actionBusy.contains('$lineId/${task['id'] ?? ''}/decide') ||
+                    _actionBusy.contains('$lineId/${task['id'] ?? ''}/cancel'))
+                  const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 6),
+                    child: SizedBox(
+                      width: 12,
+                      height: 12,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  )
+                else if (_taskActions(task).isNotEmpty)
+                  PopupMenuButton<String>(
+                    key: Key('production-task-menu-${task['id'] ?? ''}'),
+                    tooltip: '任务操作',
+                    padding: EdgeInsets.zero,
+                    iconSize: 16,
+                    onSelected: (String value) {
+                      final String id = '${task['id'] ?? ''}';
+                      switch (value) {
+                        case 'pack':
+                          _dispatch(lineId, id, 'pack');
+                        case 'run':
+                          _dispatch(lineId, id, 'run');
+                        case 'decide':
+                          _decide(lineId, id);
+                        case 'cancel':
+                          _cancelTask(lineId, id);
+                      }
+                    },
+                    itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
+                      for (final String value in _taskActions(task))
+                        PopupMenuItem<String>(
+                          value: value,
+                          child: Text(_actionLabel(value)),
+                        ),
+                    ],
+                  ),
               ],
             ),
           ),
@@ -440,12 +837,29 @@ class _ProductionLinePanelState extends State<ProductionLinePanel> {
           spacing: 4,
           children: <Widget>[
             TextButton(
+              key: Key('production-task-create-$lineId'),
+              onPressed: _actionBusy.contains('$lineId/create-task')
+                  ? null
+                  : () => _createTask(lineId),
+              child: const Text('新建任务'),
+            ),
+            TextButton(
               onPressed: () => _loadArtifacts(lineId),
               child: Text(artifacts == null ? '产物' : '收起产物'),
             ),
             TextButton(
               onPressed: () => _loadAudit(lineId),
               child: Text(audit == null ? '整理报告' : '收起报告'),
+            ),
+            TextButton(
+              key: Key('production-line-delete-$lineId'),
+              onPressed: _actionBusy.contains('$lineId/delete')
+                  ? null
+                  : () => _deleteLine(lineId),
+              child: Text(
+                '删除产线',
+                style: TextStyle(color: cs.error),
+              ),
             ),
           ],
         ),
@@ -521,6 +935,32 @@ class _ProductionLinePanelState extends State<ProductionLinePanel> {
       style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
     ),
   );
+
+  /// 任务可用操作：只给状态机允许的那几条（不把按钮摆出来再让后端 409）。
+  static List<String> _taskActions(Map<String, dynamic> task) {
+    final String status = '${task['status'] ?? ''}';
+    return <String>[
+      if (status == 'queued' || status == 'packing') 'pack',
+      if (status == 'packed') 'run',
+      if (status == 'aligning' || status == 'awaiting_user') 'decide',
+      if (status != 'done' && status != 'cancelled') 'cancel',
+    ];
+  }
+
+  static String _actionLabel(String value) {
+    switch (value) {
+      case 'pack':
+        return '打包';
+      case 'run':
+        return '执行';
+      case 'decide':
+        return '拍板';
+      case 'cancel':
+        return '取消任务';
+      default:
+        return value;
+    }
+  }
 
   static String _runLabel(Map<String, dynamic> run) {
     final String taskId = '${run['task_id'] ?? ''}';

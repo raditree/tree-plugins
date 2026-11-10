@@ -14,7 +14,7 @@ import '../ui/models/file_listing.dart';
 import '../ui/models/file_node.dart';
 import '../ui/models/git_status.dart';
 import '../ui/models/session.dart';
-import '../ui/services/message_window.dart' show kDisplayCacheLimit;
+import '../ui/services/message_window.dart' show kInitialDisplayRows;
 import 'service_availability.dart';
 
 /// 流式下载被调用方取消（M8d 下载列表的「取消」按钮）。
@@ -642,13 +642,13 @@ class ApiService {
     );
   }
 
-  /// 拉一份会话的**显示行**整段（首屏全量缓存，规格 §3.1.4，上限 [kDisplayCacheLimit]）。
+  /// 拉一份会话的**显示行**末尾段（首屏只热 [kInitialDisplayRows] 条，规格 §3.1.4）。
   ///
   /// 列表端点现在回的就是轻量显示行（preview + 小字段，无 tool_arguments /
-  /// tool_result / usage / attachments 重负载），所以首屏一次拉满、槽位表不再
-  /// 留 88px 占位空洞。核心**单页有上限**（`kHistoryPageMax`），更早的段用
-  /// `before=<最旧 id>` 逐页补拉，直到 `offset=0` 或攒够上限；超上限只保留
-  /// **最近** [kDisplayCacheLimit] 条，更早的行留给窗口机制（gapsFor 补拉）。
+  /// tool_result / usage / attachments 重负载）。**首屏不拉整份会话**：槽位表里
+  /// 全是真的消息时，列表跳到末尾要从下标 0 顺序布局到落点（见
+  /// [kInitialDisplayRows] 的说明，现场 7,578 条会话打开即 AppHang），更早的行
+  /// 留给窗口机制（gapsFor 补拉）。
   static Future<HistoryPage> getConversationDisplayRows(
     String agentId, {
     String sessionId = 'session_default',
@@ -656,27 +656,27 @@ class ApiService {
     final HistoryPage tail = await getConversationHistoryPage(
       agentId,
       sessionId: sessionId,
-      limit: kDisplayCacheLimit,
+      limit: kInitialDisplayRows,
     );
     List<Map<String, dynamic>> rows =
         List<Map<String, dynamic>>.of(tail.messages);
     int start = tail.offset;
-    while (start > 0 && rows.length < kDisplayCacheLimit) {
+    while (start > 0 && rows.length < kInitialDisplayRows) {
       final String oldestId = '${rows.isEmpty ? '' : (rows.first['id'] ?? '')}';
       if (oldestId.isEmpty) break;
       final HistoryPage older = await getConversationHistoryPage(
         agentId,
         sessionId: sessionId,
         beforeId: oldestId,
-        limit: kDisplayCacheLimit,
+        limit: kInitialDisplayRows,
       );
       // 空页 / 起点不前进 = 服务端没有更早的内容，停（防死循环）
       if (older.messages.isEmpty || older.offset >= start) break;
       rows = <Map<String, dynamic>>[...older.messages, ...rows];
       start = older.offset;
     }
-    if (rows.length > kDisplayCacheLimit) {
-      final int drop = rows.length - kDisplayCacheLimit;
+    if (rows.length > kInitialDisplayRows) {
+      final int drop = rows.length - kInitialDisplayRows;
       rows = rows.sublist(drop);
       start += drop;
     }
@@ -1145,14 +1145,52 @@ class ApiService {
     return _getJson('/api/plugin/windows');
   }
 
-  // ── 生产线（只读，§10.2；归属插件 tree.production.line）────────────────
+  // ── 生产线（§10.2；归属插件 tree.production.line）──────────────────────
   //
   // 团队经 `team_id` 查询参数下传：核心只做原样透传，归属判据在插件侧。
-  // 写操作（新建产线 / 派发 / 决策 / 取消）留到切片 3，这里不提供。
+  // 写操作：建 / 改 / 删产线、建任务、改状态、派发、决策、取消。派发在插件侧
+  // 后台跑（核心委派 30s 截止），这里只拿受理回包，进度靠再查任务 / 台账。
 
   static Future<Map<String, dynamic>> getProductionLines({
     String teamId = '',
   }) => _getJson('/api/production/lines', query: _teamQuery(teamId));
+
+  static Future<Map<String, dynamic>> createProductionLine({
+    required String name,
+    String workspaceDir = '',
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines',
+    body: <String, dynamic>{
+      'name': name,
+      'workspace_dir': workspaceDir,
+    },
+    query: _teamQuery(teamId),
+  );
+
+  static Future<Map<String, dynamic>> updateProductionLine(
+    String lineId, {
+    String? name,
+    String? status,
+    String? workspaceDir,
+    String teamId = '',
+  }) => _patchJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}',
+    body: <String, dynamic>{
+      'name': ?name,
+      'status': ?status,
+      'workspace_dir': ?workspaceDir,
+    },
+    query: _teamQuery(teamId),
+  );
+
+  static Future<Map<String, dynamic>> deleteProductionLine(
+    String lineId, {
+    String teamId = '',
+  }) => _deleteJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}',
+    query: _teamQuery(teamId),
+  );
 
   static Future<Map<String, dynamic>> getProductionTasks(
     String lineId, {
@@ -1166,6 +1204,16 @@ class ApiService {
     },
   );
 
+  static Future<Map<String, dynamic>> createProductionTask(
+    String lineId,
+    Map<String, dynamic> task, {
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/tasks',
+    body: <String, dynamic>{'task': task},
+    query: _teamQuery(teamId),
+  );
+
   static Future<Map<String, dynamic>> getProductionRuns(
     String lineId, {
     String teamId = '',
@@ -1176,6 +1224,80 @@ class ApiService {
       ..._teamQuery(teamId),
       if (taskId.isNotEmpty) 'task_id': taskId,
     },
+  );
+
+  /// 改任务状态（有限状态机由插件判，非法迁移回 409）。
+  static Future<Map<String, dynamic>> transitionProductionTask(
+    String lineId,
+    String taskId, {
+    required String to,
+    String reason = '',
+    String teamId = '',
+  }) => _patchJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}'
+    '/tasks/${Uri.encodeComponent(taskId)}',
+    body: <String, dynamic>{'to': to, 'reason': reason},
+    query: _teamQuery(teamId),
+  );
+
+  /// 进入打包 / 执行（`stage` = pack / run / auto）。
+  ///
+  /// 插件后台跑真实任务，立刻回 `accepted: true`；进度与失败原因要再查任务。
+  static Future<Map<String, dynamic>> dispatchProductionTask(
+    String lineId,
+    String taskId, {
+    String stage = 'auto',
+    String agentId = '',
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}'
+    '/tasks/${Uri.encodeComponent(taskId)}/dispatch',
+    body: <String, dynamic>{'stage': stage},
+    query: <String, String>{
+      ..._teamQuery(teamId),
+      // 员工按发起者身份继承工作空间与团队；缺它插件回 400。
+      if (agentId.trim().isNotEmpty) 'agent_id': agentId.trim(),
+    },
+  );
+
+  /// 待答问题（决策卡片的数据源）。
+  static Future<Map<String, dynamic>> getProductionQuestions(
+    String lineId,
+    String taskId, {
+    String teamId = '',
+  }) => _getJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}'
+    '/tasks/${Uri.encodeComponent(taskId)}/questions',
+    query: _teamQuery(teamId),
+  );
+
+  /// 回答 `Q`：逐条 `answers`，或「全部按推荐」。
+  static Future<Map<String, dynamic>> decideProductionTask(
+    String lineId,
+    String taskId, {
+    List<Map<String, String>>? answers,
+    bool allRecommended = false,
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}'
+    '/tasks/${Uri.encodeComponent(taskId)}/decision',
+    body: <String, dynamic>{
+      if (allRecommended) 'all_recommended': true,
+      if (answers != null && answers.isNotEmpty) 'answers': answers,
+    },
+    query: _teamQuery(teamId),
+  );
+
+  static Future<Map<String, dynamic>> cancelProductionTask(
+    String lineId,
+    String taskId, {
+    String reason = '用户取消',
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}'
+    '/tasks/${Uri.encodeComponent(taskId)}/cancel',
+    body: <String, dynamic>{'reason': reason},
+    query: _teamQuery(teamId),
   );
 
   static Future<Map<String, dynamic>> getProductionArtifacts(
@@ -2237,10 +2359,14 @@ class ApiService {
 
   /// 发送 DELETE 请求并解析 JSON 响应
   ///
-  /// [path] 为接口路径（以 / 开头）。复用 [_handleResponse] 的状态码处理
+  /// [path] 为接口路径（以 / 开头），[query] 为可选查询参数（如 `team_id`）。
+  /// 复用 [_handleResponse] 的状态码处理
   /// （401 清 token 跳登录、非 200 抛中文异常），避免各处手写重复逻辑。
-  static Future<Map<String, dynamic>> _deleteJson(String path) async {
-    final Uri uri = Uri.parse('$baseUrl$path');
+  static Future<Map<String, dynamic>> _deleteJson(
+    String path, {
+    Map<String, String>? query,
+  }) async {
+    final Uri uri = Uri.parse('$baseUrl$path').replace(queryParameters: query);
     try {
       final http.Response response = await http.delete(
         uri,

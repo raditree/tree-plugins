@@ -1679,9 +1679,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             });
           },
         ),
-        // 「生产线」面板（切片 2 只读）：产线列表 / 任务队列 / 运行台账。
+        // 「生产线」面板：列表 / 队列 / 台账 + 写入口（新建、派发、拍板、取消）。
         ProductionLinePanel(
           teamId: _selectedAgent?.teamScopeId ?? '',
+          agentId: _selectedAgent?.id ?? '',
           visible: _leftPanel == 3 && !_leftCollapsed,
           onCollapse: () {
             setState(() {

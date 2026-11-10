@@ -107,6 +107,96 @@ class ProductionStore {
     return LineRecord(_readYaml(file, 'line.yaml'));
   }
 
+  /// 改产线配置（PATCH 的落点）：只认白名单键，段内做浅合并。
+  ///
+  /// 不允许改 `id` / `created_at`（身份与审计时间不可变）；`status` 仍只允许
+  /// idle / working / paused（与 `buildLineMap` 同一口径）。
+  LineRecord updateLine(String lineId, Map<String, Object?> patch) {
+    final LineRecord line = getLine(lineId);
+    const Set<String> sections = <String>{'roles', 'limits', 'policy', 'docs'};
+    const Set<String> allowed = <String>{
+      'name',
+      'workspace_dir',
+      'status',
+      ...sections,
+    };
+    final List<String> unknown = <String>[
+      for (final String key in patch.keys)
+        if (!allowed.contains(key)) key,
+    ];
+    if (unknown.isNotEmpty) {
+      throw ProductionFailure(
+        '产线不支持改这些键：${unknown.join('、')}（允许：${allowed.join(' / ')}）',
+        code: 'invalid_arguments',
+      );
+    }
+    final Map<String, Object?> next = <String, Object?>{...line.data};
+    if (patch.containsKey('name')) {
+      final String name = textOf(patch['name']);
+      if (name.isEmpty) {
+        throw ProductionFailure('产线 name 不能为空', code: 'invalid_arguments');
+      }
+      next['name'] = name;
+    }
+    if (patch.containsKey('workspace_dir')) {
+      next['workspace_dir'] = textOf(patch['workspace_dir']);
+    }
+    if (patch.containsKey('status')) {
+      final String status = textOf(patch['status']);
+      if (!const <String>{'idle', 'working', 'paused'}.contains(status)) {
+        throw ProductionFailure(
+          '产线 status 只能是 idle / working / paused：$status',
+          code: 'invalid_arguments',
+        );
+      }
+      next['status'] = status;
+    }
+    for (final String section in sections) {
+      if (!patch.containsKey(section)) continue;
+      final Map<String, Object?> override = plainMap(patch[section]);
+      next[section] = <String, Object?>{
+        ...plainMap(line.data[section]),
+        ...override,
+      };
+    }
+    next['updated_at'] = nowText();
+    _writeText(File(_lineFile(lineId)), encodeYaml(next));
+    return LineRecord(next);
+  }
+
+  /// 删除产线：**只删插件数据**，项目资产（`docs/production_lines/<line>`）保留。
+  ///
+  /// 有在途任务时拒绝（409 `line_busy`）：正在打包 / 执行的任务被抽掉数据根
+  /// 只会留下无法回收的半成品。
+  Map<String, Object?> deleteLine(String lineId) {
+    getLine(lineId);
+    final List<String> inFlight = <String>[
+      for (final TaskRecord task in listTasks(lineId))
+        if (task.status.isInFlight) task.id,
+    ];
+    if (inFlight.isNotEmpty) {
+      throw ProductionFailure(
+        '产线还有在途任务（${inFlight.join('、')}）：先等它们结束或取消',
+        code: 'line_busy',
+      );
+    }
+    String assetsKept = '';
+    try {
+      assetsKept = assetRoot(lineId);
+    } on ProductionFailure {
+      // 没配 workspace_dir 就没有项目资产可保留。
+    }
+    Directory(lineDir(lineId)).deleteSync(recursive: true);
+    return <String, Object?>{
+      'line_id': lineId,
+      'deleted': true,
+      if (assetsKept.isNotEmpty) 'assets_kept': assetsKept,
+      'note': assetsKept.isEmpty
+          ? ''
+          : '插件数据已删除；项目资产仍保留在工作空间（需人工确认是否清理）',
+    };
+  }
+
   // ── 任务 ──────────────────────────────────────────────────────────
 
   TaskRecord createTask(String lineId, Map<String, Object?> input) {

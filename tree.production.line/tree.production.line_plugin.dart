@@ -27,7 +27,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.production.line';
 const String kDisplayName = 'Tree 标准开发流生产线';
-const String kVersion = '0.6.0';
+const String kVersion = '0.7.0';
 
 const String kStationName = 'production';
 
@@ -68,7 +68,11 @@ const String kStationReadme =
     'limits.max_parallel_tasks 决定批次；写域交叠拒绝并行，交叠对象可见；只读不改状态）'
     '与 production.task.budget（token / 时长上限、累计用量、剩余与超限原因）；'
     '打包/执行累计 usage，预算到点软停（保留当前产出、标 budget_exceeded 转 blocked）。'
-    '追问上限读 settings，缺省回退 line.yaml.limits 与 3（夹到 1–10）。';
+    '追问上限读 settings，缺省回退 line.yaml.limits 与 3（夹到 1–10）。'
+    'REST（§10.2）：GET lines/line/tasks/task/runs/artifacts/audit/questions 与 '
+    'POST lines/tasks/dispatch/decision/cancel、PATCH line/task、DELETE line；'
+    'dispatch 默认后台跑（核心委派 30s 截止，模型跑不完），受理即回 accepted，'
+    '进度看任务状态与运行台账，失败写 task.yaml.last_error。';
 
 final ProductionService _service = ProductionService();
 PreparationService? _preparation;
@@ -466,12 +470,14 @@ Future<Map<String, dynamic>?> handleRequest(
   String method,
   Map<String, dynamic> params,
 ) async {
-  // 切片 2：只读 REST 委派（§10.2 的读半边）；写操作留到切片 3。
+  // 切片 2 / 3：REST 委派（§10.2 的读半边 + 写半边）；写操作走同一批命令门面。
   if (method == M.apiDelegate) {
     return handleProductionDelegate(
       asMap(params),
       service: _service,
       audit: _audit,
+      execution: _execution,
+      preparation: _preparation,
     );
   }
   if (method != M.stationRequest) return null;
@@ -611,12 +617,14 @@ Future<int> selfTest() async {
   Map<String, dynamic> payloadOf(Map<String, dynamic> reply) =>
       asMap(reply['payload']);
 
-  /// 发一次 `api/delegate`（切片 2 只读 REST 的口径），回 `{status, json}`。
+  /// 发一次 `api/delegate`（REST 口径），回 `{status, json}`。
   Future<Map<String, dynamic>> rest(
     Object id,
     String method,
     String path, {
     Map<String, Object?> query = const <String, Object?>{},
+    Map<String, Object?> body = const <String, Object?>{},
+    String agent = '',
     String? team = 'team_a',
   }) async {
     core.ask(id, M.apiDelegate, <String, dynamic>{
@@ -625,24 +633,28 @@ Future<int> selfTest() async {
       'params': <String, dynamic>{},
       'query': query,
       'headers': <String, dynamic>{},
-      'scope': <String, dynamic>{'team_id': ?team},
+      'scope': <String, dynamic>{
+        'team_id': ?team,
+        if (agent.isNotEmpty) 'agent_id': agent,
+      },
       'workspace_dir': '',
       'data_dir': temp.path,
-      'agent_id': '',
+      'agent_id': agent,
       'team_id': ?team,
       'request_id': 'selftest-rest-$id',
+      if (body.isNotEmpty) 'body': jsonEncode(body),
     });
     final Map<Object?, Map<String, dynamic>> responses = await core.waitFor(
       <Object?>[id],
     );
     final Map<String, dynamic> frame = responses[id] ?? <String, dynamic>{};
     final Map<String, dynamic> reply = asMap(frame['result']);
-    final String body = asString(reply['body']);
+    final String rawBody = asString(reply['body']);
     return <String, dynamic>{
       ...reply,
-      'json': body.isEmpty
+      'json': rawBody.isEmpty
           ? <String, dynamic>{}
-          : asMap(jsonDecode(body)),
+          : asMap(jsonDecode(rawBody)),
     };
   }
 
@@ -778,14 +790,15 @@ Future<int> selfTest() async {
     check.check(
       declaredRoutes.length,
       kDeclaredRoutes.length,
-      '申报全部只读路由',
+      '申报全部 REST 路由（读 + 写）',
     );
+    final List<String> declaredMethods = <String>[
+      for (final dynamic route in declaredRoutes) asString(asMap(route)['method']),
+    ]..sort();
     check.check(
-      declaredRoutes.every(
-        (dynamic route) => asString(asMap(route)['method']) == 'GET',
-      ),
-      true,
-      '切片 2 只申报 GET',
+      <String>{...declaredMethods}.toList()..sort(),
+      <String>['DELETE', 'GET', 'PATCH', 'POST'],
+      '申报覆盖 GET / POST / PATCH / DELETE',
     );
 
     final Map<String, dynamic> restLines = await rest(
@@ -843,12 +856,117 @@ Future<int> selfTest() async {
       '/api/production/lines/pl_nope',
     );
     check.check(restMissing['status'], 404, 'REST 缺产线 404');
-    final Map<String, dynamic> restWrite = await rest(
-      'rest-write',
+
+    // 切片 3：写 REST（建 / 改 / 删产线，建 / 改 / 取消任务，派发与决策的拒绝路径）。
+    final Map<String, dynamic> restCreate = await rest(
+      'rest-create',
       'POST',
       linesPattern,
+      body: <String, Object?>{'id': 'pl_rest', 'name': 'REST 写'},
     );
-    check.check(restWrite['status'], 405, 'REST 写操作 405（切片 3 再开放）');
+    check.check(restCreate['status'], 200, 'POST /api/production/lines 200');
+    check.check(
+      asMap(asMap(restCreate['json'])['line'])['id'],
+      'pl_rest',
+      'REST 建产线',
+    );
+    final Map<String, dynamic> restPatchLine = await rest(
+      'rest-patch-line',
+      'PATCH',
+      '/api/production/lines/pl_rest',
+      body: <String, Object?>{'name': 'REST 改名', 'status': 'paused'},
+    );
+    check.check(
+      asMap(asMap(restPatchLine['json'])['line'])['name'],
+      'REST 改名',
+      'PATCH 产线配置',
+    );
+    final Map<String, dynamic> restTaskCreate = await rest(
+      'rest-task-create',
+      'POST',
+      '/api/production/lines/pl_rest/tasks',
+      body: <String, Object?>{
+        'id': 'RT1',
+        'title': 'REST 任务',
+        'status': 'queued',
+        'write_scope': <String>['lib/a.dart'],
+      },
+    );
+    check.check(
+      asMap(asMap(restTaskCreate['json'])['task'])['id'],
+      'RT1',
+      'POST 建任务',
+    );
+    final Map<String, dynamic> restTransition = await rest(
+      'rest-transition',
+      'PATCH',
+      '/api/production/lines/pl_rest/tasks/RT1',
+      body: <String, Object?>{'to': 'packing'},
+    );
+    check.check(
+      asMap(asMap(restTransition['json'])['task'])['status'],
+      'packing',
+      'PATCH 改任务状态',
+    );
+    final Map<String, dynamic> restBadTransition = await rest(
+      'rest-bad-transition',
+      'PATCH',
+      '/api/production/lines/pl_rest/tasks/RT1',
+      body: <String, Object?>{'to': 'done'},
+    );
+    check.check(restBadTransition['status'], 409, '非法迁移 409');
+    final Map<String, dynamic> restQuestions = await rest(
+      'rest-questions',
+      'GET',
+      '/api/production/lines/pl_rest/tasks/RT1/questions',
+    );
+    check.check(restQuestions['status'], 200, 'GET 待答问题 200');
+    final Map<String, dynamic> restDecisionEmpty = await rest(
+      'rest-decision-empty',
+      'POST',
+      '/api/production/lines/pl_rest/tasks/RT1/decision',
+    );
+    check.check(restDecisionEmpty['status'], 400, '决策缺回答 400');
+    final Map<String, dynamic> restNoAgent = await rest(
+      'rest-dispatch-no-agent',
+      'POST',
+      '/api/production/lines/pl_rest/tasks/RT1/dispatch',
+      body: <String, Object?>{'stage': 'pack'},
+    );
+    check.check(restNoAgent['status'], 400, '派发缺发起者身份 400');
+    final Map<String, dynamic> restNotDispatchable = await rest(
+      'rest-dispatch-bad',
+      'POST',
+      '/api/production/lines/pl_rest/tasks/RT1/dispatch',
+      body: <String, Object?>{'stage': 'run'},
+      agent: 'agt',
+    );
+    check.check(restNotDispatchable['status'], 409, '状态不符派发 409');
+    final Map<String, dynamic> restCancel = await rest(
+      'rest-cancel',
+      'POST',
+      '/api/production/lines/pl_rest/tasks/RT1/cancel',
+      body: <String, Object?>{'reason': '自检取消'},
+    );
+    check.check(
+      asMap(asMap(restCancel['json'])['task'])['status'],
+      'cancelled',
+      'REST 取消任务',
+    );
+    final Map<String, dynamic> restDelete = await rest(
+      'rest-delete',
+      'DELETE',
+      '/api/production/lines/pl_rest',
+    );
+    check.check(restDelete['json']['deleted'], true, 'DELETE 产线');
+    check.that(
+      !Directory(
+        <String>[temp.path, 'production_lines', 'team_a', 'pl_rest'].join(
+          Platform.pathSeparator,
+        ),
+      ).existsSync(),
+      '产线数据目录已删（项目资产不在数据根内）',
+    );
 
     final Map<String, dynamic> nextPayload = payloadOf(
       await call('queue-next', 'production.queue.next', <String, Object?>{

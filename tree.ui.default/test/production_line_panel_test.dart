@@ -7,7 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:tree_ui_default/io/api_service.dart';
 import 'package:tree_ui_default/ui/widgets/production_line_panel.dart';
 
-/// 假核心：只实现产线只读 REST（lines / tasks / runs）。
+/// 假核心：实现产线 REST（读 + 写），记录每次请求方便断言。
 class _FakeCore {
   _FakeCore._(this._http);
 
@@ -16,6 +16,23 @@ class _FakeCore {
   /// 非 0 时所有请求按该状态码回 `detail`（模拟插件未安装 / 停用）。
   int failStatus = 0;
   String failDetail = '插件 tree.production.line 未安装';
+
+  /// 任务列表里的状态（对齐 / 拍板用例用）。
+  String taskStatus = 'queued';
+
+  /// `METHOD /path` 调用流水（断言写接口有没有真的被调用）。
+  final List<String> calls = <String>[];
+
+  /// `METHOD /path` → 请求体（同路径多次调用以最后一次为准）。
+  final Map<String, Map<String, dynamic>> bodies =
+      <String, Map<String, dynamic>>{};
+
+  Map<String, dynamic> bodyOf(String method, String path) =>
+      bodies['$method $path'] ?? <String, dynamic>{};
+
+  final List<Map<String, dynamic>> _lines = <Map<String, dynamic>>[
+    <String, dynamic>{'id': 'pl_1', 'name': '标准开发流', 'status': 'working'},
+  ];
 
   static Future<_FakeCore> start() async {
     final HttpServer http = await HttpServer.bind(
@@ -31,8 +48,25 @@ class _FakeCore {
 
   Future<void> close() => _http.close(force: true);
 
+  bool called(String method, String path) => calls.contains('$method $path');
+
   Future<void> _handle(HttpRequest request) async {
+    final String method = request.method;
     final String path = request.uri.path;
+    final String raw = await utf8.decoder.bind(request).join();
+    calls.add('$method $path');
+    Map<String, dynamic> body = <String, dynamic>{};
+    if (raw.trim().isNotEmpty) {
+      final Object? decoded = jsonDecode(raw);
+      if (decoded is Map) {
+        body = decoded.map(
+          (Object? key, Object? value) =>
+              MapEntry<String, dynamic>('$key', value),
+        );
+      }
+    }
+    bodies['$method $path'] = body;
+    final Map<String, dynamic> lastBody = body;
     if (failStatus != 0) {
       request.response.statusCode = failStatus;
       request.response.headers.contentType = ContentType.json;
@@ -43,24 +77,50 @@ class _FakeCore {
       return;
     }
     Map<String, dynamic> payload = <String, dynamic>{'success': true};
-    if (path == '/api/production/lines') {
+    if (path == '/api/production/lines' && method == 'GET') {
       payload = <String, dynamic>{
-        'lines': <Map<String, dynamic>>[
+        'lines': List<Map<String, dynamic>>.of(_lines),
+        'count': _lines.length,
+      };
+    } else if (path == '/api/production/lines' && method == 'POST') {
+      final Map<String, dynamic> line = <String, dynamic>{
+        'id': 'pl_${_lines.length + 1}',
+        'name': lastBody['name'],
+        'status': 'idle',
+      };
+      _lines.add(line);
+      payload = <String, dynamic>{'line': line};
+    } else if (path.endsWith('/questions') && method == 'GET') {
+      payload = <String, dynamic>{
+        'open': <Map<String, dynamic>>[
           <String, dynamic>{
-            'id': 'pl_1',
-            'name': '标准开发流',
-            'status': 'working',
+            'qid': 'Q1',
+            'text': '选哪个实现',
+            'default': 'A',
+            'recommended': 'A',
+            'consequence': '影响后续拆分',
           },
         ],
-        'count': 1,
+        'limit': 3,
       };
-    } else if (path.endsWith('/tasks')) {
+    } else if (path.endsWith('/decision') && method == 'POST') {
+      payload = <String, dynamic>{'open': 0, 'ready': true};
+    } else if (path.endsWith('/dispatch') && method == 'POST') {
+      payload = <String, dynamic>{
+        'accepted': true,
+        'stage': lastBody['stage'] ?? 'auto',
+      };
+    } else if (path.endsWith('/cancel') && method == 'POST') {
+      payload = <String, dynamic>{
+        'task': <String, dynamic>{'id': 'T1', 'status': 'cancelled'},
+      };
+    } else if (path.endsWith('/tasks') && method == 'GET') {
       payload = <String, dynamic>{
         'tasks': <Map<String, dynamic>>[
           <String, dynamic>{
             'id': 'T1',
             'title': '底座',
-            'status': 'queued',
+            'status': taskStatus,
           },
         ],
         'count': 1,
@@ -101,17 +161,18 @@ void main() {
     ApiService.baseUrl = 'http://127.0.0.1:0';
   });
 
-  Widget panel({String teamId = 'team_a'}) => MaterialApp(
-    home: Scaffold(
-      body: SizedBox(
-        width: 280,
-        height: 720,
-        child: ProductionLinePanel(teamId: teamId),
-      ),
-    ),
-  );
+  Widget panel({String teamId = 'team_a', String agentId = 'agt_1'}) =>
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 280,
+            height: 720,
+            child: ProductionLinePanel(teamId: teamId, agentId: agentId),
+          ),
+        ),
+      );
 
-  Future<void> flyIO(WidgetTester tester, {int rounds = 5}) async {
+  Future<void> flyIO(WidgetTester tester, {int rounds = 6}) async {
     for (int i = 0; i < rounds; i++) {
       await tester.runAsync(
         () => Future<void>.delayed(const Duration(milliseconds: 25)),
@@ -120,19 +181,122 @@ void main() {
     }
   }
 
-  testWidgets('产线列表 → 展开看任务队列与运行台账', (WidgetTester tester) async {
+  /// 等到某个 Finder 出现（写操作后要等一次真实 HTTP 往返）。
+  Future<void> waitFor(
+    WidgetTester tester,
+    Finder finder, {
+    int rounds = 40,
+  }) async {
+    for (int i = 0; i < rounds; i++) {
+      if (finder.evaluate().isNotEmpty) return;
+      await flyIO(tester, rounds: 1);
+    }
+  }
+
+  Future<void> openLine(WidgetTester tester) async {
     await tester.pumpWidget(panel());
     await flyIO(tester);
+    await tester.tap(find.text('标准开发流'));
+    await flyIO(tester);
+  }
+
+  Future<void> openTaskMenu(WidgetTester tester, String action) async {
+    await tester.tap(find.byKey(const Key('production-task-menu-T1')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(action));
+    // 不能用 pumpAndSettle：写操作进行中会转圈（无限动画），永远 settle 不了。
+    await flyIO(tester, rounds: 3);
+  }
+
+  testWidgets('产线列表 → 展开看任务队列与运行台账', (WidgetTester tester) async {
+    await openLine(tester);
 
     expect(find.text('标准开发流'), findsOneWidget);
     expect(find.textContaining('pl_1'), findsOneWidget);
-
-    await tester.tap(find.text('标准开发流'));
-    await flyIO(tester);
     expect(find.text('任务队列（1）'), findsOneWidget);
     expect(find.textContaining('T1'), findsWidgets);
     expect(find.text('运行台账（1）'), findsOneWidget);
     expect(find.textContaining('packer'), findsOneWidget);
+  });
+
+  testWidgets('新建产线：POST 后列表刷新', (WidgetTester tester) async {
+    await tester.pumpWidget(panel());
+    await flyIO(tester);
+
+    await tester.tap(find.byKey(const Key('production-line-create')));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const Key('production-line-name')),
+      '新产线',
+    );
+    await tester.tap(find.text('创建'));
+    await tester.pumpAndSettle();
+    final Finder created = find.descendant(
+      of: find.byKey(const Key('production-line-list')),
+      matching: find.text('新产线'),
+    );
+    await waitFor(tester, created);
+
+    expect(core.called('POST', '/api/production/lines'), isTrue);
+    expect(core.bodyOf('POST', '/api/production/lines')['name'], '新产线');
+    expect(created, findsOneWidget);
+  });
+
+  testWidgets('取消任务：菜单 → 确认 → POST cancel', (WidgetTester tester) async {
+    await openLine(tester);
+    await openTaskMenu(tester, '取消任务');
+
+    expect(find.textContaining('取消任务 T1'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('production-confirm')));
+    await flyIO(tester);
+
+    expect(
+      core.called('POST', '/api/production/lines/pl_1/tasks/T1/cancel'),
+      isTrue,
+    );
+  });
+
+  testWidgets('派发：菜单 → POST dispatch（带 agent_id）', (WidgetTester tester) async {
+    await openLine(tester);
+    await openTaskMenu(tester, '打包');
+    await flyIO(tester);
+
+    final String call = core.calls.firstWhere(
+      (String item) => item.endsWith('/tasks/T1/dispatch'),
+      orElse: () => '',
+    );
+    expect(call, 'POST /api/production/lines/pl_1/tasks/T1/dispatch');
+    expect(
+      core.bodyOf(
+        'POST',
+        '/api/production/lines/pl_1/tasks/T1/dispatch',
+      )['stage'],
+      'pack',
+    );
+  });
+
+  testWidgets('拍板：全部按推荐 → POST decision', (WidgetTester tester) async {
+    core.taskStatus = 'aligning';
+    await openLine(tester);
+    await openTaskMenu(tester, '拍板');
+    await flyIO(tester);
+
+    expect(find.text('拍板 · T1'), findsOneWidget);
+    expect(find.textContaining('Q1'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('production-decide-recommended')));
+    await flyIO(tester);
+
+    expect(
+      core.called('POST', '/api/production/lines/pl_1/tasks/T1/decision'),
+      isTrue,
+    );
+    expect(
+      core.bodyOf(
+        'POST',
+        '/api/production/lines/pl_1/tasks/T1/decision',
+      )['all_recommended'],
+      isTrue,
+    );
   });
 
   testWidgets('插件未安装：可读说明 + 重试', (WidgetTester tester) async {
