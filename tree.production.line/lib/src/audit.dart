@@ -15,13 +15,35 @@ import 'models.dart';
 const List<String> kAuditMarkers = <String>['TODO', 'FIXME', 'XXX', 'HACK'];
 
 /// 扫描时跳过的目录（与准备阶段的 `grep` 同口径）。
+///
+/// 依赖 / 构建 / 缓存目录一律不进：它们动辄上万文件，会把一次只读整理拖成
+/// 30s 以上的 REST 委派超时（真机 504 的来源）。
 const Set<String> kAuditSkipDirs = <String>{
   '.git',
+  '.svn',
   '.dart_tool',
+  '.pub-cache',
   'build',
+  'dist',
+  'out',
+  'target',
+  'coverage',
   'node_modules',
+  'vendor',
+  '.venv',
+  'venv',
+  '__pycache__',
+  '.tox',
+  '.mypy_cache',
+  '.pytest_cache',
   '.idea',
   '.vscode',
+  '.cache',
+  '.parcel-cache',
+  '.next',
+  '.nuxt',
+  '.gradle',
+  'Pods',
   '.docnorm',
 };
 
@@ -52,8 +74,16 @@ const Set<String> kAuditExtensions = <String>{
   'ini',
 };
 
-/// 单次扫描的文件上限（到点停止并写一条说明，不静默）。
-const int kAuditMaxFiles = 2000;
+/// 单次整理会话的候选文件上限（不是单批上限；到点写说明，不静默）。
+///
+/// 依赖 / 构建目录已在 [kAuditSkipDirs] 排除，正常仓库远达不到这个数。
+const int kAuditMaxFiles = 20000;
+
+/// 每批扫描的默认文件数（UI 可改；一批一次请求，支持续扫）。
+const int kAuditDefaultBatch = 500;
+
+/// 每批扫描的文件数上限（防止一次请求被填成天文数字）。
+const int kAuditMaxBatch = 20000;
 
 /// 单文件读取上限（超过跳过并计入 skipped）。
 const int kAuditMaxFileBytes = 512 * 1024;

@@ -351,10 +351,13 @@ Future<Map<String, dynamic>> _dispatch(
   if (_matches(auditPattern, path) && method == 'GET') {
     final String lineId = _pathParam(auditPattern, path, 'lineId');
     // REST 是只读面：`write=false` 只出报告，不落 audit.md（落盘留给写接口）。
+    // `limit` = 每批文件数；不传则用插件默认（500）。
+    final int limit = intOf(_queryOf(query, 'limit'), 0);
     return _ok(
       await audit.handle('production.audit.run', <String, Object?>{
         'line_id': lineId,
         'write': false,
+        if (limit > 0) 'limit': limit,
       }, meta, scope),
     );
   }
@@ -592,6 +595,7 @@ int _statusOf(String code) {
     'execute_state',
     'prepare_state',
     'dispatch_in_flight',
+    'audit_in_progress',
   }.contains(code)) {
     return 409;
   }
