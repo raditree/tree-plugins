@@ -1158,12 +1158,16 @@ class ApiService {
   static Future<Map<String, dynamic>> createProductionLine({
     required String name,
     String workspaceDir = '',
+    Map<String, dynamic>? executor,
+    Map<String, dynamic>? roles,
     String teamId = '',
   }) => _postJson(
     '/api/production/lines',
     body: <String, dynamic>{
       'name': name,
       'workspace_dir': workspaceDir,
+      if (executor != null && executor.isNotEmpty) 'executor': executor,
+      if (roles != null && roles.isNotEmpty) 'roles': roles,
     },
     query: _teamQuery(teamId),
   );
@@ -1173,6 +1177,8 @@ class ApiService {
     String? name,
     String? status,
     String? workspaceDir,
+    Map<String, dynamic>? executor,
+    Map<String, dynamic>? roles,
     String teamId = '',
   }) => _patchJson(
     '/api/production/lines/${Uri.encodeComponent(lineId)}',
@@ -1180,8 +1186,27 @@ class ApiService {
       'name': ?name,
       'status': ?status,
       'workspace_dir': ?workspaceDir,
+      'executor': ?executor,
+      if (roles != null && roles.isNotEmpty) 'roles': roles,
     },
     query: _teamQuery(teamId),
+  );
+
+  /// 存量迁移：旧团队目录 → 全局作用域（§16.3，幂等）。
+  ///
+  /// `agent_id` / `team_id` 用于给缺 `executor` 的旧产线补执行身份；
+  /// `dryRun` 只预览不落盘。返回 `{migrated_count, conflicts, skipped, note}`。
+  static Future<Map<String, dynamic>> migrateProductionLines({
+    String agentId = '',
+    String teamId = '',
+    bool dryRun = false,
+  }) => _postJson(
+    '/api/production/migrate',
+    body: <String, dynamic>{
+      if (agentId.trim().isNotEmpty) 'agent_id': agentId.trim(),
+      if (teamId.trim().isNotEmpty) 'team_id': teamId.trim(),
+      if (dryRun) 'dry_run': true,
+    },
   );
 
   static Future<Map<String, dynamic>> deleteProductionLine(
@@ -1311,9 +1336,13 @@ class ApiService {
   static Future<Map<String, dynamic>> getProductionAudit(
     String lineId, {
     String teamId = '',
+    int? limit,
   }) => _getJson(
     '/api/production/lines/${Uri.encodeComponent(lineId)}/audit',
-    query: _teamQuery(teamId),
+    query: <String, String>{
+      ..._teamQuery(teamId),
+      if (limit != null && limit > 0) 'limit': '$limit',
+    },
   );
 
   static Map<String, String> _teamQuery(String teamId) => <String, String>{

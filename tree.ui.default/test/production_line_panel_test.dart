@@ -6,8 +6,9 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:tree_ui_default/io/api_service.dart';
 import 'package:tree_ui_default/ui/widgets/production_line_panel.dart';
+import 'package:tree_ui_default/ui/widgets/production_line_workbench.dart';
 
-/// 假核心：实现产线 REST（读 + 写），记录每次请求方便断言。
+/// 假核心：实现产线 REST（读 + 写）+ 配置页要用的 Agent / 模型池。
 class _FakeCore {
   _FakeCore._(this._http);
 
@@ -20,6 +21,10 @@ class _FakeCore {
   /// 任务列表里的状态（对齐 / 拍板用例用）。
   String taskStatus = 'queued';
 
+  /// 整理报告：是否已完成 + 最近一次请求的 limit（续扫用例）。
+  bool auditDone = true;
+  int auditLimit = -1;
+
   /// `METHOD /path` 调用流水（断言写接口有没有真的被调用）。
   final List<String> calls = <String>[];
 
@@ -31,7 +36,12 @@ class _FakeCore {
       bodies['$method $path'] ?? <String, dynamic>{};
 
   final List<Map<String, dynamic>> _lines = <Map<String, dynamic>>[
-    <String, dynamic>{'id': 'pl_1', 'name': '标准开发流', 'status': 'working'},
+    <String, dynamic>{
+      'id': 'pl_1',
+      'name': '标准开发流',
+      'status': 'working',
+      'workspace_dir': 'E:/work/demo',
+    },
   ];
 
   static Future<_FakeCore> start() async {
@@ -77,7 +87,37 @@ class _FakeCore {
       return;
     }
     Map<String, dynamic> payload = <String, dynamic>{'success': true};
-    if (path == '/api/production/lines' && method == 'GET') {
+    if (path == '/api/agents' && method == 'GET') {
+      payload = <String, dynamic>{
+        'agents': <Map<String, dynamic>>[
+          <String, dynamic>{'id': 'agt_1', 'name': '樾深'},
+          <String, dynamic>{
+            'id': 'agt_2',
+            'name': '成员',
+            'team_id': 'agt_1',
+          },
+        ],
+      };
+    } else if (path == '/api/models' && method == 'GET') {
+      payload = <String, dynamic>{
+        'models': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'model_id': 'lfm3',
+            'name': 'LFM3',
+            'kind': 'chat',
+          },
+        ],
+      };
+    } else if (path == '/api/production/migrate' && method == 'POST') {
+      payload = <String, dynamic>{
+        'scope': 'production',
+        'migrated_count': 1,
+        'migrated': <Object?>[],
+        'conflicts': <Object?>[],
+        'skipped': <Object?>[],
+        'note': '已迁移 1 条；冲突 0 条；跳过 0 条',
+      };
+    } else if (path == '/api/production/lines' && method == 'GET') {
       payload = <String, dynamic>{
         'lines': List<Map<String, dynamic>>.of(_lines),
         'count': _lines.length,
@@ -87,9 +127,22 @@ class _FakeCore {
         'id': 'pl_${_lines.length + 1}',
         'name': lastBody['name'],
         'status': 'idle',
+        'workspace_dir': lastBody['workspace_dir'] ?? '',
+        if (lastBody['executor'] is Map)
+          'executor': lastBody['executor'] as Map<String, dynamic>,
       };
       _lines.add(line);
       payload = <String, dynamic>{'line': line};
+    } else if (path.startsWith('/api/production/lines/') &&
+        method == 'PATCH') {
+      final String id = path.split('/')[4];
+      for (final Map<String, dynamic> line in _lines) {
+        if ('${line['id']}' == id) {
+          line.addAll(lastBody);
+          payload = <String, dynamic>{'line': line};
+          break;
+        }
+      }
     } else if (path.endsWith('/questions') && method == 'GET') {
       payload = <String, dynamic>{
         'open': <Map<String, dynamic>>[
@@ -121,6 +174,7 @@ class _FakeCore {
             'id': 'T1',
             'title': '底座',
             'status': taskStatus,
+            'write_scope': <String>['lib/'],
           },
         ],
         'count': 1,
@@ -137,11 +191,92 @@ class _FakeCore {
         ],
         'count': 1,
       };
+    } else if (path.endsWith('/audit')) {
+      auditLimit =
+          int.tryParse(request.uri.queryParameters['limit'] ?? '') ?? -1;
+      payload = <String, dynamic>{
+        'report': <String, dynamic>{
+          'scanned': 2,
+          'todos': <Object?>[],
+          'docs_missing': <Object?>[],
+          'duplicates': <Object?>[],
+          'large_files': <Object?>[],
+          'notes': <Object?>[],
+        },
+        'written': false,
+        'progress': <String, dynamic>{
+          'done': auditDone,
+          'index': 2,
+          'total': 5,
+          'percent': 40,
+          'batch': auditLimit > 0 ? auditLimit : 500,
+        },
+      };
     }
     request.response.statusCode = 200;
     request.response.headers.contentType = ContentType.json;
     request.response.write(jsonEncode(payload));
     await request.response.close();
+  }
+}
+
+/// 左栏列表 + 中栏工作台的组合（与 main_page 的接法一致）。
+class _Harness extends StatefulWidget {
+  const _Harness({required this.teamId, required this.agentId});
+
+  final String teamId;
+  final String agentId;
+
+  @override
+  State<_Harness> createState() => _HarnessState();
+}
+
+class _HarnessState extends State<_Harness> {
+  Map<String, dynamic>? _line;
+  int _refreshToken = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Row(
+        children: <Widget>[
+          SizedBox(
+            width: 300,
+            height: 720,
+            child: ProductionLinePanel(
+              teamId: widget.teamId,
+              agentId: widget.agentId,
+              selectedLineId: '${_line?['id'] ?? ''}',
+              refreshToken: _refreshToken,
+              onSelectLine: (Map<String, dynamic>? line) {
+                setState(() => _line = line);
+              },
+            ),
+          ),
+          const VerticalDivider(width: 1),
+          Expanded(
+            child: ProductionLineWorkbench(
+              key: ValueKey<String>('workbench-${_line?['id'] ?? ''}'),
+              line: _line,
+              teamId: widget.teamId,
+              agentId: widget.agentId,
+              onDeleted: () {
+                setState(() {
+                  _line = null;
+                  _refreshToken++;
+                });
+              },
+              onLineUpdated: (Map<String, dynamic> line) {
+                setState(() {
+                  _line = line;
+                  _refreshToken++;
+                });
+              },
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -161,15 +296,9 @@ void main() {
     ApiService.baseUrl = 'http://127.0.0.1:0';
   });
 
-  Widget panel({String teamId = 'team_a', String agentId = 'agt_1'}) =>
+  Widget harness({String teamId = 'team_a', String agentId = 'agt_1'}) =>
       MaterialApp(
-        home: Scaffold(
-          body: SizedBox(
-            width: 280,
-            height: 720,
-            child: ProductionLinePanel(teamId: teamId, agentId: agentId),
-          ),
-        ),
+        home: _Harness(teamId: teamId, agentId: agentId),
       );
 
   Future<void> flyIO(WidgetTester tester, {int rounds = 6}) async {
@@ -194,7 +323,7 @@ void main() {
   }
 
   Future<void> openLine(WidgetTester tester) async {
-    await tester.pumpWidget(panel());
+    await tester.pumpWidget(harness());
     await flyIO(tester);
     await tester.tap(find.text('标准开发流'));
     await flyIO(tester);
@@ -208,38 +337,148 @@ void main() {
     await flyIO(tester, rounds: 3);
   }
 
-  testWidgets('产线列表 → 展开看任务队列与运行台账', (WidgetTester tester) async {
+  testWidgets('左栏列表 → 选中后中栏显示任务队列与运行台账', (WidgetTester tester) async {
     await openLine(tester);
 
-    expect(find.text('标准开发流'), findsOneWidget);
-    expect(find.textContaining('pl_1'), findsOneWidget);
     expect(find.text('任务队列（1）'), findsOneWidget);
     expect(find.textContaining('T1'), findsWidgets);
     expect(find.text('运行台账（1）'), findsOneWidget);
     expect(find.textContaining('packer'), findsOneWidget);
+    expect(find.text('写域：lib/'), findsOneWidget);
   });
 
-  testWidgets('新建产线：POST 后列表刷新', (WidgetTester tester) async {
-    await tester.pumpWidget(panel());
+  testWidgets('未选团队也能列出全局产线', (WidgetTester tester) async {
+    await tester.pumpWidget(harness(teamId: ''));
+    await flyIO(tester);
+
+    expect(find.text('标准开发流'), findsOneWidget);
+    expect(find.textContaining('先在左侧选择一个 Agent'), findsNothing);
+  });
+
+  testWidgets('新建产线：配置页写 executor / 角色模型 / 执行工具', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(harness());
     await flyIO(tester);
 
     await tester.tap(find.byKey(const Key('production-line-create')));
-    await tester.pumpAndSettle();
+    await flyIO(tester);
     await tester.enterText(
       find.byKey(const Key('production-line-name')),
       '新产线',
     );
-    await tester.tap(find.text('创建'));
-    await tester.pumpAndSettle();
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('production-line-submit')));
+    await flyIO(tester, rounds: 10);
+
+    expect(core.called('POST', '/api/production/lines'), isTrue);
+    final Map<String, dynamic> body =
+        core.bodyOf('POST', '/api/production/lines');
+    expect(body['name'], '新产线');
+    expect(
+      (body['executor'] as Map<String, dynamic>)['agent_id'],
+      'agt_1',
+    );
+    final Map<String, dynamic> roles =
+        body['roles'] as Map<String, dynamic>;
+    expect(
+      (roles['executor'] as Map<String, dynamic>)['model_id'],
+      'lfm3',
+    );
+    expect(
+      (roles['executor'] as Map<String, dynamic>)['tools'],
+      contains('write'),
+    );
+    expect(
+      (roles['expert'] as Map<String, dynamic>)['enabled'],
+      isFalse,
+    );
+
     final Finder created = find.descendant(
       of: find.byKey(const Key('production-line-list')),
       matching: find.text('新产线'),
     );
     await waitFor(tester, created);
-
-    expect(core.called('POST', '/api/production/lines'), isTrue);
-    expect(core.bodyOf('POST', '/api/production/lines')['name'], '新产线');
     expect(created, findsOneWidget);
+  });
+
+  testWidgets('新建产线：预填现有工作空间，并可从目录选择', (WidgetTester tester) async {
+    await tester.pumpWidget(harness());
+    await flyIO(tester);
+
+    await tester.tap(find.byKey(const Key('production-line-create')));
+    await flyIO(tester);
+
+    expect(
+      find.descendant(
+        of: find.byType(AlertDialog),
+        matching: find.text('E:/work/demo'),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const Key('production-line-workspace-pick')),
+      findsOneWidget,
+    );
+    expect(find.byKey(const Key('production-line-executor')), findsOneWidget);
+    expect(find.byKey(const Key('production-line-submit')), findsOneWidget);
+  });
+
+  testWidgets('迁移旧产线：菜单 → 确认 → POST migrate', (WidgetTester tester) async {
+    await tester.pumpWidget(harness());
+    await flyIO(tester);
+
+    await tester.tap(find.byKey(const Key('production-line-list-menu')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('迁移旧产线'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('production-migrate-confirm')));
+    await flyIO(tester, rounds: 10);
+
+    expect(core.called('POST', '/api/production/migrate'), isTrue);
+    expect(
+      core.bodyOf('POST', '/api/production/migrate')['agent_id'],
+      'agt_1',
+    );
+  });
+
+  testWidgets('新建任务：写域可选目录 / 文件', (WidgetTester tester) async {
+    await openLine(tester);
+    await tester.tap(find.byKey(const Key('production-task-create-pl_1')));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('production-task-scope-dir')), findsOneWidget);
+    expect(find.byKey(const Key('production-task-scope-file')), findsOneWidget);
+    expect(find.byKey(const Key('production-task-scope')), findsOneWidget);
+  });
+
+  testWidgets('整理报告：分批进度 + 继续扫描按输入带上 limit', (
+    WidgetTester tester,
+  ) async {
+    core.auditDone = false;
+    await openLine(tester);
+
+    await tester.enterText(
+      find.byKey(const Key('production-audit-batch-pl_1')),
+      '2',
+    );
+    await tester.tap(find.text('整理报告'));
+    await flyIO(tester);
+
+    expect(find.textContaining('已处理 2 / 5'), findsOneWidget);
+    expect(
+      find.byKey(const Key('production-audit-continue-pl_1')),
+      findsOneWidget,
+    );
+    expect(core.auditLimit, 2);
+
+    core.auditDone = true;
+    await tester.tap(find.byKey(const Key('production-audit-continue-pl_1')));
+    await flyIO(tester);
+    expect(
+      find.byKey(const Key('production-audit-continue-pl_1')),
+      findsNothing,
+    );
   });
 
   testWidgets('取消任务：菜单 → 确认 → POST cancel', (WidgetTester tester) async {
@@ -275,10 +514,14 @@ void main() {
     );
   });
 
-  testWidgets('拍板：全部按推荐 → POST decision', (WidgetTester tester) async {
+  testWidgets('决策收件箱：拍板 → 全部按推荐 → POST decision', (
+    WidgetTester tester,
+  ) async {
     core.taskStatus = 'aligning';
     await openLine(tester);
-    await openTaskMenu(tester, '拍板');
+
+    expect(find.text('决策收件箱（1）'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('production-inbox-decide-T1')));
     await flyIO(tester);
 
     expect(find.text('拍板 · T1'), findsOneWidget);
@@ -299,9 +542,35 @@ void main() {
     );
   });
 
+  testWidgets('产线配置：菜单 → 保存 → PATCH（executor / roles）', (
+    WidgetTester tester,
+  ) async {
+    await openLine(tester);
+    await tester.tap(find.byKey(const Key('production-line-menu')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('产线配置'));
+    await flyIO(tester);
+
+    expect(find.byType(AlertDialog), findsOneWidget);
+    await tester.tap(find.byKey(const Key('production-line-submit')));
+    await flyIO(tester, rounds: 10);
+
+    expect(
+      core.called('PATCH', '/api/production/lines/pl_1'),
+      isTrue,
+    );
+    final Map<String, dynamic> body =
+        core.bodyOf('PATCH', '/api/production/lines/pl_1');
+    expect(
+      (body['executor'] as Map<String, dynamic>)['agent_id'],
+      '',
+    );
+    expect(body['roles'], isA<Map<String, dynamic>>());
+  });
+
   testWidgets('插件未安装：可读说明 + 重试', (WidgetTester tester) async {
     core.failStatus = 503;
-    await tester.pumpWidget(panel());
+    await tester.pumpWidget(harness());
     await flyIO(tester);
 
     expect(find.textContaining('未安装 tree.production.line 插件'), findsOneWidget);
@@ -312,11 +581,5 @@ void main() {
     await flyIO(tester);
     expect(find.text('标准开发流'), findsOneWidget);
     expect(find.textContaining('未安装 tree.production.line 插件'), findsNothing);
-  });
-
-  testWidgets('未选团队：提示先选 Agent', (WidgetTester tester) async {
-    await tester.pumpWidget(panel(teamId: ''));
-    await tester.pump();
-    expect(find.textContaining('先在左侧选择一个 Agent'), findsOneWidget);
   });
 }

@@ -29,6 +29,7 @@ import '../widgets/model_info_panel.dart';
 import '../widgets/onboarding_guide.dart';
 import '../widgets/plugin_panel.dart';
 import '../widgets/production_line_panel.dart';
+import '../widgets/production_line_workbench.dart';
 import '../widgets/question_panel.dart';
 import '../widgets/right_panel_host.dart';
 import '../widgets/teammates_window_page.dart';
@@ -93,6 +94,16 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 
   /// 内置左栏面板数量（Agent 列表 / 插件管理 / 下载 / 生产线）。
   static const int _builtinLeftPanelCount = 4;
+
+  /// 当前选中的产线（左栏列表选中 ⇒ 中栏切到产线工作台，§16.1）。
+  Map<String, dynamic>? _selectedProductionLine;
+
+  /// 产线列表刷新令牌：工作台改 / 删产线后递增，左栏据此重拉清单。
+  int _productionRefreshToken = 0;
+
+  /// 左侧是否停在「生产线」页（决定中栏显示工作台还是对话）。
+  bool get _productionActive => _leftPanel == 3;
+
 
   // 当前选中的 Agent（未选择时为 null）
   Agent? _selectedAgent;
@@ -1092,25 +1103,58 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       // 展开时它是唯一的弹性列，宽度由父级给（不是固定像素）
       fill: !_centerCollapsed,
       collapsedBar: _buildCollapsedCenterBar(),
-      expandedBar: MessagePanel(
-        selectedAgent: _selectedAgent,
-        refreshTrigger: _refreshTrigger,
-        onSessionChanged: (String id) {
-          setState(() {
-            _currentSessionId = id;
-          });
-        },
-        navigateMessageId: _navigateMessageId,
-        navigateSessionId: _currentSessionId,
-        navigateTrigger: _navigateTrigger,
-        // 成员配置变更后重拉 agent 列表：刷新待处理成员红点/角标
-        onAgentsChanged: _loadAgents,
-        // 折叠中栏：把宽度让给侧栏（标题栏最右边那颗 chevron）
-        onCollapse: () {
-          setState(() {
-            _centerCollapsed = true;
-          });
-        },
+      // 对话与产线工作台都常驻挂载：切页不丢会话滚动位置 / 输入草稿，
+      // 也不打断工作台里的任务明细缓存。
+      expandedBar: IndexedStack(
+        index: _productionActive ? 1 : 0,
+        children: <Widget>[
+          MessagePanel(
+            selectedAgent: _selectedAgent,
+            refreshTrigger: _refreshTrigger,
+            onSessionChanged: (String id) {
+              setState(() {
+                _currentSessionId = id;
+              });
+            },
+            navigateMessageId: _navigateMessageId,
+            navigateSessionId: _currentSessionId,
+            navigateTrigger: _navigateTrigger,
+            // 成员配置变更后重拉 agent 列表：刷新待处理成员红点/角标
+            onAgentsChanged: _loadAgents,
+            // 折叠中栏：把宽度让给侧栏（标题栏最右边那颗 chevron）
+            onCollapse: () {
+              setState(() {
+                _centerCollapsed = true;
+              });
+            },
+          ),
+          ProductionLineWorkbench(
+            key: ValueKey<String>(
+              'production-workbench-${_selectedProductionLine?['id'] ?? ''}',
+            ),
+            line: _selectedProductionLine,
+            teamId: _selectedAgent?.teamScopeId ?? '',
+            agentId: _selectedAgent?.id ?? '',
+            visible: _productionActive && !_centerCollapsed,
+            onCollapse: () {
+              setState(() {
+                _centerCollapsed = true;
+              });
+            },
+            onDeleted: () {
+              setState(() {
+                _selectedProductionLine = null;
+                _productionRefreshToken++;
+              });
+            },
+            onLineUpdated: (Map<String, dynamic> line) {
+              setState(() {
+                _selectedProductionLine = line;
+                _productionRefreshToken++;
+              });
+            },
+          ),
+        ],
       ),
     );
   }
@@ -1183,7 +1227,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 quarterTurns: 1,
                 child: Center(
                   child: Text(
-                    '消息',
+                    _productionActive ? '产线' : '消息',
                     style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
                   ),
                 ),
@@ -1679,11 +1723,20 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             });
           },
         ),
-        // 「生产线」面板：列表 / 队列 / 台账 + 写入口（新建、派发、拍板、取消）。
+        // 「生产线」面板：只列产线；选中后中栏切到产线工作台（§16.1）。
         ProductionLinePanel(
           teamId: _selectedAgent?.teamScopeId ?? '',
           agentId: _selectedAgent?.id ?? '',
           visible: _leftPanel == 3 && !_leftCollapsed,
+          selectedLineId: '${_selectedProductionLine?['id'] ?? ''}',
+          refreshToken: _productionRefreshToken,
+          onSelectLine: (Map<String, dynamic>? line) {
+            setState(() {
+              _selectedProductionLine = line;
+              // 选中产线要看到工作台：中栏若收着就展开。
+              if (line != null) _centerCollapsed = false;
+            });
+          },
           onCollapse: () {
             setState(() {
               _leftCollapsed = true;
