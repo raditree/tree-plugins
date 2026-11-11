@@ -79,7 +79,6 @@ class PreparationService {
     );
     final ProductionStore store = ProductionStore(
       dataRoot: target.dataRoot,
-      teamId: target.teamId,
       clock: _clock,
     );
     switch (command) {

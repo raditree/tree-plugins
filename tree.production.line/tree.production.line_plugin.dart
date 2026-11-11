@@ -2,7 +2,8 @@
 // P4 打包 + 执行；P5 专家工具；P6 项目整理）。
 //
 // 定位（docs/pluginization/production-line-recon.md §7/§8/§9/§10/§11）：
-// - headless 插件，granularity=team；数据只落 `<data_root>/production_lines/<team_id>/`；
+// - headless 插件，granularity=team；产线与 Agent **并列**，数据落全局
+//   `<data_root>/production_lines/production/`（§16）；执行身份写 `line.yaml.executor`；
 // - `task.yaml` 是唯一真值，`state.json` 只是可由它重建的队列索引；
 // - 状态机、队列排序、依赖判据、in-flight 崩溃恢复都在领域库，入口只做协议面；
 // - P3 准备阶段：`production.prepare.*` 走需求模板 → 侦查 → 追问 → 范围/拆任务；
@@ -27,7 +28,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.production.line';
 const String kDisplayName = 'Tree 标准开发流生产线';
-const String kVersion = '0.7.0';
+const String kVersion = '0.8.0';
 
 const String kStationName = 'production';
 
@@ -40,12 +41,15 @@ const String kToolCollectStation = 'plugin.tree.agent.collect.tools';
 const String kQuestionLimitKey = 'questions_max_per_round';
 
 const String kStationReadme =
-    '生产线：P1 production.line.create/list/get、production.task.create/list/get/'
+    '生产线：P1 production.line.create/list/get/migrate、production.task.create/list/get/'
     'transition、production.queue.next/rebuild/recover、production.run.list。'
-    '数据落 `<data_root>/production_lines/<team_id>/<line_id>/`：line.yaml / '
+    '产线与 Agent 并列，数据落全局 `<data_root>/production_lines/production/<line_id>/`：'
+    'line.yaml（含 `executor: {agent_id, team_id}`，打包 / 执行 / 专家都用它）/ '
     'tasks/<task_id>/task.yaml / tasks/<task_id>/pack.json / runs/<run_id>.json / '
     'runs/messages.jsonl / state.json / inbox.jsonl / prepare.json；task.yaml 为唯一真值，'
-    'state.json 可由它重建。状态机：draft→recon→aligning→scoped→queued→packing→'
+    'state.json 可由它重建。production.line.migrate 把旧 `<team_id>/<line_id>/` 搬进全局'
+    '作用域（幂等、冲突只报不覆盖、搬迁前留 .snapshots 快照、旧产线补 executor）。'
+    '状态机：draft→recon→aligning→scoped→queued→packing→'
     'packed→running→gating→done；aligning↔awaiting_user；gating→packed（重试）；'
     'queued/packing/packed/running/gating→blocked；blocked→awaiting_user|queued；'
     'cancelled 可从任意非终态进入。崩溃恢复：in-flight → queued 并追加一条 '
@@ -70,7 +74,7 @@ const String kStationReadme =
     '打包/执行累计 usage，预算到点软停（保留当前产出、标 budget_exceeded 转 blocked）。'
     '追问上限读 settings，缺省回退 line.yaml.limits 与 3（夹到 1–10）。'
     'REST（§10.2）：GET lines/line/tasks/task/runs/artifacts/audit/questions 与 '
-    'POST lines/tasks/dispatch/decision/cancel、PATCH line/task、DELETE line；'
+    'POST lines/tasks/dispatch/decision/cancel/migrate、PATCH line/task、DELETE line；'
     'dispatch 默认后台跑（核心委派 30s 截止，模型跑不完），受理即回 accepted，'
     '进度看任务状态与运行台账，失败写 task.yaml.last_error。';
 
@@ -669,7 +673,7 @@ Future<int> selfTest() async {
   final String lineRoot = <String>[
     temp.path,
     'production_lines',
-    'team_a',
+    'production',
     'pl_demo',
   ].join(Platform.pathSeparator);
 
@@ -684,7 +688,7 @@ Future<int> selfTest() async {
       '启动后注册执行站',
     );
 
-    // 数据根 / 团队 fail-closed。
+    // 数据根 fail-closed；team 只是调用方身份（§16 数据落全局作用域）。
     final Map<String, dynamic> noData = await call(
       'no-data',
       'production.line.list',
@@ -698,15 +702,31 @@ Future<int> selfTest() async {
       <String, Object?>{},
       team: null,
     );
-    check.check(noTeam['code'], 'team_required', '缺 team_id ⇒ team_required');
+    check.check(
+      payloadOf(noTeam)['count'],
+      0,
+      '缺 team_id 仍可读（产线数据全局存放）',
+    );
 
     // 产线：建 / 列 / 查 + 落盘。
     final Map<String, dynamic> created = await call(
       'line-create',
       'production.line.create',
-      <String, Object?>{'id': 'pl_demo', 'name': '标准开发流'},
+      <String, Object?>{
+        'id': 'pl_demo',
+        'name': '标准开发流',
+        'executor': <String, Object?>{
+          'agent_id': 'agt_demo',
+          'team_id': 'team_a',
+        },
+      },
     );
     check.check(asMap(payloadOf(created)['line'])['id'], 'pl_demo', '建产线');
+    check.check(
+      asMap(asMap(payloadOf(created)['line'])['executor'])['agent_id'],
+      'agt_demo',
+      'line.yaml 带执行身份',
+    );
     final Map<String, dynamic> listed = await call(
       'line-list',
       'production.line.list',
@@ -927,13 +947,13 @@ Future<int> selfTest() async {
       '/api/production/lines/pl_rest/tasks/RT1/decision',
     );
     check.check(restDecisionEmpty['status'], 400, '决策缺回答 400');
-    final Map<String, dynamic> restNoAgent = await rest(
-      'rest-dispatch-no-agent',
+    final Map<String, dynamic> restBadStage = await rest(
+      'rest-dispatch-bad-stage',
       'POST',
       '/api/production/lines/pl_rest/tasks/RT1/dispatch',
-      body: <String, Object?>{'stage': 'pack'},
+      body: <String, Object?>{'stage': 'nope'},
     );
-    check.check(restNoAgent['status'], 400, '派发缺发起者身份 400');
+    check.check(restBadStage['status'], 400, '非法 stage 400');
     final Map<String, dynamic> restNotDispatchable = await rest(
       'rest-dispatch-bad',
       'POST',
@@ -961,7 +981,7 @@ Future<int> selfTest() async {
     check.check(restDelete['json']['deleted'], true, 'DELETE 产线');
     check.that(
       !Directory(
-        <String>[temp.path, 'production_lines', 'team_a', 'pl_rest'].join(
+        <String>[temp.path, 'production_lines', 'production', 'pl_rest'].join(
           Platform.pathSeparator,
         ),
       ).existsSync(),
@@ -1422,7 +1442,7 @@ Future<int> selfTest() async {
         <String>[
           temp.path,
           'production_lines',
-          'team_a',
+          'production',
           'pl_prep',
           'tasks',
           'T1',
@@ -1510,7 +1530,11 @@ Future<int> selfTest() async {
       'production.task.pack',
       <String, Object?>{'line_id': 'pl_prep', 'task_id': 'T3'},
     );
-    check.check(missingAgent['code'], 'agent_required', '缺发起者身份 fail-closed');
+    check.check(
+      missingAgent['code'],
+      'executor_required',
+      '产线无执行身份且无调用方 agent ⇒ fail-closed（不猜）',
+    );
 
     // ── P5 专家工具：收集站贡献 / 默认关闭 / 次数上限 / 只读 / 台账 / 工具调用 ──
     core.ask('p5-collect', M.stationRequest, <String, dynamic>{

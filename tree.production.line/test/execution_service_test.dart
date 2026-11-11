@@ -8,6 +8,7 @@ import 'package:tree_production_line/tree_production_line.dart';
 /// 假员工：按角色返回报告（打包 JSON / 执行文本 / 专家四段 JSON）。
 class _Workers {
   final List<WorkerCall> calls = <WorkerCall>[];
+  final List<Map<String, Object?>> scopes = <Map<String, Object?>>[];
   String packReport = '';
   String runReport = '已改 lib/a.dart';
   String expertReport = '';
@@ -22,6 +23,7 @@ class _Workers {
     Map<String, Object?> scope,
   ) async {
     calls.add(call);
+    scopes.add(scope);
     if (call.role == 'packer') {
       return <String, Object?>{
         'worker_id': 'sub_packer',
@@ -94,7 +96,7 @@ void main() {
     temp = Directory.systemTemp.createTempSync('tree_production_p4_');
     workspace = p.join(temp.path, 'ws');
     Directory(workspace).createSync(recursive: true);
-    store = ProductionStore(dataRoot: temp.path, teamId: 'team_a');
+    store = ProductionStore(dataRoot: temp.path);
     workers = _Workers()
       ..packReport = jsonEncode(<String, Object?>{
         'files': <Object?>[
@@ -170,7 +172,7 @@ void main() {
         p.join(
           temp.path,
           'production_lines',
-          'team_a',
+          'production',
           'pl_t',
           'tasks',
           'T1',
@@ -207,6 +209,51 @@ void main() {
       'executor',
     });
     expect(runs.firstWhere((Map<String, Object?> r) => r['role'] == 'executor')['status'], 'ok');
+  });
+
+  test('身份取自 line.yaml.executor，与调用方 agent 无关（§16）', () async {
+    store.updateLine('pl_t', <String, Object?>{
+      'executor': <String, Object?>{
+        'agent_id': 'agt_line',
+        'team_id': 'team_line',
+      },
+    });
+    queuedTask('T1');
+    final Map<String, Object?> packed = await call(
+      'production.task.pack',
+      <String, Object?>{'line_id': 'pl_t', 'task_id': 'T1'},
+      agent: 'agt_caller',
+    );
+    expect(packed['status'], 'packed');
+    expect(workers.scopes.single['agent_id'], 'agt_line');
+    expect(workers.scopes.single['team_id'], 'team_line');
+    expect(workers.scopes.single['session_id'], 'pl_pl_t_T1');
+
+    await call('production.task.run', <String, Object?>{
+      'line_id': 'pl_t',
+      'task_id': 'T1',
+    });
+    expect(workers.scopes.last['agent_id'], 'agt_line');
+  });
+
+  test('无 executor 且无调用方身份 ⇒ executor_required（不猜 Agent）', () async {
+    queuedTask('T1');
+    await expectLater(
+      () => service.handle(
+        'production.task.pack',
+        <String, Object?>{'line_id': 'pl_t', 'task_id': 'T1'},
+        <String, Object?>{'data_dir': temp.path},
+        const <String, Object?>{},
+      ),
+      throwsA(
+        isA<ProductionFailure>().having(
+          (ProductionFailure error) => error.code,
+          'code',
+          'executor_required',
+        ),
+      ),
+    );
+    expect(workers.calls, isEmpty);
   });
 
   test('写域越界：不进 done，任务 blocked 且台账记 violations', () async {
@@ -266,7 +313,7 @@ void main() {
     expect((empty['task'] as Map<String, Object?>)['status'], 'blocked');
     expect(
       File(
-        p.join(temp.path, 'production_lines', 'team_a', 'pl_t', 'tasks', 'T1', 'pack.json'),
+        p.join(temp.path, 'production_lines', 'production', 'pl_t', 'tasks', 'T1', 'pack.json'),
       ).existsSync(),
       isFalse,
     );
@@ -317,7 +364,7 @@ void main() {
     expect(store.getTask('pl_t', 'T1').status, TaskStatus.packed);
   });
 
-  test('状态与身份 fail-closed：缺 agent / 未打包先执行', () async {
+  test('状态与执行身份 fail-closed：无 executor / 未打包先执行', () async {
     queuedTask('T1');
     await expectLater(
       call(
@@ -327,9 +374,9 @@ void main() {
       ),
       throwsA(
         isA<ProductionFailure>().having(
-          (ProductionFailure e) => e.code,
+          (ProductionFailure error) => error.code,
           'code',
-          'agent_required',
+          'executor_required',
         ),
       ),
     );
@@ -602,7 +649,7 @@ void main() {
         p.join(
           temp.path,
           'production_lines',
-          'team_a',
+          'production',
           'pl_b',
           'tasks',
           'B1',
@@ -679,7 +726,7 @@ void main() {
         p.join(
           temp.path,
           'production_lines',
-          'team_a',
+          'production',
           'pl_pre',
           'tasks',
           'P1',

@@ -27,10 +27,7 @@ void main() {
   });
 
   ProductionStore storeWith({String workspaceDir = ''}) {
-    final ProductionStore store = ProductionStore(
-      dataRoot: temp.path,
-      teamId: 'team_a',
-    );
+    final ProductionStore store = ProductionStore(dataRoot: temp.path);
     store.createLine(<String, Object?>{
       'id': 'pl_1',
       'name': '标准开发流',
@@ -208,10 +205,40 @@ void main() {
     expect(deleted['status'], 200);
     expect(deleted['json']['deleted'], isTrue);
     expect(
-      Directory(p.join(temp.path, 'production_lines', 'team_a', 'pl_new'))
+      Directory(p.join(temp.path, 'production_lines', 'production', 'pl_new'))
           .existsSync(),
       isFalse,
     );
+  });
+
+  test('迁移路由：旧团队目录搬进全局作用域并补执行身份', () async {
+    final Directory legacy = Directory(
+      p.join(temp.path, 'production_lines', 'team_a', 'pl_old'),
+    )..createSync(recursive: true);
+    File(p.join(legacy.path, 'line.yaml')).writeAsStringSync(
+      encodeYaml(<String, Object?>{
+        'id': 'pl_old',
+        'name': '旧产线',
+        'status': 'idle',
+        'created_at': '2026-11-01T00:00:00',
+        'updated_at': '2026-11-01T00:00:00',
+      }),
+    );
+
+    final Map<String, dynamic> migrated = await call(
+      'POST',
+      migratePattern,
+      body: <String, Object?>{'agent_id': 'agt_exec', 'team_id': 'team_exec'},
+    );
+    expect(migrated['status'], 200);
+    expect(migrated['json']['migrated_count'], 1);
+
+    final Map<String, dynamic> line = await call(
+      'GET',
+      '/api/production/lines/pl_old',
+    );
+    expect(line['json']['line']['executor']['agent_id'], 'agt_exec');
+    expect(line['json']['line']['executor']['team_id'], 'team_exec');
   });
 
   test('删产线：有在途任务 ⇒ 409 line_busy', () async {
@@ -330,27 +357,19 @@ void main() {
     expect(rest['json']['ready'], isTrue);
   });
 
-  test('派发：缺身份 400；auto 按状态选 pack / run；未知任务 404', () async {
+  test('派发：不依赖调用方身份；auto 按状态选 pack / run；未知任务 404', () async {
     final ProductionStore store = storeWith();
     final _FakeExecution execution = _FakeExecution();
 
-    final Map<String, dynamic> noAgent = await call(
+    // §16：派发身份取自 line.yaml.executor，REST 层不再要求 query.agent_id。
+    final Map<String, dynamic> withoutAgent = await call(
       'POST',
       '/api/production/lines/pl_1/tasks/T1/dispatch',
-      execution: execution,
-    );
-    expect(noAgent['status'], 400);
-    expect(noAgent['json']['code'], 'agent_required');
-
-    final Map<String, dynamic> packed = await call(
-      'POST',
-      '/api/production/lines/pl_1/tasks/T1/dispatch',
-      agent: 'agt',
       execution: execution,
       awaitDispatch: true,
     );
-    expect(packed['status'], 200);
-    expect(packed['json']['stage'], 'pack');
+    expect(withoutAgent['status'], 200);
+    expect(withoutAgent['json']['stage'], 'pack');
     expect(execution.calledCommands, <String>['production.task.pack']);
 
     store.transition('pl_1', 'T1', to: 'packing');
@@ -384,15 +403,17 @@ void main() {
     expect(wrongState['json']['code'], 'execute_state');
   });
 
-  test('fail-closed 与未知路由：team / data_dir / 未知产线 / 未知方法', () async {
+  test('全局作用域：缺 team 仍可读写；缺 data_dir / 未知路由照旧 fail-closed', () async {
     storeWith();
 
+    // §16：产线数据全局存放，team_id 只是调用方身份（可空）。
     final Map<String, dynamic> noTeam = await call(
       'GET',
       linesPattern,
       team: '',
     );
-    expect(noTeam['status'], 400);
+    expect(noTeam['status'], 200);
+    expect((noTeam['json']['lines'] as List<dynamic>).length, 1);
 
     final Map<String, dynamic> noData = await call(
       'GET',

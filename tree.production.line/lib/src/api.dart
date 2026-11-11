@@ -4,7 +4,8 @@
 /// 台账 / 产物 / 报告 / 待答问题；POST 建产线 / 建任务 / 派发 / 决策 / 取消；
 /// PATCH 改产线配置 / 改任务状态；DELETE 删产线（只删插件数据，项目资产保留）。
 ///
-/// 归属与数据根都取自委派信封（`data_dir` / `team_id`），缺一 fail-closed；
+/// 归属与数据根都取自委派信封（`data_dir`）；`team_id` / `agent_id` 只作调用方
+/// 身份透传（§16 起数据落全局作用域，不再按团队分目录）。
 /// 不 import 核心包，也不碰 `_kit`（领域库纪律）。
 library;
 
@@ -32,6 +33,9 @@ const String runsPattern = '/api/production/lines/{lineId}/runs';
 const String artifactsPattern = '/api/production/lines/{lineId}/artifacts';
 const String auditPattern = '/api/production/lines/{lineId}/audit';
 
+/// 存量迁移（§16）：把旧团队目录里的产线搬进全局作用域。
+const String migratePattern = '/api/production/migrate';
+
 /// 决策卡片的数据源（§10.2 表的补充读路由：没有它 UI 不知道要回答哪些 Q）。
 const String questionsPattern =
     '/api/production/lines/{lineId}/tasks/{taskId}/questions';
@@ -46,6 +50,7 @@ const String cancelPattern =
 const List<Map<String, String>> kDeclaredRoutes = <Map<String, String>>[
   <String, String>{'method': 'GET', 'pattern': linesPattern},
   <String, String>{'method': 'POST', 'pattern': linesPattern},
+  <String, String>{'method': 'POST', 'pattern': migratePattern},
   <String, String>{'method': 'GET', 'pattern': linePattern},
   <String, String>{'method': 'PATCH', 'pattern': linePattern},
   <String, String>{'method': 'DELETE', 'pattern': linePattern},
@@ -121,20 +126,14 @@ Future<Map<String, dynamic>> _dispatch(
   final String teamId = textOf(envelope['team_id']).isNotEmpty
       ? textOf(envelope['team_id'])
       : textOf(plainMap(envelope['scope'])['team_id']);
-  if (teamId.isEmpty) {
-    return _error(400, '缺少 team_id（核心未在委派信封里带团队归属）', code: 'team_required');
-  }
 
   final Map<String, Object?> meta = <String, Object?>{'data_dir': dataDir};
   final Map<String, Object?> scope = <String, Object?>{
-    'team_id': teamId,
+    if (teamId.isNotEmpty) 'team_id': teamId,
     if (textOf(envelope['agent_id']).isNotEmpty)
       'agent_id': textOf(envelope['agent_id']),
   };
-  final ProductionStore store = ProductionStore(
-    dataRoot: dataDir,
-    teamId: teamId,
-  );
+  final ProductionStore store = ProductionStore(dataRoot: dataDir);
 
   if (_matches(linesPattern, path)) {
     if (method == 'GET') {
@@ -151,6 +150,22 @@ Future<Map<String, dynamic>> _dispatch(
         service.handle('production.line.create', input, meta, scope),
       );
     }
+  }
+  if (_matches(migratePattern, path) && method == 'POST') {
+    // 旧团队目录 → 全局作用域（§16）。幂等；冲突只报不覆盖。
+    final String agentId = textOf(body['agent_id']).isNotEmpty
+        ? textOf(body['agent_id'])
+        : _queryOf(query, 'agent_id');
+    final String executorTeam = textOf(body['team_id']).isNotEmpty
+        ? textOf(body['team_id'])
+        : _queryOf(query, 'team_id');
+    return _ok(
+      store.migrateLegacy(
+        agentId: agentId,
+        teamId: executorTeam,
+        dryRun: body['dry_run'] == true,
+      ),
+    );
   }
   if (_matches(linePattern, path)) {
     final String lineId = _pathParam(linePattern, path, 'lineId');
@@ -367,12 +382,6 @@ Future<Map<String, dynamic>> _dispatchTask(
       503,
       '执行阶段需要 agent.worker.run / local.exec.command 通道，当前未接线',
       code: 'execution_unavailable',
-    );
-  }
-  if (textOf(scope['agent_id']).isEmpty) {
-    throw ProductionFailure(
-      '派发需要发起者身份（query.agent_id）：员工按它继承工作空间与团队',
-      code: 'agent_required',
     );
   }
   final TaskRecord task = store.getTask(lineId, taskId);

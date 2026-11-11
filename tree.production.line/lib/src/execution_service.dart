@@ -3,6 +3,8 @@
 /// 与 P1 / P3 门面共用同一套 [ProductionStore]（`task.yaml` 仍是唯一真值）：
 /// - 打包走 `agent.worker.run`（role=packer），产物落 `tasks/<id>/pack.json`；
 /// - 执行走 `agent.worker.run`（role=executor），改完先判**写域**再跑**门控**；
+/// - 员工身份取自 `line.yaml.executor`（§16），不依赖调用方 agent；旧产线缺
+///   executor 时回退调用方一个版本；
 /// - 门控失败按 `limits.retries` 回 `packed`，超限转 `blocked`；
 /// - `done` 只能由门控通过触发（模型自报完成一律不算）。
 library;
@@ -60,6 +62,22 @@ class WorkerCall {
   };
 }
 
+/// 产线的执行身份（`line.yaml.executor`，§16）。
+///
+/// 打包 / 执行 / 专家都按这条身份召员工；[legacyFallback] 表示旧产线还没迁移，
+/// 暂时沿用了调用方的 agent（下一个版本后不再回退）。
+class ExecutorBinding {
+  const ExecutorBinding({
+    required this.agentId,
+    this.teamId = '',
+    this.legacyFallback = false,
+  });
+
+  final String agentId;
+  final String teamId;
+  final bool legacyFallback;
+}
+
 typedef WorkerRunner =
     Future<Map<String, Object?>> Function(
       WorkerCall call,
@@ -115,7 +133,6 @@ class ProductionExecutionService {
     );
     final ProductionStore store = ProductionStore(
       dataRoot: target.dataRoot,
-      teamId: target.teamId,
       clock: _clock,
     );
     switch (command) {
@@ -171,7 +188,7 @@ class ProductionExecutionService {
         code: 'worker_unavailable',
       );
     }
-    final String agentId = _agentOf(scope);
+    final ExecutorBinding binding = _bindingOf(line, scope);
     final String modelId = _modelOf(line, 'packer');
     if (modelId.isEmpty) {
       throw ProductionFailure(
@@ -219,7 +236,7 @@ class ProductionExecutionService {
           tools: _toolsOf(line, 'packer'),
           modelId: modelId,
         ),
-        _workerScope(scope, agentId, lineId, taskId),
+        _workerScope(binding, lineId, taskId),
       );
     } catch (error) {
       result = <String, Object?>{
@@ -405,7 +422,7 @@ class ProductionExecutionService {
         code: 'command_unavailable',
       );
     }
-    final String agentId = _agentOf(scope);
+    final ExecutorBinding binding = _bindingOf(line, scope);
     final String workspace = store.workspaceDirOf(lineId);
     final String modelId = _modelOf(line, 'executor');
     if (modelId.isEmpty) {
@@ -428,8 +445,7 @@ class ProductionExecutionService {
       );
     }
     final Map<String, Object?> workerScope = _workerScope(
-      scope,
-      agentId,
+      binding,
       lineId,
       taskId,
     );
@@ -764,11 +780,10 @@ class ProductionExecutionService {
         code: 'worker_unavailable',
       );
     }
-    final String agentId = _agentOf(scope);
+    final ExecutorBinding binding = _bindingOf(line, scope);
     final String configuredModel = textOf(expertRole['model_id']);
     final Map<String, Object?> workerScope = _workerScope(
-      scope,
-      agentId,
+      binding,
       lineId,
       taskId,
     );
@@ -1027,26 +1042,45 @@ class ProductionExecutionService {
 
   // ── 内部工具 ─────────────────────────────────────────────────────
 
-  String _agentOf(Map<String, Object?> scope) {
-    final String agentId = textOf(scope['agent_id']);
-    if (agentId.isEmpty) {
-      throw ProductionFailure(
-        '执行阶段需要发起者身份（scope.agent_id）：员工按它继承工作空间与团队',
-        code: 'agent_required',
+  /// 执行身份（§16）：**优先** `line.yaml.executor`，与「谁发起派发」无关。
+  ///
+  /// 老产线缺 `executor` 时回退调用方 `scope.agent_id` 一个版本（兼容窗口）；
+  /// 两者都没有就 fail-closed，并把补齐方法写进错误里。
+  ExecutorBinding _bindingOf(
+    LineRecord line,
+    Map<String, Object?> scope,
+  ) {
+    final String configured = line.executorAgentId;
+    if (configured.isNotEmpty) {
+      return ExecutorBinding(
+        agentId: configured,
+        teamId: line.executorTeamId,
       );
     }
-    return agentId;
+    final String fallback = textOf(scope['agent_id']);
+    if (fallback.isEmpty) {
+      throw ProductionFailure(
+        '产线未配置执行 Agent（line.yaml.executor.agent_id）：'
+        '请在产线配置页选一个执行 Agent，或带 agent_id 迁移旧产线',
+        code: 'executor_required',
+      );
+    }
+    return ExecutorBinding(
+      agentId: fallback,
+      teamId: textOf(scope['team_id']),
+      legacyFallback: true,
+    );
   }
 
+  /// 员工调用的 scope：身份取自产线的执行 Agent（团队随之确定），
+  /// 会话按任务分栏复用同一条线程。
   Map<String, Object?> _workerScope(
-    Map<String, Object?> scope,
-    String agentId,
+    ExecutorBinding binding,
     String lineId,
     String taskId,
   ) => <String, Object?>{
-    ...scope,
-    'agent_id': agentId,
-    // 员工历史按任务分栏：复用同一条线程，重启后仍能接着聊。
+    'agent_id': binding.agentId,
+    if (binding.teamId.isNotEmpty) 'team_id': binding.teamId,
     'session_id': 'pl_${lineId}_$taskId',
   };
 

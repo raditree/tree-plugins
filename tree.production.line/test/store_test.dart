@@ -13,7 +13,6 @@ void main() {
     temp = Directory.systemTemp.createTempSync('tree_pl_store_');
     store = ProductionStore(
       dataRoot: temp.path,
-      teamId: 'team_a',
       clock: () => fixed,
     );
   });
@@ -26,7 +25,7 @@ void main() {
     <String>[
       temp.path,
       'production_lines',
-      'team_a',
+      'production',
       lineId,
       name,
     ].join(Platform.pathSeparator),
@@ -55,7 +54,7 @@ void main() {
           <String>[
             temp.path,
             'production_lines',
-            'team_a',
+            'production',
             'pl_1',
             'tasks',
           ].join(Platform.pathSeparator),
@@ -68,6 +67,32 @@ void main() {
       expect(loaded.data['policy'], containsPair('allow_git_write', false));
       expect(loaded.data['docs'], containsPair('asset_dir', 'docs/production_lines'));
       expect(store.listLines().map((LineRecord item) => item.id), <String>['pl_1']);
+    });
+
+    test('executor 随 line.yaml 落盘；PATCH 浅合并；未知键拒绝（§16）', () {
+      final LineRecord line = store.createLine(<String, Object?>{
+        'id': 'pl_x',
+        'name': 'x',
+        'executor': <String, Object?>{
+          'agent_id': 'agt_a',
+          'team_id': 'team_a',
+        },
+      });
+      expect(line.executorAgentId, 'agt_a');
+      expect(line.executorTeamId, 'team_a');
+
+      final LineRecord patched = store.updateLine('pl_x', <String, Object?>{
+        'executor': <String, Object?>{'agent_id': 'agt_b'},
+      });
+      expect(patched.executorAgentId, 'agt_b');
+      expect(patched.executorTeamId, 'team_a', reason: '没给的键沿用旧值');
+
+      expect(
+        () => store.updateLine('pl_x', <String, Object?>{
+          'executor': <String, Object?>{'agent': 'agt_b'},
+        }),
+        failure('invalid_arguments'),
+      );
     });
 
     test('重复 / 缺 name / 非法 id 都 fail-closed', () {
@@ -359,6 +384,127 @@ void main() {
       );
       expect(store.getTask('pl_q', 'A').status, TaskStatus.queued);
       expect(store.getTask('pl_q', 'B').status, TaskStatus.queued);
+    });
+  });
+
+  group('§16 存量迁移', () {
+    File legacyLine(String scope, String lineId) => File(
+      <String>[
+        temp.path,
+        'production_lines',
+        scope,
+        lineId,
+        'line.yaml',
+      ].join(Platform.pathSeparator),
+    );
+
+    void writeLegacy(String scope, String lineId) {
+      final File file = legacyLine(scope, lineId);
+      file.parent.createSync(recursive: true);
+      file.writeAsStringSync(
+        encodeYaml(<String, Object?>{
+          'id': lineId,
+          'name': '旧产线',
+          'workspace_dir': '',
+          'status': 'idle',
+          'roles': <String, Object?>{},
+          'limits': <String, Object?>{},
+          'policy': <String, Object?>{},
+          'docs': <String, Object?>{},
+          'created_at': '2026-11-01T00:00:00',
+          'updated_at': '2026-11-01T00:00:00',
+        }),
+      );
+      final Directory taskDir = Directory(
+        <String>[
+          file.parent.path,
+          'tasks',
+          'T1',
+        ].join(Platform.pathSeparator),
+      )..createSync(recursive: true);
+      File(<String>[taskDir.path, 'task.yaml'].join(Platform.pathSeparator))
+          .writeAsStringSync(
+            encodeYaml(<String, Object?>{
+              'id': 'T1',
+              'title': '旧任务',
+              'status': 'queued',
+              'created_at': '2026-11-01T00:00:00',
+              'updated_at': '2026-11-01T00:00:00',
+            }),
+          );
+    }
+
+    test('旧团队目录搬进全局作用域：补 executor、保留任务、留快照、幂等', () {
+      writeLegacy('team_a', 'pl_old');
+      final Map<String, Object?> first = store.migrateLegacy(
+        agentId: 'agt_exec',
+        teamId: 'team_exec',
+      );
+      expect(first['migrated_count'], 1);
+      expect(legacyLine('team_a', 'pl_old').existsSync(), isFalse);
+      expect(lineFile('pl_old').existsSync(), isTrue);
+      final LineRecord line = store.getLine('pl_old');
+      expect(line.executorAgentId, 'agt_exec');
+      expect(line.executorTeamId, 'team_exec');
+      expect(store.listTasks('pl_old').single.id, 'T1');
+      expect(
+        Directory(
+          <String>[
+            temp.path,
+            'production_lines',
+            '.snapshots',
+          ].join(Platform.pathSeparator),
+        ).existsSync(),
+        isTrue,
+      );
+      final Map<String, dynamic> manifest =
+          jsonDecode(File('${first['manifest']}').readAsStringSync())
+              as Map<String, dynamic>;
+      expect((manifest['migrated'] as List<dynamic>).length, 1);
+
+      final Map<String, Object?> again = store.migrateLegacy(
+        agentId: 'agt_exec',
+      );
+      expect(again['migrated_count'], 0);
+      expect(again['note'], contains('全局作用域'));
+    });
+
+    test('目标已存在同 id ⇒ 冲突只报不覆盖，源目录不动', () {
+      writeLegacy('team_a', 'pl_old');
+      store.createLine(<String, Object?>{'id': 'pl_old', 'name': '新产线'});
+      final Map<String, Object?> result = store.migrateLegacy(
+        agentId: 'agt_exec',
+      );
+      expect(result['migrated_count'], 0);
+      expect((result['conflicts'] as List<Object?>).length, 1);
+      expect(store.getLine('pl_old').name, '新产线');
+      expect(legacyLine('team_a', 'pl_old').existsSync(), isTrue);
+    });
+
+    test('dry_run 只预览；缺 agent 且目录名不可推断 ⇒ executor_required', () {
+      writeLegacy('team_a', 'pl_old');
+      final Map<String, Object?> preview = store.migrateLegacy(
+        agentId: 'agt_exec',
+        dryRun: true,
+      );
+      expect(preview['dry_run'], isTrue);
+      expect(preview['migrated_count'], 1);
+      expect(legacyLine('team_a', 'pl_old').existsSync(), isTrue);
+      expect(lineFile('pl_old').existsSync(), isFalse);
+
+      final Map<String, Object?> refused = store.migrateLegacy();
+      expect(refused['migrated_count'], 0);
+      expect(
+        ((refused['skipped'] as List<Object?>).single as Map<String, Object?>)['reason'],
+        'executor_required',
+      );
+    });
+
+    test('旧目录名是 agt_* 时推断执行 Agent', () {
+      writeLegacy('agt_infer', 'pl_old');
+      final Map<String, Object?> result = store.migrateLegacy();
+      expect(result['migrated_count'], 1);
+      expect(store.getLine('pl_old').executorAgentId, 'agt_infer');
     });
   });
 }

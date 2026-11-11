@@ -200,6 +200,12 @@ class LineRecord {
   String get status => textOf(data['status']).isEmpty ? 'idle' : textOf(data['status']);
   String get createdAt => textOf(data['created_at']);
 
+  /// 执行身份（§16）：产线与 Agent 并列，打包 / 执行 / 专家都用这条身份，
+  /// 不再依赖「谁点了一下派发」。
+  Map<String, Object?> get executor => plainMap(data['executor']);
+  String get executorAgentId => textOf(executor['agent_id']);
+  String get executorTeamId => textOf(executor['team_id']);
+
   Map<String, Object?> toJson() => plainMap(data);
 }
 
@@ -273,9 +279,21 @@ Map<String, Object?> buildLineMap(
         'docs/handover.md',
       ],
     },
+    // §16：产线自己的执行身份（与「谁发起派发」无关）。
+    'executor': <String, Object?>{
+      'agent_id': '',
+      'team_id': '',
+    },
     'created_at': now,
     'updated_at': now,
   };
+  final Map<String, Object?> executor = normalizeExecutor(input['executor']);
+  if (executor.isNotEmpty) {
+    data['executor'] = <String, Object?>{
+      ...plainMap(data['executor']),
+      ...executor,
+    };
+  }
   for (final String section in const <String>[
     'roles',
     'limits',
@@ -290,6 +308,35 @@ Map<String, Object?> buildLineMap(
     };
   }
   return data;
+}
+
+/// 规范化 `line.yaml.executor`（§16）：只认 `agent_id` / `team_id` 两个字符串键。
+///
+/// 允许为空（新建产线时还没选执行 Agent），但**不接受未知键或非对象**——
+/// 配置页写错键要当场报错，而不是静默存下一份不生效的配置。
+Map<String, Object?> normalizeExecutor(Object? raw) {
+  if (raw == null) return const <String, Object?>{};
+  if (raw is! Map) {
+    throw ProductionFailure(
+      'executor 必须是对象：{agent_id, team_id}',
+      code: 'invalid_arguments',
+    );
+  }
+  final Map<String, Object?> data = plainMap(raw);
+  final List<String> unknown = <String>[
+    for (final String key in data.keys)
+      if (key != 'agent_id' && key != 'team_id') key,
+  ];
+  if (unknown.isNotEmpty) {
+    throw ProductionFailure(
+      'executor 不支持这些键：${unknown.join('、')}（只认 agent_id / team_id）',
+      code: 'invalid_arguments',
+    );
+  }
+  return <String, Object?>{
+    if (data.containsKey('agent_id')) 'agent_id': textOf(data['agent_id']),
+    if (data.containsKey('team_id')) 'team_id': textOf(data['team_id']),
+  };
 }
 
 /// 新建任务的最小校验（§7.3）：只允许以 `draft` / `queued` 落盘。

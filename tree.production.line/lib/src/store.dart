@@ -1,4 +1,9 @@
-/// 产线数据根的单写者：`<data_root>/production_lines/<team_id>/<line_id>/`。
+/// 产线数据根的单写者：`<data_root>/production_lines/production/<line_id>/`。
+///
+/// §16 语义纠偏：产线与 Agent **并列**，不按 Agent / 团队分目录；执行身份写在
+/// `line.yaml.executor`，打包 / 执行 / 专家都用它。旧的
+/// `<data_root>/production_lines/<team_id>/<line_id>/` 由 [migrateLegacy] 一次性
+/// 搬进全局作用域（幂等、冲突拒绝、搬迁前留快照）。
 ///
 /// 布局（§7.1）：
 /// ```text
@@ -22,25 +27,29 @@ import 'models.dart';
 import 'queue.dart';
 import 'yaml_codec.dart';
 
+/// 全局产线作用域（固定目录名）：产线数据不随团队 / Agent 漂移。
+const String kProductionScope = 'production';
+
 class ProductionStore {
   ProductionStore({
     required this.dataRoot,
-    required this.teamId,
     DateTime Function()? clock,
   }) : _clock = clock ?? DateTime.now;
 
   final String dataRoot;
-  final String teamId;
   final DateTime Function() _clock;
 
   static int _tempSeq = 0;
   static final RegExp _segmentPattern = RegExp(r'^[A-Za-z0-9_.-]+$');
 
-  String get teamDir =>
-      p.join(dataRoot, 'production_lines', _segment(teamId, 'team_id'));
+  /// 所有产线作用域的父目录（迁移时扫它的子目录）。
+  String get linesRoot => p.join(dataRoot, 'production_lines');
+
+  /// 全局作用域目录：`<data_root>/production_lines/production/`。
+  String get scopeDir => p.join(linesRoot, kProductionScope);
 
   String lineDir(String lineId) =>
-      p.join(teamDir, _segment(lineId, 'line_id'));
+      p.join(scopeDir, _segment(lineId, 'line_id'));
 
   String _lineFile(String lineId) => p.join(lineDir(lineId), 'line.yaml');
   String _stateFile(String lineId) => p.join(lineDir(lineId), 'state.json');
@@ -83,7 +92,7 @@ class ProductionStore {
   }
 
   List<LineRecord> listLines() {
-    final Directory dir = Directory(teamDir);
+    final Directory dir = Directory(scopeDir);
     if (!dir.existsSync()) return <LineRecord>[];
     final List<LineRecord> lines = <LineRecord>[];
     for (final FileSystemEntity entity in dir.listSync()) {
@@ -118,6 +127,7 @@ class ProductionStore {
       'name',
       'workspace_dir',
       'status',
+      'executor',
       ...sections,
     };
     final List<String> unknown = <String>[
@@ -150,6 +160,16 @@ class ProductionStore {
         );
       }
       next['status'] = status;
+    }
+    if (patch.containsKey('executor')) {
+      final Map<String, Object?> executor = normalizeExecutor(
+        patch['executor'],
+      );
+      // 浅合并：只改给出的键，另一个键沿用旧值。
+      next['executor'] = <String, Object?>{
+        ...plainMap(line.data['executor']),
+        ...executor,
+      };
     }
     for (final String section in sections) {
       if (!patch.containsKey(section)) continue;
@@ -196,6 +216,189 @@ class ProductionStore {
           : '插件数据已删除；项目资产仍保留在工作空间（需人工确认是否清理）',
     };
   }
+
+  // ── 存量迁移（§16）：旧团队目录 → 全局作用域 ────────────────────────
+
+  /// 把 `<data_root>/production_lines/<team_id>/<line_id>/` 搬进全局作用域。
+  ///
+  /// - **幂等**：搬完后源目录不再有 `line.yaml`，再调一次返回 `migrated_count=0`；
+  /// - **冲突拒绝**：目标已存在同 id 产线时只记 `conflicts`，不覆盖、不合并；
+  /// - **留快照**：真正搬迁前把整条产线目录复制到
+  ///   `production_lines/.snapshots/<时间戳>/<原作用域>/<line_id>/`；
+  /// - **补执行身份**：`line.yaml.executor` 为空时用参数补齐；参数缺省时若旧目录名
+  ///   是 `agt_*`（历史上前端把 agent 当团队用）则回退该 id，否则跳过并报
+  ///   `executor_required`，不猜一个可能错的 Agent。
+  ///
+  /// [dryRun] 只预览不落盘（不写快照、不写台账）。
+  Map<String, Object?> migrateLegacy({
+    String agentId = '',
+    String teamId = '',
+    bool dryRun = false,
+  }) {
+    final Directory root = Directory(linesRoot);
+    final List<Map<String, Object?>> migrated = <Map<String, Object?>>[];
+    final List<Map<String, Object?>> conflicts = <Map<String, Object?>>[];
+    final List<Map<String, Object?>> skipped = <Map<String, Object?>>[];
+    if (!root.existsSync()) {
+      return _migrationResult(
+        dryRun: dryRun,
+        migrated: migrated,
+        conflicts: conflicts,
+        skipped: skipped,
+        snapshotDir: '',
+        manifest: '',
+      );
+    }
+    final String stamp = _clock()
+        .toIso8601String()
+        .replaceAll(RegExp(r'[:.]'), '-');
+    final String snapshotRoot = p.join(linesRoot, '.snapshots', stamp);
+    final List<FileSystemEntity> scopes = root.listSync()..sort(
+      (FileSystemEntity a, FileSystemEntity b) => a.path.compareTo(b.path),
+    );
+    for (final FileSystemEntity entity in scopes) {
+      if (entity is! Directory) continue;
+      final String scopeName = p.basename(entity.path);
+      // 全局作用域自己、快照与迁移台账目录都不是旧数据。
+      if (scopeName == kProductionScope ||
+          scopeName.startsWith('_') ||
+          scopeName.startsWith('.')) {
+        continue;
+      }
+      final List<FileSystemEntity> lineDirs = entity.listSync()..sort(
+        (FileSystemEntity a, FileSystemEntity b) => a.path.compareTo(b.path),
+      );
+      for (final FileSystemEntity lineEntity in lineDirs) {
+        if (lineEntity is! Directory) continue;
+        final String lineId = p.basename(lineEntity.path);
+        final File lineFile = File(p.join(lineEntity.path, 'line.yaml'));
+        if (!lineFile.existsSync()) continue;
+        final String targetDir = p.join(scopeDir, lineId);
+        if (File(p.join(targetDir, 'line.yaml')).existsSync() ||
+            Directory(targetDir).existsSync()) {
+          conflicts.add(<String, Object?>{
+            'line_id': lineId,
+            'source': _portable(lineEntity.path),
+            'target': _portable(targetDir),
+            'reason': 'target_exists',
+          });
+          continue;
+        }
+        final Map<String, Object?> data;
+        try {
+          data = _readYaml(lineFile, 'line.yaml');
+        } on ProductionFailure catch (error) {
+          skipped.add(<String, Object?>{
+            'line_id': lineId,
+            'source': _portable(lineEntity.path),
+            'reason': error.code,
+            'message': error.message,
+          });
+          continue;
+        }
+        final Map<String, Object?> executor = plainMap(data['executor']);
+        final String existingAgent = textOf(executor['agent_id']);
+        final String resolvedAgent = existingAgent.isNotEmpty
+            ? existingAgent
+            : (agentId.trim().isNotEmpty
+                  ? agentId.trim()
+                  : (scopeName.startsWith('agt_') ? scopeName : ''));
+        if (resolvedAgent.isEmpty) {
+          skipped.add(<String, Object?>{
+            'line_id': lineId,
+            'source': _portable(lineEntity.path),
+            'reason': 'executor_required',
+            'message': '旧产线没有 executor.agent_id，且无法从目录名推断：'
+                '请带 agent_id 再迁移（或在配置页选执行 Agent）',
+          });
+          continue;
+        }
+        final String resolvedTeam = textOf(executor['team_id']).isNotEmpty
+            ? textOf(executor['team_id'])
+            : teamId.trim();
+        final Map<String, Object?> next = <String, Object?>{
+          ...data,
+          'executor': <String, Object?>{
+            'agent_id': resolvedAgent,
+            'team_id': resolvedTeam,
+          },
+          'updated_at': nowText(),
+        };
+        final String snapshotDir = dryRun
+            ? ''
+            : p.join(snapshotRoot, scopeName, lineId);
+        if (!dryRun) {
+          _copyDirectory(Directory(lineEntity.path), Directory(snapshotDir));
+          Directory(scopeDir).createSync(recursive: true);
+          _moveDirectory(Directory(lineEntity.path), targetDir);
+          _writeText(File(p.join(targetDir, 'line.yaml')), encodeYaml(next));
+          rebuild(lineId);
+        }
+        migrated.add(<String, Object?>{
+          'line_id': lineId,
+          'from': _portable(lineEntity.path),
+          'to': _portable(targetDir),
+          'executor': <String, Object?>{'agent_id': resolvedAgent, 'team_id': resolvedTeam},
+          if (snapshotDir.isNotEmpty) 'snapshot': _portable(snapshotDir),
+        });
+      }
+      // 旧作用域目录已空则收掉，避免下次迁移再扫一遍。
+      if (!dryRun) {
+        try {
+          if (entity.listSync().isEmpty) entity.deleteSync();
+        } on FileSystemException {
+          // 目录被别的进程占着：留着不影响结果。
+        }
+      }
+    }
+    String manifest = '';
+    if (!dryRun && (migrated.isNotEmpty || conflicts.isNotEmpty || skipped.isNotEmpty)) {
+      final File file = File(
+        p.join(linesRoot, '_migrations', '$stamp.json'),
+      );
+      manifest = file.path;
+      _writeText(
+        file,
+        '${const JsonEncoder.withIndent('  ').convert(<String, Object?>{
+          'version': 1,
+          'scope': kProductionScope,
+          'at': nowText(),
+          'migrated': migrated,
+          'conflicts': conflicts,
+          'skipped': skipped,
+        })}\n',
+      );
+    }
+    return _migrationResult(
+      dryRun: dryRun,
+      migrated: migrated,
+      conflicts: conflicts,
+      skipped: skipped,
+      snapshotDir: dryRun || migrated.isEmpty ? '' : snapshotRoot,
+      manifest: manifest,
+    );
+  }
+
+  Map<String, Object?> _migrationResult({
+    required bool dryRun,
+    required List<Map<String, Object?>> migrated,
+    required List<Map<String, Object?>> conflicts,
+    required List<Map<String, Object?>> skipped,
+    required String snapshotDir,
+    required String manifest,
+  }) => <String, Object?>{
+    'scope': kProductionScope,
+    'dry_run': dryRun,
+    'migrated': migrated,
+    'migrated_count': migrated.length,
+    'conflicts': conflicts,
+    'skipped': skipped,
+    if (snapshotDir.isNotEmpty) 'snapshot_dir': _portable(snapshotDir),
+    if (manifest.isNotEmpty) 'manifest': _portable(manifest),
+    'note': migrated.isEmpty && conflicts.isEmpty && skipped.isEmpty
+        ? '没有待迁移的产线（已在全局作用域）'
+        : '已迁移 ${migrated.length} 条；冲突 ${conflicts.length} 条；跳过 ${skipped.length} 条',
+  };
 
   // ── 任务 ──────────────────────────────────────────────────────────
 
@@ -412,7 +615,7 @@ class ProductionStore {
         : const <String, Object?>{};
     final bool same =
         textOf(previous['line_id']) == lineId &&
-        textOf(previous['team_id']) == teamId &&
+        textOf(previous['scope']) == kProductionScope &&
         previous['version'] == 1 &&
         jsonEncode(previous['tasks']) == jsonEncode(indexTasks) &&
         jsonEncode(previous['queue']) == jsonEncode(queue) &&
@@ -428,7 +631,7 @@ class ProductionStore {
     final Map<String, Object?> index = <String, Object?>{
       'version': 1,
       'line_id': lineId,
-      'team_id': teamId,
+      'scope': kProductionScope,
       'rebuilt_at': nowText(),
       'tasks': indexTasks,
       'queue': queue,
@@ -874,6 +1077,34 @@ class ProductionStore {
   }
 
   // ── 读写工具 ──────────────────────────────────────────────────────
+
+  /// 路径对外展示统一用 `/`（Windows 反斜杠不进回包，便于脚本消费）。
+  String _portable(String path) => path.replaceAll('\\', '/');
+
+  /// 递归复制目录（迁移快照用；目标已存在时合并覆盖）。
+  void _copyDirectory(Directory from, Directory to) {
+    to.createSync(recursive: true);
+    for (final FileSystemEntity entity in from.listSync()) {
+      final String name = p.basename(entity.path);
+      if (entity is Directory) {
+        _copyDirectory(entity, Directory(p.join(to.path, name)));
+        continue;
+      }
+      if (entity is File) {
+        entity.copySync(p.join(to.path, name));
+      }
+    }
+  }
+
+  /// 跨目录移动（同卷直接改名；跨卷复制后删源）。
+  void _moveDirectory(Directory from, String target) {
+    try {
+      from.renameSync(target);
+    } on FileSystemException {
+      _copyDirectory(from, Directory(target));
+      from.deleteSync(recursive: true);
+    }
+  }
 
   String _segment(String raw, String what) {
     final String value = raw.trim();

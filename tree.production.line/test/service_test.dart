@@ -53,15 +53,13 @@ void main() {
       );
     });
 
-    test('缺 team_id ⇒ team_required', () {
-      expect(
-        () => call(
-          'production.line.list',
-          <String, Object?>{},
-          scope: <String, Object?>{},
-        ),
-        failure('team_required'),
+    test('缺 team_id 不再失败：产线数据落全局作用域（§16）', () {
+      final Map<String, Object?> result = call(
+        'production.line.list',
+        <String, Object?>{},
+        scope: <String, Object?>{},
       );
+      expect(result['count'], 0);
     });
 
     test('未知命令 ⇒ unknown_command', () {

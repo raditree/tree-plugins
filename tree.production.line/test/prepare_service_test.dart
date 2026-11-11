@@ -94,7 +94,6 @@ void main() {
     );
     final ProductionStore store = ProductionStore(
       dataRoot: temp.path,
-      teamId: 'team_a',
       clock: clock,
     );
     store.createLine(<String, Object?>{

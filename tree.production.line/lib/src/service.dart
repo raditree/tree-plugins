@@ -11,6 +11,7 @@ const List<String> kProductionCommands = <String>[
   'production.line.create',
   'production.line.list',
   'production.line.get',
+  'production.line.migrate',
   'production.task.create',
   'production.task.list',
   'production.task.get',
@@ -22,9 +23,12 @@ const List<String> kProductionCommands = <String>[
   'production.run.list',
 ];
 
-/// 一次站请求的落点：数据根 + 团队（两者缺一都 fail-closed）。
+/// 一次站请求的落点：数据根（缺则 fail-closed）。
+///
+/// §16 起产线数据落全局作用域，`team_id` 只作为调用方身份透传（可空），
+/// 不再决定数据目录。
 class ProductionTarget {
-  const ProductionTarget({required this.dataRoot, required this.teamId});
+  const ProductionTarget({required this.dataRoot, this.teamId = ''});
 
   final String dataRoot;
   final String teamId;
@@ -46,14 +50,10 @@ ProductionTarget resolveProductionTarget(
       code: 'missing_data_dir',
     );
   }
-  final String teamId = textOf(scope['team_id']);
-  if (teamId.isEmpty) {
-    throw ProductionFailure(
-      '核心未在站请求的 scope 里带 team_id，拒绝落到公共库',
-      code: 'team_required',
-    );
-  }
-  return ProductionTarget(dataRoot: dataRoot, teamId: teamId);
+  return ProductionTarget(
+    dataRoot: dataRoot,
+    teamId: textOf(scope['team_id']),
+  );
 }
 
 class ProductionService {
@@ -79,12 +79,17 @@ class ProductionService {
     );
     final ProductionStore store = ProductionStore(
       dataRoot: target.dataRoot,
-      teamId: target.teamId,
       clock: _clock,
     );
     switch (command) {
       case 'production.line.create':
         return <String, Object?>{'line': store.createLine(arguments).toJson()};
+      case 'production.line.migrate':
+        return store.migrateLegacy(
+          agentId: textOf(arguments['agent_id']),
+          teamId: textOf(arguments['team_id']),
+          dryRun: arguments['dry_run'] == true,
+        );
       case 'production.line.list':
         {
           final List<LineRecord> lines = store.listLines();
