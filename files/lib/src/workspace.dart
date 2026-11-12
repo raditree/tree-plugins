@@ -67,6 +67,14 @@ class WorkspaceTarget {
   }
 }
 
+/// 产线文件作用域前缀：文件窗用 `line:<lineId>` 作 workspaceId，
+/// 与 Agent 的 `workspace_id` / id 区分开（Agent id 不带冒号）。
+///
+/// 产线与 Agent 是并列的执行身份（`production-line-recon.md` §16），
+/// 它的工作目录来自 `line.yaml.workspace_dir`，不在 `agents/*.yaml` 里，
+/// 所以解析要单独走一支，而不是把产线伪装成 Agent。
+const String kProductionLineScopePrefix = 'line:';
+
 /// 从数据根读取 agents/*.yaml 并解析工作空间（每次请求重读，用户手改立即生效）。
 class WorkspaceResolver {
   WorkspaceResolver(this.dataDir, {this.log});
@@ -77,10 +85,17 @@ class WorkspaceResolver {
   late final Map<String, AgentRecord> _agents = _loadAgents();
 
   /// 按 `workspace_id` 优先、agent id 兜底匹配（与核心旧 `FileService.agentFor` 同口径）。
+  ///
+  /// `line:<lineId>` 走产线分支（§STAB-PL-5）：根取 `line.yaml.workspace_dir`。
   WorkspaceTarget resolve(String workspaceId) {
     final String id = workspaceId.trim();
     if (id.isEmpty) {
       throw FileRouteError.read('缺少 workspaceId');
+    }
+    if (id.startsWith(kProductionLineScopePrefix)) {
+      return _resolveLine(
+        id.substring(kProductionLineScopePrefix.length).trim(),
+      );
     }
     AgentRecord? agent;
     for (final AgentRecord record in _agents.values) {
@@ -116,6 +131,74 @@ class WorkspaceResolver {
       root: root,
       ssh: ssh,
     );
+  }
+
+  /// 解析产线作用域：`line.yaml.workspace_dir` 即根；产线是本地作用域（不吃 Agent SSH）。
+  WorkspaceTarget _resolveLine(String lineId) {
+    if (lineId.isEmpty) {
+      throw FileRouteError.read('缺少产线 id');
+    }
+    // 产线 id 会拼进数据目录：只允许单段安全字符，挡住路径穿越。
+    if (!RegExp(r'^[A-Za-z0-9_.-]+$').hasMatch(lineId)) {
+      throw FileRouteError.read('产线 id 非法：$lineId');
+    }
+    final File? file = _lineFile(lineId);
+    if (file == null) {
+      throw FileRouteError.read('产线不存在：$lineId');
+    }
+    Map<String, dynamic>? data;
+    try {
+      data = _readYamlMap(file);
+    } catch (error) {
+      throw FileRouteError.read('读取产线配置失败（${file.path}）：$error');
+    }
+    final String configured = (data?['workspace_dir'] ?? '').toString().trim();
+    if (configured.isEmpty) {
+      throw FileRouteError.read('产线未配置工作目录（line.yaml.workspace_dir）：$lineId');
+    }
+    if (!p.isAbsolute(configured)) {
+      throw FileRouteError.read('产线工作目录必须是绝对路径：$configured');
+    }
+    final AgentRecord line = AgentRecord(
+      id: lineId,
+      workspaceId: '$kProductionLineScopePrefix$lineId',
+      workspaceDir: configured,
+    );
+    return WorkspaceTarget(
+      workspaceId: '$kProductionLineScopePrefix$lineId',
+      agent: line,
+      owner: line,
+      root: p.normalize(configured),
+      ssh: null,
+    );
+  }
+
+  /// 找 `<data_root>/production_lines/<scope>/<lineId>/line.yaml`。
+  ///
+  /// 先是全局作用域 `production`（迁移后唯一写入口径），再退回旧团队目录，
+  /// 让迁移还没跑的存量产线也能浏览文件。
+  File? _lineFile(String lineId) {
+    final File scoped = File(
+      p.join(dataDir, 'production_lines', 'production', lineId, 'line.yaml'),
+    );
+    if (scoped.existsSync()) return scoped;
+    final Directory root = Directory(p.join(dataDir, 'production_lines'));
+    if (!root.existsSync()) return null;
+    final List<String> scopes = <String>[
+      for (final FileSystemEntity entity in root.listSync(followLinks: false))
+        if (entity is Directory)
+          p.basename(entity.path),
+    ]..sort();
+    for (final String scope in scopes) {
+      if (scope == 'production' || scope.startsWith('.') || scope == '_migrations') {
+        continue;
+      }
+      final File legacy = File(
+        p.join(root.path, scope, lineId, 'line.yaml'),
+      );
+      if (legacy.existsSync()) return legacy;
+    }
+    return null;
   }
 
   Map<String, AgentRecord> _loadAgents() {

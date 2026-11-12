@@ -90,6 +90,67 @@ void main() {
       expect(target.root, p.join(temp.path, 'workspaces', 'solo'));
       expect(target.isRemote, isFalse);
     });
+
+    test('line:<lineId> 取产线 workspace_dir；兼容旧团队目录', () {
+      final Directory ws = Directory(p.join(temp.path, 'line_ws'))
+        ..createSync(recursive: true);
+      File(
+        p.join(
+          temp.path,
+          'production_lines',
+          'production',
+          'pl_1',
+          'line.yaml',
+        ),
+      )
+        ..createSync(recursive: true)
+        ..writeAsStringSync(
+          'id: pl_1\n'
+          'workspace_dir: "${ws.path.replaceAll('\\', '/')}"\n',
+        );
+      File(
+        p.join(temp.path, 'production_lines', 'team_a', 'pl_2', 'line.yaml'),
+      )
+        ..createSync(recursive: true)
+        ..writeAsStringSync(
+          'id: pl_2\n'
+          'workspace_dir: "${ws.path.replaceAll('\\', '/')}"\n',
+        );
+      final WorkspaceResolver resolver = WorkspaceResolver(temp.path);
+      final WorkspaceTarget scoped = resolver.resolve('line:pl_1');
+      expect(scoped.workspaceId, 'line:pl_1');
+      expect(scoped.root, p.normalize(ws.path));
+      expect(scoped.isRemote, isFalse);
+      expect(resolver.resolve('line:pl_2').root, p.normalize(ws.path));
+      expect(
+        () => resolver.resolve('line:pl_missing'),
+        throwsA(isA<FileRouteError>()),
+      );
+      expect(
+        () => resolver.resolve('line:../escape'),
+        throwsA(isA<FileRouteError>()),
+        reason: '产线 id 会拼进数据目录，必须挡住路径穿越',
+      );
+    });
+
+    test('产线未配 workspace_dir / 非绝对路径 ⇒ 可读失败', () {
+      final Directory lineDir = Directory(
+        p.join(temp.path, 'production_lines', 'production', 'pl_empty'),
+      )..createSync(recursive: true);
+      File(p.join(lineDir.path, 'line.yaml'))
+          .writeAsStringSync('id: pl_empty\nworkspace_dir: ""\n');
+      final WorkspaceResolver resolver = WorkspaceResolver(temp.path);
+      expect(
+        () => resolver.resolve('line:pl_empty'),
+        throwsA(isA<FileRouteError>()),
+      );
+      File(p.join(lineDir.path, 'line.yaml'))
+          .writeAsStringSync('id: pl_empty\nworkspace_dir: relative/path\n');
+      expect(
+        () => resolver.resolve('line:pl_empty'),
+        throwsA(isA<FileRouteError>()),
+      );
+    });
   });
 
   group('本机 delegate', () {
