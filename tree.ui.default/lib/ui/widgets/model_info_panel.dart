@@ -39,6 +39,9 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
   /// 是否正在加载
   bool _loading = true;
 
+  /// 没有选中 Agent（空态，不发请求）。
+  bool _needsAgent = false;
+
   /// 加载失败信息
   String? _loadError;
 
@@ -59,18 +62,6 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
   /// 那个，旧覆盖值 `xhigh` 不再合法）。非空时在控件下给出提示，并在保存时
   /// 不下发该值——否则后端校验会拒绝整个 PATCH。
   String _staleReasoningEffort = '';
-
-  /// 思考强度可选档位兜底值。
-  ///
-  /// 正常情况下由后端按模型下发 `reasoning_effort_options`（模型 .yaml 声明，
-  /// 未声明则回退"有实际区分度"的档位）。这里仅在响应缺该字段时兜底，
-  /// **不再列 minimal/medium/xhigh/ultra**：它们与服务端档位一一等价，
-  /// 摆进下拉就是选起来无差别的假选项。
-  static const List<String> _fallbackReasoningEfforts = <String>[
-    'low',
-    'high',
-    'max',
-  ];
 
   /// 上下文压缩阈值覆盖（null = 不覆盖 = 用模型默认，通常 0.8）
   double? _compressThreshold;
@@ -103,6 +94,13 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
   void initState() {
     super.initState();
     _promptController.text = widget.initialSystemPrompt ?? '';
+    // 未选 Agent 时直接渲染空态：不要拿空 id 去拼 `/api/agents//models-info`
+    // （那会被核心当成未知接口并显示成"加载失败"，STAB-PL-4）。
+    if (widget.agentId.trim().isEmpty) {
+      _loading = false;
+      _needsAgent = true;
+      return;
+    }
     _load();
   }
 
@@ -122,25 +120,23 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
     final String? id = _selectedModelId;
     if (id == null || id.isEmpty) return null;
     for (final Map<String, dynamic> m in _models) {
-      if ((m['model_id'] as String? ?? '') == id) return m;
+      if (modelKeyOf(m) == id) return m;
     }
     return null;
   }
 
-  /// 当前选中模型的可选思考强度档位。
+  /// 思考强度可选档位（D8）：只来自模型声明（`reasoning_effort_options`）。
   ///
-  /// 数据源是后端 `models-info` 里该模型条目的 `reasoning_effort_options`
-  /// （由模型 .yaml 声明，未声明则由后端回退到有实际区分度的档位）。
-  /// 后端未下发时回退 [_fallbackReasoningEfforts]，保证下拉永不为空。
+  /// 端点没声明就返回空列表，下拉只留「不覆盖」——**不再回退 low/high/max**：
+  /// 那是兜底值，不是端点真实支持的档位。
   List<String> _reasoningEffortOptions() {
     final List<dynamic>? raw =
         _selectedModel?['reasoning_effort_options'] as List<dynamic>?;
-    if (raw == null) return _fallbackReasoningEfforts;
-    final List<String> options = raw
-        .map((dynamic e) => e.toString().trim())
-        .where((String e) => e.isNotEmpty)
-        .toList();
-    return options.isEmpty ? _fallbackReasoningEfforts : options;
+    if (raw == null) return const <String>[];
+    return <String>[
+      for (final dynamic e in raw)
+        if (e.toString().trim().isNotEmpty) e.toString().trim(),
+    ];
   }
 
   /// 加载模型池与当前模型信息
@@ -167,18 +163,15 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
               )
               .toList(),
         );
-        // 当前 agent 绑定的模型优先；无则回退模型池第一个
+        // 当前 agent 绑定的模型优先；无则回退模型池第一个。
+        // 资源身份用 `provider/model_id`（裸 id 跨 provider 重名时不再唯一）。
         final String? boundModelId = current?['model_id'] as String?;
         final bool boundInPool =
             boundModelId != null &&
-            _models.any(
-              (m) => (m['model_id'] as String? ?? '') == boundModelId,
-            );
+            _models.any((m) => modelKeyOf(m) == boundModelId);
         _selectedModelId = boundInPool
             ? boundModelId
-            : (_models.isNotEmpty
-                  ? (_models.first['model_id'] as String?)
-                  : null);
+            : (_models.isNotEmpty ? modelKeyOf(_models.first) : null);
         // models-info 返回的 system_prompt 优先于初始值
         final String? serverPrompt = current?['system_prompt'] as String?;
         if (serverPrompt != null) {
@@ -373,6 +366,21 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
 
   /// 主体：加载中 / 出错 / 内容
   Widget _buildBody() {
+    if (_needsAgent) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Text(
+            '请先在左侧选择或创建一个 Agent，再配置模型信息',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 12,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ),
+      );
+    }
     if (_loading) {
       return const Center(child: CircularProgressIndicator(strokeWidth: 2));
     }
@@ -771,9 +779,10 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
         border: OutlineInputBorder(),
       ),
       items: _models.map((Map<String, dynamic> m) {
-        final String modelId = m['model_id'] as String? ?? '';
+        final String modelKey = modelKeyOf(m);
+        final String modelId = m['model_id'] as String? ?? modelKey;
         return DropdownMenuItem<String>(
-          value: modelId,
+          value: modelKey,
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: <Widget>[
@@ -819,7 +828,7 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
         style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
       );
     }
-    final String modelId = model['model_id'] as String? ?? '';
+    final String modelId = modelKeyOf(model);
     final String name = model['name'] as String? ?? modelId;
     final String baseUrl = _maskUrl(model['base_url'] as String? ?? '');
     final int? maxSeqLen = (model['max_seqlen'] as num?)?.toInt();

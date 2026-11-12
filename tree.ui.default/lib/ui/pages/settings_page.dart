@@ -158,6 +158,11 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _modelsLoading = false;
   String? _modelsError;
 
+  /// Provider 池（D7）：模型按 provider 分组，端点与密钥在 provider 上。
+  List<Map<String, dynamic>> _providers = <Map<String, dynamic>>[];
+  bool _providersLoading = false;
+  String? _providersError;
+
   // --- 插件开发入口（M9 §4.2 的开发面） ---
 
   /// 插件清单的**真实路径**（从插件快照拿；拿不到则为 null）。
@@ -569,26 +574,36 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
-  /// 加载自定义模型列表
+  /// 加载自定义模型列表 + provider 池（两者一组展示，一起刷新）。
   Future<void> _loadModelList() async {
     if (mounted) {
       setState(() {
         _modelsLoading = true;
+        _providersLoading = true;
         _modelsError = null;
+        _providersError = null;
       });
     }
     try {
-      final List<Map<String, dynamic>> models = await ApiService.getModels();
+      final List<List<Map<String, dynamic>>> result =
+          await Future.wait(<Future<List<Map<String, dynamic>>>>[
+            ApiService.getModels(),
+            ApiService.getProviders(),
+          ]);
       if (!mounted) return;
       setState(() {
-        _models = models;
+        _models = result[0];
+        _providers = result[1];
         _modelsLoading = false;
+        _providersLoading = false;
       });
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _modelsLoading = false;
+        _providersLoading = false;
         _modelsError = '$e';
+        _providersError = '$e';
       });
     }
   }
@@ -1699,7 +1714,7 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  /// 自定义模型卡片（列出模型池 + 新增/编辑/删除入口）
+  /// 自定义模型卡片（Provider 池 + 模型池 + 新增/编辑/删除入口）
   Widget _buildCustomModelCard() {
     final cs = Theme.of(context).colorScheme;
     return Card(
@@ -1709,6 +1724,54 @@ class _SettingsPageState extends State<SettingsPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'Provider 池',
+                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+                  ),
+                ),
+                TextButton.icon(
+                  onPressed: _providersLoading
+                      ? null
+                      : () => _openProviderEditor(null),
+                  icon: const Icon(Icons.add, size: 16),
+                  label: const Text('新增 Provider'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              '写入 ~/.tree/config/providers/<id>.yaml：端点与密钥放在这里，'
+              '同一端点下的模型共用；密钥支持 api_key_env 环境变量，文件内明文只在'
+              '本机存在。',
+              style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+            ),
+            const SizedBox(height: 8),
+            if (_providersLoading)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
+              )
+            else if (_providersError != null)
+              Text(
+                'Provider 列表加载失败：$_providersError',
+                style: const TextStyle(fontSize: 12, color: Colors.redAccent),
+              )
+            else if (_providers.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 4),
+                child: Text(
+                  '还没有 Provider。旧模型仍可直接编辑（等同单模型独立端点）。',
+                  style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+                ),
+              )
+            else
+              ..._providers.map(
+                (Map<String, dynamic> p) => _buildProviderRow(p, cs),
+              ),
+            const Divider(height: 24),
             Row(
               children: [
                 const Expanded(
@@ -1735,8 +1798,8 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
             const SizedBox(height: 4),
             const Text(
-              '写入 ~/.tree/config/models/<model_id>.yaml，保存后立即对全部 Agent 生效。'
-              'API Key 以明文保存在该文件（已在 .gitignore 中忽略）。',
+              '模型身份是 provider/model_id：同一 model_id 可以挂在多个 provider 下；'
+              '保存后立即对全部 Agent 生效。API Key 以明文保存在 provider 文件。',
               style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
             ),
             const SizedBox(height: 8),
@@ -1772,11 +1835,96 @@ class _SettingsPageState extends State<SettingsPage> {
                 ),
               )
             else
-              ..._models.map((Map<String, dynamic> m) => _buildModelRow(m, cs)),
+              ..._buildModelRows(cs),
           ],
         ),
       ),
     );
+  }
+
+  /// Provider 条目行：名称 / 端点 / 密钥状态 / 模型数 / 上次拉取。
+  Widget _buildProviderRow(Map<String, dynamic> provider, ColorScheme cs) {
+    final String id = provider['id'] as String? ?? '';
+    final String name = provider['name'] as String? ?? id;
+    final bool hasKey = provider['has_api_key'] == true;
+    final String env = '${provider['api_key_env'] ?? ''}'.trim();
+    final int cached = (provider['cached_model_count'] as num?)?.toInt() ?? 0;
+    final int bound = (provider['model_count'] as num?)?.toInt() ?? 0;
+    final String error = '${provider['error'] ?? ''}'.trim();
+    final String fetched = '${provider['fetched_at'] ?? ''}'.trim();
+    final String credential = env.isNotEmpty
+        ? 'env: $env'
+        : (hasKey ? '密钥已配置' : '未配置密钥');
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      dense: true,
+      title: Text('$name  ·  $id', style: const TextStyle(fontSize: 14)),
+      subtitle: Text(
+        '${provider['base_url'] ?? ''} · $credential · '
+        '模型 $bound · 目录 $cached'
+        '${fetched.isEmpty ? '' : ' · ${_shortTime(fetched)}'}'
+        '${error.isEmpty ? '' : '\n拉取失败：$error'}',
+        style: TextStyle(
+          fontSize: 12,
+          color: error.isEmpty ? null : Colors.orange,
+        ),
+      ),
+      isThreeLine: error.isNotEmpty,
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          IconButton(
+            tooltip: '刷新模型目录',
+            icon: const Icon(Icons.cloud_download_outlined, size: 18),
+            onPressed: () => _refreshProvider(id),
+          ),
+          IconButton(
+            tooltip: '编辑',
+            icon: const Icon(Icons.edit_outlined, size: 18),
+            color: cs.primary,
+            onPressed: () => _openProviderEditor(provider),
+          ),
+          IconButton(
+            tooltip: '删除',
+            icon: const Icon(Icons.delete_outline, size: 18),
+            color: Colors.redAccent,
+            onPressed: () => _deleteProvider(provider),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 按 provider 分组列出模型（组内按 key 升序，后端已排好）。
+  List<Widget> _buildModelRows(ColorScheme cs) {
+    final List<Widget> rows = <Widget>[];
+    String current = '\u0000';
+    for (final Map<String, dynamic> model in _models) {
+      final String provider = providerOf(model);
+      if (provider != current) {
+        current = provider;
+        rows.add(
+          Padding(
+            padding: const EdgeInsets.only(top: 8, bottom: 2),
+            child: Text(
+              providerLabelOf(provider),
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: cs.onSurfaceVariant,
+              ),
+            ),
+          ),
+        );
+      }
+      rows.add(_buildModelRow(model, cs));
+    }
+    return rows;
+  }
+
+  static String _shortTime(String iso) {
+    if (iso.length < 16) return iso;
+    return iso.substring(0, 16).replaceFirst('T', ' ');
   }
 
   /// 单个模型条目行
@@ -1802,6 +1950,7 @@ class _SettingsPageState extends State<SettingsPage> {
       ModelKeyState.missing => ' · 未配置 API Key',
       ModelKeyState.unknown => ' · API Key 状态未知（插件版本过旧）',
     };
+    final String media = modelMediaLabelsOf(model).join(' / ');
     final String price = modelPricingLabel(model);
     return ListTile(
       contentPadding: EdgeInsets.zero,
@@ -1815,10 +1964,10 @@ class _SettingsPageState extends State<SettingsPage> {
         ],
       ),
       subtitle: Text(
-        '$modelId$kindDetail'
+        '${modelKeyOf(model)}$kindDetail'
         '$keyDetail'
+        '${media.isEmpty ? '' : ' · $media'}'
         '${effectiveKind == kModelKindChat && (model['thinking'] as bool? ?? false) ? ' · thinking' : ''}'
-        '${effectiveKind == kModelKindChat && (model['if_vision'] as bool? ?? false) ? ' · vision' : ''}'
         '${price.isEmpty ? '' : ' · $price'}',
         style: const TextStyle(fontSize: 12),
       ),
@@ -1873,13 +2022,17 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 返回 null = 一致（或回读失败，不盖过"已保存"主结果）；否则是可读提示。
   Future<String?> _verifyModelKind(Map<String, dynamic> payload) async {
     final String modelId = '${payload['model_id'] ?? ''}';
+    final String provider = '${payload['provider'] ?? ''}'.trim();
+    final String expectedKey = provider.isEmpty
+        ? modelId
+        : '$provider/$modelId';
     final String wantKind = '${payload['kind'] ?? ''}';
     final String wantProtocol = '${payload['protocol'] ?? ''}';
     try {
       final List<Map<String, dynamic>> models = await ApiService.getModels();
       Map<String, dynamic>? saved;
       for (final Map<String, dynamic> m in models) {
-        if ('${m['model_id'] ?? ''}' == modelId) {
+        if (modelKeyOf(m) == expectedKey) {
           saved = m;
           break;
         }
@@ -1901,21 +2054,23 @@ class _SettingsPageState extends State<SettingsPage> {
     final Map<String, dynamic>? payload =
         await showDialog<Map<String, dynamic>>(
           context: context,
-          builder: (BuildContext context) =>
-              ModelEditorDialog(existing: existing),
+          builder: (BuildContext context) => ModelEditorDialog(
+            existing: existing,
+            providers: _providers,
+          ),
         );
     if (payload == null || !mounted) return;
     try {
       if (existing == null) {
         await ApiService.createModel(payload);
       } else {
-        final String modelId = existing['model_id'] as String? ?? '';
-        await ApiService.updateModel(modelId, payload);
+        await ApiService.updateModel(modelKeyOf(existing), payload);
       }
       if (!mounted) return;
       final String? mismatch = existing == null
           ? await _verifyModelKind(payload)
           : null;
+
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -1940,6 +2095,7 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 删除模型（二次确认；若仍有 agent 绑定则提示）
   Future<void> _deleteModel(Map<String, dynamic> model) async {
     final String modelId = model['model_id'] as String? ?? '';
+    final String key = modelKeyOf(model);
     final bool? confirmed = await showDialog<bool>(
       context: context,
       builder: (BuildContext context) => AlertDialog(
@@ -1962,7 +2118,7 @@ class _SettingsPageState extends State<SettingsPage> {
     );
     if (confirmed != true || !mounted) return;
     try {
-      final Map<String, dynamic> result = await ApiService.deleteModel(modelId);
+      final Map<String, dynamic> result = await ApiService.deleteModel(key);
       final List<dynamic> bound =
           result['bound_agents'] as List<dynamic>? ?? <dynamic>[];
       if (!mounted) return;
@@ -1983,6 +2139,104 @@ class _SettingsPageState extends State<SettingsPage> {
           content: Text('删除失败：$e'),
           duration: const Duration(seconds: 3),
         ),
+      );
+    }
+  }
+
+  /// 打开 Provider 编辑对话框（[existing] 为 null 表示新增）。
+  Future<void> _openProviderEditor(Map<String, dynamic>? existing) async {
+    final Map<String, dynamic>? payload =
+        await showDialog<Map<String, dynamic>>(
+          context: context,
+          builder: (BuildContext context) =>
+              ProviderEditorDialog(existing: existing),
+        );
+    if (payload == null || !mounted) return;
+    try {
+      if (existing == null) {
+        await ApiService.createProvider(payload);
+      } else {
+        final String id = existing['id'] as String? ?? '';
+        await ApiService.updateProvider(id, payload);
+      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(existing == null ? 'Provider 已新增' : 'Provider 已更新'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+      await _loadModelList();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('保存失败：$e'),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    }
+  }
+
+  /// 删除 Provider（有模型绑定时后端拒绝，把可读原因原样带出来）。
+  Future<void> _deleteProvider(Map<String, dynamic> provider) async {
+    final String id = provider['id'] as String? ?? '';
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        title: const Text('删除 Provider'),
+        content: Text(
+          '确定删除「${provider['name'] ?? id}」（$id）？\n'
+          '仍有模型绑定时会被拒绝；目录缓存会一并删除。',
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      await ApiService.deleteProvider(id);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Provider 已删除')),
+      );
+      await _loadModelList();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('$e'), duration: const Duration(seconds: 5)),
+      );
+    }
+  }
+
+  /// 手动刷新 Provider 的模型目录；失败只提示，不动已有缓存。
+  Future<void> _refreshProvider(String providerId) async {
+    try {
+      final Map<String, dynamic> result =
+          await ApiService.refreshProvider(providerId);
+      final String error = '${result['error'] ?? ''}'.trim();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            error.isEmpty ? '目录已刷新' : '目录刷新失败：$error（保留上一次结果）',
+          ),
+          duration: Duration(seconds: error.isEmpty ? 2 : 5),
+        ),
+      );
+      await _loadModelList();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('目录刷新失败：$e')),
       );
     }
   }
@@ -2310,7 +2564,14 @@ class ModelEditorDialog extends StatefulWidget {
   /// 待编辑模型（null = 新增）
   final Map<String, dynamic>? existing;
 
-  const ModelEditorDialog({super.key, this.existing});
+  /// Provider 池（新增时可选择归属，端点与密钥由 provider 提供）。
+  final List<Map<String, dynamic>> providers;
+
+  const ModelEditorDialog({
+    super.key,
+    this.existing,
+    this.providers = const <Map<String, dynamic>>[],
+  });
 
   @override
   State<ModelEditorDialog> createState() => _ModelEditorDialogState();
@@ -2346,16 +2607,20 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
 
   bool _thinking = false;
   bool _ifVision = false;
+  bool _ifAudio = false;
+  bool _ifVideo = false;
   String _reasoningEffort = '';
+
+  /// 所属 provider（空 = 独立端点；编辑时只读）。
+  String _provider = '';
+
+  /// 当前 provider 的模型目录缓存（点选自动填充用）。
+  List<Map<String, dynamic>> _catalog = <Map<String, dynamic>>[];
+  bool _catalogLoading = false;
+  String _catalogError = '';
 
   /// 新增时可选；编辑时固定为原值（后端禁止改 kind）。
   String _kind = kModelKindChat;
-
-  /// 思考强度档位兜底（与后端 REASONING_EFFORT_CANONICAL 一致）。
-  ///
-  /// 只列**有实际区分度**的档位：端点接受的枚举全集里
-  /// minimal/medium/xhigh/ultra 与服务端档位一一等价，列出来就是假选项。
-  static const List<String> _reasoningEfforts = kFallbackReasoningEfforts;
 
   bool get _isEdit => widget.existing != null;
 
@@ -2363,16 +2628,48 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
   String? get _originalKind =>
       widget.existing == null ? null : modelKindOf(widget.existing!);
 
-  /// 档位候选：端点声明 > 已存档位 > 兜底。
+  /// 档位候选：端点声明 > 已存档位。**不再兜底**（D8：没声明就不显示假选项）。
   List<String> get _candidateEfforts {
     if (_metaEffortOptions.isNotEmpty) {
       return List<String>.of(_metaEffortOptions);
     }
-    if (_storedEffortOptions.isNotEmpty) {
-      return List<String>.of(_storedEffortOptions);
-    }
-    return List<String>.of(_reasoningEfforts);
+    return List<String>.of(_storedEffortOptions);
   }
+
+  /// Provider 下拉项；编辑旧模型时把当前 provider 补进去（可能已不在池里）。
+  List<DropdownMenuItem<String>> _providerItems() {
+    final Set<String> ids = <String>{''};
+    final List<DropdownMenuItem<String>> items = <DropdownMenuItem<String>>[
+      const DropdownMenuItem<String>(
+        value: '',
+        child: Text('独立端点（不归组）'),
+      ),
+    ];
+    for (final Map<String, dynamic> provider in widget.providers) {
+      final String id = '${provider['id'] ?? ''}'.trim();
+      if (id.isEmpty || !ids.add(id)) continue;
+      items.add(
+        DropdownMenuItem<String>(
+          value: id,
+          child: Text(
+            '${provider['name'] ?? id} ($id)',
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      );
+    }
+    if (_provider.isNotEmpty && ids.add(_provider)) {
+      items.add(
+        DropdownMenuItem<String>(
+          value: _provider,
+          child: Text(providerLabelOf(_provider)),
+        ),
+      );
+    }
+    return items;
+  }
+
+  String get _providerItemValue => _provider;
 
   /// 价格标签；端点没给价格 ⇒ 空串。
   String get _pricingLabel => modelPricingLabel(<String, dynamic>{
@@ -2385,11 +2682,14 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
     final Map<String, dynamic>? e = widget.existing;
     if (e == null) return;
     _kind = modelKindOf(e);
+    _provider = providerOf(e);
     _modelId.text = e['model_id'] as String? ?? '';
     _name.text = e['name'] as String? ?? '';
     // base_url 后端已脱敏（仅协议+主机），编辑时留空表示"按原值不变"
     _thinking = e['thinking'] as bool? ?? false;
     _ifVision = e['if_vision'] as bool? ?? false;
+    _ifAudio = e['if_audio'] as bool? ?? false;
+    _ifVideo = e['if_video'] as bool? ?? false;
     _reasoningEffort = e['reasoning_effort'] as String? ?? '';
     // 后端已按"模型声明或全局回退"解析好档位列表，直接回填（不预设当前选中值：
     // 列表仅表示"哪些可被 agent 覆盖"，与模型自身默认档位是两件事）
@@ -2434,7 +2734,9 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
 
   /// 从端点探测价格与思考档位（仅编辑已保存的模型可用）。
   Future<void> _refreshMeta() async {
-    final String modelId = widget.existing?['model_id'] as String? ?? '';
+    final Map<String, dynamic>? existing = widget.existing;
+    if (existing == null) return;
+    final String modelId = modelKeyOf(existing);
     if (modelId.isEmpty) return;
     setState(() {
       _metaLoading = true;
@@ -2493,6 +2795,87 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
     }
   }
 
+  /// 切换到某个 provider：先刷新一次目录（失败用旧缓存），再拉缓存供选择。
+  Future<void> _selectProvider(String providerId) async {
+    setState(() {
+      _provider = providerId;
+      _catalog = <Map<String, dynamic>>[];
+      _catalogError = '';
+      _metaEffortOptions = <String>[];
+      _ifVision = false;
+      _ifAudio = false;
+      _ifVideo = false;
+    });
+    if (providerId.isEmpty) return;
+    setState(() => _catalogLoading = true);
+    try {
+      final Map<String, dynamic> refreshed =
+          await ApiService.refreshProvider(providerId);
+      final String error = '${refreshed['error'] ?? ''}'.trim();
+      final Map<String, dynamic> data =
+          await ApiService.getProviderModels(providerId);
+      final List<Map<String, dynamic>> models = <Map<String, dynamic>>[
+        for (final dynamic item
+            in data['models'] as List<dynamic>? ?? <dynamic>[])
+          if (item is Map) Map<String, dynamic>.from(item),
+      ];
+      if (!mounted) return;
+      setState(() {
+        _catalogLoading = false;
+        _catalog = models;
+        _catalogError = error;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _catalogLoading = false;
+        _catalogError = '$error';
+      });
+    }
+  }
+
+  /// 从目录条目自动填充名称 / 类型 / 模态 / 上下文 / 输出 / 档位（用户仍可改）。
+  void _applyCatalogEntry(String modelId) {
+    Map<String, dynamic>? entry;
+    for (final Map<String, dynamic> item in _catalog) {
+      if ('${item['model_id'] ?? ''}' == modelId) {
+        entry = item;
+        break;
+      }
+    }
+    if (entry == null) return;
+    final List<String> modalities = <String>[
+      for (final dynamic item
+          in entry['input_modalities'] as List<dynamic>? ?? <dynamic>[])
+        '${item ?? ''}',
+    ];
+    final List<String> efforts = <String>[
+      for (final dynamic item
+          in entry['reasoning_effort_options'] as List<dynamic>? ?? <dynamic>[])
+        if ('${item ?? ''}'.trim().isNotEmpty) '${item ?? ''}'.trim(),
+    ];
+    final int context = (entry['context_length'] as num?)?.toInt() ?? 0;
+    final int output = (entry['max_output_tokens'] as num?)?.toInt() ?? 0;
+    final String kind = '${entry['kind'] ?? ''}';
+    setState(() {
+      _modelId.text = modelId;
+      if (_name.text.trim().isEmpty) {
+        _name.text = '${entry!['name'] ?? modelId}';
+      }
+      if (!_isEdit && kModelKinds.contains(kind)) _kind = kind;
+      _ifVision = modalities.contains('image');
+      _ifAudio = modalities.contains('audio');
+      _ifVideo = modalities.contains('video');
+      if (context > 0) _maxSeqlen.text = '$context';
+      if (output > 0) _maxOutput.text = '$output';
+      _metaEffortOptions = efforts;
+      _storedEffortOptions = <String>[];
+      if (_reasoningEffort.isNotEmpty && !efforts.contains(_reasoningEffort)) {
+        _reasoningEffort = '';
+      }
+    });
+  }
+
   /// 路由不存在（旧插件未实现 / 核心没注册）的可读判定。
   ///
   /// 委派语义里 404 = 核心没这个接口、501 = 插件还没搬；两种都不该当成
@@ -2527,6 +2910,7 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
   ModelEditorDraft _currentDraft() {
     return ModelEditorDraft(
       originalKind: _originalKind,
+      provider: _provider,
       kind: _isEdit ? _originalKind! : _kind,
       modelId: _modelId.text,
       name: _name.text,
@@ -2538,6 +2922,8 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
       maxOutputTokens: int.tryParse(_maxOutput.text.trim()),
       thinking: _thinking,
       ifVision: _ifVision,
+      ifAudio: _ifAudio,
+      ifVideo: _ifVideo,
       dimensions: int.tryParse(_dimensions.text.trim()),
       maxInputTokens: int.tryParse(_maxInputTokens.text.trim()),
       confidenceThreshold: double.tryParse(_confidenceThreshold.text.trim()),
@@ -2564,7 +2950,7 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
     } else if (_storedEffortOptions.isNotEmpty) {
       source = '未探测到端点档位，沿用已存档位：${_storedEffortOptions.join(' / ')}';
     } else {
-      source = '未探测到端点档位，使用兜底：${_reasoningEfforts.join(' / ')}';
+      source = '端点未声明思考档位：只保留“不设置”，不写入假选项（D8）';
     }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -2633,12 +3019,73 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
+              DropdownButtonFormField<String>(
+                key: const Key('model-editor-provider'),
+                initialValue: _providerItemValue,
+                isExpanded: true,
+                decoration: InputDecoration(
+                  labelText: 'Provider',
+                  helperText: _isEdit
+                      ? '所属 provider 创建后不可修改'
+                      : '归到 provider 下就无需重复填 base_url / api_key',
+                  isDense: true,
+                ),
+                items: _providerItems(),
+                onChanged: _isEdit
+                    ? null
+                    : (String? value) => _selectProvider(value ?? ''),
+              ),
+              if (!_isEdit && _provider.isNotEmpty) ...<Widget>[
+                const SizedBox(height: 8),
+                if (_catalogLoading)
+                  const LinearProgressIndicator(minHeight: 2)
+                else if (_catalog.isEmpty)
+                  Text(
+                    _catalogError.isEmpty
+                        ? '端点没有返回模型目录，可直接手填 model_id'
+                        : '目录拉取失败：$_catalogError（可手填 model_id）',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: _catalogError.isEmpty
+                          ? Theme.of(context).colorScheme.onSurfaceVariant
+                          : Colors.orange,
+                    ),
+                  )
+                else
+                  DropdownButtonFormField<String>(
+                    key: const Key('model-editor-catalog'),
+                    isExpanded: true,
+                    decoration: InputDecoration(
+                      labelText: '从端点目录选择（自动填充）',
+                      helperText: _catalogError.isEmpty
+                          ? '共 ${_catalog.length} 个模型'
+                          : '上次拉取失败：$_catalogError（下面可能不是最新）',
+                      isDense: true,
+                    ),
+                    items: <DropdownMenuItem<String>>[
+                      for (final Map<String, dynamic> item in _catalog)
+                        DropdownMenuItem<String>(
+                          value: '${item['model_id'] ?? ''}',
+                          child: Text(
+                            '${item['model_id'] ?? ''}',
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                    ],
+                    onChanged: (String? value) {
+                      if (value != null) _applyCatalogEntry(value);
+                    },
+                  ),
+              ],
+              const SizedBox(height: 10),
               TextField(
                 controller: _modelId,
                 enabled: !_isEdit,
-                decoration: const InputDecoration(
+                decoration: InputDecoration(
                   labelText: 'model_id',
-                  helperText: '唯一标识，同时作为配置文件名（字母/数字/. _ -）',
+                  helperText: _provider.isEmpty
+                      ? '端点请求里的 model 字段（同时作为配置文件名）'
+                      : '端点请求里的 model 字段；与 provider 组成唯一键',
                   isDense: true,
                 ),
               ),
@@ -2695,7 +3142,9 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
                   labelText: 'base_url',
                   helperText: _isEdit
                       ? '留空 = 保持原地址不变'
-                      : 'OpenAI 兼容端点，如 https://api.example.com/v1',
+                      : (_provider.isNotEmpty
+                            ? '可留空：使用 provider 的端点（填了就覆盖）'
+                            : 'OpenAI 兼容端点，如 https://api.example.com/v1'),
                   isDense: true,
                 ),
               ),
@@ -2712,7 +3161,9 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
                           ModelKeyState.unknown =>
                             '当前状态未知（旧版插件不回 has_api_key）；留空 = 不修改',
                         }
-                      : '必填',
+                      : (_provider.isNotEmpty
+                            ? '可留空：使用 provider 的密钥'
+                            : '必填'),
                   isDense: true,
                 ),
               ),
@@ -2796,6 +3247,36 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
                     style: TextStyle(fontSize: 11),
                   ),
                 ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  dense: true,
+                  value: _ifAudio,
+                  onChanged: (bool v) => setState(() => _ifAudio = v),
+                  activeThumbColor: cs.primary,
+                  title: const Text(
+                    '支持音频输入（if_audio）',
+                    style: TextStyle(fontSize: 13),
+                  ),
+                  subtitle: const Text(
+                    '端点声明支持音频时自动勾选；不确定就保持关闭，不假装支持。',
+                    style: TextStyle(fontSize: 11),
+                  ),
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  dense: true,
+                  value: _ifVideo,
+                  onChanged: (bool v) => setState(() => _ifVideo = v),
+                  activeThumbColor: cs.primary,
+                  title: const Text(
+                    '支持视频输入（if_video）',
+                    style: TextStyle(fontSize: 13),
+                  ),
+                  subtitle: const Text(
+                    '端点声明支持视频时自动勾选；不确定就保持关闭，不假装支持。',
+                    style: TextStyle(fontSize: 11),
+                  ),
+                ),
               ],
               if (fields.embedding) ...<Widget>[
                 const SizedBox(height: 10),
@@ -2849,6 +3330,168 @@ class _ModelEditorDialogState extends State<ModelEditorDialog> {
                   ),
                 ),
               ],
+            ],
+          ),
+        ),
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('取消'),
+        ),
+        ElevatedButton(onPressed: _submit, child: Text(_isEdit ? '保存' : '创建')),
+      ],
+    );
+  }
+}
+
+/// Provider 编辑对话框（新增 / 编辑）
+///
+/// 端点与密钥属于 provider：模型只引用 provider.id。密钥从不回显，编辑时留空 =
+/// 保留原值；`api_key_env` 显式空串 = 清空（它不是密钥，需要能切回明文）。
+class ProviderEditorDialog extends StatefulWidget {
+  /// 待编辑 provider（null = 新增）。
+  final Map<String, dynamic>? existing;
+
+  const ProviderEditorDialog({super.key, this.existing});
+
+  @override
+  State<ProviderEditorDialog> createState() => _ProviderEditorDialogState();
+}
+
+class _ProviderEditorDialogState extends State<ProviderEditorDialog> {
+  final TextEditingController _name = TextEditingController();
+  final TextEditingController _baseUrl = TextEditingController();
+  final TextEditingController _apiKey = TextEditingController();
+  final TextEditingController _apiKeyEnv = TextEditingController();
+  bool _enabled = true;
+
+  bool get _isEdit => widget.existing != null;
+
+  @override
+  void initState() {
+    super.initState();
+    final Map<String, dynamic>? e = widget.existing;
+    if (e == null) return;
+    _name.text = e['name'] as String? ?? '';
+    _apiKeyEnv.text = e['api_key_env'] as String? ?? '';
+    _enabled = e['enabled'] as bool? ?? true;
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _baseUrl.dispose();
+    _apiKey.dispose();
+    _apiKeyEnv.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final String name = _name.text.trim();
+    final String baseUrl = _baseUrl.text.trim();
+    final String env = _apiKeyEnv.text.trim();
+    if (name.isEmpty) {
+      _snack('name 不能为空');
+      return;
+    }
+    if (!_isEdit && baseUrl.isEmpty) {
+      _snack('base_url 不能为空');
+      return;
+    }
+    if (baseUrl.isNotEmpty) {
+      final Uri? uri = Uri.tryParse(baseUrl);
+      if (uri == null ||
+          !(uri.scheme == 'http' || uri.scheme == 'https') ||
+          uri.host.isEmpty) {
+        _snack('base_url 必须是 http(s) 地址');
+        return;
+      }
+    }
+    if (env.isNotEmpty && !RegExp(r'^[A-Za-z_][A-Za-z0-9_]*$').hasMatch(env)) {
+      _snack('api_key_env 不是合法的环境变量名');
+      return;
+    }
+    Navigator.of(context).pop(<String, dynamic>{
+      'name': name,
+      if (baseUrl.isNotEmpty) 'base_url': baseUrl,
+      if (_apiKey.text.trim().isNotEmpty) 'api_key': _apiKey.text.trim(),
+      'api_key_env': env,
+      'enabled': _enabled,
+    });
+  }
+
+  void _snack(String text) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final bool hasKey = widget.existing?['has_api_key'] == true;
+    final String maskedBase = '${widget.existing?['base_url'] ?? ''}';
+    return AlertDialog(
+      title: Text(_isEdit ? '编辑 Provider' : '新增 Provider'),
+      content: SingleChildScrollView(
+        child: SizedBox(
+          width: 420,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              TextField(
+                key: const Key('provider-editor-name'),
+                controller: _name,
+                decoration: const InputDecoration(
+                  labelText: '名称',
+                  helperText: '用于生成稳定 id（小写字母/数字/-）；创建后 id 不可改',
+                  isDense: true,
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                key: const Key('provider-editor-base-url'),
+                controller: _baseUrl,
+                decoration: InputDecoration(
+                  labelText: 'base_url',
+                  helperText: _isEdit
+                      ? '当前：${maskedBase.isEmpty ? '（未配置）' : maskedBase}；留空 = 不修改'
+                      : 'OpenAI 兼容端点，如 https://api.deepseek.com/v1',
+                  isDense: true,
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                key: const Key('provider-editor-api-key'),
+                controller: _apiKey,
+                obscureText: true,
+                decoration: InputDecoration(
+                  labelText: 'api_key',
+                  helperText: _isEdit
+                      ? (hasKey ? '已配置；留空 = 不修改' : '当前未配置；留空 = 不修改')
+                      : '明文只写本机配置；可改用下面的环境变量',
+                  isDense: true,
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                key: const Key('provider-editor-env'),
+                controller: _apiKeyEnv,
+                decoration: const InputDecoration(
+                  labelText: 'api_key_env（可选）',
+                  helperText: '非空时优先读环境变量；留空 = 用上面的明文密钥',
+                  isDense: true,
+                ),
+              ),
+              const SizedBox(height: 6),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                value: _enabled,
+                onChanged: (bool v) => setState(() => _enabled = v),
+                activeThumbColor: cs.primary,
+                title: const Text('启用', style: TextStyle(fontSize: 13)),
+              ),
             ],
           ),
         ),

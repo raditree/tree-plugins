@@ -607,6 +607,9 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
               .toList(),
         );
         _modelsLoading = false;
+        // 成员绑定可能是旧裸 model_id：能唯一对上就换成 `provider/model_id`。
+        final String? canonical = _canonicalModelKey(_selectedModelId);
+        if (canonical != null) _selectedModelId = canonical;
       });
     } catch (e) {
       if (!mounted) return;
@@ -615,6 +618,20 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
         _modelsLoading = false;
       });
     }
+  }
+
+  /// 裸 model_id / 完整键 → 模型池唯一键；对不上返回 null（视为失效）。
+  String? _canonicalModelKey(String raw) {
+    final String value = raw.trim();
+    if (value.isEmpty) return null;
+    for (final Map<String, dynamic> model in _models) {
+      if (modelKeyOf(model) == value) return modelKeyOf(model);
+    }
+    final List<Map<String, dynamic>> byBare = <Map<String, dynamic>>[
+      for (final Map<String, dynamic> model in _models)
+        if ('${model['model_id'] ?? ''}' == value) model,
+    ];
+    return byBare.length == 1 ? modelKeyOf(byBare.single) : null;
   }
 
   /// 加载该成员当前会话的历史进度（对话历史 + 实时 WS 增量合并）
@@ -781,7 +798,9 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
           setState(() {
             _member = m;
             if ((m['model_id'] as String? ?? '').isNotEmpty) {
-              _selectedModelId = m['model_id'] as String;
+              _selectedModelId =
+                  _canonicalModelKey(m['model_id'] as String) ??
+                  (m['model_id'] as String);
             }
           });
           return;
@@ -867,7 +886,9 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
       setState(() {
         if (m != null) {
           _member = <String, dynamic>{..._member, ...m};
-          _selectedModelId = m['model_id'] as String? ?? _selectedModelId;
+          _selectedModelId =
+              _canonicalModelKey(m['model_id'] as String? ?? '') ??
+              (m['model_id'] as String? ?? _selectedModelId);
           // 提交成功后以服务端返回的自身覆盖为准重算基线
           _syncOverrideControllers();
         }
@@ -1035,8 +1056,10 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
           )
         else
           DropdownButtonFormField<String>(
-            initialValue: _models.any((Map<String, dynamic> m) =>
-                    (m['model_id'] as String? ?? '') == _selectedModelId)
+            initialValue: _models.any(
+                  (Map<String, dynamic> m) =>
+                      modelKeyOf(m) == _selectedModelId,
+                )
                 ? _selectedModelId
                 : '',
             isExpanded: true,
@@ -1053,9 +1076,9 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
               ),
               ..._models.map(
                 (Map<String, dynamic> m) => DropdownMenuItem<String>(
-                  value: m['model_id'] as String? ?? '',
+                  value: modelKeyOf(m),
                   child: Text(m['name'] as String? ??
-                      (m['model_id'] as String? ?? '')),
+                      (m['model_id'] as String? ?? modelKeyOf(m))),
                 ),
               ),
             ],

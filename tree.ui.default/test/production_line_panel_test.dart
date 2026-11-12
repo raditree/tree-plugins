@@ -5,6 +5,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:tree_ui_default/io/api_service.dart';
+import 'package:tree_ui_default/ui/widgets/create_production_line_dialog.dart';
+import 'package:tree_ui_default/ui/widgets/model_info_panel.dart';
+import 'package:tree_ui_default/ui/widgets/production_line_model_info_panel.dart';
 import 'package:tree_ui_default/ui/widgets/production_line_panel.dart';
 import 'package:tree_ui_default/ui/widgets/production_line_workbench.dart';
 
@@ -105,6 +108,17 @@ class _FakeCore {
             'model_id': 'lfm3',
             'name': 'LFM3',
             'kind': 'chat',
+          },
+          // D5/D6：provider 模型 + 端点声明（模态 / 上下文 / 输出）。
+          <String, dynamic>{
+            'model_id': 'm1',
+            'provider': 'demo',
+            'key': 'demo/m1',
+            'name': '演示模型',
+            'kind': 'chat',
+            'max_seqlen': 32000,
+            'max_output_tokens': 4096,
+            'if_vision': true,
           },
         ],
       };
@@ -581,5 +595,263 @@ void main() {
     await flyIO(tester);
     expect(find.text('标准开发流'), findsOneWidget);
     expect(find.textContaining('未安装 tree.production.line 插件'), findsNothing);
+  });
+
+  testWidgets('配置页：四张角色卡各带白名单工具 + 专家开关入 roles（D6）', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(harness());
+    await flyIO(tester);
+    await tester.tap(find.byKey(const Key('production-line-create')));
+    await flyIO(tester);
+    await tester.enterText(
+      find.byKey(const Key('production-line-name')),
+      '角色产线',
+    );
+
+    for (final String role in <String>[
+      'orchestrator',
+      'packer',
+      'executor',
+      'expert',
+    ]) {
+      expect(
+        find.byKey(Key('production-line-role-$role')),
+        findsOneWidget,
+        reason: '每个角色一张卡',
+      );
+    }
+    // 硬边界：打包 / 专家不出现写文件与编辑；执行必须有。
+    expect(
+      find.byKey(const Key('production-line-tool-packer-write')),
+      findsNothing,
+    );
+    expect(
+      find.byKey(const Key('production-line-tool-expert-edit')),
+      findsNothing,
+    );
+    expect(
+      find.byKey(const Key('production-line-tool-executor-write')),
+      findsOneWidget,
+    );
+    expect(find.byKey(const Key('production-line-expert-max')), findsNothing);
+
+    await tester.ensureVisible(
+      find.byKey(const Key('production-line-expert-enabled')),
+    );
+    await tester.pumpAndSettle();
+    // 配置页在对话框的滚动区里：直接触发组件回调，避免命中测试被滚动/
+    // 遮罩干扰（这里钉的是状态与提交体，不是手势本身）。
+    final Switch expertSwitch = tester.widget<Switch>(
+      find.byKey(const Key('production-line-expert-enabled')),
+    );
+    expertSwitch.onChanged!(true);
+    await tester.pump();
+    expect(find.byKey(const Key('production-line-expert-max')), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('production-line-submit')));
+    await flyIO(tester, rounds: 10);
+
+    expect(core.called('POST', '/api/production/lines'), isTrue);
+    final Map<String, dynamic> roles =
+        core.bodyOf('POST', '/api/production/lines')['roles']
+            as Map<String, dynamic>;
+    final Map<String, dynamic> expert = roles['expert'] as Map<String, dynamic>;
+    expect(expert['enabled'], isTrue);
+    expect(expert['max_per_task'], 3);
+    final List<dynamic> packerTools =
+        (roles['packer'] as Map<String, dynamic>)['tools'] as List<dynamic>;
+    expect(packerTools, isNot(contains('write')));
+    final List<dynamic> executorTools =
+        (roles['executor'] as Map<String, dynamic>)['tools'] as List<dynamic>;
+    expect(executorTools, contains('write'));
+    final List<dynamic> orchestratorTools =
+        (roles['orchestrator'] as Map<String, dynamic>)['tools']
+            as List<dynamic>;
+    expect(orchestratorTools, containsAll(<String>['read', 'grep', 'message']));
+  });
+
+  testWidgets('执行角色缺 write / edit ⇒ 不提交（配置页拦截）', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(harness());
+    await flyIO(tester);
+    await tester.tap(find.byKey(const Key('production-line-create')));
+    await flyIO(tester);
+    await tester.enterText(
+      find.byKey(const Key('production-line-name')),
+      '无写权限',
+    );
+
+    for (final String tool in <String>['write', 'edit']) {
+      final Finder chip = find.byKey(Key('production-line-tool-executor-$tool'));
+      await tester.ensureVisible(chip);
+      await tester.pumpAndSettle();
+      final FilterChip widget = tester.widget<FilterChip>(chip);
+      widget.onSelected!(false);
+      await tester.pump();
+    }
+    await tester.tap(find.byKey(const Key('production-line-submit')));
+    await flyIO(tester, rounds: 4);
+
+    expect(core.called('POST', '/api/production/lines'), isFalse);
+    expect(find.textContaining('执行工具至少要有'), findsOneWidget);
+  });
+
+  testWidgets('产线上下文模型信息：四角色解析 / 失效标红 / 不请求 Agent（D5）', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ProductionLineModelInfoPanel(
+            line: <String, dynamic>{
+              'id': 'pl_model',
+              'name': '模型线',
+              'roles': <String, dynamic>{
+                'orchestrator': <String, dynamic>{
+                  'model_id': 'demo/m1',
+                  'tools': <String>['read', 'grep'],
+                },
+                'packer': <String, dynamic>{'model_id': 'ghost/missing'},
+                'executor': <String, dynamic>{'model_id': ''},
+                'expert': <String, dynamic>{
+                  'model_id': '',
+                  'enabled': true,
+                  'max_per_task': 3,
+                  'tools': <String>['read'],
+                },
+              },
+            },
+          ),
+        ),
+      ),
+    );
+    await flyIO(tester);
+
+    expect(
+      core.called('GET', '/api/agents//models-info'),
+      isFalse,
+      reason: '产线上下文不该拿空 agentId 去请求 Agent 模型信息',
+    );
+    expect(find.text('演示模型'), findsOneWidget);
+    expect(find.text('demo · m1'), findsOneWidget);
+    expect(find.text('上下文 32000'), findsOneWidget);
+    expect(find.text('输出 4096'), findsOneWidget);
+    expect(find.text('image'), findsOneWidget);
+    expect(find.text('工具：read、grep'), findsOneWidget);
+    expect(find.text('已失效'), findsOneWidget);
+    expect(find.text('ghost/missing（模型池里已不存在）'), findsOneWidget);
+    expect(find.text('未配置'), findsNWidgets(2));
+    expect(find.text('专家：已启用（单任务上限 3）'), findsOneWidget);
+  });
+
+  testWidgets('未选 Agent：模型信息空态且不发请求（PL-4）', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(home: Scaffold(body: ModelInfoPanel(agentId: ''))),
+    );
+    await flyIO(tester);
+
+    expect(find.textContaining('请先在左侧选择或创建一个 Agent'), findsOneWidget);
+    expect(
+      core.calls.where((String call) => call.contains('/models-info')),
+      isEmpty,
+      reason: '空 agentId 不能拼出 /api/agents//models-info',
+    );
+  });
+
+  testWidgets('存量角色模型不在池中 ⇒ 标失效并拦提交（PL-3-C）', (
+    WidgetTester tester,
+  ) async {
+    ProductionLineSpec? spec;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Builder(
+            builder: (BuildContext context) => TextButton(
+              onPressed: () async {
+                spec = await showDialog<ProductionLineSpec>(
+                  context: context,
+                  builder: (_) => const CreateProductionLineDialog(
+                    initial: <String, dynamic>{
+                      'id': 'pl_stale',
+                      'name': '存量产线',
+                      'workspace_dir': 'E:/work/demo',
+                      'roles': <String, dynamic>{
+                        'executor': <String, dynamic>{
+                          'model_id': 'ghost/missing',
+                        },
+                      },
+                    },
+                  ),
+                );
+              },
+              child: const Text('open'),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('open'));
+    await flyIO(tester);
+
+    expect(find.text('ghost/missing（已失效）'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('production-line-submit')));
+    await flyIO(tester, rounds: 4);
+
+    expect(spec, isNull, reason: '失效模型必须拦下，不产出配置');
+    expect(find.textContaining('不在模型池里（已失效）'), findsOneWidget);
+  });
+
+  testWidgets('存量非法工具：如实提示，保存时按角色白名单剔除（D6）', (
+    WidgetTester tester,
+  ) async {
+    ProductionLineSpec? spec;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Builder(
+            builder: (BuildContext context) => TextButton(
+              onPressed: () async {
+                spec = await showDialog<ProductionLineSpec>(
+                  context: context,
+                  builder: (_) => const CreateProductionLineDialog(
+                    initial: <String, dynamic>{
+                      'id': 'pl_legacy',
+                      'name': '旧配置',
+                      'workspace_dir': 'E:/work/demo',
+                      'roles': <String, dynamic>{
+                        'packer': <String, dynamic>{
+                          'model_id': 'lfm3',
+                          'tools': <String>['read', 'write'],
+                        },
+                        'executor': <String, dynamic>{'model_id': 'lfm3'},
+                      },
+                    },
+                  ),
+                );
+              },
+              child: const Text('open'),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('open'));
+    await flyIO(tester);
+
+    expect(
+      find.textContaining('已忽略非本角色允许的工具：write'),
+      findsOneWidget,
+    );
+    await tester.tap(find.byKey(const Key('production-line-submit')));
+    await flyIO(tester, rounds: 4);
+
+    expect(spec, isNotNull);
+    final Map<String, dynamic> roles =
+        spec!.roles['packer'] as Map<String, dynamic>;
+    expect(roles['tools'], isNot(contains('write')));
   });
 }

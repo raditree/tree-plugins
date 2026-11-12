@@ -29,6 +29,7 @@ import '../widgets/model_info_panel.dart';
 import '../widgets/onboarding_guide.dart';
 import '../widgets/plugin_panel.dart';
 import '../widgets/production_line_panel.dart';
+import '../widgets/production_line_model_info_panel.dart';
 import '../widgets/production_line_workbench.dart';
 import '../widgets/question_panel.dart';
 import '../widgets/right_panel_host.dart';
@@ -36,6 +37,19 @@ import '../widgets/teammates_window_page.dart';
 import '../widgets/tool_runs_panel.dart';
 import '../widgets/todo_panel.dart';
 import 'settings_page.dart';
+
+/// 文件窗 workspaceId 的纯口径（D4）：产线上下文 → `line:<id>`；
+/// 否则跟当前 Agent 的工作空间（都没有则为空，由调用方渲染空态）。
+String fileScopeWorkspaceIdOf({
+  required Map<String, dynamic>? line,
+  required String agentWorkspaceId,
+}) {
+  if (line != null) {
+    final String id = '${line['id'] ?? ''}'.trim();
+    return id.isEmpty ? '' : 'line:$id';
+  }
+  return agentWorkspaceId;
+}
 
 /// 主页面 - 三栏布局
 ///
@@ -103,6 +117,18 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 
   /// 左侧是否停在「生产线」页（决定中栏显示工作台还是对话）。
   bool get _productionActive => _leftPanel == 3;
+
+  /// 右栏「文件」「模型信息」的产线作用域：只有**停在生产线页**且选了一条产线
+  /// 才生效；切回 Agent 列表后立刻回落到当前 Agent（STAB-PL-5 / D4）。
+  Map<String, dynamic>? get _lineScope =>
+      _productionActive ? _selectedProductionLine : null;
+
+  /// 文件窗的 workspaceId：产线 = `line:<id>`（files 插件按 line.yaml 解析根），
+  /// 其余 = 当前 Agent 的工作空间。
+  String get _fileScopeWorkspaceId => fileScopeWorkspaceIdOf(
+    line: _lineScope,
+    agentWorkspaceId: _selectedAgent?.workspaceId ?? '',
+  );
 
 
   // 当前选中的 Agent（未选择时为 null）
@@ -1811,6 +1837,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   List<RightPanelEntry> _rightPanelEntries() {
     final String workspaceId = _selectedAgent?.workspaceId ?? '';
     final String agentId = _selectedAgent?.id ?? '';
+    final Map<String, dynamic>? line = _lineScope;
+    final String fileWorkspaceId = _fileScopeWorkspaceId;
+    final String lineName = '${line?['name'] ?? ''}'.trim();
     return <RightPanelEntry>[
       RightPanelEntry(
         id: 'files',
@@ -1819,16 +1848,32 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         openByDefault: true,
         // 长行 / 宽表格 / 分屏：打开时把右栏放宽到能读（用户 2026-11-08）
         preferredWidth: 560,
-        bodyBuilder: (BuildContext context) => workspaceId.isEmpty
-            ? _buildNoAgentHint()
-            : FilePanel(
-                // 换 agent = 换工作空间：整块重建（树/查看器状态都归零）
-                key: ValueKey<String>('file-window-$workspaceId'),
-                workspaceId: workspaceId,
-                teamId: _selectedAgent?.id,
-                teamName: _selectedAgent?.name ?? '',
-                fileRefreshTrigger: _fileRefreshTrigger,
-              ),
+        bodyBuilder: (BuildContext context) {
+          if (line != null) {
+            // 产线作用域（STAB-PL-5）：按 line.yaml.workspace_dir 浏览；
+            // 产线没配目录时给可读空态，而不是把错误丢给 files 插件。
+            if (fileWorkspaceId.isEmpty) return _buildNoAgentHint();
+            if ('${line['workspace_dir'] ?? ''}'.trim().isEmpty) {
+              return _buildNoLineWorkspaceHint(lineName);
+            }
+            return FilePanel(
+              key: ValueKey<String>('file-window-$fileWorkspaceId'),
+              workspaceId: fileWorkspaceId,
+              teamName: lineName.isEmpty ? '产线' : '产线 · $lineName',
+              fileRefreshTrigger: _fileRefreshTrigger,
+            );
+          }
+          return workspaceId.isEmpty
+              ? _buildNoAgentHint()
+              : FilePanel(
+                  // 换 agent = 换工作空间：整块重建（树/查看器状态都归零）
+                  key: ValueKey<String>('file-window-$workspaceId'),
+                  workspaceId: workspaceId,
+                  teamId: _selectedAgent?.id,
+                  teamName: _selectedAgent?.name ?? '',
+                  fileRefreshTrigger: _fileRefreshTrigger,
+                );
+        },
       ),
       // Todo（用户 2026-10-19）：从「文件」窗里拆出来单独成窗；Git 历史已
       // 随 git 路由删除下线（2026-10-25），右栏不再提供该窗口。
@@ -1861,7 +1906,19 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         icon: Icons.smart_toy_outlined,
         // 模型参数表
         preferredWidth: 480,
-        bodyBuilder: (BuildContext context) => ModelInfoPanel(agentId: agentId),
+        bodyBuilder: (BuildContext context) {
+          // 产线上下文以产线角色为目标（D5）：四个角色的模型都在 line.yaml 里，
+          // 即使同时选着 Agent 也不该把它当成 Agent 的模型配置页。
+          if (line != null) {
+            return ProductionLineModelInfoPanel(
+              key: ValueKey<String>('line-model-info-${line['id'] ?? ''}'),
+              line: line,
+            );
+          }
+          return agentId.isEmpty
+              ? _buildNoAgentHint()
+              : ModelInfoPanel(agentId: agentId);
+        },
       ),
       RightPanelEntry(
         id: 'questions',
@@ -1923,6 +1980,30 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
           Text(
             '请先在左侧选择或创建一个 Agent',
             style: TextStyle(fontSize: 14, color: cs.onSurfaceVariant),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 「文件」窗口在**选中的产线没有工作目录**时的空态（STAB-PL-5 / D4）。
+  Widget _buildNoLineWorkspaceHint(String lineName) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final String name = lineName.isEmpty ? '该产线' : '产线「$lineName」';
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Icon(Icons.folder_off_outlined, size: 56, color: cs.onSurfaceVariant),
+          const SizedBox(height: 12),
+          Text(
+            '$name还没有配置工作目录',
+            style: TextStyle(fontSize: 14, color: cs.onSurfaceVariant),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            '到工作台「配置」里填写 workspace_dir 后即可浏览文件',
+            style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
           ),
         ],
       ),

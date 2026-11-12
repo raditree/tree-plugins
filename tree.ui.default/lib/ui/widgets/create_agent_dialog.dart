@@ -92,13 +92,16 @@ class _CreateAgentDialogState extends State<CreateAgentDialog> {
       setState(() {
         _models = models;
         _loading = false;
-        // 恢复上次选择：记忆模型仍在池中则选中它，否则回退第一个
+        // 恢复上次选择：记忆模型仍在池中则选中它，否则回退第一个。
+        // 取值用模型池唯一键（`provider/model_id`），裸 model_id 在跨 provider
+        // 重名时不再是唯一身份（D7）。
         final bool remembered = _lastSelectedModelId != null &&
-            models.any((m) =>
-                (m['model_id'] as String? ?? '') == _lastSelectedModelId);
+            models.any(
+              (m) => modelKeyOf(m) == _lastSelectedModelId,
+            );
         _selectedModelId = remembered
             ? _lastSelectedModelId
-            : (models.isNotEmpty ? models.first['model_id'] as String : null);
+            : (models.isNotEmpty ? modelKeyOf(models.first) : null);
       });
     } catch (e) {
       if (!mounted) return;
@@ -181,7 +184,7 @@ class _CreateAgentDialogState extends State<CreateAgentDialog> {
 
     String modelName = _selectedModelId!;
     for (final m in _models) {
-      if (m['model_id'] == _selectedModelId && m['name'] is String) {
+      if (modelKeyOf(m) == _selectedModelId && m['name'] is String) {
         modelName = m['name'] as String;
         break;
       }
@@ -371,9 +374,10 @@ class _CreateAgentDialogState extends State<CreateAgentDialog> {
         border: OutlineInputBorder(),
       ),
       items: _models.map((m) {
-        final String modelId = m['model_id'] as String;
+        final String modelKey = modelKeyOf(m);
+        final String modelId = m['model_id'] as String? ?? modelKey;
         return DropdownMenuItem<String>(
-          value: modelId,
+          value: modelKey,
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [

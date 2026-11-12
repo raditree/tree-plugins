@@ -932,7 +932,10 @@ class ApiService {
   /// `{"models": [{"model_id","name","max_seqlen","thinking","if_vision","base_url"}], "current": {...}}`。
   /// 网络异常或核心进程返回错误时抛出中文异常。
   static Future<Map<String, dynamic>> getAgentModelsInfo(String agentId) async {
-    return _getJson('/api/agents/$agentId/models-info');
+    if (agentId.trim().isEmpty) {
+      throw ArgumentError('agentId 不能为空');
+    }
+    return _getJson('/api/agents/${Uri.encodeComponent(agentId)}/models-info');
   }
 
   // ==================== 自定义模型管理（设置页） ====================
@@ -976,6 +979,57 @@ class ApiService {
     return _postJson(
       '/api/models/${Uri.encodeComponent(modelId)}/meta',
       body: const <String, dynamic>{},
+    );
+  }
+
+  // ==================== Provider 池（D7） ====================
+
+  /// provider 列表（含模型数 / 目录缓存摘要）。
+  static Future<List<Map<String, dynamic>>> getProviders() async {
+    final Map<String, dynamic> data = await _getJson('/api/providers');
+    final List<dynamic> providers =
+        data['providers'] as List<dynamic>? ?? <dynamic>[];
+    return providers
+        .map(
+          (dynamic e) => Map<String, dynamic>.from(e as Map<dynamic, dynamic>),
+        )
+        .toList();
+  }
+
+  static Future<Map<String, dynamic>> createProvider(
+    Map<String, dynamic> payload,
+  ) async {
+    return _postJson('/api/providers', body: payload);
+  }
+
+  static Future<Map<String, dynamic>> updateProvider(
+    String providerId,
+    Map<String, dynamic> payload,
+  ) async {
+    return _patchJson(
+      '/api/providers/${Uri.encodeComponent(providerId)}',
+      body: payload,
+    );
+  }
+
+  static Future<Map<String, dynamic>> deleteProvider(String providerId) async {
+    return _deleteJson('/api/providers/${Uri.encodeComponent(providerId)}');
+  }
+
+  /// 重新拉取 provider 的 `/models` 并写缓存。
+  static Future<Map<String, dynamic>> refreshProvider(String providerId) async {
+    return _postJson(
+      '/api/providers/${Uri.encodeComponent(providerId)}/refresh',
+      body: const <String, dynamic>{},
+    );
+  }
+
+  /// provider 的模型目录缓存（`{provider_id, fetched_at, error, models}`）。
+  static Future<Map<String, dynamic>> getProviderModels(
+    String providerId,
+  ) async {
+    return _getJson(
+      '/api/providers/${Uri.encodeComponent(providerId)}/models',
     );
   }
 

@@ -91,8 +91,35 @@ ModelKindFields modelKindFieldsOf(String kind) {
   );
 }
 
-/// 思考强度档位的兜底列表（与后端 `CoreModelConfig.defaultReasoningEfforts` 一致）。
+/// 思考强度档位的兜底列表（**仅**后端旧行为使用；D8 起 UI 不再显示假档位）。
 const List<String> kFallbackReasoningEfforts = <String>['low', 'high', 'max'];
+
+/// 模型所属 provider（旧数据没有该字段 ⇒ 空串）。
+String providerOf(Map<String, dynamic> model) =>
+    (model['provider'] as String? ?? '').trim();
+
+/// 模型池唯一键（`provider/model_id`）；旧插件 / 旧数据回落到裸 `model_id`。
+String modelKeyOf(Map<String, dynamic> model) {
+  final String key = (model['key'] as String? ?? '').trim();
+  if (key.isNotEmpty) return key;
+  final String modelId = (model['model_id'] as String? ?? '').trim();
+  final String provider = providerOf(model);
+  return provider.isEmpty ? modelId : '$provider/$modelId';
+}
+
+/// provider 分组标题（`legacy` 是旧文件的归组 id）。
+String providerLabelOf(String providerId) {
+  if (providerId.isEmpty) return '独立端点（未归组）';
+  if (providerId == 'legacy') return '旧版模型（未归组）';
+  return providerId;
+}
+
+/// 模态徽标（端点声明 / 用户手改后的 `if_vision` / `if_audio` / `if_video`）。
+List<String> modelMediaLabelsOf(Map<String, dynamic> model) => <String>[
+  if (model['if_vision'] == true) 'image',
+  if (model['if_audio'] == true) 'audio',
+  if (model['if_video'] == true) 'video',
+];
 
 /// 从模型条目的 `meta` 里取端点声明的思考档位（没探测过 / 未声明 ⇒ 空）。
 List<String> modelMetaEffortsOf(Map<String, dynamic> model) {
@@ -137,6 +164,9 @@ String _formatPrice(num? value) {
 class ModelEditorDraft {
   /// 编辑前的 kind（null = 新增）。
   final String? originalKind;
+
+  /// 所属 provider（空 = 独立端点；编辑时沿用原值、不下发）。
+  final String provider;
   final String kind;
   final String modelId;
   final String name;
@@ -148,6 +178,8 @@ class ModelEditorDraft {
   final int? maxOutputTokens;
   final bool thinking;
   final bool ifVision;
+  final bool ifAudio;
+  final bool ifVideo;
   final int? dimensions;
   final int? maxInputTokens;
   final double? confidenceThreshold;
@@ -157,6 +189,7 @@ class ModelEditorDraft {
     required this.modelId,
     required this.name,
     this.originalKind,
+    this.provider = '',
     this.baseUrl = '',
     this.apiKey = '',
     this.reasoningEffort = '',
@@ -165,6 +198,8 @@ class ModelEditorDraft {
     this.maxOutputTokens,
     this.thinking = false,
     this.ifVision = false,
+    this.ifAudio = false,
+    this.ifVideo = false,
     this.dimensions,
     this.maxInputTokens,
     this.confidenceThreshold,
@@ -177,8 +212,10 @@ class ModelEditorDraft {
   /// 返回 null 表示通过；否则是可读错误文案（弹 SnackBar）。
   String? validate() {
     if (modelId.trim().isEmpty) return 'model_id 不能为空';
-    if (!isEdit && (baseUrl.trim().isEmpty || apiKey.trim().isEmpty)) {
-      return '新增模型必须填写 base_url 与 api_key';
+    if (!isEdit && provider.trim().isEmpty) {
+      if (baseUrl.trim().isEmpty || apiKey.trim().isEmpty) {
+        return '独立端点必须填写 base_url 与 api_key（或先选一个 provider）';
+      }
     }
     if (kind == kModelKindEmbedding) {
       final int? dim = dimensions;
@@ -204,6 +241,10 @@ class ModelEditorDraft {
       'model_id': modelId.trim(),
       'name': name.trim(),
     };
+    // provider 创建后不可改：只在新增时下发。
+    if (!isEdit && provider.trim().isNotEmpty) {
+      payload['provider'] = provider.trim();
+    }
     // 新增必须带 kind / protocol；编辑不带（后端禁止改类型）。
     if (!isEdit) {
       payload['kind'] = kind;
@@ -232,10 +273,12 @@ class ModelEditorDraft {
       default:
         payload['thinking'] = thinking;
         payload['if_vision'] = ifVision;
+        payload['if_audio'] = ifAudio;
+        payload['if_video'] = ifVideo;
         if (reasoningEffort.isNotEmpty) {
           payload['reasoning_effort'] = reasoningEffort;
         }
-        // 留空 = 用后端默认档位，此时不下发该键。
+        // D8：只下发端点声明或用户显式选的档位，不再落 low/high/max 兜底。
         if (reasoningEffortOptions.isNotEmpty) {
           payload['reasoning_effort_options'] = reasoningEffortOptions;
         }

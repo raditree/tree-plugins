@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
+import '../app_radius.dart';
 import '../models/agent.dart';
 import '../services/model_pool.dart';
 import 'production_line_utils.dart';
@@ -63,24 +64,27 @@ class _RoleDef {
 }
 
 const List<_RoleDef> _roleDefs = <_RoleDef>[
-  _RoleDef('orchestrator', '主控', 'lfm3', <String>['read', 'grep', 'message']),
+  _RoleDef('orchestrator', '主控', '', <String>['read', 'grep', 'message']),
   _RoleDef(
     'packer',
     '打包',
-    'lfm3',
+    '',
     <String>['read', 'list', 'grep', 'terminal', 'message'],
   ),
   _RoleDef(
     'executor',
     '执行',
-    'lfm3',
+    '',
     <String>['read', 'write', 'edit', 'terminal', 'message', 'spec'],
   ),
-  _RoleDef('expert', '专家', 'lfm3', <String>['read', 'grep']),
+  _RoleDef('expert', '专家', '', <String>['read', 'grep']),
 ];
 
-/// 执行模型可勾选的工具（§6.4 工具分组）。
-const List<(String, String)> _executorToolDefs = <(String, String)>[
+/// 角色工具目录：名称 + 中文标签（顺序即 chips 顺序）。
+///
+/// 与后端硬边界一致（`expert.dart` 禁 write / edit / subagent / team / ask_expert；
+/// 打包只要读 + 命令），因此**不把非法组合摆出来**：每张角色卡只列自己的工具。
+const List<(String, String)> _toolDefs = <(String, String)>[
   ('read', '读文件'),
   ('list', '列目录'),
   ('grep', '搜索'),
@@ -90,6 +94,23 @@ const List<(String, String)> _executorToolDefs = <(String, String)>[
   ('message', '协作'),
   ('spec', '规范'),
 ];
+
+/// 各角色允许勾选的工具（白名单；工具名与 `kRoleDefaultTools` 同键）。
+const Map<String, Set<String>> _roleAllowedTools = <String, Set<String>>{
+  'orchestrator': <String>{'read', 'list', 'grep', 'message'},
+  'packer': <String>{'read', 'list', 'grep', 'terminal', 'message'},
+  'executor': <String>{
+    'read',
+    'list',
+    'grep',
+    'write',
+    'edit',
+    'terminal',
+    'message',
+    'spec',
+  },
+  'expert': <String>{'read', 'list', 'grep'},
+};
 
 class _CreateProductionLineDialogState
     extends State<CreateProductionLineDialog> {
@@ -111,7 +132,14 @@ class _CreateProductionLineDialogState
 
   String _executorAgentId = '';
   final Map<String, String> _roleModels = <String, String>{};
-  final Set<String> _tools = <String>{};
+  final Map<String, Set<String>> _roleTools = <String, Set<String>>{};
+
+  /// 存量产线里出现过、但不属于该角色的工具（保存时剔除；如实提示一次）。
+  final Map<String, List<String>> _droppedTools = <String, List<String>>{};
+
+  /// `roles.expert.enabled` / `max_per_task`（默认关闭，与后端一致）。
+  bool _expertEnabled = false;
+  int _expertMax = 3;
 
   bool get _editing => widget.initial != null;
 
@@ -123,11 +151,26 @@ class _CreateProductionLineDialogState
       final Object? raw = roles[role.key];
       final Map<String, dynamic> data = productionMap(raw);
       final String model = '${data['model_id'] ?? ''}'.trim();
-      _roleModels[role.key] = model.isEmpty ? role.defaultModel : model;
-      if (role.key == 'executor') {
-        final List<dynamic> tools =
-            data['tools'] as List<dynamic>? ?? role.defaultTools;
-        _tools.addAll(tools.map((dynamic item) => '$item'));
+      _roleModels[role.key] = model;
+      final Set<String> allowed =
+          _roleAllowedTools[role.key] ?? const <String>{};
+      final List<String> configured = <String>[
+        for (final Object? item
+            in (data['tools'] as List<dynamic>? ?? role.defaultTools))
+          if ('${item ?? ''}'.trim().isNotEmpty) '${item ?? ''}'.trim(),
+      ];
+      _roleTools[role.key] = <String>{
+        for (final String tool in configured)
+          if (allowed.contains(tool)) tool,
+      };
+      final List<String> dropped = <String>[
+        for (final String tool in configured)
+          if (!allowed.contains(tool)) tool,
+      ];
+      if (dropped.isNotEmpty) _droppedTools[role.key] = dropped;
+      if (role.key == 'expert') {
+        _expertEnabled = data['enabled'] == true;
+        _expertMax = (data['max_per_task'] as num?)?.toInt() ?? 3;
       }
     }
     final Map<String, dynamic> executor = productionMap(
@@ -162,6 +205,20 @@ class _CreateProductionLineDialogState
         _agents = results[0] as List<Agent>;
         _models = chatModelsOf(results[1] as List<Map<String, dynamic>>);
         _loading = false;
+        // 旧产线的角色模型是裸 model_id：能唯一对上就换成 `provider/model_id`；
+        // 对不上（或池里根本没有）保持原值，由下拉标成"已失效"、提交被拦下。
+        for (final _RoleDef role in _roles) {
+          final String raw = (_roleModels[role.key] ?? '').trim();
+          if (raw.isEmpty) {
+            // 不再凭空写 `lfm3`：默认 = 模型池第一个 chat 模型（池空则留空）。
+            if (_models.isNotEmpty) {
+              _roleModels[role.key] = modelKeyOf(_models.first);
+            }
+            continue;
+          }
+          final String? canonical = _canonicalKey(raw);
+          if (canonical != null) _roleModels[role.key] = canonical;
+        }
       });
     } catch (error) {
       if (!mounted) return;
@@ -178,13 +235,39 @@ class _CreateProductionLineDialogState
     setState(() => _workspace.text = picked);
   }
 
+  /// 裸 model_id / 完整键 → 模型池里的唯一键；对不上返回 null（视为失效）。
+  String? _canonicalKey(String raw) {
+    final String value = raw.trim();
+    if (value.isEmpty) return null;
+    for (final Map<String, dynamic> model in _models) {
+      if (modelKeyOf(model) == value) return modelKeyOf(model);
+    }
+    final List<Map<String, dynamic>> byBare = <Map<String, dynamic>>[
+      for (final Map<String, dynamic> model in _models)
+        if ('${model['model_id'] ?? ''}' == value) model,
+    ];
+    return byBare.length == 1 ? modelKeyOf(byBare.single) : null;
+  }
+
   void _submit() {
     final String name = _name.text.trim();
     if (name.isEmpty) {
       _toast('请填写产线名称');
       return;
     }
-    if (!_tools.contains('write') && !_tools.contains('edit')) {
+    for (final _RoleDef role in _roles) {
+      final String value = (_roleModels[role.key] ?? '').trim();
+      if (value.isEmpty) {
+        _toast('请为「${role.label}」选择模型');
+        return;
+      }
+      if (_models.isNotEmpty && _canonicalKey(value) == null) {
+        _toast('「${role.label}」的模型不在模型池里（已失效），请重新选择');
+        return;
+      }
+    }
+    if (!(_roleTools['executor'] ?? const <String>{}).contains('write') &&
+        !(_roleTools['executor'] ?? const <String>{}).contains('edit')) {
       _toast('执行工具至少要有「写文件」或「编辑」：否则执行模型无法落地');
       return;
     }
@@ -221,18 +304,16 @@ class _CreateProductionLineDialogState
     final Map<String, dynamic> roles = <String, dynamic>{};
     for (final _RoleDef role in _roles) {
       final Map<String, dynamic> existing = productionMap(current[role.key]);
-      final List<dynamic> tools =
-          existing['tools'] as List<dynamic>? ?? role.defaultTools;
+      final Set<String> tools = _roleTools[role.key] ?? <String>{};
+      final List<String> sorted = tools.toList()..sort();
       roles[role.key] = <String, dynamic>{
-        if (role.key == 'expert') ...<String, dynamic>{
-          'enabled': existing['enabled'] ?? false,
-          'max_per_task': existing['max_per_task'] ?? 3,
-        },
         ...existing,
-        'model_id': _roleModels[role.key] ?? role.defaultModel,
-        'tools': role.key == 'executor'
-            ? (_tools.toList()..sort())
-            : List<dynamic>.of(tools),
+        'model_id': _roleModels[role.key] ?? '',
+        'tools': sorted,
+        if (role.key == 'expert') ...<String, dynamic>{
+          'enabled': _expertEnabled,
+          'max_per_task': _expertMax,
+        },
       };
     }
     return roles;
@@ -337,50 +418,14 @@ class _CreateProductionLineDialogState
                   ),
                 ),
               const SizedBox(height: 14),
-              _label('角色与模型'),
+              _label('角色配置（每个角色独立选模型与工具）'),
               const SizedBox(height: 6),
-              for (int i = 0; i < _roles.length; i += 2) ...<Widget>[
-                Row(
-                  children: <Widget>[
-                    Expanded(child: _modelField(_roles[i])),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: i + 1 < _roles.length
-                          ? _modelField(_roles[i + 1])
-                          : const SizedBox.shrink(),
-                    ),
-                  ],
-                ),
-                if (i + 2 < _roles.length) const SizedBox(height: 10),
+              for (final _RoleDef role in _roles) ...<Widget>[
+                _roleCard(role),
+                const SizedBox(height: 8),
               ],
-              const SizedBox(height: 14),
-              _label('执行工具'),
-              const SizedBox(height: 4),
-              Wrap(
-                spacing: 6,
-                runSpacing: 2,
-                children: <Widget>[
-                  for (final (String tool, String label) in _executorToolDefs)
-                    FilterChip(
-                      key: Key('production-line-tool-$tool'),
-                      label: Text(label, style: const TextStyle(fontSize: 12)),
-                      selected: _tools.contains(tool),
-                      visualDensity: VisualDensity.compact,
-                      onSelected: (bool selected) {
-                        setState(() {
-                          if (selected) {
-                            _tools.add(tool);
-                          } else {
-                            _tools.remove(tool);
-                          }
-                        });
-                      },
-                    ),
-                ],
-              ),
-              const SizedBox(height: 4),
               const Text(
-                '写文件 / 编辑至少勾一个，否则执行模型无法落地',
+                '执行角色至少要有「写文件」或「编辑」；打包 / 专家不能写文件（工具白名单）。',
                 style: TextStyle(fontSize: 11, color: Colors.grey),
               ),
             ],
@@ -409,40 +454,162 @@ class _CreateProductionLineDialogState
     ),
   );
 
-  Widget _modelField(_RoleDef role) {
-    final String current = _roleModels[role.key] ?? role.defaultModel;
-    final Set<String> options = <String>{
-      for (final Map<String, dynamic> model in _models)
-        '${model['model_id'] ?? ''}',
-      current,
-    }..remove('');
-    if (options.isEmpty) options.add(role.defaultModel);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: <Widget>[
-        Text(role.label, style: const TextStyle(fontSize: 12)),
-        const SizedBox(height: 4),
-        DropdownButtonFormField<String>(
-          key: ValueKey<String>('role-${role.key}-$current'),
-          initialValue: current,
-          isExpanded: true,
-          decoration: const InputDecoration(
-            isDense: true,
-            border: OutlineInputBorder(),
-          ),
-          items: <DropdownMenuItem<String>>[
-            for (final String id in options)
-              DropdownMenuItem<String>(
-                value: id,
-                child: Text(id, overflow: TextOverflow.ellipsis),
+  /// 一张角色卡：模型下拉 + 该角色允许的工具 chips（+ 专家开关）。
+  Widget _roleCard(_RoleDef role) {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final Set<String> allowed =
+        _roleAllowedTools[role.key] ?? const <String>{};
+    final Set<String> selected = _roleTools[role.key] ?? <String>{};
+    final List<String> dropped = _droppedTools[role.key] ?? const <String>[];
+    return Container(
+      key: Key('production-line-role-${role.key}'),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(AppRadius.md),
+        border: Border.all(color: cs.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Text(
+                role.label,
+                style: const TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
+              if (role.key == 'expert') ...<Widget>[
+                const Spacer(),
+                Text(
+                  '启用',
+                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                ),
+                Switch(
+                  key: const Key('production-line-expert-enabled'),
+                  value: _expertEnabled,
+                  onChanged: (bool value) {
+                    setState(() => _expertEnabled = value);
+                  },
+                ),
+              ],
+            ],
+          ),
+          const SizedBox(height: 4),
+          _modelDropdown(role),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 6,
+            runSpacing: 2,
+            children: <Widget>[
+              for (final (String tool, String label) in _toolDefs)
+                if (allowed.contains(tool))
+                  FilterChip(
+                    key: Key('production-line-tool-${role.key}-$tool'),
+                    label: Text(label, style: const TextStyle(fontSize: 12)),
+                    selected: selected.contains(tool),
+                    visualDensity: VisualDensity.compact,
+                    onSelected: (bool value) {
+                      setState(() {
+                        final Set<String> next = _roleTools.putIfAbsent(
+                          role.key,
+                          () => <String>{},
+                        );
+                        if (value) {
+                          next.add(tool);
+                        } else {
+                          next.remove(tool);
+                        }
+                      });
+                    },
+                  ),
+            ],
+          ),
+          if (dropped.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 4),
+            Text(
+              '已忽略非本角色允许的工具：${dropped.join('、')}（保存后剔除）',
+              style: TextStyle(fontSize: 11, color: cs.error),
+            ),
           ],
-          onChanged: (String? value) {
-            if (value == null) return;
-            setState(() => _roleModels[role.key] = value);
-          },
+          if (role.key == 'expert' && _expertEnabled) ...<Widget>[
+            const SizedBox(height: 4),
+            Row(
+              children: <Widget>[
+                Text(
+                  '单任务上限',
+                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                ),
+                const SizedBox(width: 8),
+                DropdownButton<int>(
+                  key: const Key('production-line-expert-max'),
+                  value: _expertMax,
+                  isDense: true,
+                  items: <DropdownMenuItem<int>>[
+                    for (int i = 1; i <= 5; i++)
+                      DropdownMenuItem<int>(
+                        value: i,
+                        child: Text('$i', style: const TextStyle(fontSize: 12)),
+                      ),
+                  ],
+                  onChanged: (int? value) {
+                    if (value == null) return;
+                    setState(() => _expertMax = value);
+                  },
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _modelDropdown(_RoleDef role) {
+    final String current = (_roleModels[role.key] ?? '').trim();
+    final List<String> options = <String>[
+      for (final Map<String, dynamic> model in _models) modelKeyOf(model),
+    ];
+    final bool invalid = current.isNotEmpty && !options.contains(current);
+    if (options.isEmpty && !invalid) {
+      return Text(
+        '模型池里没有 chat 模型：请先到「设置 → 模型池」新增',
+        style: TextStyle(
+          fontSize: 12,
+          color: Theme.of(context).colorScheme.error,
         ),
+      );
+    }
+    return DropdownButtonFormField<String>(
+      key: ValueKey<String>('role-${role.key}-$current'),
+      initialValue: current.isEmpty ? null : current,
+      isExpanded: true,
+      decoration: const InputDecoration(
+        isDense: true,
+        border: OutlineInputBorder(),
+      ),
+      items: <DropdownMenuItem<String>>[
+        for (final String id in options)
+          DropdownMenuItem<String>(
+            value: id,
+            child: Text(id, overflow: TextOverflow.ellipsis),
+          ),
+        // 存量产线的模型已被删除 / 不在池里：如实标失效，不静默替换。
+        if (invalid)
+          DropdownMenuItem<String>(
+            value: current,
+            child: Text(
+              '$current（已失效）',
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+          ),
       ],
+      onChanged: (String? value) {
+        if (value == null) return;
+        setState(() => _roleModels[role.key] = value);
+      },
     );
   }
 }

@@ -1010,7 +1010,8 @@ class _NewTaskDialogState extends State<_NewTaskDialog> {
                 hintText: 'lib/ui/widgets/agent_list.dart',
                 helperText: widget.workspace.isEmpty
                     ? '产线未配置工作空间：只能手填相对路径'
-                    : '执行阶段只允许改这些路径；留空则不能打包',
+                    : '执行阶段只允许改这些路径；留空 = 整个工作空间（不限制范围，禁区仍拦，'
+                          '且会与其它任务串行）',
               ),
             ),
             const SizedBox(height: 6),

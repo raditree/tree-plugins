@@ -127,6 +127,79 @@ void main() {
     });
   });
 
+  group('D7 provider / 模型身份', () {
+    test('provider / key / 分组标题 / 模态徽标', () {
+      final Map<String, dynamic> model = <String, dynamic>{
+        'provider': 'deepseek',
+        'key': 'deepseek/flash',
+        'model_id': 'flash',
+        'if_vision': true,
+        'if_audio': false,
+        'if_video': true,
+      };
+      expect(providerOf(model), 'deepseek');
+      expect(modelKeyOf(model), 'deepseek/flash');
+      expect(modelMediaLabelsOf(model), <String>['image', 'video']);
+      // 旧数据：没有 provider / key。
+      expect(
+        modelKeyOf(<String, dynamic>{'model_id': 'm1'}),
+        'm1',
+      );
+      expect(providerLabelOf('legacy'), contains('旧版'));
+      expect(providerLabelOf(''), contains('独立端点'));
+    });
+
+    test('归到 provider 的新增：免端点密钥，提交带 provider', () {
+      const ModelEditorDraft draft = ModelEditorDraft(
+        kind: kModelKindChat,
+        provider: 'deepseek',
+        modelId: 'flash',
+        name: 'Flash',
+        ifVision: true,
+      );
+      expect(draft.validate(), isNull);
+      final Map<String, dynamic> payload = draft.toPayload();
+      expect(payload['provider'], 'deepseek');
+      expect(payload.containsKey('base_url'), isFalse);
+      expect(payload.containsKey('api_key'), isFalse);
+      expect(payload['if_vision'], isTrue);
+      expect(payload['if_audio'], isFalse);
+      expect(payload['if_video'], isFalse);
+    });
+
+    test('独立端点仍要求 base_url/api_key', () {
+      const ModelEditorDraft draft = ModelEditorDraft(
+        kind: kModelKindChat,
+        modelId: 'x',
+        name: 'X',
+      );
+      expect(draft.validate(), contains('base_url 与 api_key'));
+    });
+
+    test('D8：没声明档位就不下发 reasoning_effort_options', () {
+      const ModelEditorDraft draft = ModelEditorDraft(
+        kind: kModelKindChat,
+        provider: 'p',
+        modelId: 'm',
+        name: 'M',
+      );
+      final Map<String, dynamic> payload = draft.toPayload();
+      expect(payload.containsKey('reasoning_effort_options'), isFalse);
+      expect(payload.containsKey('reasoning_effort'), isFalse);
+    });
+
+    test('编辑 provider 模型：不下发 provider（创建后不可改）', () {
+      const ModelEditorDraft draft = ModelEditorDraft(
+        originalKind: kModelKindChat,
+        provider: 'deepseek',
+        kind: kModelKindChat,
+        modelId: 'flash',
+        name: 'Flash',
+      );
+      expect(draft.toPayload().containsKey('provider'), isFalse);
+    });
+  });
+
   group('ModelEditorDraft 提交体', () {
     test('chat 新增：带 kind/protocol 与现有 chat 字段', () {
       const ModelEditorDraft draft = ModelEditorDraft(

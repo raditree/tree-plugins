@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../io/api_service.dart';
+import '../app_radius.dart';
 import 'create_production_line_dialog.dart';
 import 'production_line_utils.dart';
 
@@ -305,15 +306,20 @@ class _ProductionLinePanelState extends State<ProductionLinePanel> {
     final String status = '${line['status'] ?? 'idle'}';
     final String workspace = '${line['workspace_dir'] ?? ''}'.trim();
     final bool selected = widget.selectedLineId == id;
-    return Material(
-      color: selected
-          ? cs.secondaryContainer.withValues(alpha: 0.5)
-          : Colors.transparent,
-      child: InkWell(
-        key: Key('production-line-item-$id'),
-        onTap: () => widget.onSelectLine?.call(line),
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 8, 10, 8),
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+      child: Material(
+        color: selected
+            ? cs.secondaryContainer.withValues(alpha: 0.5)
+            : Colors.transparent,
+        borderRadius: BorderRadius.circular(AppRadius.sm),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          key: Key('production-line-item-$id'),
+          borderRadius: BorderRadius.circular(AppRadius.sm),
+          onTap: () => widget.onSelectLine?.call(line),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(8, 8, 6, 8),
           child: Row(
             children: <Widget>[
               Container(
@@ -360,6 +366,7 @@ class _ProductionLinePanelState extends State<ProductionLinePanel> {
               if (selected)
                 Icon(Icons.chevron_right, size: 16, color: cs.primary),
             ],
+          ),
           ),
         ),
       ),
