@@ -11,6 +11,8 @@ export 'src/expert.dart';
 export 'src/execution.dart';
 export 'src/execution_service.dart';
 export 'src/models.dart';
+export 'src/orchestrator.dart';
+export 'src/orchestrator_service.dart';
 export 'src/preparation.dart';
 export 'src/preparation_service.dart';
 export 'src/queue.dart';

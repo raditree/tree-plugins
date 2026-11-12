@@ -18,6 +18,7 @@ import 'package:path/path.dart' as p;
 import 'audit_service.dart';
 import 'execution_service.dart';
 import 'models.dart';
+import 'orchestrator_service.dart';
 import 'preparation_service.dart';
 import 'service.dart';
 import 'store.dart';
@@ -39,6 +40,16 @@ const String migratePattern = '/api/production/migrate';
 /// 决策卡片的数据源（§10.2 表的补充读路由：没有它 UI 不知道要回答哪些 Q）。
 const String questionsPattern =
     '/api/production/lines/{lineId}/tasks/{taskId}/questions';
+/// 运行期问题回答（D6-O §7.1）：追加 answer → `blocked → queued`。
+const String answerPattern =
+    '/api/production/lines/{lineId}/tasks/{taskId}/answer';
+
+/// 主控决策循环（D6-O §7.1）。
+const String orchestratePattern = '/api/production/lines/{lineId}/orchestrate';
+const String pausePattern = '/api/production/lines/{lineId}/pause';
+const String resumePattern = '/api/production/lines/{lineId}/resume';
+const String orchestratorPattern =
+    '/api/production/lines/{lineId}/orchestrator';
 const String dispatchPattern =
     '/api/production/lines/{lineId}/tasks/{taskId}/dispatch';
 const String decisionPattern =
@@ -62,6 +73,11 @@ const List<Map<String, String>> kDeclaredRoutes = <Map<String, String>>[
   <String, String>{'method': 'GET', 'pattern': artifactsPattern},
   <String, String>{'method': 'GET', 'pattern': auditPattern},
   <String, String>{'method': 'GET', 'pattern': questionsPattern},
+  <String, String>{'method': 'POST', 'pattern': answerPattern},
+  <String, String>{'method': 'POST', 'pattern': orchestratePattern},
+  <String, String>{'method': 'POST', 'pattern': pausePattern},
+  <String, String>{'method': 'POST', 'pattern': resumePattern},
+  <String, String>{'method': 'GET', 'pattern': orchestratorPattern},
   <String, String>{'method': 'POST', 'pattern': dispatchPattern},
   <String, String>{'method': 'POST', 'pattern': decisionPattern},
   <String, String>{'method': 'POST', 'pattern': cancelPattern},
@@ -83,6 +99,7 @@ Future<Map<String, dynamic>> handleProductionDelegate(
   ProductionAuditService? audit,
   ProductionExecutionService? execution,
   PreparationService? preparation,
+  OrchestratorService? orchestrator,
   bool awaitDispatch = false,
   Map<String, String>? environment,
 }) async {
@@ -93,6 +110,7 @@ Future<Map<String, dynamic>> handleProductionDelegate(
       audit ?? ProductionAuditService(environment: environment),
       preparation ?? PreparationService(environment: environment),
       execution,
+      orchestrator,
       awaitDispatch,
     );
   } on ProductionFailure catch (error) {
@@ -112,6 +130,7 @@ Future<Map<String, dynamic>> _dispatch(
   ProductionAuditService audit,
   PreparationService preparation,
   ProductionExecutionService? execution,
+  OrchestratorService? orchestrator,
   bool awaitDispatch,
 ) async {
   final String method = textOf(envelope['method']).toUpperCase();
@@ -243,13 +262,61 @@ Future<Map<String, dynamic>> _dispatch(
     if (method == 'GET') {
       final String lineId = _pathParam(questionsPattern, path, 'lineId');
       final String taskId = _pathParam(questionsPattern, path, 'taskId');
-      return _ok(
-        await preparation.handle('production.prepare.questions', <String, Object?>{
-          'line_id': lineId,
-          'task_id': taskId,
-        }, meta, scope),
+      final Map<String, Object?> preparePayload = await preparation.handle(
+        'production.prepare.questions',
+        <String, Object?>{'line_id': lineId, 'task_id': taskId},
+        meta,
+        scope,
+      );
+      // D6-O §7.2：收件箱要能区分准备阶段与运行期问题；运行期问题单独给一组。
+      Map<String, Object?> executePayload = <String, Object?>{};
+      if (execution != null) {
+        executePayload = await execution.handle(
+          'production.task.questions',
+          <String, Object?>{'line_id': lineId, 'task_id': taskId},
+          meta,
+          scope,
+        );
+      }
+      return _ok(<String, Object?>{
+        ...preparePayload,
+        'execute_questions': executePayload['questions'] ?? <Object?>[],
+        'execute_open': intOf(executePayload['open'], 0),
+      });
+    }
+  }
+  if (_matches(answerPattern, path) && method == 'POST') {
+    final String lineId = _pathParam(answerPattern, path, 'lineId');
+    final String taskId = _pathParam(answerPattern, path, 'taskId');
+    if (execution == null) {
+      return _error(
+        503,
+        '运行期问答需要执行阶段通道，当前未接线',
+        code: 'execution_unavailable',
       );
     }
+    final Map<String, Object?> answered = await execution.handle(
+      'production.task.answer',
+      <String, Object?>{
+        'line_id': lineId,
+        'task_id': taskId,
+        'qid': textOf(body['qid']),
+        'value': textOf(body['value']).isEmpty
+            ? textOf(body['answer'])
+            : textOf(body['value']),
+      },
+      meta,
+      scope,
+    );
+    // §3.1：回答落盘后立即 tick（后台，不拖慢回答回包）。
+    if (orchestrator != null) {
+      unawaited(
+        orchestrator
+            .tick(store, lineId, meta: meta, scope: scope, trigger: 'event')
+            .catchError((Object _) => <String, Object?>{}),
+      );
+    }
+    return _ok(answered);
   }
   if (_matches(dispatchPattern, path)) {
     if (method == 'POST') {
@@ -334,6 +401,69 @@ Future<Map<String, dynamic>> _dispatch(
       );
     }
   }
+  if (_matches(orchestratePattern, path) && method == 'POST') {
+    final String lineId = _pathParam(orchestratePattern, path, 'lineId');
+    if (orchestrator == null) {
+      return _error(
+        503,
+        '主控决策循环需要 llm.call 通道，当前未接线',
+        code: 'orchestrator_unavailable',
+      );
+    }
+    return _ok(
+      await orchestrator.handle(
+        'production.orchestrator.tick',
+        <String, Object?>{'line_id': lineId, 'trigger': 'manual'},
+        meta,
+        scope,
+      ),
+    );
+  }
+  if (_matches(pausePattern, path) && method == 'POST') {
+    final String lineId = _pathParam(pausePattern, path, 'lineId');
+    return _ok(<String, Object?>{
+      'line': store.updateLine(lineId, <String, Object?>{
+        'status': 'paused',
+      }).toJson(),
+    });
+  }
+  if (_matches(resumePattern, path) && method == 'POST') {
+    final String lineId = _pathParam(resumePattern, path, 'lineId');
+    final Map<String, Object?> line = store.updateLine(lineId, <String, Object?>{
+      'status': 'working',
+    }).toJson();
+    // §3.4：恢复后立即 tick 一次；tick 失败不撤销恢复本身。
+    Map<String, Object?>? tickResult;
+    String tickError = '';
+    if (orchestrator != null) {
+      try {
+        tickResult = await orchestrator.handle(
+          'production.orchestrator.tick',
+          <String, Object?>{'line_id': lineId, 'trigger': 'manual'},
+          meta,
+          scope,
+        );
+      } on ProductionFailure catch (error) {
+        tickError = error.message;
+      }
+    }
+    return _ok(<String, Object?>{
+      'line': line,
+      'tick': tickResult,
+      if (tickError.isNotEmpty) 'tick_error': tickError,
+    });
+  }
+  if (_matches(orchestratorPattern, path) && method == 'GET') {
+    final String lineId = _pathParam(orchestratorPattern, path, 'lineId');
+    if (orchestrator == null) {
+      return _error(
+        503,
+        '主控状态需要主控服务，当前未接线',
+        code: 'orchestrator_unavailable',
+      );
+    }
+    return _ok(orchestrator.status(store, lineId));
+  }
   if (_matches(runsPattern, path) && method == 'GET') {
     final String lineId = _pathParam(runsPattern, path, 'lineId');
     final String taskId = _queryOf(query, 'task_id');
@@ -379,7 +509,31 @@ Future<Map<String, dynamic>> _dispatchTask(
   Map<String, Object?> meta,
   Map<String, Object?> scope,
   bool awaitDispatch,
-) async {
+) => dispatchProductionTask(
+  store: store,
+  execution: execution,
+  lineId: lineId,
+  taskId: taskId,
+  stage: textOf(body['stage']),
+  meta: meta,
+  scope: scope,
+  awaitDispatch: awaitDispatch,
+);
+
+/// 派发一个任务（打包或执行）：REST 与主控 tick 共用同一把 in-flight 锁。
+///
+/// 默认后台跑（`awaitDispatch=false`）：核心的委派回包截止是 30s，而打包 /
+/// 执行要等模型与本机命令；真实进度由任务状态与运行台账轮询。
+Future<Map<String, dynamic>> dispatchProductionTask({
+  required ProductionStore store,
+  required ProductionExecutionService? execution,
+  required String lineId,
+  required String taskId,
+  String stage = 'auto',
+  required Map<String, Object?> meta,
+  required Map<String, Object?> scope,
+  bool awaitDispatch = false,
+}) async {
   if (execution == null) {
     return _error(
       503,
@@ -388,13 +542,12 @@ Future<Map<String, dynamic>> _dispatchTask(
     );
   }
   final TaskRecord task = store.getTask(lineId, taskId);
-  final String requested = textOf(body['stage']);
-  String stage = requested;
-  if (stage.isEmpty || stage == 'auto') {
+  String resolved = stage;
+  if (resolved.isEmpty || resolved == 'auto') {
     if (task.status == TaskStatus.queued || task.status == TaskStatus.packing) {
-      stage = 'pack';
+      resolved = 'pack';
     } else if (task.status == TaskStatus.packed) {
-      stage = 'run';
+      resolved = 'run';
     } else {
       throw ProductionFailure(
         '任务当前 ${task.status.wire} 不能派发（打包要 queued / packing，执行要 packed）',
@@ -402,13 +555,13 @@ Future<Map<String, dynamic>> _dispatchTask(
       );
     }
   }
-  if (stage != 'pack' && stage != 'run') {
+  if (resolved != 'pack' && resolved != 'run') {
     throw ProductionFailure(
-      'dispatch 的 stage 只能是 pack / run / auto：$stage',
+      'dispatch 的 stage 只能是 pack / run / auto：$resolved',
       code: 'invalid_arguments',
     );
   }
-  if (stage == 'pack' &&
+  if (resolved == 'pack' &&
       task.status != TaskStatus.queued &&
       task.status != TaskStatus.packing) {
     throw ProductionFailure(
@@ -416,7 +569,7 @@ Future<Map<String, dynamic>> _dispatchTask(
       code: 'execute_state',
     );
   }
-  if (stage == 'run' && task.status != TaskStatus.packed) {
+  if (resolved == 'run' && task.status != TaskStatus.packed) {
     throw ProductionFailure(
       '只有 packed 可以执行（当前 ${task.status.wire}）',
       code: 'execute_state',
@@ -429,7 +582,7 @@ Future<Map<String, dynamic>> _dispatchTask(
       code: 'dispatch_in_flight',
     );
   }
-  final String command = stage == 'pack'
+  final String command = resolved == 'pack'
       ? 'production.task.pack'
       : 'production.task.run';
   final Map<String, Object?> arguments = <String, Object?>{
@@ -441,20 +594,20 @@ Future<Map<String, dynamic>> _dispatchTask(
     try {
       return await execution.handle(command, arguments, meta, scope);
     } catch (error) {
-      _recordDispatchFailure(store, lineId, taskId, stage, error);
+      _recordDispatchFailure(store, lineId, taskId, resolved, error);
       rethrow;
     } finally {
       _dispatchInFlight.remove(key);
     }
   }();
   if (awaitDispatch) {
-    return _ok(<String, Object?>{...await job, 'stage': stage});
+    return _ok(<String, Object?>{...await job, 'stage': resolved});
   }
   // 后台跑：错误已经落到 task.yaml.last_error，这里只兜住未捕获异常。
   unawaited(job.then<void>((_) {}, onError: (Object _) {}));
   return _ok(<String, Object?>{
     'accepted': true,
-    'stage': stage,
+    'stage': resolved,
     'line_id': lineId,
     'task_id': taskId,
     'task': task.toJson(),
@@ -584,6 +737,9 @@ Map<String, Object?> _bodyOf(Map<String, dynamic> envelope) {
 int _statusOf(String code) {
   if (code == 'not_found') return 404;
   if (code == 'missing_data_dir' || code == 'internal_error') return 500;
+  if (code == 'orchestrator_unavailable' || code == 'execution_unavailable') {
+    return 503;
+  }
   if (const <String>{
     'terminal_state',
     'invalid_transition',
@@ -596,6 +752,10 @@ int _statusOf(String code) {
     'prepare_state',
     'dispatch_in_flight',
     'audit_in_progress',
+    'question_pending',
+    'question_state',
+    'ask_limit_exceeded',
+    'no_open_questions',
   }.contains(code)) {
     return 409;
   }

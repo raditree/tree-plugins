@@ -464,15 +464,23 @@ class QuestionState {
 
 /// 重放问题台账；[taskId] 非空时只取该任务。
 ///
-/// 只认 `type=question|answer` 两类事件，其它（window 等）忽略；坏条目跳过，
-/// 不让一行脏数据毁掉整份台账。
+/// [stage] 为空 = 只看**准备阶段**（默认排除 `stage=execute` 的运行期问题）；
+/// 传 `execute` 则只看运行期问题。只认 `type=question|answer` 两类事件，其它
+/// （window 等）忽略；坏条目跳过，不让一行脏数据毁掉整份台账。
 List<QuestionState> replayQuestions(
   List<Map<String, Object?>> inbox, {
   String taskId = '',
+  String stage = '',
 }) {
   final Map<String, QuestionState> byId = <String, QuestionState>{};
   for (final Map<String, Object?> entry in inbox) {
     if (taskId.isNotEmpty && textOf(entry['task_id']) != taskId) continue;
+    final String entryStage = textOf(entry['stage']);
+    if (stage.isEmpty) {
+      if (entryStage == 'execute') continue;
+    } else if (entryStage != stage) {
+      continue;
+    }
     final String type = textOf(entry['type']);
     final String qid = textOf(entry['qid']);
     final String owner = textOf(entry['task_id']);

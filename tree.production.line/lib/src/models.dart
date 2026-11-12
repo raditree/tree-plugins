@@ -17,6 +17,28 @@ class ProductionFailure implements Exception {
   String toString() => message;
 }
 
+/// 主控（执行期决策循环）的默认配置（D6-O §4.1）。
+///
+/// `line.yaml.orchestrator` 缺键即取这里的值；显式配置做浅合并，不批量改写旧文件。
+const Map<String, Object?> kOrchestratorDefaults = <String, Object?>{
+  'enabled': true,
+  'tick_interval_seconds': 5,
+  'auto_retry': true,
+  'max_asks_per_task': 3,
+  'stop_on_budget': true,
+  'max_ticks_per_minute': 12,
+};
+
+/// `task.yaml.loop` 的默认值（D6-O §4.2）；缺键即取这里的值。
+const Map<String, Object?> kTaskLoopDefaults = <String, Object?>{
+  'attempts': 0,
+  'ask_count': 0,
+  'last_action': '',
+  'last_decision_at': '',
+  'stop_reason': '',
+  'pending_question': '',
+};
+
 /// 任务状态（`wire` 与 `task.yaml` 的 `status` 逐字一致）。
 enum TaskStatus {
   draft('draft'),
@@ -199,6 +221,15 @@ class TaskRecord {
   String get blockedReason => textOf(data['blocked_reason']);
   Map<String, Object?> get artifacts => plainMap(data['artifacts']);
 
+  /// 主控循环游标（D6-O §4.2）；旧任务缺键时返回空表（读取方给默认值）。
+  Map<String, Object?> get loop => plainMap(data['loop']);
+  /// 主控重试次数（与门控 `gate_attempts` 分开计）。
+  int get loopAttempts => intOf(loop['attempts'], 0);
+  int get askCount => intOf(loop['ask_count'], 0);
+  String get lastAction => textOf(loop['last_action']);
+  String get pendingQuestion => textOf(loop['pending_question']);
+  String get stopReason => textOf(loop['stop_reason']);
+
   Map<String, Object?> toJson() => plainMap(data);
 }
 
@@ -219,6 +250,9 @@ class LineRecord {
   Map<String, Object?> get executor => plainMap(data['executor']);
   String get executorAgentId => textOf(executor['agent_id']);
   String get executorTeamId => textOf(executor['team_id']);
+
+  /// 主控配置（`line.yaml.orchestrator`）；缺键时返回空表，读取方按默认值处理。
+  Map<String, Object?> get orchestrator => plainMap(data['orchestrator']);
 
   Map<String, Object?> toJson() => plainMap(data);
 }
@@ -298,6 +332,8 @@ Map<String, Object?> buildLineMap(
       'agent_id': '',
       'team_id': '',
     },
+    // D6-O §4.1：执行期主控配置；缺省即默认（enabled=true / 5s tick）。
+    'orchestrator': <String, Object?>{...kOrchestratorDefaults},
     'created_at': now,
     'updated_at': now,
   };
@@ -313,7 +349,19 @@ Map<String, Object?> buildLineMap(
     'limits',
     'policy',
     'docs',
+    'orchestrator',
   ]) {
+    if (section == 'orchestrator') {
+      final Map<String, Object?> override = normalizeOrchestrator(
+        input['orchestrator'],
+      );
+      if (override.isEmpty) continue;
+      data[section] = <String, Object?>{
+        ...plainMap(data[section]),
+        ...override,
+      };
+      continue;
+    }
     final Map<String, Object?> override = plainMap(input[section]);
     if (override.isEmpty) continue;
     data[section] = <String, Object?>{
@@ -351,6 +399,21 @@ Map<String, Object?> normalizeExecutor(Object? raw) {
     if (data.containsKey('agent_id')) 'agent_id': textOf(data['agent_id']),
     if (data.containsKey('team_id')) 'team_id': textOf(data['team_id']),
   };
+}
+
+/// 规范化 `line.yaml.orchestrator`（D6-O §4.1）：只接受对象，键保留做浅合并。
+///
+/// 不在这里校验取值范围：读配置时按默认值兜底（旧文件缺键 / 空值都能跑）。
+Map<String, Object?> normalizeOrchestrator(Object? raw) {
+  if (raw == null) return const <String, Object?>{};
+  if (raw is! Map) {
+    throw ProductionFailure(
+      'orchestrator 必须是对象：{enabled, tick_interval_seconds, auto_retry, '
+      'max_asks_per_task, stop_on_budget, max_ticks_per_minute}',
+      code: 'invalid_arguments',
+    );
+  }
+  return plainMap(raw);
 }
 
 /// 新建任务的最小校验（§7.3）：只允许以 `draft` / `queued` 落盘。

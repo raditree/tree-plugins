@@ -16,6 +16,7 @@ import 'models.dart';
 import 'budget.dart';
 import 'execution.dart';
 import 'expert.dart';
+import 'orchestrator.dart';
 import 'preparation.dart';
 import 'service.dart';
 import 'store.dart';
@@ -27,6 +28,9 @@ const List<String> kExecutionCommands = <String>[
   'production.task.expert',
   'production.task.message',
   'production.task.messages',
+  'production.task.question',
+  'production.task.questions',
+  'production.task.answer',
   'production.task.budget',
 ];
 
@@ -148,6 +152,12 @@ class ProductionExecutionService {
         return _message(store, arguments);
       case 'production.task.messages':
         return _messages(store, arguments);
+      case 'production.task.question':
+        return _question(store, arguments);
+      case 'production.task.questions':
+        return _questions(store, arguments);
+      case 'production.task.answer':
+        return _answer(store, arguments);
       case 'production.task.budget':
         return _taskBudget(store, arguments);
       default:
@@ -949,6 +959,194 @@ class ProductionExecutionService {
       'messages': thread,
       'count': thread.length,
       'task_id': taskId,
+    };
+  }
+
+  // ── 运行期询问（D6-O §3.4 / O2）────────────────────────────────────
+
+  /// 主控或员工发起一条运行期问题：任务暂停（`blocked` + `question_pending`），
+  /// 等用户回答后由 [answer] 回队列。
+  Map<String, Object?> _question(
+    ProductionStore store,
+    Map<String, Object?> arguments,
+  ) {
+    final String lineId = _arg(arguments, 'line_id');
+    final String taskId = _arg(arguments, 'task_id');
+    final LineRecord line = store.getLine(lineId);
+    final TaskRecord task = store.getTask(lineId, taskId);
+    final String text = textOf(arguments['text']).isEmpty
+        ? textOf(arguments['question'])
+        : textOf(arguments['text']);
+    if (text.isEmpty) {
+      throw ProductionFailure(
+        'production.task.question 需要 text',
+        code: 'invalid_arguments',
+      );
+    }
+    if (task.status.isTerminal) {
+      throw ProductionFailure(
+        '任务已处于终态 ${task.status.wire}，不能再提问',
+        code: 'terminal_state',
+      );
+    }
+    if (task.pendingQuestion.isNotEmpty) {
+      throw ProductionFailure(
+        '任务 $taskId 已有待回答问题 ${task.pendingQuestion}：先回答再提问',
+        code: 'question_pending',
+      );
+    }
+    if (!canTransition(task.status, TaskStatus.blocked)) {
+      throw ProductionFailure(
+        '任务当前 ${task.status.wire} 不能暂停提问（只允许 queued / packing / '
+        'packed / running / gating）',
+        code: 'question_state',
+      );
+    }
+    final OrchestratorConfig config = OrchestratorConfig.of(line);
+    if (task.askCount >= config.maxAsksPerTask) {
+      throw ProductionFailure(
+        '任务 $taskId 的提问次数已达上限（${task.askCount}/${config.maxAsksPerTask}）：'
+        '只能停止或让用户处理',
+        code: 'ask_limit_exceeded',
+      );
+    }
+    final String qid = textOf(arguments['qid']).isEmpty
+        ? 'X${task.askCount + 1}'
+        : textOf(arguments['qid']);
+    final Map<String, Object?> question = <String, Object?>{
+      'type': 'question',
+      'stage': 'execute',
+      'line_id': lineId,
+      'task_id': taskId,
+      'qid': qid,
+      'text': text,
+      'options': stringsOf(arguments['options']),
+      'default': textOf(arguments['default']),
+      'asked_by': textOf(arguments['from']).isEmpty
+          ? 'orchestrator'
+          : textOf(arguments['from']),
+      'asked_at': _now,
+    };
+    store.appendInbox(lineId, question);
+    store.updateLoop(lineId, taskId, <String, Object?>{
+      'ask_count': task.askCount + 1,
+      'pending_question': qid,
+      'last_action': 'ask',
+      'last_decision_at': _now,
+    });
+    store.transition(
+      lineId,
+      taskId,
+      to: TaskStatus.blocked.wire,
+      reason: 'question_pending',
+    );
+    return <String, Object?>{
+      'question': <String, Object?>{
+        ...question,
+        'status': 'open',
+      },
+      'task': store.getTask(lineId, taskId).toJson(),
+    };
+  }
+
+  /// 运行期问题列表（只读）：`stage=execute` 的 question / answer 重放。
+  Map<String, Object?> _questions(
+    ProductionStore store,
+    Map<String, Object?> arguments,
+  ) {
+    final String lineId = _arg(arguments, 'line_id');
+    final String taskId = _arg(arguments, 'task_id');
+    store.getTask(lineId, taskId);
+    final List<QuestionState> questions = executeQuestionsOf(
+      store.readInbox(lineId),
+      taskId: taskId,
+    );
+    final int open = openQuestionsOf(questions).length;
+    return <String, Object?>{
+      'task_id': taskId,
+      'questions': <Map<String, Object?>>[
+        for (final QuestionState question in questions) question.toJson(),
+      ],
+      'count': questions.length,
+      'open': open,
+    };
+  }
+
+  /// 回答运行期问题：追加 answer → 清 `pending_question` → `blocked → queued`。
+  Map<String, Object?> _answer(
+    ProductionStore store,
+    Map<String, Object?> arguments,
+  ) {
+    final String lineId = _arg(arguments, 'line_id');
+    final String taskId = _arg(arguments, 'task_id');
+    final TaskRecord task = store.getTask(lineId, taskId);
+    final String value = textOf(arguments['value']).isEmpty
+        ? textOf(arguments['answer'])
+        : textOf(arguments['value']);
+    if (value.isEmpty) {
+      throw ProductionFailure(
+        'production.task.answer 需要 value（回答内容）',
+        code: 'invalid_arguments',
+      );
+    }
+    final List<QuestionState> open = openQuestionsOf(
+      executeQuestionsOf(store.readInbox(lineId), taskId: taskId),
+    );
+    if (open.isEmpty) {
+      throw ProductionFailure(
+        '任务 $taskId 没有待回答的运行期问题',
+        code: 'no_open_questions',
+      );
+    }
+    final String requested = textOf(arguments['qid']);
+    final String wanted = requested.isNotEmpty
+        ? requested
+        : (task.pendingQuestion.isNotEmpty
+              ? task.pendingQuestion
+              : open.first.qid);
+    QuestionState? question;
+    for (final QuestionState item in open) {
+      if (item.qid == wanted) {
+        question = item;
+        break;
+      }
+    }
+    if (question == null) {
+      throw ProductionFailure(
+        '任务 $taskId 没有待回答问题「$wanted」',
+        code: 'unknown_question',
+      );
+    }
+    store.appendInbox(lineId, <String, Object?>{
+      'type': 'answer',
+      'stage': 'execute',
+      'line_id': lineId,
+      'task_id': taskId,
+      'qid': question.qid,
+      'value': value,
+      'source': 'user',
+      'answered_at': _now,
+    });
+    final List<QuestionState> openAfter = openQuestionsOf(
+      executeQuestionsOf(store.readInbox(lineId), taskId: taskId),
+    );
+    final int remaining = openAfter.length;
+    store.updateLoop(lineId, taskId, <String, Object?>{
+      'pending_question': openAfter.isEmpty ? '' : openAfter.first.qid,
+      'last_action': 'continue',
+      'last_decision_at': _now,
+    });
+    if (remaining == 0 &&
+        task.status == TaskStatus.blocked &&
+        canTransition(task.status, TaskStatus.queued)) {
+      store.transition(lineId, taskId, to: TaskStatus.queued.wire);
+    }
+    return <String, Object?>{
+      'task': store.getTask(lineId, taskId).toJson(),
+      'qid': question.qid,
+      'answer': value,
+      'open': remaining,
+      'ready': remaining == 0,
     };
   }
 

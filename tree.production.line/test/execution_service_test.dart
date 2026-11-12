@@ -797,4 +797,121 @@ void main() {
       reason: '预算到点不跑门控',
     );
   });
+
+  group('运行期询问闭环（D6-O O2）', () {
+    test('提问 → blocked(question_pending) → 回答 → queued', () async {
+      queuedTask('Q1');
+      final Map<String, Object?> asked = await call(
+        'production.task.question',
+        <String, Object?>{
+          'line_id': 'pl_t',
+          'task_id': 'Q1',
+          'text': '这段逻辑要保留旧行为吗？',
+          'options': <String>['保留', '改掉'],
+        },
+      );
+      final Map<String, Object?> question = plainMap(asked['question']);
+      expect(question['qid'], 'X1');
+      expect(question['stage'], 'execute');
+      expect(question['status'], 'open');
+
+      final TaskRecord blocked = store.getTask('pl_t', 'Q1');
+      expect(blocked.status, TaskStatus.blocked);
+      expect(blocked.blockedReason, 'question_pending');
+      expect(blocked.pendingQuestion, 'X1');
+      expect(blocked.askCount, 1);
+
+      final Map<String, Object?> listed = await call(
+        'production.task.questions',
+        <String, Object?>{'line_id': 'pl_t', 'task_id': 'Q1'},
+      );
+      expect(listed['count'], 1);
+      expect(listed['open'], 1);
+
+      final Map<String, Object?> answered = await call(
+        'production.task.answer',
+        <String, Object?>{
+          'line_id': 'pl_t',
+          'task_id': 'Q1',
+          'value': '保留',
+        },
+      );
+      expect(answered['qid'], 'X1');
+      expect(answered['ready'], isTrue);
+      final TaskRecord queued = store.getTask('pl_t', 'Q1');
+      expect(queued.status, TaskStatus.queued);
+      expect(queued.pendingQuestion, isEmpty);
+      expect(queued.blockedReason, isEmpty);
+      expect(queued.lastAction, 'continue');
+
+      final List<Map<String, Object?>> inbox = store.readInbox('pl_t');
+      expect(inbox.length, 2);
+      expect(inbox.every((Map<String, Object?> e) => e['stage'] == 'execute'), isTrue);
+      expect(inbox.last['type'], 'answer');
+    });
+
+    test('问满 max_asks_per_task 后只能停：第 4 次提问被拒', () async {
+      queuedTask('Q2');
+      for (int i = 1; i <= 3; i++) {
+        await call('production.task.question', <String, Object?>{
+          'line_id': 'pl_t',
+          'task_id': 'Q2',
+          'text': '第 $i 问',
+        });
+        await call('production.task.answer', <String, Object?>{
+          'line_id': 'pl_t',
+          'task_id': 'Q2',
+          'value': '答 $i',
+        });
+      }
+      expect(store.getTask('pl_t', 'Q2').askCount, 3);
+      await expectLater(
+        call('production.task.question', <String, Object?>{
+          'line_id': 'pl_t',
+          'task_id': 'Q2',
+          'text': '第 4 问',
+        }),
+        throwsA(
+          isA<ProductionFailure>().having(
+            (ProductionFailure error) => error.code,
+            'code',
+            'ask_limit_exceeded',
+          ),
+        ),
+      );
+    });
+
+    test('没有未答问题时回答失败；终态任务不能提问', () async {
+      queuedTask('Q3');
+      await expectLater(
+        call('production.task.answer', <String, Object?>{
+          'line_id': 'pl_t',
+          'task_id': 'Q3',
+          'value': 'x',
+        }),
+        throwsA(
+          isA<ProductionFailure>().having(
+            (ProductionFailure error) => error.code,
+            'code',
+            'no_open_questions',
+          ),
+        ),
+      );
+      store.transition('pl_t', 'Q3', to: 'cancelled', reason: '用户取消');
+      await expectLater(
+        call('production.task.question', <String, Object?>{
+          'line_id': 'pl_t',
+          'task_id': 'Q3',
+          'text': '还能问吗',
+        }),
+        throwsA(
+          isA<ProductionFailure>().having(
+            (ProductionFailure error) => error.code,
+            'code',
+            'terminal_state',
+          ),
+        ),
+      );
+    });
+  });
 }

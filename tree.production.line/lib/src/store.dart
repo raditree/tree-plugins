@@ -122,7 +122,13 @@ class ProductionStore {
   /// idle / working / paused（与 `buildLineMap` 同一口径）。
   LineRecord updateLine(String lineId, Map<String, Object?> patch) {
     final LineRecord line = getLine(lineId);
-    const Set<String> sections = <String>{'roles', 'limits', 'policy', 'docs'};
+    const Set<String> sections = <String>{
+      'roles',
+      'limits',
+      'policy',
+      'docs',
+      'orchestrator',
+    };
     const Set<String> allowed = <String>{
       'name',
       'workspace_dir',
@@ -173,7 +179,9 @@ class ProductionStore {
     }
     for (final String section in sections) {
       if (!patch.containsKey(section)) continue;
-      final Map<String, Object?> override = plainMap(patch[section]);
+      final Map<String, Object?> override = section == 'orchestrator'
+          ? normalizeOrchestrator(patch[section])
+          : plainMap(patch[section]);
       next[section] = <String, Object?>{
         ...plainMap(line.data[section]),
         ...override,
@@ -650,6 +658,9 @@ class ProductionStore {
       'tasks': indexTasks,
       'queue': queue,
       'dispatchable': dispatchable,
+      // 主控游标不是可重建索引的一部分：重建时原样带过去，别把它冲掉。
+      if (previous['orchestrator'] is Map)
+        'orchestrator': plainMap(previous['orchestrator']),
     };
     _writeText(
       file,
@@ -859,6 +870,59 @@ class ProductionStore {
     _writeText(File(_taskFile(lineId, taskId)), encodeYaml(next));
     rebuild(lineId);
     return TaskRecord(next);
+  }
+
+  /// 写回 `task.yaml.loop`（浅合并；未知键保留），返回合并后的 loop。
+  ///
+  /// D6-O §4.2：`attempts` / `ask_count` / `last_action` / `pending_question`
+  /// 等都落在这里，`task.yaml` 仍是唯一真值。
+  Map<String, Object?> updateLoop(
+    String lineId,
+    String taskId,
+    Map<String, Object?> patch,
+  ) {
+    final TaskRecord task = getTask(lineId, taskId);
+    final Map<String, Object?> loop = <String, Object?>{
+      ...plainMap(task.data['loop']),
+      ...plainMap(patch),
+    };
+    putTask(lineId, taskId, <String, Object?>{'loop': loop});
+    return loop;
+  }
+
+  /// 主控游标（`state.json.orchestrator`）；不存在 ⇒ 空表。
+  Map<String, Object?> readOrchestratorState(String lineId) {
+    final File file = File(_stateFile(lineId));
+    if (!file.existsSync()) return <String, Object?>{};
+    return plainMap(_tryReadJson(file)['orchestrator']);
+  }
+
+  /// 浅合并写主控游标；`state.json` 仍是可重建索引，坏文件按空表重写。
+  Map<String, Object?> writeOrchestratorState(
+    String lineId,
+    Map<String, Object?> patch,
+  ) {
+    getLine(lineId);
+    final File file = File(_stateFile(lineId));
+    final Map<String, Object?> state = file.existsSync()
+        ? _tryReadJson(file)
+        : <String, Object?>{};
+    final Map<String, Object?> orchestrator = <String, Object?>{
+      ...plainMap(state['orchestrator']),
+      ...plainMap(patch),
+    };
+    final Map<String, Object?> next = <String, Object?>{
+      ...state,
+      'version': 1,
+      'line_id': lineId,
+      'scope': kProductionScope,
+      'orchestrator': orchestrator,
+    };
+    _writeText(
+      file,
+      '${const JsonEncoder.withIndent('  ').convert(next)}\n',
+    );
+    return orchestrator;
   }
 
   String _prepareFile(String lineId) =>

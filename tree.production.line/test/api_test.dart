@@ -77,6 +77,7 @@ void main() {
     String agent = '',
     String? dataDir,
     ProductionExecutionService? execution,
+    OrchestratorService? orchestrator,
     bool awaitDispatch = false,
   }) async {
     final Map<String, dynamic> reply = await handleProductionDelegate(
@@ -90,6 +91,7 @@ void main() {
         dataDir: dataDir,
       ),
       execution: execution,
+      orchestrator: orchestrator,
       awaitDispatch: awaitDispatch,
     );
     return <String, dynamic>{
@@ -403,6 +405,114 @@ void main() {
     expect(wrongState['json']['code'], 'execute_state');
   });
 
+  test('主控路由：orchestrate / status / pause / resume', () async {
+    final ProductionStore store = storeWith();
+    store.updateLine('pl_1', <String, Object?>{
+      'roles': <String, Object?>{
+        'orchestrator': <String, Object?>{'model_id': 'chat/main'},
+      },
+    });
+    final _ApiLlm llm = _ApiLlm()
+      ..replies.add(<String, Object?>{
+        'action': 'continue',
+        'reason': 'T1 可打包',
+        'task_ids': <String>['T1'],
+      });
+    final _ApiDispatcher dispatcher = _ApiDispatcher();
+    final OrchestratorService orchestrator = OrchestratorService(
+      environment: const <String, String>{},
+      llm: llm.call,
+      dispatcher: dispatcher.dispatch,
+    );
+
+    final Map<String, dynamic> tick = await call(
+      'POST',
+      '/api/production/lines/pl_1/orchestrate',
+      orchestrator: orchestrator,
+    );
+    expect(tick['status'], 200);
+    expect(tick['json']['status'], 'applied');
+    expect(tick['json']['action'], 'continue');
+    expect(dispatcher.calls, <String>['T1/pack']);
+
+    final Map<String, dynamic> status = await call(
+      'GET',
+      '/api/production/lines/pl_1/orchestrator',
+      orchestrator: orchestrator,
+    );
+    expect(status['status'], 200);
+    expect(status['json']['config']['enabled'], isTrue);
+    expect(status['json']['state']['last_action'], 'continue');
+
+    final Map<String, dynamic> paused = await call(
+      'POST',
+      '/api/production/lines/pl_1/pause',
+    );
+    expect(paused['status'], 200);
+    expect(paused['json']['line']['status'], 'paused');
+
+    llm.replies.add(<String, Object?>{
+      'action': 'continue',
+      'reason': '恢复后继续',
+      'task_ids': <String>['T1'],
+    });
+    final Map<String, dynamic> resumed = await call(
+      'POST',
+      '/api/production/lines/pl_1/resume',
+      orchestrator: orchestrator,
+    );
+    expect(resumed['status'], 200);
+    expect(resumed['json']['line']['status'], 'working');
+    expect(resumed['json']['tick']['status'], 'applied');
+
+    // 未接线主控：503，不是静默成功。
+    final Map<String, dynamic> unavailable = await call(
+      'POST',
+      '/api/production/lines/pl_1/orchestrate',
+    );
+    expect(unavailable['status'], 503);
+  });
+
+  test('运行期问答：questions 增 execute_questions；answer 回 queued', () async {
+    final ProductionStore store = storeWith();
+    final ProductionExecutionService execution = ProductionExecutionService(
+      environment: const <String, String>{},
+    );
+    await execution.handle(
+      'production.task.question',
+      <String, Object?>{
+        'line_id': 'pl_1',
+        'task_id': 'T1',
+        'text': '旧行为要保留吗？',
+      },
+      <String, Object?>{'data_dir': temp.path},
+      <String, Object?>{},
+    );
+    expect(store.getTask('pl_1', 'T1').status, TaskStatus.blocked);
+
+    final Map<String, dynamic> questions = await call(
+      'GET',
+      '/api/production/lines/pl_1/tasks/T1/questions',
+      execution: execution,
+    );
+    expect(questions['status'], 200);
+    expect(questions['json']['execute_open'], 1);
+    expect(
+      (questions['json']['execute_questions'] as List<dynamic>).single['qid'],
+      'X1',
+    );
+
+    final Map<String, dynamic> answered = await call(
+      'POST',
+      '/api/production/lines/pl_1/tasks/T1/answer',
+      execution: execution,
+      body: <String, Object?>{'value': '保留'},
+    );
+    expect(answered['status'], 200);
+    expect(answered['json']['ready'], isTrue);
+    expect(store.getTask('pl_1', 'T1').status, TaskStatus.queued);
+  });
+
   test('全局作用域：缺 team 仍可读写；缺 data_dir / 未知路由照旧 fail-closed', () async {
     storeWith();
 
@@ -461,5 +571,33 @@ class _FakeExecution extends ProductionExecutionService {
       'command': command,
       'task_id': arguments['task_id'],
     };
+  }
+}
+
+/// 假主控模型：按顺序回包（api 层只验路由，不验决策质量）。
+class _ApiLlm {
+  final List<Map<String, Object?>> replies = <Map<String, Object?>>[];
+
+  Future<Map<String, Object?>> call(
+    String point,
+    String system,
+    String prompt,
+    Map<String, Object?> scope,
+    String modelId,
+  ) async => replies.removeAt(0);
+}
+
+/// 假派发器：记录 tick 决定的派发动作。
+class _ApiDispatcher {
+  final List<String> calls = <String>[];
+
+  Future<void> dispatch(
+    String lineId,
+    String taskId,
+    String stage,
+    Map<String, Object?> meta,
+    Map<String, Object?> scope,
+  ) async {
+    calls.add('$taskId/$stage');
   }
 }

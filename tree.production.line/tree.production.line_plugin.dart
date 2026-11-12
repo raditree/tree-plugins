@@ -28,7 +28,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.production.line';
 const String kDisplayName = 'Tree 标准开发流生产线';
-const String kVersion = '0.8.0';
+const String kVersion = '0.9.0';
 
 const String kStationName = 'production';
 
@@ -76,14 +76,29 @@ const String kStationReadme =
     'REST（§10.2）：GET lines/line/tasks/task/runs/artifacts/audit/questions 与 '
     'POST lines/tasks/dispatch/decision/cancel/migrate、PATCH line/task、DELETE line；'
     'dispatch 默认后台跑（核心委派 30s 截止，模型跑不完），受理即回 accepted，'
-    '进度看任务状态与运行台账，失败写 task.yaml.last_error。';
+    '进度看任务状态与运行台账，失败写 task.yaml.last_error。'
+    'D6-O 主控决策循环：production.orchestrator.tick|status 每 tick 只做一个决策'
+    '（continue / retry / ask / stop，优先级 stop > ask > retry > continue）；'
+    'line.yaml.orchestrator 配 enabled / tick_interval_seconds / auto_retry / '
+    'max_asks_per_task / stop_on_budget / max_ticks_per_minute，task.yaml.loop 记 '
+    'attempts / ask_count / last_action / pending_question / stop_reason；'
+    '快照哈希不变不调模型，单线单 tick，连续 3 次失败暂停产线，决策落 '
+    'runs(role=orchestrator) 台账；运行期问答 production.task.question|questions|answer'
+    '（blocked + question_pending，回答回 queued）；REST 增 orchestrate / pause / '
+    'resume / orchestrator 与 tasks/{id}/answer。';
 
 final ProductionService _service = ProductionService();
 PreparationService? _preparation;
 ProductionExecutionService? _execution;
 ProductionAuditService? _audit;
+OrchestratorService? _orchestrator;
 PluginKitServer? _activeServer;
 final Set<String> _settingsTeams = <String>{};
+
+/// 事件 debounce：同一产线 1s 内的多次事件合并为一次 tick。
+final Map<String, Timer> _eventTimers = <String, Timer>{};
+final Map<String, DateTime> _lastTimerTick = <String, DateTime>{};
+Timer? _periodicTick;
 
 /// 工作空间 → 本插件登记的本机租约（`local.lease.register` 的返回值）。
 final Map<String, String> _leases = <String, String>{};
@@ -111,6 +126,12 @@ Future<void> _onReady(PluginKitServer server) async {
     commands: _runCommand,
   );
   _audit = ProductionAuditService();
+  _orchestrator = OrchestratorService(
+    environment: Platform.environment,
+    llm: _callLlm,
+    dispatcher: _dispatchFromOrchestrator,
+    execution: _execution,
+  );
   server.channel.log(
     '已上线：v$kVersion（tree.production.line，P1 数据 + P3 准备阶段 + P4 打包执行 + P5 专家 + P6 项目整理）',
   );
@@ -140,6 +161,7 @@ Future<void> _onReady(PluginKitServer server) async {
           ...kPreparationCommands,
           ...kExecutionCommands,
           ...kAuditCommands,
+          ...kOrchestratorCommands,
         ],
       },
     );
@@ -149,6 +171,130 @@ Future<void> _onReady(PluginKitServer server) async {
   } catch (error) {
     server.channel.log('自建执行站失败：$error');
   }
+  // D6-O O5：崩溃恢复 + 定时兜底（没有 data_dir 的进程不做这两件事）。
+  _startOrchestratorDrivers(server);
+}
+
+/// 主控驱动（D6-O §3.1 / §5.4）：恢复一次 + 5s 定时兜底。
+///
+/// 定时只对有在途任务的产线生效，且每条产线按 `tick_interval_seconds`
+/// 节流；没有 `TREE_DATA_ROOT` 时直接跳过（插件只处理带 data_dir 的请求）。
+void _startOrchestratorDrivers(PluginKitServer server) {
+  final String dataRoot = Platform.environment['TREE_DATA_ROOT'] ?? '';
+  final OrchestratorService? orchestrator = _orchestrator;
+  if (dataRoot.isEmpty || orchestrator == null) return;
+  final ProductionStore store = ProductionStore(dataRoot: dataRoot);
+  Future<void> recover() async {
+    try {
+      final List<LineRecord> lines = store.listLines();
+      for (final LineRecord line in lines) {
+        final List<TaskRecord> tasks = store.listTasks(line.id);
+        if (!tasks.any((TaskRecord task) => task.status.isInFlight)) continue;
+        store.recover(line.id);
+        await orchestrator.tick(
+          store,
+          line.id,
+          meta: <String, Object?>{'data_dir': dataRoot},
+          scope: _scopeOf(line),
+          trigger: 'recovery',
+        );
+      }
+    } catch (error) {
+      server.channel.log('主控崩溃恢复失败：$error');
+    }
+  }
+
+  unawaited(recover());
+  _periodicTick?.cancel();
+  _periodicTick = Timer.periodic(const Duration(seconds: 5), (_) {
+    unawaited(() async {
+      try {
+        for (final LineRecord line in store.listLines()) {
+          final OrchestratorConfig config = OrchestratorConfig.of(line);
+          if (!config.enabled || config.tickIntervalSeconds <= 0) continue;
+          final DateTime now = DateTime.now();
+          final DateTime? last = _lastTimerTick[line.id];
+          if (last != null &&
+              now.difference(last).inSeconds < config.tickIntervalSeconds) {
+            continue;
+          }
+          _lastTimerTick[line.id] = now;
+          await orchestrator.tick(
+            store,
+            line.id,
+            meta: <String, Object?>{'data_dir': dataRoot},
+            scope: _scopeOf(line),
+            trigger: 'timer',
+          );
+        }
+      } catch (error) {
+        server.channel.log('主控定时 tick 失败：$error');
+      }
+    }());
+  });
+}
+
+/// 主控调用模型 / 派发员工时使用的身份（取自 `line.yaml.executor`）。
+Map<String, Object?> _scopeOf(LineRecord line) => <String, Object?>{
+  if (line.executorAgentId.isNotEmpty) 'agent_id': line.executorAgentId,
+  if (line.executorTeamId.isNotEmpty) 'team_id': line.executorTeamId,
+};
+
+/// 主控决策后的派发：后台跑打包 / 执行，结束后 debounce 一次事件 tick。
+Future<void> _dispatchFromOrchestrator(
+  String lineId,
+  String taskId,
+  String stage,
+  Map<String, Object?> meta,
+  Map<String, Object?> scope,
+) async {
+  final String dataDir = asString(meta['data_dir']);
+  if (dataDir.isEmpty) return;
+  final ProductionStore store = ProductionStore(dataRoot: dataDir);
+  try {
+    await dispatchProductionTask(
+      store: store,
+      execution: _execution,
+      lineId: lineId,
+      taskId: taskId,
+      stage: stage,
+      meta: meta,
+      scope: scope,
+      awaitDispatch: true,
+    );
+  } catch (error) {
+    // 失败已写进 task.yaml.last_error；仍要 tick，让主控决定重试 / 停止。
+    _activeServer?.channel.log('主控派发失败（$lineId/$taskId/$stage）：$error');
+  } finally {
+    _scheduleEventTick(lineId, dataDir, scope);
+  }
+}
+
+/// 1s debounce：同一产线的多次事件合并为一次 tick（§6.4）。
+void _scheduleEventTick(
+  String lineId,
+  String dataDir,
+  Map<String, Object?> scope,
+) {
+  _eventTimers[lineId]?.cancel();
+  _eventTimers[lineId] = Timer(const Duration(seconds: 1), () {
+    _eventTimers.remove(lineId);
+    final OrchestratorService? orchestrator = _orchestrator;
+    if (orchestrator == null) return;
+    unawaited(() async {
+      try {
+        await orchestrator.tick(
+          ProductionStore(dataRoot: dataDir),
+          lineId,
+          meta: <String, Object?>{'data_dir': dataDir},
+          scope: scope,
+          trigger: 'event',
+        );
+      } catch (error) {
+        _activeServer?.channel.log('主控事件 tick 失败：$error');
+      }
+    }());
+  });
 }
 
 /// 向 `tree.agent` 的 `llm.call` 要一份 JSON：只透传本次请求的 scope（身份/团队）。
@@ -184,6 +330,8 @@ Future<Map<String, Object?>> _callLlm(
     return <String, Object?>{
       for (final MapEntry<dynamic, dynamic> entry in json.entries)
         entry.key.toString(): entry.value,
+      // 主控台账要记用量；不污染模型自己的 JSON（下划线键不参与动作解析）。
+      if (payload['usage'] is Map) '_usage': payload['usage'],
     };
   }
   final String text = asString(payload['text']);
@@ -192,6 +340,7 @@ Future<Map<String, Object?>> _callLlm(
     return <String, Object?>{
       for (final MapEntry<dynamic, dynamic> entry in decoded.entries)
         entry.key.toString(): entry.value,
+      if (payload['usage'] is Map) '_usage': payload['usage'],
     };
   }
   throw ProductionFailure(
@@ -487,6 +636,7 @@ Future<Map<String, dynamic>?> handleRequest(
       audit: _audit,
       execution: _execution,
       preparation: _preparation,
+      orchestrator: _orchestrator,
     );
   }
   if (method != M.stationRequest) return null;
@@ -513,9 +663,11 @@ Future<Map<String, dynamic>?> handleRequest(
   final bool isPrepare = kPreparationCommands.contains(command);
   final bool isExecute = kExecutionCommands.contains(command);
   final bool isAudit = kAuditCommands.contains(command);
+  final bool isOrchestrator = kOrchestratorCommands.contains(command);
   if (!isPrepare &&
       !isExecute &&
       !isAudit &&
+      !isOrchestrator &&
       !kProductionCommands.contains(command)) {
     return null;
   }
@@ -536,6 +688,13 @@ Future<Map<String, dynamic>?> handleRequest(
           )
         : isAudit
         ? await _audit!.handle(
+            command,
+            asMap(payload['arguments']),
+            asMap(params['meta']),
+            asMap(params['scope']),
+          )
+        : isOrchestrator
+        ? await _orchestrator!.handle(
             command,
             asMap(payload['arguments']),
             asMap(params['meta']),
@@ -1174,6 +1333,23 @@ Future<int> selfTest() async {
           final String text = messages
               .map((dynamic item) => asString(asMap(item)['content']))
               .join('\n');
+          // D6-O：执行期主控的决策回包（自检只验协议面与落盘，不验决策质量）。
+          if (text.contains('执行期主控')) {
+            return <String, dynamic>{
+              'ok': true,
+              'payload': <String, dynamic>{
+                'json': <String, Object?>{
+                  'action': 'stop',
+                  'reason': '自检：先停任务',
+                  'task_ids': <String>['O1'],
+                  'stop_scope': 'task',
+                },
+                'text': '{}',
+                'model': 'fake',
+                'usage': <String, Object?>{'prompt': 5, 'completion': 2},
+              },
+            };
+          }
           if (text.contains('侦查员')) {
             return <String, dynamic>{
               'ok': true,
@@ -1963,6 +2139,76 @@ Future<int> selfTest() async {
       budgetAgain['code'],
       'execute_state',
       '软停后不静默继续（blocked 不再打包）',
+    );
+
+    // ── D6-O 主控决策循环：一次 tick（stop）+ 游标 + 台账 ──
+    await call('orch-line', 'production.line.create', <String, Object?>{
+      'id': 'pl_orch',
+      'name': '主控产线',
+      'workspace_dir': ws,
+      'roles': <String, Object?>{
+        'orchestrator': <String, Object?>{'model_id': 'fake/orchestrator'},
+        'packer': <String, Object?>{'model_id': 'fake/packer'},
+        'executor': <String, Object?>{'model_id': 'fake/executor'},
+      },
+    });
+    await call('orch-task', 'production.task.create', <String, Object?>{
+      'line_id': 'pl_orch',
+      'task': <String, Object?>{
+        'id': 'O1',
+        'title': '主控停止',
+        'status': 'queued',
+        'write_scope': <String>['lib/a.dart'],
+      },
+    });
+    final Map<String, dynamic> orchTick = payloadOf(
+      await call(
+        'orch-tick',
+        'production.orchestrator.tick',
+        <String, Object?>{'line_id': 'pl_orch'},
+      ),
+    );
+    check.check(orchTick['status'], 'applied', '主控 tick 落盘');
+    check.check(orchTick['action'], 'stop', '主控按回包执行 stop');
+    final Map<String, dynamic> orchTask = payloadOf(
+      await call('orch-task-get', 'production.task.get', <String, Object?>{
+        'line_id': 'pl_orch',
+        'task_id': 'O1',
+      }),
+    );
+    check.check(
+      asMap(orchTask['task'])['status'],
+      'blocked',
+      '主控停止后任务 blocked',
+    );
+    check.check(
+      asMap(orchTask['task'])['blocked_reason'],
+      'orchestrator_stop',
+      '停止原因可读（可恢复）',
+    );
+    final Map<String, dynamic> orchStatus = payloadOf(
+      await call(
+        'orch-status',
+        'production.orchestrator.status',
+        <String, Object?>{'line_id': 'pl_orch'},
+      ),
+    );
+    check.check(
+      asMap(orchStatus['state'])['last_action'],
+      'stop',
+      '主控游标写 last_action',
+    );
+    final Map<String, dynamic> orchRuns = payloadOf(
+      await call('orch-runs', 'production.run.list', <String, Object?>{
+        'line_id': 'pl_orch',
+      }),
+    );
+    check.check(
+      (orchRuns['runs'] as List<dynamic>).any(
+        (dynamic run) => asMap(run)['role'] == 'orchestrator',
+      ),
+      true,
+      '主控决策落 runs 台账',
     );
   } catch (error) {
     check.that(false, '自检过程未抛异常', actual: '$error');
