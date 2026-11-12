@@ -155,6 +155,18 @@ class ModelMeta {
     error: message,
   );
 
+  /// 换一个缓存键（provider 池的键是 `provider/model_id`，探测结果本身只认识 `model_id`）。
+  ModelMeta withModelId(String key) => ModelMeta(
+    modelId: key,
+    pricing: pricing,
+    reasoningEffortOptions: reasoningEffortOptions,
+    reasoningSupported: reasoningSupported,
+    contextLength: contextLength,
+    source: source,
+    fetchedAt: fetchedAt,
+    error: error,
+  );
+
   static ModelMeta? fromJson(Object? raw) {
     if (raw is! Map) return null;
     final String modelId = (raw['model_id'] ?? '').toString().trim();
@@ -194,7 +206,7 @@ Map<String, Object?> selectOpenAiModelEntry(
     rawList = models;
   }
   if (rawList == null) {
-    final String direct = _entryId(payload);
+    final String direct = modelEntryId(payload);
     if (direct.isEmpty) {
       throw ModelMetaFailure(
         '端点回包没有 data / models 列表（也不像单模型对象）',
@@ -218,13 +230,15 @@ Map<String, Object?> selectOpenAiModelEntry(
         },
   ];
   for (final Map<String, Object?> entry in entries) {
-    if (_entryId(entry) == wanted) return entry;
+    if (modelEntryId(entry) == wanted) return entry;
   }
   for (final Map<String, Object?> entry in entries) {
-    if (_entryId(entry).toLowerCase() == wanted.toLowerCase()) return entry;
+    if (modelEntryId(entry).toLowerCase() == wanted.toLowerCase()) {
+      return entry;
+    }
   }
   for (final Map<String, Object?> entry in entries) {
-    if (_idMatches(_entryId(entry), wanted)) return entry;
+    if (_idMatches(modelEntryId(entry), wanted)) return entry;
   }
   throw ModelMetaFailure(
     '端点模型列表里没有 $wanted（共 ${entries.length} 个模型）',
@@ -300,7 +314,8 @@ int _contextLengthOf(Map<String, Object?> entry) {
   return 0;
 }
 
-String _entryId(Map<String, Object?> entry) {
+/// 模型条目的 id（依次尝试 `id` / `model_id` / `name`；都没有返回空串）。
+String modelEntryId(Map<String, Object?> entry) {
   for (final String key in const <String>['id', 'model_id', 'name']) {
     final String value = (entry[key] ?? '').toString().trim();
     if (value.isNotEmpty) return value;

@@ -11,6 +11,7 @@ import 'package:tree_agent_loop/src/llm/model_catalog_client.dart';
 import 'package:tree_agent_loop/src/model_meta.dart';
 import 'package:tree_agent_loop/src/paths.dart';
 import 'package:tree_agent_loop/src/settings/domain_settings.dart';
+import 'package:tree_agent_loop/src/settings/provider_settings.dart';
 import 'package:tree_agent_loop/src/runtime/agent_runtime.dart';
 import 'package:tree_agent_loop/src/store/conversation_db.dart';
 import 'package:tree_agent_loop/src/store/file_store.dart';
@@ -972,6 +973,327 @@ void main() {
     });
   });
 
+  group('D7 Provider 池', () {
+    test('provider CRUD：校验 / 新增自动刷新缓存 / 列表与详情', () async {
+      expect(_bodyOf(await _call('GET', '/api/providers', paths)), <String, dynamic>{
+        'providers': <dynamic>[],
+      });
+      _expectError(
+        await _call(
+          'POST',
+          '/api/providers',
+          paths,
+          body: <String, dynamic>{'name': 'x'},
+        ),
+        400,
+        'base_url 不能为空',
+      );
+
+      final Map<String, dynamic> created = await _call(
+        'POST',
+        '/api/providers',
+        paths,
+        body: <String, dynamic>{
+          'name': 'DeepSeek 官方',
+          'base_url': 'https://api.deepseek.com/v1/',
+          'api_key': 'sk-file',
+          'api_key_env': 'DEEPSEEK_API_KEY',
+        },
+        modelCatalog: _FakeCatalog.entries(<Map<String, Object?>>[
+          <String, Object?>{
+            'id': 'deepseek-v4.1-flash',
+            'name': 'DeepSeek V4.1 Flash',
+            'context_length': 131072,
+            'architecture': <String, Object?>{
+              'input_modalities': <Object?>['text', 'image'],
+            },
+            'reasoning': <String, Object?>{
+              'supported_efforts': <Object?>['low', 'high'],
+            },
+            'pricing': <String, Object?>{
+              'prompt': '0.0000001',
+              'completion': '0.0000002',
+            },
+          },
+        ]),
+      );
+      expect(created['status'], 200);
+      final Map<String, dynamic> createdBody = _bodyOf(created);
+      final Map<String, dynamic> provider =
+          (createdBody['provider'] as Map).cast<String, dynamic>();
+      expect(provider['id'], 'deepseek');
+      expect(provider['base_url'], 'https://api.deepseek.com', reason: '脱敏');
+      expect(provider['has_api_key'], isTrue);
+      expect(provider['api_key_env'], 'DEEPSEEK_API_KEY');
+      expect(provider['cached_model_count'], 1);
+      final Map<String, dynamic> cache =
+          (createdBody['cache'] as Map).cast<String, dynamic>();
+      final Map<String, dynamic> cachedModel =
+          (cache['models'] as List<dynamic>).single as Map<String, dynamic>;
+      expect(cachedModel['model_id'], 'deepseek-v4.1-flash');
+      expect(cachedModel['input_modalities'], <dynamic>['text', 'image']);
+      expect(cachedModel['reasoning_effort_options'], <dynamic>['low', 'high']);
+      // 配置与缓存都落盘（密钥只在配置文件里）。
+      expect(File(paths.providerFile('deepseek')).existsSync(), isTrue);
+      expect(File(paths.providerModelsFile('deepseek')).existsSync(), isTrue);
+      expect(
+        File(paths.providerFile('deepseek')).readAsStringSync(),
+        contains('api_key: sk-file'),
+      );
+
+      final Map<String, dynamic> listed = await _call(
+        'GET',
+        '/api/providers',
+        paths,
+      );
+      expect(
+        ((_bodyOf(listed)['providers'] as List<dynamic>).single
+            as Map<String, dynamic>)['cached_model_count'],
+        1,
+      );
+
+      final Map<String, dynamic> detail = await _call(
+        'GET',
+        '/api/providers/deepseek',
+        paths,
+        params: <String, String>{'providerId': 'deepseek'},
+      );
+      expect(detail['status'], 200);
+      expect(
+        ((_bodyOf(detail)['provider'] as Map)['name']),
+        'DeepSeek 官方',
+      );
+      expect(
+        ((_bodyOf(detail)['cache'] as Map)['models'] as List<dynamic>).length,
+        1,
+      );
+
+      final Map<String, dynamic> patched = await _call(
+        'PATCH',
+        '/api/providers/deepseek',
+        paths,
+        params: <String, String>{'providerId': 'deepseek'},
+        body: <String, dynamic>{'name': 'DS', 'api_key_env': ''},
+      );
+      expect(patched['status'], 200);
+      final Map<String, dynamic> patchedProvider =
+          (_bodyOf(patched)['provider'] as Map).cast<String, dynamic>();
+      expect(patchedProvider['name'], 'DS');
+      expect(patchedProvider['api_key_env'], '', reason: '显式空串 = 清空');
+      expect(patchedProvider['has_api_key'], isTrue, reason: '明文密钥保留');
+    });
+
+    test('refresh：失败保留旧条目并记 error；/models 只读缓存', () async {
+      _writeProvider(paths, 'deepseek');
+      writeProviderModelCache(
+        paths,
+        ProviderModelCache(
+          providerId: 'deepseek',
+          fetchedAt: '2026-11-12T00:00:00.000Z',
+          models: <ProviderModelEntry>[
+            const ProviderModelEntry(modelId: 'flash', name: 'Flash'),
+          ],
+        ),
+      );
+      final Map<String, dynamic> refreshed = await _call(
+        'POST',
+        '/api/providers/deepseek/refresh',
+        paths,
+        params: <String, String>{'providerId': 'deepseek'},
+        modelCatalog: _FakeCatalog.failure('端点不可达'),
+      );
+      expect(refreshed['status'], 200);
+      final Map<String, dynamic> body = _bodyOf(refreshed);
+      expect(body['success'], isFalse);
+      expect(body['error'], '端点不可达');
+      final Map<String, dynamic> cache =
+          (body['cache'] as Map).cast<String, dynamic>();
+      expect(
+        (cache['models'] as List<dynamic>).single,
+        containsPair('model_id', 'flash'),
+        reason: '失败不丢上一次的目录',
+      );
+
+      final Map<String, dynamic> models = await _call(
+        'GET',
+        '/api/providers/deepseek/models',
+        paths,
+        params: <String, String>{'providerId': 'deepseek'},
+      );
+      expect(models['status'], 200);
+      expect(
+        ((_bodyOf(models)['models'] as List<dynamic>).single
+            as Map<String, dynamic>)['model_id'],
+        'flash',
+      );
+
+      _expectError(
+        await _call(
+          'POST',
+          '/api/providers/nope/refresh',
+          paths,
+          params: <String, String>{'providerId': 'nope'},
+        ),
+        404,
+        'provider 不存在',
+      );
+    });
+
+    test('模型身份：provider 下免端点密钥 / 重复键 409 / 裸 id 歧义', () async {
+      _writeProvider(paths, 'deepseek');
+      final Map<String, dynamic> created = await _call(
+        'POST',
+        '/api/models',
+        paths,
+        body: <String, dynamic>{
+          'provider': 'deepseek',
+          'model_id': 'flash',
+          'name': 'Flash',
+        },
+      );
+      expect(created['status'], 200);
+      final Map<String, dynamic> model =
+          (_bodyOf(created)['model'] as Map).cast<String, dynamic>();
+      expect(model['provider'], 'deepseek');
+      expect(model['key'], 'deepseek/flash');
+      expect(model['has_api_key'], isFalse, reason: '密钥在 provider 上');
+      expect(
+        File(paths.modelFileFor(provider: 'deepseek', modelId: 'flash'))
+            .existsSync(),
+        isTrue,
+      );
+
+      _expectError(
+        await _call(
+          'POST',
+          '/api/models',
+          paths,
+          body: <String, dynamic>{'provider': 'deepseek', 'model_id': 'flash'},
+        ),
+        409,
+        '模型已存在：deepseek/flash',
+      );
+      _expectError(
+        await _call(
+          'POST',
+          '/api/models',
+          paths,
+          body: <String, dynamic>{'provider': 'nope', 'model_id': 'x'},
+        ),
+        400,
+        'provider 不存在：nope',
+      );
+
+      // 旧模型（无 provider）在读接口里归到 legacy，但绑定 id 保持裸 model_id。
+      final Map<String, dynamic> listed = await _call(
+        'GET',
+        '/api/models',
+        paths,
+      );
+      final List<Map<String, dynamic>> models = (_bodyOf(listed)['models']
+              as List<dynamic>)
+          .cast<Map<String, dynamic>>();
+      final Map<String, dynamic> legacy = models.firstWhere(
+        (Map<String, dynamic> item) => item['model_id'] == 'm1',
+      );
+      expect(legacy['provider'], 'legacy');
+      expect(legacy['key'], 'legacy/m1');
+
+      // 再挂一个 provider 下的同名模型：裸 model_id 变成歧义。
+      // 走接口创建（运行时已装载配置，直接写文件它看不见）。
+      await _call(
+        'POST',
+        '/api/providers',
+        paths,
+        body: <String, dynamic>{
+          'name': 'mirror',
+          'base_url': 'https://api.mirror.example.com/v1',
+          'api_key': 'sk-m',
+        },
+        modelCatalog: _FakeCatalog.entries(const <Map<String, Object?>>[]),
+      );
+      await _call(
+        'POST',
+        '/api/models',
+        paths,
+        body: <String, dynamic>{'provider': 'mirror', 'model_id': 'm1'},
+      );
+      final Map<String, dynamic> ambiguous = await _call(
+        'PATCH',
+        '/api/models/m1',
+        paths,
+        params: <String, String>{'modelId': 'm1'},
+        body: <String, dynamic>{'name': '改名'},
+      );
+      expect(ambiguous['status'], 409);
+      expect(
+        (_bodyOf(ambiguous)['candidates'] as List<dynamic>),
+        <dynamic>['legacy/m1', 'mirror/m1'],
+      );
+
+      // URL 编码的完整键仍能精确命中。
+      final Map<String, dynamic> exact = await _call(
+        'PATCH',
+        '/api/models/mirror%2Fm1',
+        paths,
+        params: <String, String>{'modelId': 'mirror/m1'},
+        body: <String, dynamic>{'name': '镜像'},
+      );
+      expect(exact['status'], 200);
+      expect((_bodyOf(exact)['model'] as Map)['key'], 'mirror/m1');
+    });
+
+    test('DELETE provider：有绑定 409；删完绑定后删除并清缓存', () async {
+      _writeProvider(paths, 'deepseek');
+      writeProviderModelCache(
+        paths,
+        ProviderModelCache(providerId: 'deepseek'),
+      );
+      await _call(
+        'POST',
+        '/api/models',
+        paths,
+        body: <String, dynamic>{'provider': 'deepseek', 'model_id': 'flash'},
+      );
+
+      final Map<String, dynamic> blocked = await _call(
+        'DELETE',
+        '/api/providers/deepseek',
+        paths,
+        params: <String, String>{'providerId': 'deepseek'},
+      );
+      expect(blocked['status'], 409);
+      expect(
+        _bodyOf(blocked)['bound_models'],
+        <dynamic>['deepseek/flash'],
+      );
+
+      expect(
+        (await _call(
+          'DELETE',
+          '/api/models/deepseek%2Fflash',
+          paths,
+          params: <String, String>{'modelId': 'deepseek/flash'},
+        ))['status'],
+        200,
+      );
+      expect(
+        (await _call(
+          'DELETE',
+          '/api/providers/deepseek',
+          paths,
+          params: <String, String>{'providerId': 'deepseek'},
+        ))['status'],
+        200,
+      );
+      expect(File(paths.providerFile('deepseek')).existsSync(), isFalse);
+      expect(
+        File(paths.providerModelsFile('deepseek')).existsSync(),
+        isFalse,
+      );
+    });
+  });
+
   group('P8 模型元数据路由', () {
     test('GET 无缓存 ⇒ meta:null；POST 成功写缓存并出现在 /api/models', () async {
       final Map<String, dynamic> empty = await _call(
@@ -1147,11 +1469,19 @@ ModelMeta _meta({String modelId = 'm1'}) => ModelMeta(
 );
 
 class _FakeCatalog extends ModelCatalogClient {
-  _FakeCatalog.success(this.meta) : failure = null;
-  _FakeCatalog.failure(this.failure) : meta = null;
+  _FakeCatalog.success(this.meta)
+    : failure = null,
+      entries = null;
+  _FakeCatalog.failure(this.failure)
+    : meta = null,
+      entries = null;
+  _FakeCatalog.entries(this.entries)
+    : meta = null,
+      failure = null;
 
   final ModelMeta? meta;
   final String? failure;
+  final List<Map<String, Object?>>? entries;
 
   @override
   Future<ModelMeta> probe(
@@ -1162,6 +1492,30 @@ class _FakeCatalog extends ModelCatalogClient {
     if (error != null) throw ModelMetaFailure(error);
     return meta!;
   }
+
+  @override
+  Future<List<Map<String, Object?>>> fetchCatalog({
+    required String baseUrl,
+    required String apiKey,
+  }) async {
+    final String? error = failure;
+    if (error != null) throw ModelMetaFailure(error);
+    return entries ?? const <Map<String, Object?>>[];
+  }
+}
+
+/// provider 夹具（含明文密钥）。
+void _writeProvider(AgentDataPaths paths, String id) {
+  File(paths.providerFile(id))
+    ..createSync(recursive: true)
+    ..writeAsStringSync(
+      'id: $id\n'
+      'name: $id provider\n'
+      'base_url: https://api.deepseek.com/v1\n'
+      'api_key: sk-$id\n'
+      'protocol: openai\n'
+      'enabled: true\n',
+    );
 }
 
 Future<Map<String, dynamic>> _call(

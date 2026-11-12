@@ -18,6 +18,7 @@ import 'settings/prompt_store.dart';
 import 'spec/spec_service.dart';
 import 'session_store.dart';
 import 'settings/domain_settings.dart';
+import 'settings/provider_settings.dart';
 import 'settings/ssh_config.dart';
 import 'store/conversation_db.dart';
 import 'store/records.dart';
@@ -65,6 +66,10 @@ const String messagesPattern =
 const String cancelPattern =
     '/api/agents/{agentId}/cancel'; // C-08 新增：停止
 const String modelPattern = '/api/models/{modelId}'; // 模型池 #16（PATCH/DELETE）
+const String providersPattern = '/api/providers'; // Provider 池（D7）
+const String providerPattern = '/api/providers/{providerId}';
+const String providerRefreshPattern = '/api/providers/{providerId}/refresh';
+const String providerModelsPattern = '/api/providers/{providerId}/models';
 const String tokenRatePattern =
     '/api/settings/token-rate'; // token 节奏 #1/#2
 const String teammatePattern =
@@ -560,6 +565,148 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     });
   }
 
+  // ── Provider 池（D7）──────────────────────────────────────────────
+  if (method == 'GET' && _matches(providersPattern, path)) {
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final List<CoreModelConfig> models = runtime.settings.models();
+    return _jsonReply(200, <String, dynamic>{
+      'providers': <Map<String, dynamic>>[
+        for (final ProviderConfig provider in runtime.settings.providers())
+          providerApiJson(
+            paths,
+            provider,
+            boundModelCount: models
+                .where((CoreModelConfig model) => model.provider == provider.id)
+                .length,
+          ),
+      ],
+    });
+  }
+  if (method == 'POST' && _matches(providersPattern, path)) {
+    final Map<String, dynamic> body = _bodyOf(envelope);
+    final String? invalid = ProviderConfig.validateProvider(body);
+    if (invalid != null) {
+      return _jsonReply(400, <String, dynamic>{'detail': invalid});
+    }
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final ProviderConfig? provider = runtime.settings.createProvider(body);
+    if (provider == null) {
+      return _jsonReply(400, <String, dynamic>{'detail': 'provider 创建失败'});
+    }
+    await runtime.settingsSink.flush();
+    // 新增即拉一次目录：失败只记 error，不阻断保存（§5.1.3）。
+    final ProviderModelCache cache = await refreshProviderCatalog(
+      paths,
+      provider,
+      client: modelCatalog,
+    );
+    return _jsonReply(200, <String, dynamic>{
+      'success': true,
+      'provider': providerApiJson(paths, provider),
+      'cache': providerCacheJson(cache),
+    });
+  }
+  if (method == 'GET' && _matches(providerPattern, path)) {
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final ProviderConfig? provider = runtime.settings.provider(
+      _str(params['providerId']),
+    );
+    if (provider == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'provider 不存在'});
+    }
+    final ProviderModelCache? cache = readProviderModelCache(
+      paths,
+      provider.id,
+    );
+    return _jsonReply(200, <String, dynamic>{
+      'provider': providerApiJson(
+        paths,
+        provider,
+        boundModelCount: runtime.settings.boundModelKeys(provider.id).length,
+      ),
+      'cache': cache == null ? null : providerCacheJson(cache),
+    });
+  }
+  if (method == 'PATCH' && _matches(providerPattern, path)) {
+    final String providerId = _str(params['providerId']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final ProviderConfig? existing = runtime.settings.provider(providerId);
+    if (existing == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'provider 不存在'});
+    }
+    final Map<String, dynamic> body = _bodyOf(envelope);
+    final String? invalid = ProviderConfig.validateProvider(
+      body,
+      base: existing,
+    );
+    if (invalid != null) {
+      return _jsonReply(400, <String, dynamic>{'detail': invalid});
+    }
+    final ProviderConfig? provider = runtime.settings.updateProvider(
+      providerId,
+      body,
+    );
+    if (provider == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'provider 不存在'});
+    }
+    await runtime.settingsSink.flush();
+    return _jsonReply(200, <String, dynamic>{
+      'success': true,
+      'provider': providerApiJson(paths, provider),
+    });
+  }
+  if (method == 'DELETE' && _matches(providerPattern, path)) {
+    final String providerId = _str(params['providerId']);
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final ProviderConfig? provider = runtime.settings.provider(providerId);
+    if (provider == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'provider 不存在'});
+    }
+    final List<String> bound = runtime.settings.boundModelKeys(provider.id);
+    if (bound.isNotEmpty) {
+      return _jsonReply(409, <String, dynamic>{
+        'detail': 'provider 下还有 ${bound.length} 个模型，请先删除或转移',
+        'bound_models': bound,
+      });
+    }
+    runtime.settings.deleteProvider(provider.id);
+    removeProviderModelCache(paths, provider.id);
+    await runtime.settingsSink.flush();
+    return _jsonReply(200, <String, dynamic>{'success': true});
+  }
+  if (method == 'POST' && _matches(providerRefreshPattern, path)) {
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final ProviderConfig? provider = runtime.settings.provider(
+      _str(params['providerId']),
+    );
+    if (provider == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'provider 不存在'});
+    }
+    final ProviderModelCache cache = await refreshProviderCatalog(
+      paths,
+      provider,
+      client: modelCatalog,
+    );
+    return _jsonReply(200, <String, dynamic>{
+      'success': cache.error.isEmpty,
+      if (cache.error.isNotEmpty) 'error': cache.error,
+      'cache': providerCacheJson(cache),
+    });
+  }
+  if (method == 'GET' && _matches(providerModelsPattern, path)) {
+    final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final ProviderConfig? provider = runtime.settings.provider(
+      _str(params['providerId']),
+    );
+    if (provider == null) {
+      return _jsonReply(404, <String, dynamic>{'detail': 'provider 不存在'});
+    }
+    final ProviderModelCache cache =
+        readProviderModelCache(paths, provider.id) ??
+        ProviderModelCache(providerId: provider.id);
+    return _jsonReply(200, providerCacheJson(cache));
+  }
+
   // ── 模型池写接口（POST / PATCH / DELETE）──────────────────────────
   if (method == 'POST' && _matches(modelsPattern, path)) {
     final Map<String, dynamic> body = _bodyOf(envelope);
@@ -568,10 +715,17 @@ Future<Map<String, dynamic>> _dispatchDelegate(
       return _jsonReply(400, <String, dynamic>{'detail': invalid});
     }
     final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
+    final String providerId = (body['provider'] as String? ?? '').trim();
+    if (providerId.isNotEmpty && runtime.settings.provider(providerId) == null) {
+      return _jsonReply(400, <String, dynamic>{
+        'detail': 'provider 不存在：$providerId',
+      });
+    }
     final CoreModelConfig? model = runtime.settings.createModel(body);
     if (model == null) {
       return _jsonReply(409, <String, dynamic>{
-        'detail': '模型已存在：${body['model_id']}',
+        'detail': '模型已存在：${providerId.isEmpty ? '' : '$providerId/'}'
+            '${body['model_id']}',
       });
     }
     await runtime.settingsSink.flush();
@@ -583,7 +737,11 @@ Future<Map<String, dynamic>> _dispatchDelegate(
   if (method == 'PATCH' && _matches(modelPattern, path)) {
     final String modelId = _str(params['modelId']);
     final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
-    final CoreModelConfig? existing = runtime.settings.model(modelId);
+    final ModelResolution resolution = runtime.settings.resolveModel(modelId);
+    if (resolution.ambiguous) {
+      return _jsonReply(409, _ambiguousModel(resolution));
+    }
+    final CoreModelConfig? existing = resolution.model;
     if (existing == null) {
       return _jsonReply(404, <String, dynamic>{'detail': '模型不存在'});
     }
@@ -593,14 +751,17 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     if (invalid != null) {
       return _jsonReply(400, <String, dynamic>{'detail': invalid});
     }
-    final CoreModelConfig? model = runtime.settings.updateModel(modelId, body);
+    final CoreModelConfig? model = runtime.settings.updateModel(
+      existing.key,
+      body,
+    );
     if (model == null) {
       return _jsonReply(404, <String, dynamic>{'detail': '模型不存在'});
     }
     // 端点 / 密钥变了：旧的探测结果（价格、档位）不再可信，丢弃等重新探测。
     // 只改 name / thinking 等展示字段不清缓存（否则改个名字就要重新探测）。
     if (body.containsKey('base_url') || body.containsKey('api_key')) {
-      removeModelMeta(paths, modelId);
+      _removeModelMetaFor(paths, existing);
     }
     await runtime.settingsSink.flush();
     return _jsonReply(200, <String, dynamic>{
@@ -611,14 +772,19 @@ Future<Map<String, dynamic>> _dispatchDelegate(
   if (method == 'DELETE' && _matches(modelPattern, path)) {
     final String modelId = _str(params['modelId']);
     final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
-    if (!runtime.settings.deleteModel(modelId)) {
+    final ModelResolution resolution = runtime.settings.resolveModel(modelId);
+    if (resolution.ambiguous) {
+      return _jsonReply(409, _ambiguousModel(resolution));
+    }
+    final CoreModelConfig? existing = resolution.model;
+    if (existing == null || !runtime.settings.deleteModel(existing.key)) {
       return _jsonReply(404, <String, dynamic>{'detail': '模型不存在'});
     }
-    removeModelMeta(paths, modelId);
+    _removeModelMetaFor(paths, existing);
     await runtime.settingsSink.flush();
     final List<String> bound = <String>[
       for (final AgentRecord record in readAgentRecords(paths))
-        if (record.modelId == modelId) record.id,
+        if (_bindsModel(record.modelId, existing)) record.id,
     ];
     return _jsonReply(200, <String, dynamic>{
       'success': true,
@@ -630,19 +796,30 @@ Future<Map<String, dynamic>> _dispatchDelegate(
   if (method == 'GET' && _matches(modelMetaPattern, path)) {
     final String modelId = _str(params['modelId']);
     final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
-    if (runtime.settings.model(modelId) == null) {
+    final ModelResolution resolution = runtime.settings.resolveModel(modelId);
+    if (resolution.ambiguous) {
+      return _jsonReply(409, _ambiguousModel(resolution));
+    }
+    final CoreModelConfig? model = resolution.model;
+    if (model == null) {
       return _jsonReply(404, <String, dynamic>{'detail': '模型不存在'});
     }
-    final ModelMeta? meta = readModelMeta(paths, modelId);
+    final ModelMeta? meta =
+        readModelMeta(paths, _metaKeyOf(model)) ??
+        readModelMeta(paths, model.modelId);
     return _jsonReply(200, <String, dynamic>{
-      'model_id': modelId,
+      'model_id': model.key,
       'meta': meta?.toJson(),
     });
   }
   if (method == 'POST' && _matches(modelMetaPattern, path)) {
     final String modelId = _str(params['modelId']);
     final AgentRuntime runtime = AgentRuntime.forDataDir(paths.root);
-    final CoreModelConfig? model = runtime.settings.model(modelId);
+    final ModelResolution resolution = runtime.settings.resolveModel(modelId);
+    if (resolution.ambiguous) {
+      return _jsonReply(409, _ambiguousModel(resolution));
+    }
+    final CoreModelConfig? model = resolution.model;
     if (model == null) {
       return _jsonReply(404, <String, dynamic>{'detail': '模型不存在'});
     }
@@ -650,25 +827,36 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     final bool owns = modelCatalog == null;
     try {
       final ModelMeta meta = await catalog.probe(model);
-      writeModelMeta(paths, meta);
+      // 缓存键用模型池身份（`provider/model_id`）：同一端点模型挂在两个 provider
+      // 下时价格/档位不能互相串味。
+      final ModelMeta keyed = meta.withModelId(_metaKeyOf(model));
+      writeModelMeta(paths, keyed);
       return _jsonReply(200, <String, dynamic>{
         'success': true,
-        'model_id': modelId,
-        'meta': meta.toJson(),
+        'model_id': model.key,
+        'meta': keyed.toJson(),
       });
     } on ModelMetaFailure catch (error) {
-      final ModelMeta failed = _failedMeta(paths, modelId, error.message);
+      final ModelMeta failed = _failedMeta(
+        paths,
+        _metaKeyOf(model),
+        error.message,
+      );
       return _jsonReply(200, <String, dynamic>{
         'success': false,
-        'model_id': modelId,
+        'model_id': model.key,
         'error': error.message,
         'meta': failed.toJson(),
       });
     } catch (error) {
-      final ModelMeta failed = _failedMeta(paths, modelId, '探测失败：$error');
+      final ModelMeta failed = _failedMeta(
+        paths,
+        _metaKeyOf(model),
+        '探测失败：$error',
+      );
       return _jsonReply(200, <String, dynamic>{
         'success': false,
-        'model_id': modelId,
+        'model_id': model.key,
         'error': failed.error,
         'meta': failed.toJson(),
       });
@@ -817,7 +1005,11 @@ Future<Map<String, dynamic>> _dispatchDelegate(
       return _jsonReply(400, <String, dynamic>{'detail': 'model_id 不能为空'});
     }
     final AgentRuntime runtime = _runtimeFor(paths, runtimeFor);
-    final CoreModelConfig? model = runtime.settings.model(modelId);
+    final ModelResolution resolution = runtime.settings.resolveModel(modelId);
+    if (resolution.ambiguous) {
+      return _jsonReply(409, _ambiguousModel(resolution));
+    }
+    final CoreModelConfig? model = resolution.model;
     if (model == null) {
       return _jsonReply(400, <String, dynamic>{'detail': '模型不存在：$modelId'});
     }
@@ -828,7 +1020,8 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     final CoreAgent agent = runtime.store.createAgent(
       name: name,
       systemPrompt: body['system_prompt'] as String? ?? '',
-      modelId: modelId,
+      // 新绑定写模型池身份（`provider/model_id`），旧绑定的裸 id 仍可解析。
+      modelId: _bindingIdOf(model),
       teamMemberCount: (body['team_member_count'] as num?)?.toInt() ?? 0,
       maxLevel: TeamLimits.level(body['max_level']),
       maxMembersPerLevel: TeamLimits.members(body['max_members_per_level']),
@@ -848,14 +1041,19 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     final Map<String, dynamic> body = _bodyOf(envelope);
     final String modelId = (body['model_id'] as String? ?? '').trim();
     final AgentRuntime runtime = _runtimeFor(paths, runtimeFor);
+    CoreModelConfig? boundModel;
     if (modelId.isNotEmpty) {
-      final CoreModelConfig? model = runtime.settings.model(modelId);
-      if (model == null) {
+      final ModelResolution resolution = runtime.settings.resolveModel(modelId);
+      if (resolution.ambiguous) {
+        return _jsonReply(409, _ambiguousModel(resolution));
+      }
+      boundModel = resolution.model;
+      if (boundModel == null) {
         return _jsonReply(400, <String, dynamic>{
           'detail': '模型不存在：$modelId',
         });
       }
-      final String? kindError = DomainSettings.modelKindError(model);
+      final String? kindError = DomainSettings.modelKindError(boundModel);
       if (kindError != null) {
         return _jsonReply(400, <String, dynamic>{'detail': kindError});
       }
@@ -865,7 +1063,7 @@ Future<Map<String, dynamic>> _dispatchDelegate(
       systemPrompt: body.containsKey('system_prompt')
           ? (body['system_prompt'] as String? ?? '')
           : null,
-      modelId: modelId.isEmpty ? null : modelId,
+      modelId: boundModel == null ? null : _bindingIdOf(boundModel),
     );
     if (agent == null) {
       return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
@@ -1480,6 +1678,39 @@ ModelMeta _failedMeta(AgentDataPaths paths, String modelId, String error) {
   );
   writeModelMeta(paths, failed);
   return failed;
+}
+
+/// 裸 `model_id` 命中多个 provider 时的可读回包（D7 绑定歧义）。
+Map<String, dynamic> _ambiguousModel(ModelResolution resolution) =>
+    <String, dynamic>{
+      'detail':
+          '模型绑定有歧义，请重新选择（候选：${resolution.candidates.join(' / ')}）',
+      'candidates': resolution.candidates,
+    };
+
+/// 清理模型的元数据缓存：新键是 `provider/model_id`，旧缓存键是裸 `model_id`。
+void _removeModelMetaFor(AgentDataPaths paths, CoreModelConfig model) {
+  removeModelMeta(paths, _metaKeyOf(model));
+  if (model.provider == kLegacyProviderId) {
+    removeModelMeta(paths, model.modelId);
+  }
+}
+
+/// 元数据缓存键：旧模型（`legacy` / 无 provider）沿用裸 `model_id`，保持旧缓存可用；
+/// 真正的 provider 模型用 `provider/model_id`（同一端点模型挂两个 provider 时不串味）。
+String _metaKeyOf(CoreModelConfig model) =>
+    model.provider.isEmpty || model.provider == kLegacyProviderId
+    ? model.modelId
+    : model.key;
+
+/// Agent / 产线绑定的模型身份：旧模型继续写裸 `model_id`（零迁移），
+/// provider 模型写 `provider/model_id`。
+String _bindingIdOf(CoreModelConfig model) => _metaKeyOf(model);
+
+/// Agent 的绑定是否指向这个模型（新绑定写 `provider/model_id`，旧绑定写裸 id）。
+bool _bindsModel(String bound, CoreModelConfig model) {
+  if (bound == model.key || bound == _bindingIdOf(model)) return true;
+  return model.provider == kLegacyProviderId && bound == model.modelId;
 }
 
 /// 路径模板匹配（`{name}` 段匹配任意非空段；其余段逐字相等）。

@@ -320,13 +320,13 @@ class DecisionClient {
         code: 'invalid_model',
       );
     }
-    if (model.baseUrl.trim().isEmpty) {
+    if (model.effectiveBaseUrl.isEmpty) {
       throw DecisionFailure(
         '模型 ${model.modelId} 未配置 base_url',
         code: 'invalid_model',
       );
     }
-    if (model.apiKey.trim().isEmpty) {
+    if (model.effectiveApiKey.isEmpty) {
       throw DecisionFailure(
         '模型 ${model.modelId} 未配置 api_key',
         code: 'invalid_model',
@@ -341,7 +341,7 @@ class DecisionClient {
     if (_closed) {
       throw DecisionFailure('DecisionClient 已关闭', code: 'client_closed');
     }
-    final String base = model.baseUrl.trim().replaceFirst(
+    final String base = model.effectiveBaseUrl.replaceFirst(
       RegExp(r'/+$'),
       '',
     );
@@ -354,7 +354,7 @@ class DecisionClient {
       request.headers.contentType = ContentType.json;
       request.headers.set(
         HttpHeaders.authorizationHeader,
-        'Bearer ${model.apiKey}',
+        'Bearer ${model.effectiveApiKey}',
       );
       request.add(utf8.encode(jsonEncode(body)));
       final HttpClientResponse response = await request.close().timeout(

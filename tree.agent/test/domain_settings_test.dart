@@ -5,6 +5,7 @@ import 'package:test/test.dart';
 import 'package:tree_agent_loop/src/model_catalog.dart';
 import 'package:tree_agent_loop/src/paths.dart';
 import 'package:tree_agent_loop/src/settings/domain_settings.dart';
+import 'package:tree_agent_loop/src/settings/provider_settings.dart';
 
 /// 领域设置的独立自检（A3 从核心 `CoreSettings` 拆出的模型池半边）。
 void main() {
@@ -403,6 +404,8 @@ class _RecordingSink implements DomainSettingsSink {
   final void Function()? onSave;
   final List<CoreModelConfig> saved = <CoreModelConfig>[];
   final List<String> deleted = <String>[];
+  final List<ProviderConfig> savedProviders = <ProviderConfig>[];
+  final List<String> deletedProviders = <String>[];
   final List<int> tokenRates = <int>[];
 
   @override
@@ -412,7 +415,13 @@ class _RecordingSink implements DomainSettingsSink {
   }
 
   @override
-  void deleteModel(String modelId) => deleted.add(modelId);
+  void deleteModel(CoreModelConfig model) => deleted.add(model.key);
+
+  @override
+  void saveProvider(ProviderConfig provider) => savedProviders.add(provider);
+
+  @override
+  void deleteProvider(String providerId) => deletedProviders.add(providerId);
 
   @override
   void saveTokenRate(int rate) => tokenRates.add(rate);

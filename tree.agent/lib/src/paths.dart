@@ -21,6 +21,45 @@ class AgentDataPaths {
   /// `<root>/config/models`：模型池配置（每个模型一个 yaml）。
   String get modelsDir => p.join(root, 'config', 'models');
 
+  /// `<root>/config/providers`：provider 池（每个 provider 一个 yaml，含密钥）。
+  String get providersDir => p.join(root, 'config', 'providers');
+
+  /// `<root>/config/provider_models`：provider 的模型目录缓存（每个 provider 一个 json）。
+  String get providerModelsDir => p.join(root, 'config', 'provider_models');
+
+  /// 单个 provider 配置：`<root>/config/providers/<id>.yaml`。
+  String providerFile(String providerId) =>
+      p.join(providersDir, '${safeSegment(providerId)}.yaml');
+
+  /// 单个 provider 的模型目录缓存：`<root>/config/provider_models/<id>.json`。
+  String providerModelsFile(String providerId) =>
+      p.join(providerModelsDir, '${safeSegment(providerId)}.json');
+
+  /// 模型配置文件：旧文件保持 `<model_id>.yaml`，新文件用
+  /// `<provider>__<model>.yaml`（避免跨 provider 同名互相覆盖）。
+  String modelFileFor({required String provider, required String modelId}) =>
+      p.join(
+        modelsDir,
+        '${modelFileStem(provider: provider, modelId: modelId)}.yaml',
+      );
+
+  /// 模型文件名（不含扩展名）。
+  ///
+  /// `provider` 为空 ⇒ 旧式裸 `model_id`（与 [modelFile] 同口径）；
+  /// 非空 ⇒ `<provider>__<model>`，其中 model_id 里的路径分隔符等非法字符
+  /// 换成 `_`（`openai/gpt-4o` → `openai__openai_gpt-4o`）。
+  static String modelFileStem({
+    required String provider,
+    required String modelId,
+  }) {
+    if (provider.trim().isEmpty) return safeSegment(modelId);
+    final String model = safeSegment(modelId.replaceAll(
+      RegExp(r'[^A-Za-z0-9_.-]'),
+      '_',
+    ));
+    return '${safeSegment(provider)}__$model';
+  }
+
   /// `<root>/config/agent_settings.yaml`：领域设置（L-22 乙方案后**只**由本插件写）。
   String get agentSettingsFile =>
       p.join(root, 'config', 'agent_settings.yaml');

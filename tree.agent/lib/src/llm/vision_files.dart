@@ -622,7 +622,7 @@ class WorkspaceVisionFileResolver implements VisionFileResolver {
     }
 
     final String key = visionCacheKey(
-      baseUrl: config.baseUrl,
+      baseUrl: config.effectiveBaseUrl,
       workspaceRoot: io.root,
       path: path,
       size: size,
@@ -703,8 +703,8 @@ class WorkspaceVisionFileResolver implements VisionFileResolver {
   /// **file_id 缓存键不带 model**——file_id 属于"账号 + 端点"，与模型无关，
   /// 带上它只会让所有老缓存失效。
   VisionFileUploader? _uploaderFor(CoreModelConfig config) {
-    final String baseUrl = config.baseUrl.trim();
-    final String apiKey = config.apiKey.trim();
+    final String baseUrl = config.effectiveBaseUrl;
+    final String apiKey = config.effectiveApiKey;
     if (baseUrl.isEmpty || apiKey.isEmpty) return null;
     final String modelId = config.modelId.trim();
     final String key = '$baseUrl|$apiKey|$modelId';

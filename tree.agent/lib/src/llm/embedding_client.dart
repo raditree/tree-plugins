@@ -168,13 +168,13 @@ class EmbeddingClient {
         code: 'invalid_model',
       );
     }
-    if (model.baseUrl.trim().isEmpty) {
+    if (model.effectiveBaseUrl.isEmpty) {
       throw EmbeddingFailure(
         '模型 ${model.modelId} 未配置 base_url',
         code: 'invalid_model',
       );
     }
-    if (model.apiKey.trim().isEmpty) {
+    if (model.effectiveApiKey.isEmpty) {
       throw EmbeddingFailure(
         '模型 ${model.modelId} 未配置 api_key',
         code: 'invalid_model',
@@ -190,12 +190,12 @@ class EmbeddingClient {
       throw EmbeddingFailure('EmbeddingClient 已关闭', code: 'client_closed');
     }
     final Uri uri = Uri.parse(
-      '${model.baseUrl.trim().replaceFirst(RegExp(r'/+$'), '')}/embeddings',
+      '${model.effectiveBaseUrl.replaceFirst(RegExp(r'/+$'), '')}/embeddings',
     );
     try {
       final Map<String, dynamic> body = await _send(
         uri,
-        model.apiKey,
+        model.effectiveApiKey,
         <String, Object?>{
           'model': model.modelId,
           'input': batch,

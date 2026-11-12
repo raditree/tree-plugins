@@ -4,6 +4,7 @@ import '../paths.dart';
 import '../store/atomic_file.dart';
 import '../store/yaml_codec.dart';
 import '../yaml_utils.dart';
+import 'provider_settings.dart';
 
 /// `token_scale` 的默认值（与核心 `defaultTokenScale` 同值）。
 const double kDefaultTokenScale = 2.0;
@@ -40,6 +41,7 @@ const int kFallbackMaxSeqlen = 128000;
 class CoreModelConfig {
   CoreModelConfig({
     required this.modelId,
+    this.provider = '',
     this.name = '',
     String kind = kModelKindChat,
     String protocol = '',
@@ -50,6 +52,8 @@ class CoreModelConfig {
     this.apiKey = '',
     this.thinking = false,
     this.ifVision = false,
+    this.ifAudio = false,
+    this.ifVideo = false,
     this.reasoningEffort = '',
     List<String>? reasoningEffortOptions,
     this.maxSeqlen = 0,
@@ -73,6 +77,36 @@ class CoreModelConfig {
   ];
 
   final String modelId;
+
+  /// 所属 provider 的 id（旧文件为 [kLegacyProviderId]；空 = 未归组）。
+  String provider;
+
+  /// 模型池唯一键：`provider/model_id`（provider 为空时就是 `model_id`）。
+  String get key => provider.isEmpty ? modelId : '$provider/$modelId';
+
+  /// 由 provider 配置解析出的端点根（**不落盘**；模型级 `base_url` 非空时不用它）。
+  String providerBaseUrl = '';
+
+  /// 由 provider 配置解析出的密钥（**不落盘**；模型级 `api_key` 非空时不用它）。
+  String providerApiKey = '';
+
+  /// 该模型落盘的文件路径（装载时记下；新建为空 ⇒ 按 `provider__model_id` 推导）。
+  ///
+  /// 旧文件必须记住原路径：否则编辑一次旧模型会写到新命名上、留下同名两份。
+  String storageFile = '';
+
+  /// 请求时真正使用的端点：模型级覆盖优先，其次 provider。
+  String get effectiveBaseUrl {
+    final String own = baseUrl.trim();
+    return own.isNotEmpty ? own : providerBaseUrl.trim();
+  }
+
+  /// 请求时真正使用的密钥：模型级覆盖优先，其次 provider（含环境变量解析）。
+  String get effectiveApiKey {
+    final String own = apiKey.trim();
+    return own.isNotEmpty ? own : providerApiKey.trim();
+  }
+
   String name;
 
   /// 模型类型：`chat` / `embedding` / `decision`（创建后不可改，见 MP-2）。
@@ -94,6 +128,10 @@ class CoreModelConfig {
   String apiKey;
   bool thinking;
   bool ifVision;
+
+  /// 端点声明的模态能力（D7 自动填充、用户可改；`false` = 不假装支持）。
+  bool ifAudio;
+  bool ifVideo;
   String reasoningEffort;
   List<String> reasoningEffortOptions;
   int maxSeqlen;
@@ -125,6 +163,7 @@ class CoreModelConfig {
   /// `kind` / `protocol` 等新键**只在与缺省值不同时写**：旧 chat 模型保存后仍逐键
   /// 保持原样（旧 YAML 无新键 ⇒ 读补默认值、不回写文件，TC-MP-01）。
   Map<String, dynamic> toJson() => <String, dynamic>{
+    if (provider.isNotEmpty) 'provider': provider,
     'model_id': modelId,
     'name': name,
     if (kind != kModelKindChat) 'kind': kind,
@@ -136,6 +175,8 @@ class CoreModelConfig {
     'api_key': apiKey,
     'thinking': thinking,
     'if_vision': ifVision,
+    if (ifAudio) 'if_audio': ifAudio,
+    if (ifVideo) 'if_video': ifVideo,
     'reasoning_effort': reasoningEffort,
     'reasoning_effort_options': reasoningEffortOptions,
     'max_seqlen': maxSeqlen,
@@ -146,6 +187,8 @@ class CoreModelConfig {
 
   /// 前端形态：无密钥、base_url 脱敏；`kind` / `protocol` 始终下发（旧 UI 忽略）。
   Map<String, dynamic> toApiJson() => <String, dynamic>{
+    'provider': provider,
+    'key': key,
     'model_id': modelId,
     'name': name.isEmpty ? modelId : name,
     'kind': kind,
@@ -160,6 +203,8 @@ class CoreModelConfig {
     'has_api_key': apiKey.trim().isNotEmpty,
     'thinking': thinking,
     'if_vision': ifVision,
+    'if_audio': ifAudio,
+    'if_video': ifVideo,
     'reasoning_effort': reasoningEffort,
     'reasoning_effort_options': reasoningEffortOptions,
     'max_seqlen': maxSeqlen,
@@ -171,6 +216,7 @@ class CoreModelConfig {
   static CoreModelConfig fromJson(Map<String, dynamic> json) {
     return CoreModelConfig(
       modelId: json['model_id'] as String? ?? '',
+      provider: json['provider'] as String? ?? '',
       name: json['name'] as String? ?? '',
       kind: json['kind'] as String? ?? kModelKindChat,
       protocol: json['protocol'] as String? ?? '',
@@ -181,6 +227,8 @@ class CoreModelConfig {
       apiKey: json['api_key'] as String? ?? '',
       thinking: json['thinking'] as bool? ?? false,
       ifVision: json['if_vision'] as bool? ?? false,
+      ifAudio: json['if_audio'] as bool? ?? false,
+      ifVideo: json['if_video'] as bool? ?? false,
       reasoningEffort: json['reasoning_effort'] as String? ?? '',
       reasoningEffortOptions:
           (json['reasoning_effort_options'] as List<dynamic>?)
@@ -199,6 +247,10 @@ class CoreModelConfig {
   /// `kind` 变更而未同时给 `protocol` 时，协议回到新类型的默认值（创建 embedding /
   /// decision 模型不必重复写协议）；改动是否合法由 MP-2 的 API 校验负责。
   void merge(Map<String, dynamic> payload) {
+    if (payload.containsKey('provider')) {
+      final String value = (payload['provider'] as String? ?? '').trim();
+      if (value.isNotEmpty) provider = value;
+    }
     if (payload.containsKey('name')) name = payload['name'] as String? ?? name;
     if (payload.containsKey('kind')) {
       final String value = _readKind(payload['kind'] as String? ?? '');
@@ -236,6 +288,12 @@ class CoreModelConfig {
     if (payload.containsKey('if_vision')) {
       ifVision = payload['if_vision'] as bool? ?? ifVision;
     }
+    if (payload.containsKey('if_audio')) {
+      ifAudio = payload['if_audio'] as bool? ?? ifAudio;
+    }
+    if (payload.containsKey('if_video')) {
+      ifVideo = payload['if_video'] as bool? ?? ifVideo;
+    }
     if (payload.containsKey('reasoning_effort')) {
       reasoningEffort = payload['reasoning_effort'] as String? ?? '';
     }
@@ -264,17 +322,7 @@ class CoreModelConfig {
   }
 
   /// `base_url` 脱敏：仅保留协议 + 主机（+ 非默认端口）。
-  static String maskBaseUrl(String raw) {
-    if (raw.isEmpty) return '';
-    final Uri? uri = Uri.tryParse(raw);
-    if (uri == null || uri.host.isEmpty) return '';
-    final bool defaultPort =
-        (uri.scheme == 'https' && uri.port == 443) ||
-        (uri.scheme == 'http' && uri.port == 80);
-    return defaultPort || uri.port == 0
-        ? '${uri.scheme}://${uri.host}'
-        : '${uri.scheme}://${uri.host}:${uri.port}';
-  }
+  static String maskBaseUrl(String raw) => maskEndpointUrl(raw);
 
   /// 应用成员级模型参数覆盖（只覆盖非空项，返回副本；学习状态一起带走）。
   ///
@@ -284,6 +332,7 @@ class CoreModelConfig {
     if (overrides.isEmpty) return this;
     final CoreModelConfig copy = CoreModelConfig(
       modelId: modelId,
+      provider: provider,
       name: name,
       kind: kind,
       protocol: protocol,
@@ -294,13 +343,19 @@ class CoreModelConfig {
       apiKey: apiKey,
       thinking: thinking,
       ifVision: ifVision,
+      ifAudio: ifAudio,
+      ifVideo: ifVideo,
       reasoningEffort: reasoningEffort,
       reasoningEffortOptions: reasoningEffortOptions,
       maxSeqlen: maxSeqlen,
       maxOutputTokens: maxOutputTokens,
       tokenScale: tokenScale,
       longestSessionTokens: longestSessionTokens,
-    );
+    )
+      // provider 解析出的端点/密钥也要带走，否则成员级覆盖后会退回"未配置 base_url"。
+      ..providerBaseUrl = providerBaseUrl
+      ..providerApiKey = providerApiKey;
+
     final Object? effort = overrides['reasoning_effort'];
     if (effort is String && effort.trim().isNotEmpty) {
       copy.reasoningEffort = effort.trim();
@@ -362,17 +417,49 @@ class CoreModelConfig {
 abstract interface class DomainSettingsSink {
   void saveModel(CoreModelConfig model);
 
-  void deleteModel(String modelId);
+  void deleteModel(CoreModelConfig model);
+
+  /// provider 变更（写 `config/providers/<id>.yaml`）。
+  void saveProvider(ProviderConfig provider);
+
+  void deleteProvider(String providerId);
 
   /// token 速率变更（写 `config/agent_settings.yaml` 的 `token_acquisition_rate`）。
   void saveTokenRate(int rate);
 }
 
-/// 领域设置（模型池 + token 速率）——从核心 `CoreSettings` 拆出的**领域半边**。
+/// 一次模型解析的结果（模型池身份是 `provider/model_id`，旧绑定是裸 `model_id`）。
+class ModelResolution {
+  const ModelResolution.found(CoreModelConfig this.model)
+    : ambiguous = false,
+      candidates = const <String>[];
+
+  const ModelResolution.notFound()
+    : model = null,
+      ambiguous = false,
+      candidates = const <String>[];
+
+  const ModelResolution.ambiguous(this.candidates)
+    : model = null,
+      ambiguous = true;
+
+  final CoreModelConfig? model;
+
+  /// 裸 `model_id` 命中多个 provider 时为 true（调用方应提示"绑定有歧义，请重新选择"）。
+  final bool ambiguous;
+
+  /// 歧义时的候选键（`provider/model_id`）。
+  final List<String> candidates;
+
+  bool get found => model != null;
+}
+
+/// 领域设置（模型池 + provider 池 + token 速率）——从核心 `CoreSettings` 拆出的**领域半边**。
 ///
 /// 核心的 `CoreSettings` 混装平台开关与领域配置；插件只保留后者。存储位置按
-/// L-22 乙方案分文件：模型池 `config/models/*.yaml`、token 速率
-/// `config/agent_settings.yaml`（旧核心的 `settings.yaml` 只在迁移期兜底读）。
+/// L-22 乙方案分文件：模型池 `config/models/*.yaml`、provider 池
+/// `config/providers/*.yaml`、token 速率 `config/agent_settings.yaml`
+/// （旧核心的 `settings.yaml` 只在迁移期兜底读）。
 class DomainSettings {
   DomainSettings({this.sink});
 
@@ -384,63 +471,189 @@ class DomainSettings {
 
   final Map<String, CoreModelConfig> _models = <String, CoreModelConfig>{};
 
+  final Map<String, ProviderConfig> _providers = <String, ProviderConfig>{};
+
   int _tokenAcquisitionRate = tokenRateMax;
 
-  /// 模型列表（按 model_id 升序）。
+  /// 模型列表（按 `provider/model_id` 升序）。
   List<CoreModelConfig> models() {
     final List<CoreModelConfig> list = _models.values.toList()
-      ..sort(
-        (CoreModelConfig a, CoreModelConfig b) =>
-            a.modelId.compareTo(b.modelId),
-      );
+      ..sort((CoreModelConfig a, CoreModelConfig b) => a.key.compareTo(b.key));
     return list;
   }
 
-  CoreModelConfig? model(String modelId) => _models[modelId];
+  /// 按 `provider/model_id` 或裸 `model_id` 精确取模型（歧义时返回 null，见 [resolveModel]）。
+  CoreModelConfig? model(String idOrKey) => resolveModel(idOrKey).model;
+
+  /// 解析模型身份（D7）：
+  /// 1. `provider/model_id` 全等；
+  /// 2. 否则按裸 `model_id` 唯一匹配（旧绑定零迁移）；
+  /// 3. 多个 provider 下同名 ⇒ 歧义，调用方要求用户重新选择。
+  ///
+  /// 解析顺序必须先全等再裸 id：否则旧库里出现 `x` 与 `a/x` 后，精确绑定 `x`
+  /// 会被误判成歧义。
+  ModelResolution resolveModel(String idOrKey) {
+    final String key = idOrKey.trim();
+    if (key.isEmpty) return const ModelResolution.notFound();
+    final CoreModelConfig? direct = _models[key];
+    if (direct != null) return ModelResolution.found(direct);
+    final List<CoreModelConfig> matches = <CoreModelConfig>[
+      for (final CoreModelConfig model in _models.values)
+        if (model.modelId == key) model,
+    ];
+    if (matches.isEmpty) return const ModelResolution.notFound();
+    if (matches.length == 1) return ModelResolution.found(matches.first);
+    final List<String> candidates = <String>[
+      for (final CoreModelConfig model in matches) model.key,
+    ]..sort();
+    return ModelResolution.ambiguous(candidates);
+  }
 
   /// 直接放入模型（装载用；不触发落盘）。
   void putModel(CoreModelConfig model) => _attach(model);
 
   void _attach(CoreModelConfig model) {
     model.onChanged = (CoreModelConfig changed) => sink?.saveModel(changed);
-    _models[model.modelId] = model;
+    _models[model.key] = model;
+    _applyProviderToModel(model);
   }
 
-  /// 新建模型；`model_id` 已存在时返回 null（调用方回 409）。
+  /// provider 列表（按 id 升序）。
+  List<ProviderConfig> providers() {
+    final List<ProviderConfig> list = _providers.values.toList()
+      ..sort((ProviderConfig a, ProviderConfig b) => a.id.compareTo(b.id));
+    return list;
+  }
+
+  ProviderConfig? provider(String providerId) =>
+      _providers[providerId.trim()];
+
+  /// 直接放入 provider（装载用；不触发落盘）。
+  void putProvider(ProviderConfig provider) => _putProvider(provider);
+
+  void _putProvider(ProviderConfig provider) {
+    _providers[provider.id] = provider;
+    for (final CoreModelConfig model in _models.values) {
+      _applyProviderToModel(model);
+    }
+  }
+
+  void _applyProviderToModel(CoreModelConfig model) {
+    final ProviderConfig? provider = _providers[model.provider];
+    model.providerBaseUrl = provider?.resolvedBaseUrl ?? '';
+    model.providerApiKey = provider?.resolveApiKey() ?? '';
+  }
+
+  /// 绑在某个 provider 上的模型键（删除 provider 前的守卫）。
+  List<String> boundModelKeys(String providerId) {
+    final List<String> keys = <String>[
+      for (final CoreModelConfig model in _models.values)
+        if (model.provider == providerId) model.key,
+    ]..sort();
+    return keys;
+  }
+
+  /// 新建 provider；`id` 缺省按显示名 slug 生成，冲突自动加 `-2` / `-3`。
+  ProviderConfig? createProvider(Map<String, dynamic> payload) {
+    final String name = (payload['name'] as String? ?? '').trim();
+    final String explicitId = (payload['id'] as String? ?? '').trim();
+    final ProviderConfig provider = ProviderConfig(
+      id: _uniqueProviderId(
+        ProviderConfig.slugOf(explicitId.isEmpty ? name : explicitId),
+      ),
+      createdAt: DateTime.now().toIso8601String(),
+    );
+    provider.merge(payload);
+    provider.name = name.isEmpty ? provider.id : name;
+    provider.updatedAt = provider.createdAt;
+    _putProvider(provider);
+    sink?.saveProvider(provider);
+    return provider;
+  }
+
+  /// 更新 provider；不存在返回 null。
+  ProviderConfig? updateProvider(
+    String providerId,
+    Map<String, dynamic> payload,
+  ) {
+    final ProviderConfig? provider = _providers[providerId.trim()];
+    if (provider == null) return null;
+    provider.merge(payload);
+    provider.updatedAt = DateTime.now().toIso8601String();
+    _putProvider(provider);
+    sink?.saveProvider(provider);
+    return provider;
+  }
+
+  /// 删除 provider；还有模型绑定时拒绝（调用方回 409 + [boundModelKeys]）。
+  bool deleteProvider(String providerId) {
+    final String id = providerId.trim();
+    if (_providers[id] == null || boundModelKeys(id).isNotEmpty) return false;
+    _providers.remove(id);
+    sink?.deleteProvider(id);
+    return true;
+  }
+
+  String _uniqueProviderId(String base) {
+    if (!_providers.containsKey(base)) return base;
+    int index = 2;
+    while (_providers.containsKey('$base-$index')) {
+      index++;
+    }
+    return '$base-$index';
+  }
+
+  /// 新建模型；同 `provider/model_id` 已存在时返回 null（调用方回 409）。
+  ///
+  /// 显示名不做唯一校验：同一模型允许挂多个别名（STAB-PL-8 的拍板）。
   CoreModelConfig? createModel(Map<String, dynamic> payload) {
     final String modelId = (payload['model_id'] as String? ?? '').trim();
-    if (modelId.isEmpty || _models.containsKey(modelId)) return null;
-    final CoreModelConfig model = CoreModelConfig(modelId: modelId);
+    if (modelId.isEmpty) return null;
+    final String provider = (payload['provider'] as String? ?? '').trim();
+    if (provider.isNotEmpty && !_providers.containsKey(provider)) return null;
+    final CoreModelConfig model = CoreModelConfig(
+      modelId: modelId,
+      provider: provider,
+    );
+    if (_models.containsKey(model.key)) return null;
     model.merge(payload);
     _attach(model);
     sink?.saveModel(model);
     return model;
   }
 
-  /// 更新模型；不存在返回 null。
-  CoreModelConfig? updateModel(String modelId, Map<String, dynamic> payload) {
-    final CoreModelConfig? model = _models[modelId];
-    if (model == null) return null;
-    model.merge(payload);
-    sink?.saveModel(model);
-    return model;
+  /// 更新模型（`idOrKey` 支持 `provider/model_id` 与裸 `model_id`）；不存在返回 null。
+  CoreModelConfig? updateModel(String idOrKey, Map<String, dynamic> payload) {
+    final CoreModelConfig? existing = model(idOrKey);
+    if (existing == null) return null;
+    existing.merge(payload);
+    sink?.saveModel(existing);
+    return existing;
   }
 
   /// 删除模型；返回是否真的删除了条目。
-  bool deleteModel(String modelId) {
-    final bool removed = _models.remove(modelId) != null;
-    if (removed) sink?.deleteModel(modelId);
-    return removed;
+  bool deleteModel(String idOrKey) {
+    final CoreModelConfig? model = this.model(idOrKey);
+    if (model == null) return false;
+    _models.remove(model.key);
+    sink?.deleteModel(model);
+    return true;
   }
 
-  /// 校验新增模型必填项与 kind/protocol 组合（与核心一致：model_id / base_url / api_key）。
+  /// 校验新增模型必填项与 kind/protocol 组合。
+  ///
+  /// 归到 provider 下的模型不需要重复填 `base_url` / `api_key`（由 provider 提供）；
+  /// 裸模型（旧式 / 独立端点）仍与核心一致：两者必填。
   static String? validateNewModel(Map<String, dynamic> payload) {
     final String modelId = (payload['model_id'] as String? ?? '').trim();
     if (modelId.isEmpty) return 'model_id 不能为空';
-    final String baseUrl = (payload['base_url'] as String? ?? '').trim();
-    if (baseUrl.isEmpty) return 'base_url 不能为空';
-    final String apiKey = (payload['api_key'] as String? ?? '').trim();
-    if (apiKey.isEmpty) return 'api_key 不能为空';
+    final String provider = (payload['provider'] as String? ?? '').trim();
+    if (provider.isEmpty) {
+      final String baseUrl = (payload['base_url'] as String? ?? '').trim();
+      if (baseUrl.isEmpty) return 'base_url 不能为空';
+      final String apiKey = (payload['api_key'] as String? ?? '').trim();
+      if (apiKey.isEmpty) return 'api_key 不能为空';
+    }
     return validateModelKindFields(payload);
   }
 
@@ -457,6 +670,14 @@ class DomainSettings {
     }
     if (!kModelProtocols.contains(existing.protocol)) {
       return '模型协议未知：${existing.protocol}（请删除后按合法类型重建）';
+    }
+    final String provider = (payload['provider'] as String? ?? '').trim();
+    if (provider.isNotEmpty && provider != existing.provider) {
+      return 'provider 创建后不可修改（当前 ${existing.provider}）';
+    }
+    final String modelId = (payload['model_id'] as String? ?? '').trim();
+    if (modelId.isNotEmpty && modelId != existing.modelId) {
+      return 'model_id 创建后不可修改（当前 ${existing.modelId}）';
     }
     return validateModelKindFields(payload, base: existing);
   }
@@ -571,11 +792,14 @@ class DomainSettings {
 /// 读 `config/models/*.yaml`（含密钥的完整模型配置）。
 ///
 /// 与核心 `FileSettingsSink.load` 同口径：逐文件解析、坏文件跳过、`model_id` 为空
-/// 跳过、同 id 后读覆盖先读；调用方自行按 model_id 排序（[DomainSettings.models]）。
+/// 跳过、同键后读覆盖先读；调用方自行按 `key` 排序（[DomainSettings.models]）。
+///
+/// 旧文件没有 `provider` 键 ⇒ 归到 [kLegacyProviderId]（不移动文件、不改绑定）；
+/// 同时在 `storageFile` 里记下原路径，编辑保存时仍写回同一份文件。
 List<CoreModelConfig> readModelConfigs(AgentDataPaths paths) {
   final Directory dir = Directory(paths.modelsDir);
   if (!dir.existsSync()) return <CoreModelConfig>[];
-  final Map<String, CoreModelConfig> byId = <String, CoreModelConfig>{};
+  final Map<String, CoreModelConfig> byKey = <String, CoreModelConfig>{};
   for (final FileSystemEntity entity in dir.listSync()) {
     if (entity is! File || !entity.path.endsWith('.yaml')) continue;
     final Map<String, dynamic>? json = readYamlMap(entity);
@@ -583,21 +807,27 @@ List<CoreModelConfig> readModelConfigs(AgentDataPaths paths) {
     try {
       final CoreModelConfig model = CoreModelConfig.fromJson(json);
       if (model.modelId.isEmpty) continue;
-      byId[model.modelId] = model;
+      if (model.provider.isEmpty) model.provider = kLegacyProviderId;
+      model.storageFile = entity.path;
+      byKey[model.key] = model;
     } catch (_) {
       continue; // 字段类型不符：与核心同一取舍（跳过该文件）
     }
   }
-  return byId.values.toList();
+  return byKey.values.toList();
 }
 
-/// 从磁盘装载领域设置（模型池 + token 速率）。
+/// 从磁盘装载领域设置（provider 池 + 模型池 + token 速率）。
 ///
 /// L-22 乙方案（阶段 1）：优先读 `config/agent_settings.yaml`；不存在则回退读平台
 /// `settings.yaml` 的旧键，并**当场原子写一份新文件**（"写完即可见"的同步语义，
 /// 让核心下一次启动就能安全删旧键，且与两侧启动顺序无关）。缺失 = 默认 1000。
 DomainSettings loadDomainSettings(AgentDataPaths paths) {
   final DomainSettings settings = DomainSettings();
+  // provider 先装载：模型装载时要拿它解析端点与密钥（`provider/model_id` 身份）。
+  for (final ProviderConfig provider in readProviderConfigs(paths)) {
+    settings.putProvider(provider);
+  }
   for (final CoreModelConfig model in readModelConfigs(paths)) {
     settings.putModel(model);
   }

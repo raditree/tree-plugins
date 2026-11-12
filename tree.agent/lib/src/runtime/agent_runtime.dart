@@ -86,6 +86,21 @@ String? sshStationCommandFor(String command) {
 bool isLocalStationCommand(String command) =>
     command.startsWith(kLocalStationCommandPrefix);
 
+/// `llm.call` 的模型选择口径（D5/D6）：
+/// - 显式 `model_id`（模型池键 / 裸 id）优先，此时**不要求 Agent 存在**——
+///   产线准备阶段用它消费 `roles.orchestrator.model_id`；
+/// - 否则沿用调用方 Agent 的模型；
+/// - 两者都没有 ⇒ null（调用方回可读的「agent 不存在」）。
+String? llmCallModelId({
+  required String explicitModelId,
+  required String agentModelId,
+  required bool agentExists,
+}) {
+  final String explicit = explicitModelId.trim();
+  if (explicit.isNotEmpty) return explicit;
+  return agentExists ? agentModelId : null;
+}
+
 /// 插件进程内**单个数据根**的运行时：存储 + 设置 + 提问回路 + 会话服务 + 临时员工。
 ///
 /// 为什么按数据根缓存：REST 是无状态的，但"在途生成 / 提问等待 / 排队代次"必须在
@@ -99,7 +114,7 @@ class AgentRuntime {
     : store = FileTreeStore(TreePaths(paths.root)) {
     agentInstances = AgentInstanceRegistry(paths: paths);
     settings = CoreSettings.load(paths);
-    settingsSink = FileDomainSettingsSink(TreePaths(paths.root));
+    settingsSink = FileDomainSettingsSink(paths);
     settings.domain.sink = settingsSink;
     registry = SubagentRegistry(persistence: store);
     hub = WsHub(
@@ -959,18 +974,30 @@ class AgentRuntime {
   /// 返回形状与旧核心的 `llm.call` 逐字一致：成功 `{ok, json, text, model, usage}`；
   /// 失败 `{error, error_kind?, text, text_length, truncated_suspect?, model}`。
   /// `response_format: "text"` 时**不发**该字段（为复用对话前缀缓存，见节点 #27）。
+  ///
+  /// `model_id` = 显式指定模型池条目（`provider/model_id` 或裸 id）。产线准备阶段
+  /// 用它消费 `roles.orchestrator.model_id`，因此**没有 Agent 也能调用**；
+  /// `model` 仍是"同一端点下换 wire 模型名"的覆盖，两者不是一回事。
   Future<Map<String, dynamic>> _llmCall(
     Map<String, dynamic> arguments,
     String agentId,
     String sessionId,
   ) async {
+    final String explicitModelId = _text(arguments['model_id']);
     final CoreAgent? agent = store.agent(agentId);
-    if (agent == null) return <String, dynamic>{'error': 'agent 不存在：$agentId'};
+    final String? selectedModelId = llmCallModelId(
+      explicitModelId: explicitModelId,
+      agentModelId: agent?.modelId ?? '',
+      agentExists: agent != null,
+    );
+    if (selectedModelId == null) {
+      return <String, dynamic>{'error': 'agent 不存在：$agentId'};
+    }
     final Object? rawMessages = arguments['messages'];
     final Object? rawTools = arguments['tools'];
     return llmCaller.call(
       agentId: agentId,
-      modelId: agent.modelId,
+      modelId: selectedModelId,
       messages: rawMessages is List ? rawMessages : null,
       prompt: _text(arguments['prompt']),
       system: _text(arguments['system']),

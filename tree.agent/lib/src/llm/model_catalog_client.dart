@@ -51,6 +51,54 @@ class ModelCatalogClient {
     required String apiKey,
     required String modelId,
   }) async {
+    final Map<String, Object?> payload = await _fetchModelsPayload(
+      baseUrl: baseUrl,
+      apiKey: apiKey,
+    );
+    return selectOpenAiModelEntry(payload, modelId);
+  }
+
+  /// 拉取端点声明的**全部**模型条目（provider 池的目录缓存用，D7）。
+  ///
+  /// 回包不是列表（单模型对象）时返回只含该对象的一项；条目缺少 id/name 的跳过。
+  Future<List<Map<String, Object?>>> fetchCatalog({
+    required String baseUrl,
+    required String apiKey,
+  }) async {
+    final Map<String, Object?> payload = await _fetchModelsPayload(
+      baseUrl: baseUrl,
+      apiKey: apiKey,
+    );
+    final Object? data = payload['data'];
+    final Object? models = payload['models'];
+    final Object? rawList = data is List
+        ? data
+        : (models is List ? models : null);
+    if (rawList == null) {
+      final List<Map<String, Object?>> single = <Map<String, Object?>>[];
+      if (modelEntryId(payload).isNotEmpty) single.add(payload);
+      if (single.isEmpty) {
+        throw ModelMetaFailure(
+          '端点回包没有 data / models 列表（也不像单模型对象）',
+          code: 'model_meta_shape',
+        );
+      }
+      return single;
+    }
+    return <Map<String, Object?>>[
+      for (final Object? item in rawList as List<Object?>)
+        if (item is Map)
+          <String, Object?>{
+            for (final MapEntry<Object?, Object?> entry in item.entries)
+              entry.key.toString(): entry.value,
+          },
+    ];
+  }
+
+  Future<Map<String, Object?>> _fetchModelsPayload({
+    required String baseUrl,
+    required String apiKey,
+  }) async {
     final Uri uri = Uri.parse(modelsEndpointFor(baseUrl));
     if (apiKey.trim().isEmpty) {
       throw ModelMetaFailure('模型未配置 api_key', code: 'invalid_model');
@@ -98,11 +146,10 @@ class ModelCatalogClient {
         code: 'model_meta_shape',
       );
     }
-    final Map<String, Object?> payload = <String, Object?>{
+    return <String, Object?>{
       for (final MapEntry<Object?, Object?> entry in decoded.entries)
         entry.key.toString(): entry.value,
     };
-    return selectOpenAiModelEntry(payload, modelId);
   }
 
   /// 探测一个模型的元数据（价格 / 思考档位 / 上下文长度）。
@@ -117,8 +164,8 @@ class ModelCatalogClient {
       );
     }
     final Map<String, Object?> entry = await fetchModelEntry(
-      baseUrl: model.baseUrl,
-      apiKey: model.apiKey,
+      baseUrl: model.effectiveBaseUrl,
+      apiKey: model.effectiveApiKey,
       modelId: model.modelId,
     );
     final DateTime now = (clock ?? DateTime.now)();

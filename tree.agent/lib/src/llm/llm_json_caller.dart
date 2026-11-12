@@ -131,7 +131,7 @@ class LlmJsonCaller {
         'code': 'invalid_arguments',
       };
     }
-    if (config.baseUrl.trim().isEmpty || config.apiKey.trim().isEmpty) {
+    if (config.effectiveBaseUrl.isEmpty || config.effectiveApiKey.isEmpty) {
       return <String, dynamic>{
         'error': '模型「${config.name.isEmpty ? config.modelId : config.name}」'
             '缺少 base_url 或 api_key',
@@ -530,13 +530,16 @@ class LlmJsonCaller {
   }
 
   LlmTransport _transportFor(CoreModelConfig config) {
-    final String key = '${config.baseUrl}|${config.apiKey}';
+    final String key = '${config.effectiveBaseUrl}|${config.effectiveApiKey}';
     final LlmTransport? existing = _transports[key];
     if (existing != null) return existing;
     final TransportFactory? factory = transportFactory;
     final LlmTransport created = factory != null
         ? factory(config)
-        : HttpSseTransport(baseUrl: config.baseUrl, apiKey: config.apiKey);
+        : HttpSseTransport(
+            baseUrl: config.effectiveBaseUrl,
+            apiKey: config.effectiveApiKey,
+          );
     _transports[key] = created;
     return created;
   }

@@ -5,6 +5,7 @@ import 'package:path/path.dart' as p;
 import '../paths.dart';
 import '../yaml_utils.dart';
 import 'domain_settings.dart';
+import 'provider_settings.dart';
 
 /// 插件侧的 `CoreSettings` **兼容门面**（A3 生成循环专用）。
 ///
@@ -54,8 +55,29 @@ class CoreSettings {
   /// 模型配置（含密钥；不存在返回 null）。
   CoreModelConfig? model(String modelId) => domain.model(modelId);
 
-  /// 模型列表（按 model_id 升序）。
+  /// 按 `provider/model_id` 或裸 `model_id` 解析（歧义见 [DomainSettings.resolveModel]）。
+  ModelResolution resolveModel(String idOrKey) => domain.resolveModel(idOrKey);
+
+  /// 模型列表（按 `provider/model_id` 升序）。
   List<CoreModelConfig> models() => domain.models();
+
+  /// provider 列表（按 id 升序）。
+  List<ProviderConfig> providers() => domain.providers();
+
+  ProviderConfig? provider(String providerId) => domain.provider(providerId);
+
+  ProviderConfig? createProvider(Map<String, dynamic> payload) =>
+      domain.createProvider(payload);
+
+  ProviderConfig? updateProvider(
+    String providerId,
+    Map<String, dynamic> payload,
+  ) => domain.updateProvider(providerId, payload);
+
+  bool deleteProvider(String providerId) => domain.deleteProvider(providerId);
+
+  List<String> boundModelKeys(String providerId) =>
+      domain.boundModelKeys(providerId);
 
   /// 直接放入模型（装载 / 测试夹具用；不触发落盘）。
   void putModel(CoreModelConfig model) => domain.putModel(model);

@@ -218,13 +218,16 @@ class LlmSummarizer implements ContextSummarizer {
       config.maxOutputTokens > 0 ? config.maxOutputTokens : null;
 
   LlmTransport _transportFor(CoreModelConfig config) {
-    final String key = '${config.baseUrl}|${config.apiKey}';
+    final String key = '${config.effectiveBaseUrl}|${config.effectiveApiKey}';
     final LlmTransport? existing = _transports[key];
     if (existing != null) return existing;
     final TransportFactory? factory = transportFactory;
     final LlmTransport created = factory != null
         ? factory(config)
-        : HttpSseTransport(baseUrl: config.baseUrl, apiKey: config.apiKey);
+        : HttpSseTransport(
+            baseUrl: config.effectiveBaseUrl,
+            apiKey: config.effectiveApiKey,
+          );
     _transports[key] = created;
     return created;
   }

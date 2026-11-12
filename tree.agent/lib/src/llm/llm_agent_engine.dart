@@ -237,7 +237,7 @@ class LlmAgentEngine implements AgentEngine {
       yield const AgentDone();
       return;
     }
-    if (config.baseUrl.trim().isEmpty || config.apiKey.trim().isEmpty) {
+    if (config.effectiveBaseUrl.isEmpty || config.effectiveApiKey.isEmpty) {
       yield AgentError(
         '模型「${config.name.isEmpty ? config.modelId : config.name}」缺少 '
         'base_url 或 api_key：请到「设置 → 自定义模型」补全',
@@ -449,14 +449,17 @@ class LlmAgentEngine implements AgentEngine {
   }
 
   LlmTransport _transportFor(CoreModelConfig config) {
-    final String key = '${config.baseUrl}|${config.apiKey}';
+    final String key = '${config.effectiveBaseUrl}|${config.effectiveApiKey}';
     final LlmTransport? existing = _transports[key];
     if (existing != null) return existing;
     // 工厂创建的传输同样入缓存：close() 必须能把它关掉（否则连接池泄漏）
     final TransportFactory? factory = transportFactory;
     final LlmTransport created = factory != null
         ? factory(config)
-        : HttpSseTransport(baseUrl: config.baseUrl, apiKey: config.apiKey);
+        : HttpSseTransport(
+            baseUrl: config.effectiveBaseUrl,
+            apiKey: config.effectiveApiKey,
+          );
     _transports[key] = created;
     return created;
   }
@@ -634,7 +637,7 @@ class LlmAgentEngine implements AgentEngine {
       agentOverrides?.call(context.agentId) ?? const <String, Object?>{},
     );
     if (config == null) return null;
-    if (config.baseUrl.trim().isEmpty || config.apiKey.trim().isEmpty) {
+    if (config.effectiveBaseUrl.isEmpty || config.effectiveApiKey.isEmpty) {
       return null;
     }
     try {

@@ -1036,14 +1036,85 @@ Future<int> selfTest() async {
         method: 'DELETE',
       ),
     );
+    // D7：provider 池（新增即尝试拉目录；1 端口必然拒绝，验证"失败不阻断保存"）。
+    // 编号用 900+：58 起被后面的顺序委派用例占用。
+    core.ask(900, M.apiDelegate, envelope(providersPattern, 'agt'));
+    core.ask(
+      901,
+      M.apiDelegate,
+      postEnvelope(providersPattern, 'agt', <String, dynamic>{
+        'name': 'Selftest',
+        'base_url': 'http://127.0.0.1:1',
+        'api_key': 'sk-selftest',
+      }),
+    );
+    core.ask(
+      902,
+      M.apiDelegate,
+      envelope(
+        providerModelsPattern,
+        'agt',
+        extraParams: <String, String>{'providerId': 'selftest'},
+      ),
+    );
+    core.ask(
+      903,
+      M.apiDelegate,
+      postEnvelope(modelsPattern, 'agt', <String, dynamic>{
+        'provider': 'selftest',
+        'model_id': 'st-model',
+      }),
+    );
+    core.ask(
+      904,
+      M.apiDelegate,
+      envelope(
+        providerPattern,
+        'agt',
+        extraParams: <String, String>{'providerId': 'selftest'},
+      ),
+    );
+    core.ask(
+      905,
+      M.apiDelegate,
+      postEnvelope(
+        providerPattern,
+        'agt',
+        <String, dynamic>{},
+        extraParams: <String, String>{'providerId': 'selftest'},
+        method: 'DELETE',
+      ),
+    );
+    core.ask(
+      906,
+      M.apiDelegate,
+      postEnvelope(
+        modelPattern,
+        'agt',
+        <String, dynamic>{},
+        extraParams: <String, String>{'modelId': 'selftest/st-model'},
+        method: 'DELETE',
+      ),
+    );
+    core.ask(
+      907,
+      M.apiDelegate,
+      postEnvelope(
+        providerPattern,
+        'agt',
+        <String, dynamic>{},
+        extraParams: <String, String>{'providerId': 'selftest'},
+        method: 'DELETE',
+      ),
+    );
 
     final Map<Object?, Map<String, dynamic>> late = await core.waitFor(
-      <int>[26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57],
+      <int>[26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 900, 901, 902, 903, 904, 905, 906, 907],
     );
     final Map<Object?, Map<String, dynamic>> byId =
         <Object?, Map<String, dynamic>>{...early, ...late};
 
-    check.that(byId.length == 58, '五十八条请求都有回包', actual: '${byId.length}');
+    check.that(byId.length == 66, '六十六条请求都有回包', actual: '${byId.length}');
     check.check(
       byId[0]?['result']?['plugin_id'],
       kPluginId,
@@ -1143,6 +1214,8 @@ Future<int> selfTest() async {
     // ── A2：模型池 / models-info ───────────────────────────────────────
     const List<dynamic> expectedModels = <dynamic>[
       <String, dynamic>{
+        'provider': 'legacy',
+        'key': 'legacy/m1',
         'model_id': 'm1',
         'name': '模型一',
         'kind': 'chat',
@@ -1154,6 +1227,8 @@ Future<int> selfTest() async {
         'has_api_key': true,
         'thinking': true,
         'if_vision': false,
+        'if_audio': false,
+        'if_video': false,
         'reasoning_effort': 'high',
         'reasoning_effort_options': <String>['low', 'high'],
         'max_seqlen': 64000,
@@ -1162,6 +1237,8 @@ Future<int> selfTest() async {
         'longest_session_tokens': 12000,
       },
       <String, dynamic>{
+        'provider': 'legacy',
+        'key': 'legacy/m2',
         'model_id': 'm2',
         'name': 'm2',
         'kind': 'chat',
@@ -1173,6 +1250,8 @@ Future<int> selfTest() async {
         'has_api_key': false,
         'thinking': false,
         'if_vision': false,
+        'if_audio': false,
+        'if_video': false,
         'reasoning_effort': '',
         'reasoning_effort_options': <String>['low', 'high', 'max'],
         'max_seqlen': 0,
@@ -2544,6 +2623,72 @@ Future<int> selfTest() async {
       !readModelMetaCache(AgentDataPaths(temp.path)).containsKey('meta_probe'),
       'P8：删除模型同时清掉元数据缓存',
     );
+
+    // ── D7：Provider 池 / 模型身份 ─────────────────────────────────────
+    Map<String, dynamic> replyOf(int id) =>
+        (byId[id]?['result'] as Map?)?.cast<String, dynamic>() ?? {};
+    Map<String, dynamic> bodyOf(Map<String, dynamic> reply) =>
+        (jsonDecode('${reply['body'] ?? '{}'}') as Map).cast<String, dynamic>();
+
+    check.check(replyOf(900)['status'], 200, 'D7：provider 列表 200');
+    check.check(
+      (bodyOf(replyOf(900))['providers'] as List<dynamic>).length,
+      0,
+      'D7：初始没有 provider',
+    );
+
+    final Map<String, dynamic> createdProvider = bodyOf(replyOf(901));
+    check.check(replyOf(901)['status'], 200, 'D7：新增 provider 200');
+    check.check(createdProvider['success'], true, 'D7：目录拉取失败不阻断保存');
+    final Map<String, dynamic> providerView =
+        (createdProvider['provider'] as Map).cast<String, dynamic>();
+    check.check(providerView['id'], 'selftest', 'D7：provider id 由显示名 slug');
+    check.check(
+      providerView['has_api_key'],
+      true,
+      'D7：密钥只回"是否配置"',
+    );
+    check.that(
+      '${providerView['error'] ?? ''}'.isNotEmpty,
+      'D7：端点不可达时把原因记进 error',
+      actual: '${providerView['error']}',
+    );
+
+    final Map<String, dynamic> cachedModels = bodyOf(replyOf(902));
+    check.check(replyOf(902)['status'], 200, 'D7：provider 目录 200');
+    check.check(
+      (cachedModels['models'] as List<dynamic>).length,
+      0,
+      'D7：拉取失败时目录为空（不编造模型）',
+    );
+
+    final Map<String, dynamic> providerModel =
+        (bodyOf(replyOf(903))['model'] as Map).cast<String, dynamic>();
+    check.check(replyOf(903)['status'], 200, 'D7：provider 下建模型 200');
+    check.check(
+      providerModel['key'],
+      'selftest/st-model',
+      'D7：模型身份 = provider/model_id',
+    );
+    check.check(
+      providerModel['has_api_key'],
+      false,
+      'D7：provider 模型不需要自己的密钥',
+    );
+
+    check.check(
+      ((bodyOf(replyOf(904))['provider'] as Map)['model_count']),
+      1,
+      'D7：provider 详情带绑定模型数',
+    );
+    check.check(replyOf(905)['status'], 409, 'D7：有绑定时删除 provider 被拒');
+    check.check(
+      bodyOf(replyOf(905))['bound_models'],
+      <String>['selftest/st-model'],
+      'D7：拒绝时回绑定清单',
+    );
+    check.check(replyOf(906)['status'], 200, 'D7：删除 provider 模型 200');
+    check.check(replyOf(907)['status'], 200, 'D7：解绑后删除 provider 200');
 
     // 生成是异步的：等它收尾再删临时目录。
     await AgentRuntime.forDataDir(temp.path).waitIdle();
