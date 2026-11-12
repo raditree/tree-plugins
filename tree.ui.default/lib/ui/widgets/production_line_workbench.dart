@@ -58,6 +58,9 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
   Map<String, dynamic>? _artifacts;
   Map<String, dynamic>? _audit;
 
+  /// 主控状态（D6-O）：配置 / 最近动作 / 连续失败 / 未答运行期问题。
+  Map<String, dynamic>? _orchestrator;
+
   /// 整理报告每批文件数（一次请求一批；改完点「继续扫描」跑下一批）。
   final TextEditingController _auditBatch = TextEditingController(text: '500');
 
@@ -94,6 +97,7 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
       _runs = <Map<String, dynamic>>[];
       _artifacts = null;
       _audit = null;
+      _orchestrator = null;
       _error = '';
       _loading = _lineId != null;
       if (_lineId != null) _loadDetails();
@@ -130,6 +134,19 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
         _tasks = productionListOf(results[0], 'tasks');
         _runs = productionListOf(results[1], 'runs');
       });
+      // 主控状态是增量能力：老插件没有这条路由时不影响任务 / 台账展示。
+      try {
+        final Map<String, dynamic> orchestrator =
+            await ApiService.getProductionOrchestrator(
+              lineId,
+              teamId: _teamId,
+            );
+        if (!mounted) return;
+        setState(() => _orchestrator = orchestrator);
+      } catch (_) {
+        if (!mounted) return;
+        setState(() => _orchestrator = null);
+      }
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -274,6 +291,138 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
     });
   }
 
+  /// 恢复被主控 / 门控停下的任务（`blocked → queued`）。
+  Future<void> _resumeTask(String taskId) async {
+    final String? lineId = _lineId;
+    if (lineId == null) return;
+    await _act('$lineId/$taskId/resume', () async {
+      await ApiService.transitionProductionTask(
+        lineId,
+        taskId,
+        to: 'queued',
+        reason: '用户恢复',
+        teamId: _teamId,
+      );
+      await _loadDetails();
+      _notify('已恢复：$taskId（回到队列）');
+    });
+  }
+
+  /// 手动推进一次主控决策（D6-O §7.2「立即决策」）。
+  Future<void> _orchestrate() async {
+    final String? lineId = _lineId;
+    if (lineId == null) return;
+    await _act('$lineId/orchestrate', () async {
+      final Map<String, dynamic> result =
+          await ApiService.orchestrateProductionLine(
+            lineId,
+            teamId: _teamId,
+          );
+      await _loadDetails();
+      final String status = '${result['status'] ?? ''}';
+      if (status == 'skipped') {
+        _notify('主控跳过：${result['reason'] ?? ''}');
+        return;
+      }
+      if (status == 'failed') {
+        _notify('主控失败：${result['error'] ?? result['reason'] ?? ''}');
+        return;
+      }
+      final String guard = '${result['guard'] ?? ''}';
+      _notify(
+        '主控 ${result['action'] ?? ''}：${result['reason'] ?? ''}'
+        '${guard.isEmpty ? '' : '（护栏：$guard）'}',
+      );
+    });
+  }
+
+  Future<void> _setLinePaused(bool paused) async {
+    final String? lineId = _lineId;
+    if (lineId == null) return;
+    await _act('$lineId/${paused ? 'pause' : 'resume'}', () async {
+      final Map<String, dynamic> result = paused
+          ? await ApiService.pauseProductionLine(lineId, teamId: _teamId)
+          : await ApiService.resumeProductionLine(lineId, teamId: _teamId);
+      final Map<String, dynamic> updated = productionMap(result['line']);
+      if (updated.isNotEmpty) widget.onLineUpdated?.call(updated);
+      await _loadDetails();
+      _notify(paused ? '已暂停：不再自动派发' : '已恢复：立即决策一次');
+    });
+  }
+
+  /// 回答运行期问题（收件箱 execute 区）：回答后任务回队列。
+  Future<void> _answerRuntime(Map<String, dynamic> question) async {
+    final String? lineId = _lineId;
+    final String taskId = '${question['task_id'] ?? ''}';
+    final String qid = '${question['qid'] ?? ''}';
+    if (lineId == null || taskId.isEmpty) return;
+    final List<String> options =
+        (question['options'] as List<dynamic>? ?? <dynamic>[])
+            .map((dynamic item) => '$item'.trim())
+            .where((String item) => item.isNotEmpty)
+            .toList();
+    String draft = options.isNotEmpty
+        ? options.first
+        : '${question['default'] ?? ''}';
+    final String? value = await showDialog<String>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        title: Text('运行期问题 · $qid'),
+        content: SizedBox(
+          width: 460,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Text(
+                '${question['text'] ?? ''}',
+                style: const TextStyle(fontSize: 12.5),
+              ),
+              const SizedBox(height: 6),
+              for (final String option in options)
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton(
+                    onPressed: () => Navigator.of(context).pop(option),
+                    child: Text(option),
+                  ),
+                ),
+              TextFormField(
+                key: Key('production-runtime-answer-$qid'),
+                initialValue: draft,
+                decoration: const InputDecoration(labelText: '回答'),
+                onChanged: (String text) => draft = text,
+              ),
+            ],
+          ),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            key: Key('production-runtime-submit-$qid'),
+            onPressed: () => Navigator.of(context).pop(draft),
+            child: const Text('提交回答'),
+          ),
+        ],
+      ),
+    );
+    if (value == null || value.trim().isEmpty) return;
+    await _act('$lineId/$taskId/answer', () async {
+      await ApiService.answerProductionQuestion(
+        lineId,
+        taskId,
+        qid: qid,
+        value: value.trim(),
+        teamId: _teamId,
+      );
+      await _loadDetails();
+      _notify('已回答 $qid：任务回队列，等主控继续');
+    });
+  }
+
   /// 拍板：先拉待答问题，再让用户逐条回答或「全部按推荐」。
   Future<void> _decide(String taskId) async {
     final String? lineId = _lineId;
@@ -408,6 +557,7 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
         workspaceDir: spec.workspace,
         executor: spec.executor,
         roles: spec.roles,
+        orchestrator: spec.orchestrator,
         teamId: _teamId,
       );
       final Map<String, dynamic> updated = productionMap(result['line']);
@@ -578,8 +728,89 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
             ],
           ),
         ),
+        _buildOrchestratorBar(cs, id, status),
         Expanded(child: _buildBody(cs, id)),
       ],
+    );
+  }
+
+  /// 主控条（D6-O §7.2）：开关 / 最近动作 / 连续失败 / 暂停恢复 / 立即决策。
+  Widget _buildOrchestratorBar(
+    ColorScheme cs,
+    String lineId,
+    String lineStatus,
+  ) {
+    final Map<String, dynamic> data = _orchestrator ?? <String, dynamic>{};
+    final Map<String, dynamic> config = productionMap(data['config']);
+    final Map<String, dynamic> state = productionMap(data['state']);
+    final bool enabled = config['enabled'] != false;
+    final String action = '${state['last_action'] ?? ''}';
+    final int failures =
+        (state['consecutive_failures'] as num?)?.toInt() ?? 0;
+    final int open = (data['open_question_count'] as num?)?.toInt() ?? 0;
+    final bool paused = lineStatus == 'paused';
+    final bool busy =
+        _actionBusy.contains('$lineId/orchestrate') ||
+        _actionBusy.contains('$lineId/pause') ||
+        _actionBusy.contains('$lineId/resume');
+    final String summary = <String>[
+      action.isEmpty ? '还没有决策' : '最近：$action',
+      if (failures > 0) '连续失败 $failures',
+      if (open > 0) '待答 $open',
+      if (paused) '已暂停',
+    ].join(' · ');
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 2, 4, 2),
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHighest.withValues(alpha: 0.35),
+        border: Border(
+          bottom: BorderSide(color: Theme.of(context).dividerColor),
+        ),
+      ),
+      child: Row(
+        children: <Widget>[
+          Icon(
+            Icons.smart_toy_outlined,
+            size: 15,
+            color: enabled ? cs.primary : cs.outline,
+          ),
+          const SizedBox(width: 6),
+          Text(
+            enabled ? '主控' : '主控（关）',
+            style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              summary,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+            ),
+          ),
+          if (busy)
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 8),
+              child: SizedBox(
+                width: 12,
+                height: 12,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            )
+          else ...<Widget>[
+            TextButton(
+              key: Key('production-orchestrate-$lineId'),
+              onPressed: _orchestrate,
+              child: const Text('立即决策'),
+            ),
+            TextButton(
+              key: Key('production-${paused ? 'resume' : 'pause'}-$lineId'),
+              onPressed: () => _setLinePaused(!paused),
+              child: Text(paused ? '恢复' : '暂停'),
+            ),
+          ],
+        ],
+      ),
     );
   }
 
@@ -608,6 +839,10 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
       for (final Map<String, dynamic> task in _tasks)
         if (productionTaskActions(task).contains('decide')) task,
     ];
+    final List<Map<String, dynamic>> runtimeQuestions = productionListOf(
+      _orchestrator ?? <String, dynamic>{},
+      'open_questions',
+    );
     final Map<String, dynamic>? artifacts = _artifacts;
     final Map<String, dynamic>? audit = _audit;
     return ListView(
@@ -618,6 +853,11 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
           _sectionTitle(cs, '决策收件箱', '${decisions.length}'),
           for (final Map<String, dynamic> task in decisions)
             _buildDecisionCard(cs, lineId, task),
+        ],
+        if (runtimeQuestions.isNotEmpty) ...<Widget>[
+          _sectionTitle(cs, '运行期问题', '${runtimeQuestions.length}'),
+          for (final Map<String, dynamic> question in runtimeQuestions)
+            _buildRuntimeQuestionCard(cs, question),
         ],
         _sectionTitle(cs, '任务队列', '${_tasks.length}'),
         if (_tasks.isEmpty)
@@ -685,9 +925,21 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
     final String scope = (task['write_scope'] as List<dynamic>? ?? <dynamic>[])
         .map((dynamic item) => '$item')
         .join(', ');
+    final Map<String, dynamic> loop = productionMap(task['loop']);
+    final int attempts = (loop['attempts'] as num?)?.toInt() ?? 0;
+    final int askCount = (loop['ask_count'] as num?)?.toInt() ?? 0;
+    final String pending = '${loop['pending_question'] ?? ''}';
+    final String stopReason = '${loop['stop_reason'] ?? ''}';
+    final String loopText = <String>[
+      if (attempts > 0) '重试 $attempts',
+      if (askCount > 0) '提问 $askCount',
+      if (pending.isNotEmpty) '待答 $pending',
+      if (stopReason.isNotEmpty) '停止：$stopReason',
+    ].join(' · ');
     final bool busy = _actionBusy.contains('$lineId/$id/dispatch') ||
         _actionBusy.contains('$lineId/$id/decide') ||
-        _actionBusy.contains('$lineId/$id/cancel');
+        _actionBusy.contains('$lineId/$id/cancel') ||
+        _actionBusy.contains('$lineId/$id/resume');
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 3, 8, 3),
       child: Row(
@@ -704,6 +956,13 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
                 if (scope.isNotEmpty)
                   Text(
                     '写域：$scope',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 10.5, color: cs.outline),
+                  ),
+                if (loopText.isNotEmpty)
+                  Text(
+                    loopText,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(fontSize: 10.5, color: cs.outline),
@@ -742,6 +1001,8 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
                     _dispatch(id, 'run');
                   case 'decide':
                     _decide(id);
+                  case 'resume':
+                    _resumeTask(id);
                   case 'cancel':
                     _cancelTask(id);
                 }
@@ -801,6 +1062,63 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
                   : () => _decide(id),
               child: const Text('拍板'),
             ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 运行期问题卡（收件箱 execute 区）：直接回答，任务回队列后由主控继续。
+  Widget _buildRuntimeQuestionCard(
+    ColorScheme cs,
+    Map<String, dynamic> question,
+  ) {
+    final String taskId = '${question['task_id'] ?? ''}';
+    final String qid = '${question['qid'] ?? ''}';
+    final bool busy = _actionBusy.contains(
+      '${_lineId ?? ''}/$taskId/answer',
+    );
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 3, 16, 3),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(10, 8, 8, 8),
+        decoration: BoxDecoration(
+          color: cs.tertiaryContainer.withValues(alpha: 0.35),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: cs.tertiary.withValues(alpha: 0.3)),
+        ),
+        child: Row(
+          children: <Widget>[
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Text(
+                    '$taskId · $qid',
+                    style: const TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  Text(
+                    '${question['text'] ?? ''}',
+                    style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                  ),
+                ],
+              ),
+            ),
+            if (busy)
+              const SizedBox(
+                width: 12,
+                height: 12,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            else
+              FilledButton.tonal(
+                key: Key('production-inbox-answer-$qid'),
+                onPressed: () => _answerRuntime(question),
+                child: const Text('回答'),
+              ),
           ],
         ),
       ),
@@ -904,8 +1222,14 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
 
   static String _runLabel(Map<String, dynamic> run) {
     final String taskId = '${run['task_id'] ?? ''}';
+    final String action = '${run['action'] ?? ''}';
+    final String guard = '${run['guard'] ?? ''}';
+    final String reason = '${run['reason'] ?? run['error'] ?? ''}';
     return '${run['role'] ?? ''} · ${run['status'] ?? ''}'
-        '${taskId.isEmpty ? '' : ' · $taskId'}';
+        '${action.isEmpty ? '' : ' · $action'}'
+        '${guard.isEmpty ? '' : ' · 护栏 $guard'}'
+        '${taskId.isEmpty ? '' : ' · $taskId'}'
+        '${reason.isEmpty ? '' : ' · $reason'}';
   }
 }
 

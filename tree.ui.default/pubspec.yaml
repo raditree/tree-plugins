@@ -4,7 +4,7 @@ description: Tree 默认图形界面（runtime ui 插件；零依赖：契约由
 publish_to: 'none'
 
 # 插件版本（独立于核心版本；打包脚本按这里写 plugin.json 与发布索引）
-version: 1.0.8+1
+version: 1.0.9+1
 
 # desktop 分支：升级到 Dart 3（Flutter 3.47.5 / Dart 3.13.4），放弃 Windows 7/8（最低 Windows 10）
 environment:

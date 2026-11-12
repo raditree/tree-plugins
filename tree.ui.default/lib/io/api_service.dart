@@ -1214,6 +1214,7 @@ class ApiService {
     String workspaceDir = '',
     Map<String, dynamic>? executor,
     Map<String, dynamic>? roles,
+    Map<String, dynamic>? orchestrator,
     String teamId = '',
   }) => _postJson(
     '/api/production/lines',
@@ -1222,6 +1223,8 @@ class ApiService {
       'workspace_dir': workspaceDir,
       if (executor != null && executor.isNotEmpty) 'executor': executor,
       if (roles != null && roles.isNotEmpty) 'roles': roles,
+      if (orchestrator != null && orchestrator.isNotEmpty)
+        'orchestrator': orchestrator,
     },
     query: _teamQuery(teamId),
   );
@@ -1233,6 +1236,7 @@ class ApiService {
     String? workspaceDir,
     Map<String, dynamic>? executor,
     Map<String, dynamic>? roles,
+    Map<String, dynamic>? orchestrator,
     String teamId = '',
   }) => _patchJson(
     '/api/production/lines/${Uri.encodeComponent(lineId)}',
@@ -1242,6 +1246,8 @@ class ApiService {
       'workspace_dir': ?workspaceDir,
       'executor': ?executor,
       if (roles != null && roles.isNotEmpty) 'roles': roles,
+      if (orchestrator != null && orchestrator.isNotEmpty)
+        'orchestrator': orchestrator,
     },
     query: _teamQuery(teamId),
   );
@@ -1376,6 +1382,59 @@ class ApiService {
     '/api/production/lines/${Uri.encodeComponent(lineId)}'
     '/tasks/${Uri.encodeComponent(taskId)}/cancel',
     body: <String, dynamic>{'reason': reason},
+    query: _teamQuery(teamId),
+  );
+
+  /// 回答运行期问题（D6-O §7.1）：`blocked → queued`，下一次 tick 继续。
+  static Future<Map<String, dynamic>> answerProductionQuestion(
+    String lineId,
+    String taskId, {
+    String qid = '',
+    required String value,
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}'
+    '/tasks/${Uri.encodeComponent(taskId)}/answer',
+    body: <String, dynamic>{'qid': qid, 'value': value},
+    query: _teamQuery(teamId),
+  );
+
+  /// 主控状态：配置 / 游标 / 最近决策 / 未答运行期问题（只读）。
+  static Future<Map<String, dynamic>> getProductionOrchestrator(
+    String lineId, {
+    String teamId = '',
+  }) => _getJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/orchestrator',
+    query: _teamQuery(teamId),
+  );
+
+  /// 手动推进一次主控决策（每 tick 只做一个动作）。
+  static Future<Map<String, dynamic>> orchestrateProductionLine(
+    String lineId, {
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/orchestrate',
+    body: <String, dynamic>{},
+    query: _teamQuery(teamId),
+  );
+
+  /// 整线暂停：不再自动派发（`line.status=paused`）。
+  static Future<Map<String, dynamic>> pauseProductionLine(
+    String lineId, {
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/pause',
+    body: <String, dynamic>{},
+    query: _teamQuery(teamId),
+  );
+
+  /// 整线恢复：写回 working 并立即 tick 一次。
+  static Future<Map<String, dynamic>> resumeProductionLine(
+    String lineId, {
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/resume',
+    body: <String, dynamic>{},
     query: _teamQuery(teamId),
   );
 

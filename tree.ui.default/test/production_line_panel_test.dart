@@ -122,6 +122,68 @@ class _FakeCore {
           },
         ],
       };
+    } else if (path.endsWith('/orchestrator') && method == 'GET') {
+      payload = <String, dynamic>{
+        'line_id': 'pl_1',
+        'status': 'working',
+        'config': <String, dynamic>{
+          'enabled': true,
+          'tick_interval_seconds': 5,
+          'auto_retry': true,
+          'max_asks_per_task': 3,
+          'stop_on_budget': true,
+          'max_ticks_per_minute': 12,
+        },
+        'state': <String, dynamic>{
+          'last_action': 'continue',
+          'consecutive_failures': 0,
+        },
+        'last_decision': <String, dynamic>{'action': 'continue'},
+        'last_runs': <Object?>[],
+        'open_questions': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'task_id': 'T1',
+            'qid': 'X1',
+            'text': '运行期：旧行为要保留吗？',
+            'options': <String>['保留', '改掉'],
+            'default': '保留',
+            'status': 'open',
+          },
+        ],
+        'open_question_count': 1,
+      };
+    } else if (path.endsWith('/orchestrate') && method == 'POST') {
+      payload = <String, dynamic>{
+        'status': 'applied',
+        'action': 'continue',
+        'reason': 'T1 可打包',
+        'task_ids': <String>['T1'],
+        'applied': true,
+      };
+    } else if (path.endsWith('/pause') && method == 'POST') {
+      payload = <String, dynamic>{
+        'line': <String, dynamic>{
+          'id': 'pl_1',
+          'name': '标准开发流',
+          'status': 'paused',
+        },
+      };
+    } else if (path.endsWith('/resume') && method == 'POST') {
+      payload = <String, dynamic>{
+        'line': <String, dynamic>{
+          'id': 'pl_1',
+          'name': '标准开发流',
+          'status': 'working',
+        },
+        'tick': <String, dynamic>{'status': 'applied', 'action': 'continue'},
+      };
+    } else if (path.endsWith('/answer') && method == 'POST') {
+      payload = <String, dynamic>{
+        'qid': lastBody['qid'] ?? 'X1',
+        'answer': lastBody['value'] ?? '',
+        'open': 0,
+        'ready': true,
+      };
     } else if (path == '/api/production/migrate' && method == 'POST') {
       payload = <String, dynamic>{
         'scope': 'production',
@@ -189,6 +251,11 @@ class _FakeCore {
             'title': '底座',
             'status': taskStatus,
             'write_scope': <String>['lib/'],
+            'loop': <String, dynamic>{
+              'attempts': 1,
+              'ask_count': 2,
+              'stop_reason': 'orchestrator_stop',
+            },
           },
         ],
         'count': 1,
@@ -853,5 +920,61 @@ void main() {
     final Map<String, dynamic> roles =
         spec!.roles['packer'] as Map<String, dynamic>;
     expect(roles['tools'], isNot(contains('write')));
+  });
+
+  testWidgets('主控条：最近动作 / 立即决策 / 暂停 / 回答运行期问题（D6-O）', (
+    WidgetTester tester,
+  ) async {
+    await openLine(tester);
+    await waitFor(tester, find.textContaining('最近：continue'));
+    expect(find.textContaining('最近：continue'), findsOneWidget);
+    await waitFor(tester, find.text('运行期问题（1）'));
+    expect(find.text('运行期问题（1）'), findsOneWidget);
+    expect(find.textContaining('运行期：旧行为要保留吗？'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('production-orchestrate-pl_1')));
+    await waitFor(tester, find.textContaining('主控 continue'));
+    expect(
+      core.called('POST', '/api/production/lines/pl_1/orchestrate'),
+      isTrue,
+    );
+
+    await tester.tap(find.byKey(const Key('production-inbox-answer-X1')));
+    await tester.pumpAndSettle();
+    expect(find.text('运行期问题 · X1'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('production-runtime-submit-X1')));
+    await flyIO(tester, rounds: 10);
+    expect(
+      core.called('POST', '/api/production/lines/pl_1/tasks/T1/answer'),
+      isTrue,
+    );
+    expect(
+      core.bodyOf('POST', '/api/production/lines/pl_1/tasks/T1/answer')['qid'],
+      'X1',
+    );
+
+    await tester.tap(find.byKey(const Key('production-pause-pl_1')));
+    await flyIO(tester, rounds: 10);
+    expect(core.called('POST', '/api/production/lines/pl_1/pause'), isTrue);
+  });
+
+  testWidgets('任务卡展示 loop；blocked 任务给「恢复」（D6-O）', (
+    WidgetTester tester,
+  ) async {
+    core.taskStatus = 'blocked';
+    await openLine(tester);
+    expect(find.textContaining('重试 1'), findsOneWidget);
+    expect(find.textContaining('停止：orchestrator_stop'), findsOneWidget);
+
+    await openTaskMenu(tester, '恢复');
+    await flyIO(tester, rounds: 10);
+    expect(
+      core.called('PATCH', '/api/production/lines/pl_1/tasks/T1'),
+      isTrue,
+    );
+    expect(
+      core.bodyOf('PATCH', '/api/production/lines/pl_1/tasks/T1')['to'],
+      'queued',
+    );
   });
 }

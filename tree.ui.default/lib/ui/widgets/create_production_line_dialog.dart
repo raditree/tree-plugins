@@ -42,6 +42,7 @@ class ProductionLineSpec {
     required this.workspace,
     required this.executor,
     required this.roles,
+    required this.orchestrator,
   });
 
   final String name;
@@ -52,6 +53,10 @@ class ProductionLineSpec {
 
   /// 四个角色槽位（model_id + tools；专家保留 enabled / max_per_task）。
   final Map<String, dynamic> roles;
+
+  /// D6-O `line.yaml.orchestrator`（enabled / tick / auto_retry / max_asks /
+  /// stop_on_budget）；缺省即后端默认。
+  final Map<String, dynamic> orchestrator;
 }
 
 class _RoleDef {
@@ -141,6 +146,17 @@ class _CreateProductionLineDialogState
   bool _expertEnabled = false;
   int _expertMax = 3;
 
+  /// `line.yaml.orchestrator`（D6-O；缺省与后端默认一致）。
+  bool _orchestratorEnabled = true;
+  bool _autoRetry = true;
+  bool _stopOnBudget = true;
+  late final TextEditingController _tickInterval = TextEditingController(
+    text: '${productionMap(widget.initial?['orchestrator'])['tick_interval_seconds'] ?? 5}',
+  );
+  late final TextEditingController _maxAsks = TextEditingController(
+    text: '${productionMap(widget.initial?['orchestrator'])['max_asks_per_task'] ?? 3}',
+  );
+
   bool get _editing => widget.initial != null;
 
   @override
@@ -176,6 +192,12 @@ class _CreateProductionLineDialogState
     final Map<String, dynamic> executor = productionMap(
       widget.initial?['executor'],
     );
+    final Map<String, dynamic> orchestrator = productionMap(
+      widget.initial?['orchestrator'],
+    );
+    _orchestratorEnabled = orchestrator['enabled'] != false;
+    _autoRetry = orchestrator['auto_retry'] != false;
+    _stopOnBudget = orchestrator['stop_on_budget'] != false;
     final String configured = '${executor['agent_id'] ?? ''}'.trim();
     _executorAgentId = configured.isNotEmpty
         ? configured
@@ -187,6 +209,8 @@ class _CreateProductionLineDialogState
   void dispose() {
     _name.dispose();
     _workspace.dispose();
+    _tickInterval.dispose();
+    _maxAsks.dispose();
     super.dispose();
   }
 
@@ -278,6 +302,7 @@ class _CreateProductionLineDialogState
         workspace: _workspace.text.trim(),
         executor: executor,
         roles: _buildRoles(),
+        orchestrator: _buildOrchestrator(),
       ),
     );
   }
@@ -318,6 +343,16 @@ class _CreateProductionLineDialogState
     }
     return roles;
   }
+
+  Map<String, dynamic> _buildOrchestrator() => <String, dynamic>{
+    ...productionMap(widget.initial?['orchestrator']),
+    'enabled': _orchestratorEnabled,
+    'tick_interval_seconds': (int.tryParse(_tickInterval.text.trim()) ?? 5)
+        .clamp(0, 3600),
+    'auto_retry': _autoRetry,
+    'max_asks_per_task': (int.tryParse(_maxAsks.text.trim()) ?? 3).clamp(0, 10),
+    'stop_on_budget': _stopOnBudget,
+  };
 
   void _toast(String text) {
     ScaffoldMessenger.maybeOf(
@@ -428,6 +463,96 @@ class _CreateProductionLineDialogState
                 '执行角色至少要有「写文件」或「编辑」；打包 / 专家不能写文件（工具白名单）。',
                 style: TextStyle(fontSize: 11, color: Colors.grey),
               ),
+              const SizedBox(height: 12),
+              _label('主控决策循环（执行期）'),
+              Wrap(
+                spacing: 16,
+                runSpacing: 2,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: <Widget>[
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      const Text('启用', style: TextStyle(fontSize: 11.5)),
+                      Switch(
+                        key: const Key('production-orchestrator-enabled'),
+                        value: _orchestratorEnabled,
+                        onChanged: (bool value) {
+                          setState(() => _orchestratorEnabled = value);
+                        },
+                      ),
+                    ],
+                  ),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      const Text('间隔（秒）', style: TextStyle(fontSize: 11.5)),
+                      const SizedBox(width: 6),
+                      SizedBox(
+                        width: 64,
+                        child: TextField(
+                          key: const Key('production-orchestrator-tick'),
+                          controller: _tickInterval,
+                          keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(
+                            isDense: true,
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      const Text('提问上限', style: TextStyle(fontSize: 11.5)),
+                      const SizedBox(width: 6),
+                      SizedBox(
+                        width: 64,
+                        child: TextField(
+                          key: const Key('production-orchestrator-asks'),
+                          controller: _maxAsks,
+                          keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(
+                            isDense: true,
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      const Text('自动重试', style: TextStyle(fontSize: 11.5)),
+                      Switch(
+                        key: const Key('production-orchestrator-retry'),
+                        value: _autoRetry,
+                        onChanged: (bool value) {
+                          setState(() => _autoRetry = value);
+                        },
+                      ),
+                    ],
+                  ),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      const Text('预算到点停止', style: TextStyle(fontSize: 11.5)),
+                      Switch(
+                        key: const Key('production-orchestrator-budget'),
+                        value: _stopOnBudget,
+                        onChanged: (bool value) {
+                          setState(() => _stopOnBudget = value);
+                        },
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+              const Text(
+                '主控工具只用于准备阶段参考，不参与执行期决策；间隔 0 = 只靠事件驱动。',
+                style: TextStyle(fontSize: 11, color: Colors.grey),
+              ),
             ],
           ),
         ),
@@ -526,6 +651,11 @@ class _CreateProductionLineDialogState
                   ),
             ],
           ),
+          if (role.key == 'orchestrator')
+            Text(
+              '仅准备阶段参考，不参与执行决策',
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+            ),
           if (dropped.isNotEmpty) ...<Widget>[
             const SizedBox(height: 4),
             Text(

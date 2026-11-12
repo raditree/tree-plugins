@@ -152,6 +152,7 @@ class _ProductionLinePanelState extends State<ProductionLinePanel> {
         workspaceDir: spec.workspace,
         executor: spec.executor,
         roles: spec.roles,
+        orchestrator: spec.orchestrator,
         teamId: _teamId,
       );
       await _load();

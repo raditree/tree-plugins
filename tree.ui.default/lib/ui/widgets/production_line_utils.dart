@@ -72,6 +72,8 @@ List<String> productionTaskActions(Map<String, dynamic> task) {
     if (status == 'queued' || status == 'packing') 'pack',
     if (status == 'packed') 'run',
     if (status == 'aligning' || status == 'awaiting_user') 'decide',
+    // D6-O：主控 / 门控停下的任务可恢复（blocked → queued）。
+    if (status == 'blocked') 'resume',
     if (status != 'done' && status != 'cancelled') 'cancel',
   ];
 }
@@ -84,6 +86,8 @@ String productionActionLabel(String value) {
       return '执行';
     case 'decide':
       return '拍板';
+    case 'resume':
+      return '恢复';
     case 'cancel':
       return '取消任务';
     default:
