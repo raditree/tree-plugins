@@ -100,8 +100,8 @@ class DispatchPlan {
   /// 本轮可以同时派发的任务（写域两两不相交、依赖已满足）。
   final List<TaskRecord> batch;
 
-  /// 不能派发的任务与原因（`depends_on` / `write_scope_missing` /
-  /// `write_scope_overlap` / `max_parallel`）。
+  /// 不能派发的任务与原因（`depends_on` / `write_scope_overlap` /
+  /// `max_parallel`）。空写域按工作空间根参与交叠判断（D2）。
   final List<Map<String, Object?>> skipped;
 
   /// 已占用并行槽位的在途任务（packing / packed / running / gating）。
@@ -147,17 +147,12 @@ DispatchPlan planDispatch(
       });
       continue;
     }
-    // 空写域无法打包（`production.task.pack` 会拒绝），派发阶段就不该入选。
-    if (task.writeScope.isEmpty) {
-      skipped.add(<String, Object?>{
-        'id': task.id,
-        'reason': 'write_scope_missing',
-      });
-      continue;
-    }
+    // D2：空写域 = 工作空间根（`**`），不再拒绝；它与任何写域都判交叠，
+    // 因此这类任务会自然串行（不破坏“写域不相交才并行”）。
+    final List<String> scope = task.effectiveWriteScope;
     TaskRecord? conflict;
     for (final TaskRecord peer in reserved) {
-      if (writeScopesOverlap(task.writeScope, peer.writeScope)) {
+      if (writeScopesOverlap(scope, peer.effectiveWriteScope)) {
         conflict = peer;
         break;
       }
@@ -167,7 +162,7 @@ DispatchPlan planDispatch(
         'id': task.id,
         'reason': 'write_scope_overlap',
         'with_task': conflict.id,
-        'scope': task.writeScope,
+        'scope': scope,
       });
       continue;
     }

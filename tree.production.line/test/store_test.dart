@@ -135,6 +135,22 @@ void main() {
       expect(loaded.createdAt, isNotEmpty);
     });
 
+    test('缺 id 自动生成 T<millis>，重复创建不冲突（D1）', () {
+      final TaskRecord first = store.createTask('pl_1', <String, Object?>{
+        'title': '一',
+      });
+      final TaskRecord second = store.createTask('pl_1', <String, Object?>{
+        'title': '二',
+      });
+      expect(first.id, startsWith('T'));
+      expect(second.id, startsWith('T'));
+      expect(second.id, isNot(first.id));
+      expect(
+        store.listTasks('pl_1').map((TaskRecord task) => task.id),
+        containsAll(<String>[first.id, second.id]),
+      );
+    });
+
     test('缺 title / 终态 / 自依赖 / 重复 id 都拒绝', () {
       expect(
         () => store.createTask('pl_1', <String, Object?>{'id': 'T1'}),
@@ -356,7 +372,7 @@ void main() {
       expect(skipped.single['reason'], 'limit');
     });
 
-    test('写域交叠 / 缺写域都给出可读原因，且不改状态', () {
+    test('写域交叠 / 空写域按工作根参与交叠，且不改状态', () {
       store.createTask('pl_q', <String, Object?>{
         'id': 'A',
         'title': 'A',
@@ -374,13 +390,14 @@ void main() {
         'title': 'C',
         'status': 'queued',
       });
+      expect(store.getTask('pl_q', 'C').effectiveWriteScope, <String>['**']);
       final Map<String, Object?> plan = store.dispatch('pl_q');
       expect(plan['batch_ids'], <String>['A']);
       final List<Map<String, Object?>> skipped = (plan['skipped'] as List<dynamic>)
           .cast<Map<String, Object?>>();
       expect(
         skipped.map((Map<String, Object?> item) => item['reason']),
-        <String>['write_scope_overlap', 'write_scope_missing'],
+        <String>['write_scope_overlap', 'write_scope_overlap'],
       );
       expect(store.getTask('pl_q', 'A').status, TaskStatus.queued);
       expect(store.getTask('pl_q', 'B').status, TaskStatus.queued);

@@ -132,14 +132,15 @@ void main() {
       );
     });
 
-    test('空写域不入选（先补计划再打包）', () {
+    test('空写域 = 工作根：与任何写域交叠，不并行（D2）', () {
       final DispatchPlan plan = planDispatch(<TaskRecord>[
         task('A', writeScope: <String>['lib/a']),
         task('B'),
       ], maxParallel: 4);
       expect(plan.batch.map((TaskRecord item) => item.id), <String>['A']);
       expect(plan.skipped.single['id'], 'B');
-      expect(plan.skipped.single['reason'], 'write_scope_missing');
+      expect(plan.skipped.single['reason'], 'write_scope_overlap');
+      expect(plan.skipped.single['with_task'], 'A');
     });
 
     test('槽位被在途任务占用时不再派发', () {

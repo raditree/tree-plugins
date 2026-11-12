@@ -5,6 +5,14 @@ import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_production_line/tree_production_line.dart';
 
+/// 新产线模板不再编造模型（D7）：测试夹具显式给四个角色配模型。
+const Map<String, Object?> _testRoles = <String, Object?>{
+  'orchestrator': <String, Object?>{'model_id': 'chat/main'},
+  'packer': <String, Object?>{'model_id': 'chat/main'},
+  'executor': <String, Object?>{'model_id': 'chat/main'},
+  'expert': <String, Object?>{'model_id': 'chat/main'},
+};
+
 /// 假员工：按角色返回报告（打包 JSON / 执行文本 / 专家四段 JSON）。
 class _Workers {
   final List<WorkerCall> calls = <WorkerCall>[];
@@ -124,6 +132,7 @@ void main() {
       'name': '测试产线',
       'workspace_dir': workspace,
       'limits': <String, Object?>{'retries': 1},
+      'roles': _testRoles,
     });
   });
 
@@ -158,6 +167,13 @@ void main() {
       'acceptance': <String>['dart analyze 无新增'],
     });
   }
+
+  test('角色默认工具含主控（D6）', () {
+    expect(
+      kRoleDefaultTools['orchestrator'],
+      <String>['read', 'grep', 'message'],
+    );
+  });
 
   test('打包 → 执行 → 门控：端到端 done，pack.json / pack.md / runs 都落盘', () async {
     queuedTask('T1');
@@ -404,6 +420,7 @@ void main() {
       'name': '专家产线',
       'workspace_dir': workspace,
       'roles': <String, Object?>{
+        ..._testRoles,
         'expert': <String, Object?>{
           'enabled': true,
           'model_id': 'm1',
@@ -552,6 +569,7 @@ void main() {
       'name': '越界专家',
       'workspace_dir': workspace,
       'roles': <String, Object?>{
+        ..._testRoles,
         'expert': <String, Object?>{
           'enabled': true,
           'tools': <String>['read', 'write'],
@@ -626,6 +644,7 @@ void main() {
       'name': '预算产线',
       'workspace_dir': workspace,
       'limits': <String, Object?>{'max_tokens_per_task': 10},
+      'roles': _testRoles,
     });
     store.createTask('pl_b', <String, Object?>{
       'id': 'B1',
@@ -698,6 +717,7 @@ void main() {
       'name': '预算前置',
       'workspace_dir': workspace,
       'limits': <String, Object?>{'max_tokens_per_task': 10},
+      'roles': _testRoles,
     });
     store.createTask('pl_pre', <String, Object?>{
       'id': 'P1',
@@ -743,6 +763,7 @@ void main() {
       'name': '执行预算',
       'workspace_dir': workspace,
       'limits': <String, Object?>{'max_tokens_per_task': 10},
+      'roles': _testRoles,
     });
     store.createTask('pl_run', <String, Object?>{
       'id': 'R1',

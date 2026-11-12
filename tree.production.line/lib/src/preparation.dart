@@ -796,6 +796,7 @@ String reconUserPrompt({
   required String title,
   required Map<String, String> intake,
   required String memory,
+  List<String> tools = const <String>[],
 }) {
   final StringBuffer buffer = StringBuffer()
     ..writeln('产线：${lineName.isEmpty ? taskId : lineName}')
@@ -805,7 +806,13 @@ String reconUserPrompt({
     ..writeln('验收：${intake['acceptance'] ?? ''}')
     ..writeln('禁区：${intake['forbidden'] ?? ''}')
     ..writeln('期限：${intake['deadline'] ?? ''}')
-    ..writeln()
+    ..writeln();
+  if (tools.isNotEmpty) {
+    buffer
+      ..writeln('主控可用工具：${tools.join(', ')}（规划落点必须落在这些能力内）')
+      ..writeln();
+  }
+  buffer
     ..writeln('项目文档检索（docnorm.query 的结果，可能为空）：')
     ..writeln(memory.trim().isEmpty ? '（无）' : memory.trim())
     ..writeln()

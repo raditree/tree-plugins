@@ -404,7 +404,9 @@ class ProductionStore {
 
   TaskRecord createTask(String lineId, Map<String, Object?> input) {
     getLine(lineId);
-    final String id = _segment(textOf(input['id']), 'task_id');
+    // D1：id 由插件生成（UI 不下发）；同毫秒重复时追加 -2 / -3，避免 task_exists。
+    final String rawId = textOf(input['id']);
+    final String id = rawId.isEmpty ? _nextTaskId(lineId) : _segment(rawId, 'task_id');
     final File file = File(_taskFile(lineId, id));
     if (file.existsSync()) {
       throw ProductionFailure('任务已存在：$id', code: 'task_exists');
@@ -417,6 +419,18 @@ class ProductionStore {
     _writeText(file, encodeYaml(data));
     rebuild(lineId);
     return TaskRecord(data);
+  }
+
+  /// 任务 id 生成：`T<millis>`，冲突时追加 `-2`、`-3`（D1）。
+  String _nextTaskId(String lineId) {
+    final String base = 'T${_clock().millisecondsSinceEpoch}';
+    String id = base;
+    int suffix = 2;
+    while (File(_taskFile(lineId, id)).existsSync()) {
+      id = '$base-$suffix';
+      suffix++;
+    }
+    return id;
   }
 
   List<TaskRecord> listTasks(String lineId) {

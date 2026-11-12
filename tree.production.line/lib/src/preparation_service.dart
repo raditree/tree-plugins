@@ -7,6 +7,7 @@ library;
 
 import 'dart:io';
 
+import 'execution_service.dart';
 import 'models.dart';
 import 'preparation.dart';
 import 'service.dart';
@@ -27,12 +28,16 @@ const List<String> kPreparationCommands = <String>[
 ];
 
 /// 模型调用（插件层接 `llm.call`；单测注入假实现）。
+///
+/// [modelId] = 产线主控（`roles.orchestrator.model_id`）；空表示沿用调用方
+/// Agent 的模型（旧产线还没配主控时）。
 typedef PreparationLlm =
     Future<Map<String, Object?>> Function(
       String point,
       String system,
       String prompt,
       Map<String, Object?> scope,
+      String modelId,
     );
 
 /// 文档检索（插件层接 `docnorm.query`；准备阶段**fail-closed**，不许凭空侦查）。
@@ -194,8 +199,10 @@ class PreparationService {
         title: task.title,
         intake: intake,
         memory: memory,
+        tools: _orchestratorTools(line),
       ),
       scope,
+      _orchestratorModel(line),
     );
     final ReconDraft draft = parseReconJson(json, maxQuestions: 10);
     final List<Map<String, Object?>> inbox = store.readInbox(lineId);
@@ -723,6 +730,7 @@ class PreparationService {
         decisionsText: decisionsText,
       ),
       scope,
+      _orchestratorModel(line),
     );
     return parseScopeJson(json);
   }
@@ -951,6 +959,7 @@ class PreparationService {
     String system,
     String prompt,
     Map<String, Object?> scope,
+    String modelId,
   ) async {
     final PreparationLlm? runner = llm;
     if (runner == null) {
@@ -960,12 +969,27 @@ class PreparationService {
       );
     }
     try {
-      return await runner(point, system, prompt, scope);
+      return await runner(point, system, prompt, scope, modelId);
     } on ProductionFailure {
       rethrow;
     } catch (error) {
       throw ProductionFailure('模型调用失败（$point）：$error', code: 'llm_failed');
     }
+  }
+
+  /// 主控（orchestrator）的模型：准备阶段的侦查与拆解都由它出（D6）。
+  String _orchestratorModel(LineRecord line) => textOf(
+    plainMap(plainMap(line.data['roles'])['orchestrator'])['model_id'],
+  );
+
+  /// 主控可用的工具（写进侦查提示词，规划落点必须落在这些能力内）。
+  List<String> _orchestratorTools(LineRecord line) {
+    final List<String> configured = stringsOf(
+      plainMap(plainMap(line.data['roles'])['orchestrator'])['tools'],
+    );
+    return configured.isEmpty
+        ? (kRoleDefaultTools['orchestrator'] ?? const <String>[])
+        : configured;
   }
 
   String _arg(Map<String, Object?> arguments, String key) {

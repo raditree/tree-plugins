@@ -32,6 +32,8 @@ const List<String> kExecutionCommands = <String>[
 
 /// 角色默认工具（与 recon §9.1 / §9.2 / §9.4 一致；插件间不互相 import）。
 const Map<String, List<String>> kRoleDefaultTools = <String, List<String>>{
+  // 主控（orchestrator）：只读 + 沟通；准备阶段的模型调用会消费它的 model_id。
+  'orchestrator': <String>['read', 'grep', 'message'],
   'packer': <String>['read', 'list', 'grep', 'terminal', 'message'],
   'executor': <String>['read', 'write', 'edit', 'terminal', 'message', 'spec'],
   'expert': <String>['read', 'grep'],
@@ -174,13 +176,8 @@ class ProductionExecutionService {
         code: 'execute_state',
       );
     }
-    final List<String> writeScope = stringsOf(task.data['write_scope']);
-    if (writeScope.isEmpty) {
-      throw ProductionFailure(
-        '任务没有 write_scope：无法判定执行边界（先补计划再打包）',
-        code: 'write_scope_required',
-      );
-    }
+    // D2：空写域 = 工作空间根（`**`），不再在这里拒绝。
+    final List<String> writeScope = task.effectiveWriteScope;
     final WorkerRunner? runner = workers;
     if (runner == null) {
       throw ProductionFailure(
@@ -401,13 +398,8 @@ class ProductionExecutionService {
         code: 'pack_required',
       );
     }
-    final List<String> writeScope = stringsOf(task.data['write_scope']);
-    if (writeScope.isEmpty) {
-      throw ProductionFailure(
-        '任务没有 write_scope：无法判定执行边界',
-        code: 'write_scope_required',
-      );
-    }
+    // D2：空写域 = 工作空间根（`**`），不再在这里拒绝。
+    final List<String> writeScope = task.effectiveWriteScope;
     final WorkerRunner? runner = workers;
     if (runner == null) {
       throw ProductionFailure(

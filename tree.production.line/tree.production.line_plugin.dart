@@ -152,11 +152,15 @@ Future<void> _onReady(PluginKitServer server) async {
 }
 
 /// 向 `tree.agent` 的 `llm.call` 要一份 JSON：只透传本次请求的 scope（身份/团队）。
+///
+/// [modelId] = 产线主控的模型（`roles.orchestrator.model_id`）；非空时显式选中该
+/// 模型池条目，空则沿用调用方 Agent 的模型（旧产线 / 未配主控）。
 Future<Map<String, Object?>> _callLlm(
   String point,
   String system,
   String prompt,
   Map<String, Object?> scope,
+  String modelId,
 ) async {
   final PluginKitServer? server = _activeServer;
   if (server == null) {
@@ -170,6 +174,7 @@ Future<Map<String, Object?>> _callLlm(
         <String, dynamic>{'role': 'user', 'content': prompt},
       ],
       'temperature': 0.2,
+      if (modelId.trim().isNotEmpty) 'model_id': modelId.trim(),
     },
     '',
     scope,
@@ -1344,6 +1349,14 @@ Future<int> selfTest() async {
       'id': 'pl_prep',
       'name': '准备阶段',
       'workspace_dir': ws,
+      // D7 起角色模型默认留空（由用户在模型池自选）；自检用假员工，
+      // 这里显式给每个角色一个模型，避免打包 / 执行按 fail-closed 拒绝。
+      'roles': <String, Object?>{
+        'orchestrator': <String, Object?>{'model_id': 'fake/orchestrator'},
+        'packer': <String, Object?>{'model_id': 'fake/packer'},
+        'executor': <String, Object?>{'model_id': 'fake/executor'},
+        'expert': <String, Object?>{'model_id': 'fake/expert'},
+      },
     });
     await call('prep-intake', 'production.prepare.intake', <String, Object?>{
       'line_id': 'pl_prep',
@@ -1572,6 +1585,10 @@ Future<int> selfTest() async {
       'name': '专家产线',
       'workspace_dir': ws,
       'roles': <String, Object?>{
+        // D7 起角色模型默认留空；自检的假员工仍要显式模型才过 fail-closed。
+        'orchestrator': <String, Object?>{'model_id': 'fake/orchestrator'},
+        'packer': <String, Object?>{'model_id': 'fake/packer'},
+        'executor': <String, Object?>{'model_id': 'fake/executor'},
         'expert': <String, Object?>{
           'enabled': true,
           'model_id': 'lfm3',
@@ -1892,6 +1909,12 @@ Future<int> selfTest() async {
       'name': '预算产线',
       'workspace_dir': ws,
       'limits': <String, Object?>{'max_tokens_per_task': 10},
+      'roles': <String, Object?>{
+        'orchestrator': <String, Object?>{'model_id': 'fake/orchestrator'},
+        'packer': <String, Object?>{'model_id': 'fake/packer'},
+        'executor': <String, Object?>{'model_id': 'fake/executor'},
+        'expert': <String, Object?>{'model_id': 'fake/expert'},
+      },
     });
     await call('p8-budget-task', 'production.task.create', <String, Object?>{
       'line_id': 'pl_budget',

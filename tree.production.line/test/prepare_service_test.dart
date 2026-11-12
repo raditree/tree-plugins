@@ -12,6 +12,8 @@ void main() {
   late int limit;
   late int llmCalls;
   late int docCalls;
+  late List<String> llmModelIds;
+  late List<String> llmPrompts;
   late Map<String, Object?> reconJson;
   late Map<String, Object?> scopeJson;
   late PreparationService service;
@@ -32,6 +34,8 @@ void main() {
     limit = 0;
     llmCalls = 0;
     docCalls = 0;
+    llmModelIds = <String>[];
+    llmPrompts = <String>[];
     reconJson = <String, Object?>{
       'regular': <Object?>[
         <String, Object?>{'text': '改列表', 'landing': 'lib/ui/agent_list.dart'},
@@ -71,8 +75,11 @@ void main() {
         String system,
         String prompt,
         Map<String, Object?> scope,
+        String modelId,
       ) async {
         llmCalls += 1;
+        llmModelIds.add(modelId);
+        llmPrompts.add(prompt);
         return point == 'production.recon' ? reconJson : scopeJson;
       },
       docQuery: (String repo, String question, Map<String, Object?> scope) async {
@@ -159,6 +166,44 @@ void main() {
 
   String asset(String relative) =>
       p.join(workspace.path, 'docs', 'production_lines', 'pl_demo', relative);
+
+  test('主控角色：准备阶段消费 roles.orchestrator 的模型与工具（D6）', () async {
+    final ProductionStore store = ProductionStore(
+      dataRoot: temp.path,
+      clock: clock,
+    );
+    store.createLine(<String, Object?>{
+      'id': 'pl_orch',
+      'name': '带主控的产线',
+      'workspace_dir': workspace.path,
+      'roles': <String, Object?>{
+        'orchestrator': <String, Object?>{
+          'model_id': 'prov/m1',
+          'tools': <String>['read', 'grep'],
+        },
+      },
+    });
+    await call('production.prepare.intake', <String, Object?>{
+      'line_id': 'pl_orch',
+      'task': <String, Object?>{
+        'id': 'T0',
+        'title': '列表过滤',
+        'intake': <String, Object?>{
+          'goal': '按项目过滤会话',
+          'acceptance': '选中项目后只剩该项目会话；有测试',
+        },
+      },
+    });
+    await call(
+      'production.prepare.recon',
+      <String, Object?>{'line_id': 'pl_orch', 'task_id': 'T0'},
+    );
+    expect(llmModelIds, contains('prov/m1'));
+    expect(
+      llmPrompts.any((String text) => text.contains('主控可用工具：read, grep')),
+      isTrue,
+    );
+  });
 
   test('侦查：上限读 line.yaml、四节落档、提问进入台账', () async {
     await intake();
@@ -389,7 +434,8 @@ void main() {
     final PreparationService withoutDocs = PreparationService(
       environment: const <String, String>{},
       clock: clock,
-      llm: (String point, String system, String prompt, Map<String, Object?> scope) async =>
+      llm: (String point, String system, String prompt,
+              Map<String, Object?> scope, String modelId) async =>
           <String, Object?>{},
     );
     await intake();

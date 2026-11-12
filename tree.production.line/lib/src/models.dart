@@ -166,6 +166,18 @@ bool canTransition(TaskStatus from, TaskStatus to) =>
 Set<TaskStatus> allowedTransitions(TaskStatus from) =>
     kTaskTransitions[from] ?? const <TaskStatus>{};
 
+/// 空写域 = 整个工作空间（D2 拍板）。
+///
+/// 用 `**` 表达：现有 [matchesWriteScope] / [writeScopesOverlap] 的 glob
+/// 语义可直接覆盖“任意路径”，且与任何具体写域都判交叠 ⇒ 这类任务天然串行。
+const List<String> kRootWriteScope = <String>['**'];
+
+/// 任务的有效写域：配置为空时归一为工作空间根。
+List<String> resolveWriteScope(Object? raw) {
+  final List<String> scope = stringsOf(raw);
+  return scope.isEmpty ? List<String>.of(kRootWriteScope) : scope;
+}
+
 /// `task.yaml` 的只读视图（保留原始键，未知键在写回时不丢）。
 class TaskRecord {
   TaskRecord(this.data);
@@ -180,6 +192,8 @@ class TaskRecord {
   List<String> get dependsOn => stringsOf(data['depends_on']);
   /// 写域：并行判据（§9.6）与执行边界（§9.2）共用。
   List<String> get writeScope => stringsOf(data['write_scope']);
+  /// 有效写域：空 = 工作空间根（D2）。
+  List<String> get effectiveWriteScope => resolveWriteScope(data['write_scope']);
   String get createdAt => textOf(data['created_at']);
   String get updatedAt => textOf(data['updated_at']);
   String get blockedReason => textOf(data['blocked_reason']);
@@ -232,15 +246,15 @@ Map<String, Object?> buildLineMap(
     'status': status,
     'roles': <String, Object?>{
       'orchestrator': <String, Object?>{
-        'model_id': 'lfm3',
+        'model_id': '',
         'tools': <String>['read', 'grep', 'message'],
       },
       'packer': <String, Object?>{
-        'model_id': 'lfm3',
+        'model_id': '',
         'tools': <String>['read', 'list', 'grep', 'terminal', 'message'],
       },
       'executor': <String, Object?>{
-        'model_id': 'lfm3',
+        'model_id': '',
         'tools': <String>[
           'read',
           'write',
@@ -251,7 +265,7 @@ Map<String, Object?> buildLineMap(
         ],
       },
       'expert': <String, Object?>{
-        'model_id': 'lfm3',
+        'model_id': '',
         'tools': <String>['read', 'grep'],
         // Q3 / §9.4：默认不能召专家，模型配置页勾选后才置 true。
         'enabled': false,
@@ -381,7 +395,7 @@ Map<String, Object?> buildTaskMap(
     if (plainMap(input['intake']).isNotEmpty) 'intake': plainMap(input['intake']),
     'priority': intOf(input['priority'], 50),
     'depends_on': dependsOn,
-    'write_scope': stringsOf(input['write_scope']),
+    'write_scope': resolveWriteScope(input['write_scope']),
     'read_scope': stringsOf(input['read_scope']),
     'acceptance': stringsOf(input['acceptance']),
     'artifacts': plainMap(input['artifacts']),
