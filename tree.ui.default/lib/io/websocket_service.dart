@@ -208,7 +208,6 @@ class WebSocketService {
     // 尝试都会把计数归零，`_scheduleReconnect` 的指数退避将恒为 0 秒并永不
     // 触达 _maxReconnectAttempts（后端不可用时形成 0 秒重连风暴）。
     _isConnected = true;
-    onConnectionChange?.call(true);
 
     _subscription = _channel!.stream.listen(
       (dynamic data) {
@@ -223,8 +222,12 @@ class WebSocketService {
     );
 
     _startHeartbeat();
-    // 身份先于一切业务帧：核心按 ui.hello 建立连接归属，站点订阅依赖它。
+    // 身份必须**先于**任何业务帧上线：核心按 ui.hello 绑定连接归属，未绑定时
+    // `station/subscribe` 会被可读拒绝（且订阅方不重试）。而
+    // [onConnectionChange] 的监听者（StationClient）在收到 true 的同一拍就会发订阅，
+    // 因此 hello 必须排在它前面；放在后面会让首轮订阅必然被拒、站点帧永久收不到。
     _sendHello();
+    onConnectionChange?.call(true);
     // 连接确认：宽限期内未收到错误/正常关闭，则视为握手成功，此时才清零
     // 重连计数（使下一轮故障重新从 0 开始退避，而非叠加历史失败次数）。
     _connectedTimer?.cancel();

@@ -166,7 +166,14 @@ class StationClient {
   /// 公开可见是为了让测试在不起真实 socket 的情况下验证四态语义。
   void handleFrame(Map<String, dynamic> frame) {
     final StationDelivery? delivery = StationDelivery.fromFrame(frame);
-    if (delivery == null) return;
+    if (delivery == null) {
+      // 核心拒绝站点请求走普通 error 帧（例如 ui.hello 之前就订阅）。过去一律
+      // 静默吞掉，"订不上站"就表现成"界面完全没有实时帧"，且没有可查日志。
+      if (frame['type'] == WsOutboundType.error) {
+        debugPrint('[Station] 核心拒绝：${frame['data']}');
+      }
+      return;
+    }
     switch (delivery.state) {
       case StationDeliveryState.data:
         if (!_acceptSeq(delivery)) return;
