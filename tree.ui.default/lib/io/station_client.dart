@@ -17,8 +17,30 @@ import 'websocket_service.dart';
 /// **不发 `station/trigger`**：功能调用一律走 REST 委派端点；这里没有"从 UI 反向
 /// 触发别的插件"的通道。
 class StationClient {
-  StationClient({WebSocketService Function()? connectionFactory})
-    : _connectionFactory = connectionFactory ?? WebSocketService.new;
+  StationClient({
+    WebSocketService Function()? connectionFactory,
+    this.retryDelays = defaultRetryDelays,
+  }) : _connectionFactory = connectionFactory ?? WebSocketService.new;
+
+  /// 订阅失败 / 通道终止后的重订退避（协议 1.1 起有 `station_ack` 才生效）。
+  ///
+  /// 指数退避 + 次数上限：站点真不可用（插件没装 / 被停用）时退化成几秒一次，
+  /// 不会形成重试风暴；用尽后保留横幅，等下一次连接或通道事件再试。
+  static const List<Duration> defaultRetryDelays = <Duration>[
+    Duration(seconds: 1),
+    Duration(seconds: 2),
+    Duration(seconds: 4),
+    Duration(seconds: 8),
+    Duration(seconds: 16),
+  ];
+
+  /// 可重试的错误码（其余码重试也不会变，直接放弃）。
+  static const Set<String> _retryableCodes = <String>{
+    StationErrorCodes.stationNotFound,
+    StationErrorCodes.identityRequired,
+    StationErrorCodes.identityQueueOverflow,
+    StationErrorCodes.subscribeRejected,
+  };
 
   /// 应用级单例（一条独立连接，只承载站点订阅）。
   static final StationClient instance = StationClient();
@@ -43,7 +65,20 @@ class StationClient {
 
   final WebSocketService Function() _connectionFactory;
 
+  /// 重订退避表（测试可注入毫秒级，避免等待真实秒数）。
+  final List<Duration> retryDelays;
+
   final Set<String> _stations = <String>{};
+
+  /// 已确认生效的订阅（ack ok 或继续收到该站投递）。
+  final Set<String> _subscribed = <String>{};
+
+  /// 每个站点的重试次数 / 在途计时器（连接重放时整体清空）。
+  final Map<String, int> _retryAttempts = <String, int>{};
+  final Map<String, Timer> _retryTimers = <String, Timer>{};
+
+  /// 当前横幅是由哪个站点引起的（该站恢复后精确清掉，不被别的站投递误清）。
+  String? _offlineStationId;
   final StreamController<StationDelivery> _deliveries =
       StreamController<StationDelivery>.broadcast();
 
@@ -87,11 +122,14 @@ class StationClient {
         // 因此订阅可以立即发出；真正的"确认在线"由 onSessionReady 给出。
         _subscribeAll(ws);
       } else {
+        _cancelAllRetries();
+        _offlineStationId = null;
         offlineReason.value = '与核心的连接已断开，正在重连…';
       }
     };
     ws.onSessionReady = () {
       // 宽限期无错误 = 本次连接可用：清掉离线提示（closed 若仍在会再次写入）。
+      _offlineStationId = null;
       offlineReason.value = null;
     };
     ws.connect(CoreAttachment.instance.token);
@@ -99,6 +137,10 @@ class StationClient {
 
   /// 停止（主要给测试与登出场景用）。
   void stop() {
+    _cancelAllRetries();
+    _retryAttempts.clear();
+    _subscribed.clear();
+    _offlineStationId = null;
     _ws?.disconnect();
     _ws = null;
     _started = false;
@@ -106,8 +148,13 @@ class StationClient {
   }
 
   /// 订阅所有已登记站点。重连时由 [WebSocketService.onConnectionChange] 再次调用。
+  ///
+  /// 新一轮连接 = 重试预算归零：上一轮失败留下的退避不再沿用。
   void _subscribeAll(WebSocketService ws) {
     if (_stations.isEmpty) return;
+    _cancelAllRetries();
+    _retryAttempts.clear();
+    _subscribed.clear();
     subscribePasses += 1;
     for (final String stationId in _stations) {
       _sendSubscription(ws, WsInboundType.stationSubscribe, stationId);
@@ -146,6 +193,13 @@ class StationClient {
     if (id.isEmpty || !_stations.remove(id)) return;
     // 该站的 topic 水位不再有意义：留着只会在下次订阅时误丢首帧。
     _lastSeq.removeWhere((String topic, int _) => topic.startsWith('terminal.'));
+    _cancelRetry(id);
+    _retryAttempts.remove(id);
+    _subscribed.remove(id);
+    if (_offlineStationId == id) {
+      _offlineStationId = null;
+      offlineReason.value = null;
+    }
     final WebSocketService? ws = _ws;
     if (ws != null) {
       _sendSubscription(ws, WsInboundType.stationUnsubscribe, id);
@@ -165,6 +219,12 @@ class StationClient {
   ///
   /// 公开可见是为了让测试在不起真实 socket 的情况下验证四态语义。
   void handleFrame(Map<String, dynamic> frame) {
+    // 协议 1.1：每条站点请求都有一条 station_ack（成功也回）。
+    final StationAck? ack = StationAck.fromFrame(frame);
+    if (ack != null) {
+      _handleAck(ack);
+      return;
+    }
     final StationDelivery? delivery = StationDelivery.fromFrame(frame);
     if (delivery == null) {
       // 核心拒绝站点请求走普通 error 帧（例如 ui.hello 之前就订阅）。过去一律
@@ -177,11 +237,19 @@ class StationClient {
     switch (delivery.state) {
       case StationDeliveryState.data:
         if (!_acceptSeq(delivery)) return;
+        _noteHealthy(delivery.stationId);
         _deliveries.add(delivery);
       case StationDeliveryState.closed:
         // 终止订阅：必须先让用户看见，不能静默失效。
+        _subscribed.remove(delivery.stationId);
+        _offlineStationId = delivery.stationId;
         offlineReason.value = '服务下线：${delivery.reason ?? delivery.stationId}';
         _deliveries.add(delivery);
+        // 站点还在“想要的集合”里 ⇒ 插件可能只是重启，按退避重订。
+        if (_stations.contains(delivery.stationId)) {
+          _retryAttempts.remove(delivery.stationId);
+          _scheduleRetry(delivery.stationId);
+        }
       case StationDeliveryState.lagged:
         // 背压：帧丢了，调用方需要重新拉快照（这里只透传，不猜快照端点）。
         debugPrint('[Station] 队列溢出，需重新拉快照：${delivery.stationId}');
@@ -189,8 +257,66 @@ class StationClient {
       case StationDeliveryState.reset:
         // 插件重启后 seq 归零：清空该站水位（全清，避免拿到旧 topic 的残留）。
         _lastSeq.clear();
+        _noteHealthy(delivery.stationId);
         _deliveries.add(delivery);
     }
+  }
+
+  /// 处理 `station_ack`：成功确认、失败按码退避重订。
+  void _handleAck(StationAck ack) {
+    // UI 只发订阅（退订也发，但重试入口只有订阅）。
+    if (ack.request != StationRequestName.subscribe) return;
+    final String id = ack.stationId;
+    if (id.isEmpty || !_stations.contains(id)) return;
+    if (ack.ok) {
+      _noteHealthy(id);
+      return;
+    }
+    _subscribed.remove(id);
+    _offlineStationId = id;
+    offlineReason.value = '实时通道未建立：'
+        '${ack.message.trim().isEmpty ? ack.code : ack.message.trim()}';
+    debugPrint('[Station] 订阅 $id 被拒（${ack.code}）：${ack.message}');
+    if (_retryableCodes.contains(ack.code)) {
+      _scheduleRetry(id);
+    }
+  }
+
+  /// 通道健康（收到投递或成功回执）：清掉该站的重试与横幅。
+  void _noteHealthy(String stationId) {
+    _subscribed.add(stationId);
+    _retryAttempts.remove(stationId);
+    _cancelRetry(stationId);
+    if (_offlineStationId == stationId) {
+      _offlineStationId = null;
+      offlineReason.value = null;
+    }
+  }
+
+  /// 安排一次退避重订；次数用尽即放弃（横幅保留，等下一次连接事件）。
+  void _scheduleRetry(String stationId) {
+    if (!_stations.contains(stationId)) return;
+    final int attempt = _retryAttempts[stationId] ?? 0;
+    if (attempt >= retryDelays.length) return;
+    _retryTimers.remove(stationId)?.cancel();
+    _retryAttempts[stationId] = attempt + 1;
+    _retryTimers[stationId] = Timer(retryDelays[attempt], () {
+      _retryTimers.remove(stationId);
+      final WebSocketService? ws = _ws;
+      if (ws == null || !_stations.contains(stationId)) return;
+      _sendSubscription(ws, WsInboundType.stationSubscribe, stationId);
+    });
+  }
+
+  void _cancelRetry(String stationId) {
+    _retryTimers.remove(stationId)?.cancel();
+  }
+
+  void _cancelAllRetries() {
+    for (final Timer timer in _retryTimers.values) {
+      timer.cancel();
+    }
+    _retryTimers.clear();
   }
 
   /// 水位判定：重复 / 回退直接丢弃；跳号记一次 gap 但仍然投递（不静默丢）。

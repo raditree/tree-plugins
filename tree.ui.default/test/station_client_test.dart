@@ -30,6 +30,20 @@ class _FakeWs extends WebSocketService {
   }
 }
 
+Map<String, dynamic> ack({
+  required String stationId,
+  bool ok = true,
+  String code = '',
+  String message = '',
+}) => <String, dynamic>{
+  'type': 'station_ack',
+  'request': 'subscribe',
+  'station_id': stationId,
+  'ok': ok,
+  if (code.isNotEmpty) 'code': code,
+  if (message.isNotEmpty) 'message': message,
+};
+
 Map<String, dynamic> delivery({
   required String state,
   String stationId = StationClient.pluginStateStation,
@@ -128,6 +142,97 @@ void main() {
 
     ws.onConnectionChange?.call(false);
     expect(client.offlineReason.value, contains('断开'));
+  });
+
+  test('station_ack：成功清横幅；station_not_found 按退避重订', () async {
+    final _FakeWs fast = _FakeWs();
+    final StationClient retry = StationClient(
+      connectionFactory: () => fast,
+      retryDelays: const <Duration>[Duration(milliseconds: 5)],
+    );
+    retry.start();
+    addTearDown(retry.stop);
+
+    final String id = StationClient.agentEventsStation;
+    int subscribesFor(String station) => fast.sent
+        .where(
+          (Map<String, dynamic> f) =>
+              f['type'] == 'station/subscribe' &&
+              (f['data'] as Map<String, dynamic>)['station_id'] == station,
+        )
+        .length;
+
+    final int before = subscribesFor(id);
+    retry.handleFrame(
+      ack(
+        stationId: id,
+        ok: false,
+        code: StationErrorCodes.stationNotFound,
+        message: '站点不存在',
+      ),
+    );
+    expect(retry.isOffline, isTrue);
+    expect(retry.offlineReason.value, contains('实时通道未建立'));
+
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(subscribesFor(id), before + 1, reason: '可重试错误应按退避重发订阅');
+
+    retry.handleFrame(ack(stationId: id));
+    expect(retry.isOffline, isFalse, reason: '回执成功后失败横幅必须清掉');
+  });
+
+  test('station_ack：不可重试的错误码不重发', () async {
+    final _FakeWs fast = _FakeWs();
+    final StationClient retry = StationClient(
+      connectionFactory: () => fast,
+      retryDelays: const <Duration>[Duration(milliseconds: 5)],
+    );
+    retry.start();
+    addTearDown(retry.stop);
+
+    final String id = StationClient.agentEventsStation;
+    final int before = fast.sent.length;
+    retry.handleFrame(
+      ack(
+        stationId: id,
+        ok: false,
+        code: StationErrorCodes.notBroadcast,
+        message: '不是广播站',
+      ),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(fast.sent.length, before, reason: '不可重试的错误不得形成重试风暴');
+    expect(retry.isOffline, isTrue);
+  });
+
+  test('closed 后按退避重订；收到 reset 视为恢复并清横幅', () async {
+    final _FakeWs fast = _FakeWs();
+    final StationClient retry = StationClient(
+      connectionFactory: () => fast,
+      retryDelays: const <Duration>[Duration(milliseconds: 5)],
+    );
+    retry.start();
+    addTearDown(retry.stop);
+
+    final String id = StationClient.agentEventsStation;
+    int subscribesFor(String station) => fast.sent
+        .where(
+          (Map<String, dynamic> f) =>
+              f['type'] == 'station/subscribe' &&
+              (f['data'] as Map<String, dynamic>)['station_id'] == station,
+        )
+        .length;
+
+    final int before = subscribesFor(id);
+    retry.handleFrame(delivery(state: 'closed', stationId: id, reason: '插件重启'));
+    expect(retry.isOffline, isTrue);
+    expect(retry.offlineReason.value, contains('服务下线'));
+
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(subscribesFor(id), before + 1, reason: '插件可能只是重启，应自动重订');
+
+    retry.handleFrame(delivery(state: 'reset', stationId: id));
+    expect(retry.isOffline, isFalse, reason: '重订成功后横幅必须清掉');
   });
 
   test('data 帧按增量投递；非 station_delivery 帧一律忽略', () async {

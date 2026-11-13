@@ -10,7 +10,7 @@
 library;
 
 /// UI 与核心共同的契约版本（与核心 `/api/meta.ui_contract` 同串）。
-const String uiContractVersion = '1.0';
+const String uiContractVersion = '1.1';
 
 // ── api_paths.dart ─────────────────────────────────────────────
 /// REST 路径（UI 实际调用的 26 条：插件面板 / 发布源 / 终端与会话）。
@@ -659,6 +659,12 @@ abstract final class WsOutboundType {
   /// 风格的方法名（见 `ws_inbound.dart`），两者不是同一套命名习惯。
   static const String stationDelivery = 'station_delivery';
 
+  /// 站点请求回执（核心 → 请求方，协议 1.1）。
+  ///
+  /// 帧形状：`{type, request, station_id, ok, code?, message?}`；每条站点请求恰好
+  /// 回一条（成功也回）。失败按 [StationErrorCodes] 决策是否重试，**不得**匹配文案。
+  static const String stationAck = 'station_ack';
+
   // ── 集成终端（Ctrl+J） ────────────────────────────────────────────────
   // 值复用 [TerminalOutboundType.*]（**别名**，不重复字面量），见 terminal.dart。
 
@@ -698,6 +704,7 @@ abstract final class WsOutboundType {
     pluginStatus,
     pluginConfigChanged,
     stationDelivery,
+    stationAck,
     terminalReady,
     terminalOutput,
     terminalExit,
@@ -755,6 +762,9 @@ abstract final class StationWsFrames {
   /// 站点投递（下行）。
   static const String delivery = WsOutboundType.stationDelivery;
 
+  /// 站点请求回执（下行，协议 1.1）。
+  static const String ack = WsOutboundType.stationAck;
+
   /// 全部 WS 站点帧名。
   static const Set<String> all = <String>{
     uiHello,
@@ -764,6 +774,7 @@ abstract final class StationWsFrames {
     unregister,
     trigger,
     delivery,
+    ack,
   };
 
   /// 上行（UI → 核心）。
@@ -777,7 +788,7 @@ abstract final class StationWsFrames {
   };
 
   /// 下行（核心 → UI）。
-  static const Set<String> outbound = <String>{delivery};
+  static const Set<String> outbound = <String>{delivery, ack};
 }
 
 /// `station_delivery.state` 的取值（§6.7 / 不变量 32）。
@@ -952,6 +963,106 @@ class StationDelivery {
   String toString() =>
       'StationDelivery(${stationId.toString()}, state=${state.wire}, '
       'topic=${topic ?? '-'}, seq=${seq ?? '-'})';
+}
+
+/// `station_ack.request` 的取值（**裸动作名**）。
+abstract final class StationRequestName {
+  /// 订阅广播站。
+  static const String subscribe = 'subscribe';
+
+  /// 退订广播站。
+  static const String unsubscribe = 'unsubscribe';
+
+  /// 注册自建广播站。
+  static const String register = 'register';
+
+  /// 注销自建广播站。
+  static const String unregister = 'unregister';
+
+  /// 向自建广播站发布事件。
+  static const String trigger = 'trigger';
+}
+
+/// 站点面**稳定错误码**（`station_ack.code`）。
+///
+/// 客户端按码决策（是否重试），**不得**匹配 `message` 文案。
+abstract final class StationErrorCodes {
+  /// 连接尚未完成 `ui.hello`，且挂起队列已到期。
+  static const String identityRequired = 'identity_required';
+
+  /// 身份建立前的挂起队列溢出。
+  static const String identityQueueOverflow = 'identity_queue_overflow';
+
+  /// 同一连接声称了两个不同的插件身份。
+  static const String identityConflict = 'identity_conflict';
+
+  /// 站点还不存在（插件未注册 / 未安装）。
+  static const String stationNotFound = 'station_not_found';
+
+  /// WS 侧只允许广播站。
+  static const String notBroadcast = 'not_broadcast';
+
+  /// scope 非法。
+  static const String scopeInvalid = 'scope_invalid';
+
+  /// 触发 / 注销的不是自己注册的自建站。
+  static const String notOwner = 'not_owner';
+
+  /// 请求缺必填字段。
+  static const String invalidRequest = 'invalid_request';
+
+  /// 站点侧拒绝（上限、配置等）。
+  static const String subscribeRejected = 'subscribe_rejected';
+
+  /// 广播被拒（scope 不可证明归属 / 站点被禁用）。
+  static const String broadcastRejected = 'broadcast_rejected';
+}
+
+/// `station_ack` 帧的值对象（核心 → 请求方，协议 1.1）。
+class StationAck {
+  const StationAck({
+    required this.request,
+    required this.stationId,
+    required this.ok,
+    this.code = '',
+    this.message = '',
+  });
+
+  /// 被回执的动作（[StationRequestName]）。
+  final String request;
+
+  /// 请求里的站点 id（缺失时为空串）。
+  final String stationId;
+
+  /// 是否受理成功。
+  final bool ok;
+
+  /// 稳定错误码（成功时为空串）。
+  final String code;
+
+  /// 可读解释（成功时为空串）。
+  final String message;
+
+  /// 从完整 WS 帧解析（`type` 不匹配返回 null；兼容平铺与 `data` 包裹）。
+  static StationAck? fromFrame(Map<String, dynamic> frame) {
+    if (frame['type'] != StationWsFrames.ack) return null;
+    final Object? data = frame['data'];
+    final Map<String, dynamic> json = data is Map
+        ? Map<String, dynamic>.from(data)
+        : frame;
+    return StationAck(
+      request: (json['request'] ?? '').toString().trim(),
+      stationId: (json['station_id'] ?? '').toString().trim(),
+      ok: json['ok'] == true,
+      code: (json['code'] ?? '').toString().trim(),
+      message: (json['message'] ?? '').toString(),
+    );
+  }
+
+  @override
+  String toString() =>
+      'StationAck($request, ${stationId.isEmpty ? '-' : stationId}, ok=$ok'
+      '${code.isEmpty ? '' : ', code=$code'})';
 }
 
 /// **topic 约定**：`<plugin_id>.<session_id>.<kind>`（设计文档 §6.7）。
