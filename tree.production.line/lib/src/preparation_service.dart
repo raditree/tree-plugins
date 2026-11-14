@@ -5,10 +5,15 @@
 /// 两条门面共用同一套 [ProductionStore]（`task.yaml` 仍是唯一真值）。
 library;
 
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'execution_service.dart';
+import 'memory_port.dart';
 import 'models.dart';
+import 'plan_document.dart';
+import 'planner.dart';
 import 'preparation.dart';
 import 'service.dart';
 import 'store.dart';
@@ -25,28 +30,41 @@ const List<String> kPreparationCommands = <String>[
   'production.prepare.read',
   'production.prepare.finalize',
   'production.prepare.status',
+  'production.plan.validate',
+  'production.plan.get',
 ];
 
 /// 模型调用（插件层接 `llm.call`；单测注入假实现）。
 ///
 /// [modelId] = 产线主控（`roles.orchestrator.model_id`）；空表示沿用调用方
 /// Agent 的模型（旧产线还没配主控时）。
-typedef PreparationLlm =
-    Future<Map<String, Object?>> Function(
-      String point,
-      String system,
-      String prompt,
-      Map<String, Object?> scope,
-      String modelId,
-    );
+typedef PreparationLlm = Future<Map<String, Object?>> Function(
+  String point,
+  String system,
+  String prompt,
+  Map<String, Object?> scope,
+  String modelId,
+);
+
+/// 视觉模型调用（多模态 `llm.call`；单测注入假实现）。
+///
+/// [images] 的每项固定为 `{'name', 'mime', 'base64'}`；base64 只在内存里周转，
+/// 不写进任何落盘文件。
+typedef PreparationVisionLlm = Future<Map<String, Object?>> Function(
+  String point,
+  String system,
+  String prompt,
+  List<Map<String, Object?>> images,
+  Map<String, Object?> scope,
+  String modelId,
+);
 
 /// 文档检索（插件层接 `docnorm.query`；准备阶段**fail-closed**，不许凭空侦查）。
-typedef DocQuery =
-    Future<Map<String, Object?>> Function(
-      String repo,
-      String question,
-      Map<String, Object?> scope,
-    );
+typedef DocQuery = Future<Map<String, Object?>> Function(
+  String repo,
+  String question,
+  Map<String, Object?> scope,
+);
 
 /// 追问上限（插件层接 `settings.get`；null = 没配，回退 line.yaml / 默认 3）。
 typedef QuestionLimitReader = Future<int?> Function(Map<String, Object?> scope);
@@ -56,18 +74,47 @@ class PreparationService {
     Map<String, String>? environment,
     DateTime Function()? clock,
     this.llm,
+    this.visionLlm,
     this.docQuery,
     this.limitReader,
+    this.onCycle,
+    this.memory,
+    this.onTaskState,
+    this.queryTimeout = const Duration(seconds: 5),
+    this.retrievalDeadline = const Duration(seconds: 10),
+    this.totalDeadline = const Duration(seconds: 60),
   }) : _environment = environment ?? Platform.environment,
        _clock = clock ?? DateTime.now;
 
   final Map<String, String> _environment;
   final DateTime Function() _clock;
 
+  /// 任务状态变化的事件监听（Task 9.1；旁路，失败不影响业务）。
+  final TaskStateListener? onTaskState;
+
   /// 模型调用；null = 未接线（准备阶段 fail-closed）。
   final PreparationLlm? llm;
+
+  /// 视觉模型调用；null = 不送图（退回纯文本摘要，不阻断侦查）。
+  final PreparationVisionLlm? visionLlm;
   final DocQuery? docQuery;
   final QuestionLimitReader? limitReader;
+
+  /// `tree.agent` 记忆端口；null = 不启用（侦查照常，元数据标不可用）。
+  final MemoryPort? memory;
+
+  /// 单次检索超时（两次 embed 并行，合计目标 ≤5s）。
+  final Duration queryTimeout;
+
+  /// 检索阶段总门控（P95 ≤10s）；超时用已召回部分继续，不补第三轮。
+  final Duration retrievalDeadline;
+
+  /// 1 分钟理解总时限（从 `production.prepare.recon` 开始计）；LLM #2 只用剩余时间，
+  /// 超时返回 partial 首版卡，不流转状态、不伪造侦查。
+  final Duration totalDeadline;
+
+  /// 落档（finalize）完成后触发主控 tick（插件层接事件驱动；null = 不触发）。
+  final ProductionCycleTrigger? onCycle;
 
   String get _now => _clock().toIso8601String();
 
@@ -85,6 +132,7 @@ class PreparationService {
     final ProductionStore store = ProductionStore(
       dataRoot: target.dataRoot,
       clock: _clock,
+      onTaskState: onTaskState,
     );
     switch (command) {
       case 'production.prepare.intake':
@@ -104,9 +152,22 @@ class PreparationService {
       case 'production.prepare.read':
         return _read(store, arguments);
       case 'production.prepare.finalize':
-        return await _finalize(store, arguments, scope);
+        {
+          final Map<String, Object?> result = await _finalize(
+            store,
+            arguments,
+            scope,
+          );
+          // 落档建出 queued 任务后补一次主控 tick（插件层 debounce，幂等）。
+          await _notifyCycle(arguments, meta, scope);
+          return result;
+        }
       case 'production.prepare.status':
         return _status(store, arguments);
+      case 'production.plan.validate':
+        return _planValidate(store, arguments);
+      case 'production.plan.get':
+        return _planGet(store, arguments);
       default:
         throw ProductionFailure('未知准备阶段命令：$command', code: 'unknown_command');
     }
@@ -127,7 +188,10 @@ class PreparationService {
       plainMap(input['intake'] ?? input),
     );
     if (!intake.ok) {
-      throw ProductionFailure(intake.blocking.join('；'), code: 'intake_incomplete');
+      throw ProductionFailure(
+        intake.blocking.join('；'),
+        code: 'intake_incomplete',
+      );
     }
     final String title = textOf(input['title']).isNotEmpty
         ? textOf(input['title'])
@@ -159,6 +223,8 @@ class PreparationService {
     Map<String, Object?> arguments,
     Map<String, Object?> scope,
   ) async {
+    // 1 分钟口径从这里开始：摘要 + 双查询 + LLM #2 共用这一份预算。
+    final Stopwatch totalWatch = Stopwatch()..start();
     final String lineId = _arg(arguments, 'line_id');
     final String taskId = _arg(arguments, 'task_id');
     final LineRecord line = store.getLine(lineId);
@@ -185,26 +251,120 @@ class PreparationService {
       for (final String key in kIntakeKeys) key: textOf(intakeMap[key]),
     };
     final int limit = await _limitFor(store, line, scope);
-    // 工作空间 + 文档检索：**fail-closed**（§10.1 缺 docnorm 不降级为凭空侦查）。
+    // 工作空间 + 检索通道：**fail-closed**（缺 docnorm / llm 不降级为凭空侦查）。
     final String workspace = store.workspaceDirOf(lineId);
-    final String memory = _formatDocs(
-      await _queryDocs(workspace, intake['goal']!, scope),
-    );
-    final Map<String, Object?> json = await _callLlm(
-      'production.recon',
-      reconSystemPrompt(maxQuestions: limit),
-      reconUserPrompt(
-        lineName: line.name,
-        taskId: taskId,
-        title: task.title,
-        intake: intake,
-        memory: memory,
-        tools: _orchestratorTools(line),
-      ),
+    _requireDocQuery();
+    final List<Map<String, Object?>> attachments = _attachmentsOf(task);
+    final String modelId = _orchestratorModel(line);
+    // 记忆只喂提示词；落盘的只有 hash / sources / unavailable（读失败不阻断）。
+    final MemoryView memoryView = await _readMemory(
+      textOf(plainMap(line.data['executor'])['agent_id']),
+      'production.prepare.recon',
       scope,
-      _orchestratorModel(line),
     );
-    final ReconDraft draft = parseReconJson(json, maxQuestions: 10);
+
+    // ① LLM #1：先摘要/关键词；单独计时，不混入检索 10s。
+    // 视觉附件（vision_model）走多模态通道，图片本体只在内存里；失败即跳过。
+    final Stopwatch digestWatch = Stopwatch()..start();
+    final List<Map<String, Object?>> digestImages = _digestImages(
+      store,
+      lineId,
+      attachments,
+    );
+    final String digestSystem = digestSystemPrompt();
+    final String digestPrompt = digestUserPrompt(
+      intake: intake,
+      attachments: attachments,
+      projectMemory: memoryView.text,
+    );
+    final Map<String, Object?> digestJson =
+        visionLlm != null && digestImages.isNotEmpty
+        ? await _callVisionLlm(
+            'production.digest',
+            digestSystem,
+            digestPrompt,
+            digestImages,
+            scope,
+            modelId,
+          )
+        : await _callLlm(
+            'production.digest',
+            digestSystem,
+            digestPrompt,
+            scope,
+            modelId,
+          );
+    digestWatch.stop();
+    final Digest digest = parseDigestJson(digestJson);
+
+    // ② 双查询并行（原文 + 关键词），各自超时；合计目标 ≤5s。
+    final String queryA = requirementSearchQuery(intake);
+    final String queryB = digestSearchQuery(digest);
+    final _Retrieval retrieval = await _retrieveDocs(
+      workspace,
+      queryA,
+      queryB,
+      scope,
+    );
+
+    // ③ LLM #2：只读摘要 + evidence；只用 1 分钟预算的剩余时间。
+    final Stopwatch llmWatch = Stopwatch()..start();
+    final Duration remaining = totalDeadline - totalWatch.elapsed;
+    Map<String, Object?>? json;
+    if (remaining > Duration.zero) {
+      try {
+        json = await _callLlm(
+          'production.recon',
+          reconSystemPrompt(maxQuestions: limit),
+          reconUserPrompt(
+            lineName: line.name,
+            taskId: taskId,
+            title: task.title,
+            intake: intake,
+            tools: _orchestratorTools(line),
+            digest: digest,
+            evidence: retrieval.evidence,
+          ),
+          scope,
+          modelId,
+        ).timeout(remaining);
+      } on TimeoutException {
+        json = null;
+      }
+    }
+    llmWatch.stop();
+    totalWatch.stop();
+    if (json == null) {
+      // 到点：不抛错、不流转状态、不伪造侦查；落 partial 首版卡供 UI 显示与重试。
+      return _partialRecon(
+        store: store,
+        lineId: lineId,
+        taskId: taskId,
+        task: task,
+        limit: limit,
+        digest: digest,
+        retrieval: retrieval,
+        memoryView: memoryView,
+        digestMs: digestWatch.elapsedMilliseconds,
+        llmMs: llmWatch.elapsedMilliseconds,
+        totalMs: totalWatch.elapsedMilliseconds,
+      );
+    }
+    final Set<String> knownEvidence = <String>{
+      for (final ReconEvidence item in retrieval.evidence) item.id,
+    };
+    final ReconDraft draft = parseReconJson(
+      json,
+      maxQuestions: 10,
+      knownEvidence: knownEvidence,
+    );
+    final Map<String, Object?> timing = <String, Object?>{
+      'digest_ms': digestWatch.elapsedMilliseconds,
+      'retrieve_ms': retrieval.retrieveMs,
+      'llm_ms': llmWatch.elapsedMilliseconds,
+      'total_ms': totalWatch.elapsedMilliseconds,
+      'deadline_ms': totalDeadline.inMilliseconds,
+    };
     final List<Map<String, Object?>> inbox = store.readInbox(lineId);
     final List<QuestionState> existing = replayQuestions(inbox, taskId: taskId);
     final ({List<ReconQuestionSpec> added, int dropped}) planned =
@@ -229,6 +389,8 @@ class PreparationService {
         'default': question.defaultValue,
         'recommended': question.recommended,
         'consequence': question.consequence,
+        if (question.evidenceIds.isNotEmpty)
+          'evidence_ids': question.evidenceIds,
         'round': intOf(window['round'], 1),
         'window_id': textOf(window['id']),
         'asked_at': _now,
@@ -240,6 +402,7 @@ class PreparationService {
     );
     final String assetDir = _assetDir(store, lineId);
     final String reconRelative = '$assetDir/recon.md';
+    final String reconJsonRelative = '$assetDir/recon.json';
     store.writeAsset(
       lineId,
       'recon.md',
@@ -250,6 +413,27 @@ class PreparationService {
         recon: draft,
         questions: questions,
       ),
+    );
+    store.writeAsset(
+      lineId,
+      'recon.json',
+      '${const JsonEncoder.withIndent('  ').convert(<String, Object?>{
+        'version': 1,
+        'task_id': taskId,
+        'asked_at': _now,
+        'intake': intake,
+        'digest': digest.toJson(),
+        'digest_images': digestImages.length,
+        'queries': <String, Object?>{'a': queryA, 'b': queryB},
+        'evidence': <Map<String, Object?>>[for (final ReconEvidence item in retrieval.evidence) item.toJson()],
+        'timing': timing,
+        ..._memoryMeta(memoryView),
+        'degraded': retrieval.degraded,
+        'partial': retrieval.partial,
+        'recall_gap': retrieval.recallGap,
+        'recon': draft.toJson(),
+        'questions': <Map<String, Object?>>[for (final QuestionState question in questions) question.toJson()],
+      })}\n',
     );
     _writeDecisions(store, lineId);
     // 状态推进：draft → recon → aligning（没有问题时同样进 aligning，由用户拍板分发）。
@@ -262,17 +446,33 @@ class PreparationService {
     task = store.putTask(lineId, taskId, <String, Object?>{
       'recon': <String, Object?>{
         'path': reconRelative,
+        'json': reconJsonRelative,
         'asked_at': _now,
         'round': intOf(window['round'], 1),
         'questions': questions.length,
         'open': openQuestionsOf(questions).length,
         'dropped': planned.dropped,
         'flags': draft.flags,
+        ...timing,
+        ..._memoryMeta(memoryView),
+        'degraded': retrieval.degraded,
+        'partial': retrieval.partial,
+        'timeout': false,
+        'recall_gap': retrieval.recallGap,
+        'digest': digest.toJson(),
+        'digest_images': digestImages.length,
+        'evidence': <Map<String, Object?>>[
+          for (final ReconEvidence item in retrieval.evidence) item.toJson(),
+        ],
       },
     });
     return <String, Object?>{
       'task': task.toJson(),
       'recon': draft.toJson(),
+      'digest': digest.toJson(),
+      'evidence': <Map<String, Object?>>[
+        for (final ReconEvidence item in retrieval.evidence) item.toJson(),
+      ],
       'questions': <Map<String, Object?>>[
         for (final QuestionState question in questions) question.toJson(),
       ],
@@ -280,6 +480,75 @@ class PreparationService {
       'dropped': planned.dropped,
       'limit': limit,
       'window': window,
+      ...timing,
+      'degraded': retrieval.degraded,
+      'partial': retrieval.partial,
+      'timeout': false,
+      'recall_gap': retrieval.recallGap,
+    };
+  }
+
+  /// 1 分钟到点：只回摘要 + 检索证据 + 分段耗时；不写 `recon.md`、不建问题、
+  /// 不流转状态，让 UI 先显示 partial 首版卡并给出「重试」。
+  Map<String, Object?> _partialRecon({
+    required ProductionStore store,
+    required String lineId,
+    required String taskId,
+    required TaskRecord task,
+    required int limit,
+    required Digest digest,
+    required _Retrieval retrieval,
+    required MemoryView memoryView,
+    required int digestMs,
+    required int llmMs,
+    required int totalMs,
+  }) {
+    final int deadlineMs = totalDeadline.inMilliseconds;
+    final List<QuestionState> existing = replayQuestions(
+      store.readInbox(lineId),
+      taskId: taskId,
+    );
+    final List<Map<String, Object?>> evidence = <Map<String, Object?>>[
+      for (final ReconEvidence item in retrieval.evidence) item.toJson(),
+    ];
+    final TaskRecord saved = store.putTask(lineId, taskId, <String, Object?>{
+      'recon': <String, Object?>{
+        ...plainMap(task.data['recon']),
+        'asked_at': _now,
+        'partial': true,
+        'timeout': true,
+        'deadline_ms': deadlineMs,
+        'digest_ms': digestMs,
+        'retrieve_ms': retrieval.retrieveMs,
+        'llm_ms': llmMs,
+        'total_ms': totalMs,
+        'degraded': retrieval.degraded,
+        'recall_gap': retrieval.recallGap,
+        'digest': digest.toJson(),
+        'evidence': evidence,
+        ..._memoryMeta(memoryView),
+      },
+    });
+    return <String, Object?>{
+      'task': saved.toJson(),
+      'digest': digest.toJson(),
+      'evidence': evidence,
+      'questions': <Map<String, Object?>>[
+        for (final QuestionState question in existing) question.toJson(),
+      ],
+      'open': openQuestionsOf(existing).length,
+      'dropped': 0,
+      'limit': limit,
+      'window': _windowOf(store, lineId),
+      'digest_ms': digestMs,
+      'retrieve_ms': retrieval.retrieveMs,
+      'llm_ms': llmMs,
+      'total_ms': totalMs,
+      'deadline_ms': deadlineMs,
+      'degraded': retrieval.degraded,
+      'partial': true,
+      'timeout': true,
+      'recall_gap': retrieval.recallGap,
     };
   }
 
@@ -383,8 +652,10 @@ class PreparationService {
     }
     final Map<String, Object?> window = _ensureWindow(store, lineId);
     final Map<String, QuestionState> byId = <String, QuestionState>{
-      for (final QuestionState question
-          in replayQuestions(store.readInbox(lineId), taskId: taskId))
+      for (final QuestionState question in replayQuestions(
+        store.readInbox(lineId),
+        taskId: taskId,
+      ))
         question.qid: question,
     };
     for (final Map<String, Object?> answer in answers) {
@@ -392,7 +663,10 @@ class PreparationService {
       final String value = textOf(answer['value']);
       final QuestionState? question = byId[qid];
       if (question == null) {
-        throw ProductionFailure('任务 $taskId 没有 ${qid.isEmpty ? '（空 qid）' : qid}', code: 'unknown_question');
+        throw ProductionFailure(
+          '任务 $taskId 没有 ${qid.isEmpty ? '（空 qid）' : qid}',
+          code: 'unknown_question',
+        );
       }
       if (value.isEmpty) {
         throw ProductionFailure('$qid 的回答不能为空', code: 'invalid_arguments');
@@ -422,10 +696,7 @@ class PreparationService {
       store.transition(lineId, taskId, to: TaskStatus.aligning.wire);
     }
     task = store.putTask(lineId, taskId, <String, Object?>{
-      'questions': <String, Object?>{
-        'total': questions.length,
-        'open': open,
-      },
+      'questions': <String, Object?>{'total': questions.length, 'open': open},
     });
     _writeDecisions(store, lineId);
     return <String, Object?>{
@@ -567,10 +838,7 @@ class PreparationService {
     store.writePrepare(lineId, <String, Object?>{
       ...prepare,
       'version': 1,
-      'reads': <String, Object?>{
-        ...reads,
-        taskId: budget.toJson(),
-      },
+      'reads': <String, Object?>{...reads, taskId: budget.toJson()},
     });
     return <String, Object?>{...reply, 'budget': budget.toJson()};
   }
@@ -608,65 +876,99 @@ class PreparationService {
         code: 'prepare_state',
       );
     }
-    final ScopePlan plan = await _planFor(
-      store,
-      line,
-      task,
-      questions,
-      arguments,
-      scope,
+    final Set<String> existingIds = <String>{
+      taskId,
+      for (final TaskRecord existing in store.listTasks(lineId)) existing.id,
+    };
+    final int maxParallel = intOf(
+      plainMap(line.data['limits'])['max_parallel_tasks'],
+      1,
     );
-    _validatePlan(store, lineId, taskId, plan);
+    final ({PlanDocument doc, PlanDocValidation validation}) planned =
+        await _planFor(
+          store,
+          line,
+          task,
+          questions,
+          arguments,
+          scope,
+          existingIds: existingIds,
+          maxParallel: maxParallel,
+        );
+    final PlanDocValidation validation = planned.validation;
+    final ScopePlan plan = _scopePlanOf(planned.doc);
+    final int version = store.nextPlanVersion(lineId);
+    final String planVersion = 'plan-v$version';
+    store.writePlanVersion(lineId, version, <String, Object?>{
+      ...validation.doc.toJson(),
+      'saved_at': _now,
+    }, validation: _validationJson(validation, existingIds, maxParallel));
+    store.writePlanFindings(lineId, version, validation.doc.findings);
+    final ScopePlan fixedPlan = _fixedPlan(plan, validation.doc.tasks);
     // 落档顺序（§8.6）：先写文档，再建任务，最后重建索引。
     final String assetDir = _assetDir(store, lineId);
     store.writeAsset(
       lineId,
       'scope.md',
-      renderScopeMd(taskId: taskId, plan: plan),
+      renderScopeMd(taskId: taskId, plan: fixedPlan),
     );
     store.writeAsset(
       lineId,
       'plan.md',
-      renderPlanMd(lineName: line.name, taskId: taskId, plan: plan),
+      renderPlanMd(lineName: line.name, taskId: taskId, plan: fixedPlan),
     );
     final List<Map<String, Object?>> created = <Map<String, Object?>>[];
-    for (final PlanTaskSpec spec in plan.tasks) {
+    for (final Map<String, Object?> spec in validation.doc.tasks) {
+      final String id = textOf(spec['id']);
+      final List<String> acceptance = stringsOf(spec['acceptance']);
       store.writeAsset(
         lineId,
-        'tasks/${spec.id}/acceptance.md',
+        'tasks/$id/acceptance.md',
         renderAcceptanceMd(
-          taskId: spec.id,
-          title: spec.title,
-          acceptance: spec.acceptance,
+          taskId: id,
+          title: textOf(spec['title']),
+          acceptance: acceptance,
         ),
       );
-      store.createTask(
-        lineId,
-        <String, Object?>{
-          'id': spec.id,
-          'title': spec.title,
-          'kind': spec.kind,
-          'status': TaskStatus.queued.wire,
-          'priority': 50,
-          'depends_on': spec.dependsOn,
-          'read_scope': spec.readScope,
-          'write_scope': spec.writeScope,
-          'acceptance': spec.acceptance,
-          'artifacts': <String, Object?>{
-            'recon': '$assetDir/recon.md#$taskId',
-            'acceptance': '$assetDir/tasks/${spec.id}/acceptance.md',
-          },
+      store.createTask(lineId, <String, Object?>{
+        'id': id,
+        'title': textOf(spec['title']),
+        'kind': textOf(spec['kind']),
+        'status': TaskStatus.queued.wire,
+        'priority': 50,
+        'task_type': textOf(spec['task_type']),
+        'depends_on': stringsOf(spec['depends_on']),
+        'read_scope': stringsOf(spec['read_scope']),
+        'write_scope': stringsOf(spec['write_scope']),
+        'acceptance': acceptance,
+        'gate': plainMap(spec['gate']),
+        'estimated_files': intOf(spec['estimated_files'], 1),
+        'risk': textOf(spec['risk']),
+        if (spec['contract'] != null) 'contract': plainValue(spec['contract']),
+        'rationale': textOf(spec['rationale']),
+        'artifacts': <String, Object?>{
+          'recon': '$assetDir/recon.md#$taskId',
+          'acceptance': '$assetDir/tasks/$id/acceptance.md',
         },
-      );
-      final TaskRecord saved = store.putTask(lineId, spec.id, <String, Object?>{
+      });
+      final TaskRecord saved = store.putTask(lineId, id, <String, Object?>{
         'prepared_by': taskId,
-        'estimated_files': spec.estimatedFiles,
+        'plan_version': planVersion,
+        'estimated_lines': intOf(spec['estimated_lines'], 0),
+        'estimated_packages': intOf(spec['estimated_packages'], 0),
+        if (textOf(spec['split_reason']).isNotEmpty)
+          'split_reason': textOf(spec['split_reason']),
       });
       created.add(saved.toJson());
     }
     store.transition(lineId, taskId, to: TaskStatus.scoped.wire);
+    final Map<String, Object?> scopeData = <String, Object?>{
+      ...plan.toJson(),
+      'tasks': validation.doc.tasks,
+      'plan_version': planVersion,
+    };
     task = store.putTask(lineId, taskId, <String, Object?>{
-      'scope': plan.toJson(),
+      'scope': scopeData,
       'artifacts': <String, Object?>{
         'recon': '$assetDir/recon.md',
         'scope': '$assetDir/scope.md',
@@ -676,35 +978,45 @@ class PreparationService {
     });
     final int limit = await _limitFor(store, line, scope);
     final List<String> summary = distributionSummary(
-      tasks: plan.tasks,
+      tasks: fixedPlan.tasks,
       openQuestions: open.length,
       questionLimit: limit,
     );
     return <String, Object?>{
       'task': task.toJson(),
-      'scope': plan.toJson(),
+      'scope': scopeData,
       'created_tasks': created,
       'queue': store.next(lineId, limit: 0)['queue'],
       'summary': summary,
     };
   }
 
-  Future<ScopePlan> _planFor(
+  /// 生成计划文档：显式 `plan` 保持旧行为（只跑 Task 7 校验，不调模型）；
+  /// 否则走「起草 → 独立批判 → 打补丁」，最多 3 轮（§4.3）。
+  Future<({PlanDocument doc, PlanDocValidation validation})> _planFor(
     ProductionStore store,
     LineRecord line,
     TaskRecord task,
     List<QuestionState> questions,
     Map<String, Object?> arguments,
-    Map<String, Object?> scope,
-  ) async {
+    Map<String, Object?> scope, {
+    required Set<String> existingIds,
+    required int maxParallel,
+  }) async {
     final Object? planInput = arguments['plan'];
     if (planInput is List && planInput.isNotEmpty) {
-      return parseScopeJson(<String, Object?>{
+      final PlanDocument doc = parsePlanDocument(<String, Object?>{
         'in': arguments['in'],
         'out': arguments['out'],
         'not_doing': arguments['not_doing'],
         'tasks': planInput,
       });
+      _validatePlanIds(existingIds, doc.tasks);
+      return _validatedPlan(
+        doc,
+        existingIds: existingIds,
+        maxParallel: maxParallel,
+      );
     }
     final Map<String, String> intake = <String, String>{
       for (final String key in kIntakeKeys)
@@ -719,53 +1031,306 @@ class PreparationService {
       line.id,
       '$assetDir/decisions.md',
     );
-    final Map<String, Object?> json = await _callLlm(
-      'production.scope',
-      scopeSystemPrompt(),
-      scopeUserPrompt(
-        taskId: task.id,
-        title: task.title,
-        intake: intake,
-        reconText: reconText,
-        decisionsText: decisionsText,
+    final String modelId = _orchestratorModel(line);
+    PlanDocument current = parsePlanDocument(
+      await _callLlm(
+        'production.plan',
+        planDocumentSystemPrompt(),
+        planDocumentUserPrompt(
+          taskId: task.id,
+          title: task.title,
+          intake: intake,
+          reconText: reconText,
+          decisionsText: decisionsText,
+          round: 1,
+        ),
+        scope,
+        modelId,
       ),
-      scope,
-      _orchestratorModel(line),
     );
-    return parseScopeJson(json);
+    // 旧式 tasks-only 计划（模型没给 requirements/design）只跑 Task 7 校验。
+    if (!current.structured) {
+      final PlanDocValidation legacy = validatePlanDocument(
+        current,
+        existingIds: existingIds,
+        maxParallel: maxParallel,
+      );
+      if (!legacy.ok) {
+        throw ProductionFailure(
+          legacy.message,
+          code: legacy.code,
+          missing: legacy.missing,
+        );
+      }
+      _validatePlanIds(existingIds, legacy.doc.tasks);
+      return (doc: legacy.doc, validation: legacy);
+    }
+    List<Map<String, Object?>> carried = <Map<String, Object?>>[];
+    for (int round = 1; round <= 3; round++) {
+      final PlanDocValidation roundValidation = validatePlanDocument(
+        current,
+        existingIds: existingIds,
+        maxParallel: maxParallel,
+      );
+      final List<Map<String, Object?>> roundFindings = <Map<String, Object?>>[
+        for (final PlanIssue issue in roundValidation.issues)
+          findingOf(issue, round),
+      ];
+      final List<Map<String, Object?>> merged = _mergeFindings(
+        <Map<String, Object?>>[
+          for (final Map<String, Object?> finding in carried)
+            if (textOf(finding['status']) != 'closed') finding,
+        ],
+        roundFindings,
+      );
+      current = current.copyWith(findings: merged);
+      final bool openHigh = merged.any(
+        (Map<String, Object?> finding) =>
+            textOf(finding['severity']) == 'high' &&
+            textOf(finding['status']) != 'closed',
+      );
+      // 至少一轮批判（R1 起草 → R2 批判 → R3 修正），之后无 high 即收敛。
+      if (roundValidation.ok && !openHigh && round > 1) break;
+      if (round == 3) break;
+      final List<Map<String, Object?>> criticFindings = parseFindingsJson(
+        await _callLlm(
+          'production.plan.critic',
+          planCriticSystemPrompt(),
+          planCriticUserPrompt(current),
+          scope,
+          modelId,
+        ),
+        round: round,
+      );
+      carried = _mergeFindings(carried, criticFindings);
+      final List<Map<String, Object?>> forFix = <Map<String, Object?>>[
+        for (final Map<String, Object?> finding in _mergeFindings(
+          carried,
+          roundFindings,
+        ))
+          if (textOf(finding['status']) != 'closed') finding,
+      ];
+      final PlanDocument patched = parsePlanDocument(
+        await _callLlm(
+          'production.plan.fix',
+          planFixSystemPrompt(),
+          planFixUserPrompt(current, forFix),
+          scope,
+          modelId,
+        ),
+        rounds: round + 1,
+      );
+      final List<Map<String, Object?>> preservation = _preservationFindings(
+        current,
+        patched,
+        round + 1,
+      );
+      carried = _mergeFindings(<Map<String, Object?>>[
+        ...carried,
+        ...preservation,
+      ], patched.findings);
+      current = patched.copyWith(rounds: round + 1);
+    }
+    final PlanDocValidation validation = validatePlanDocument(
+      current,
+      existingIds: existingIds,
+      maxParallel: maxParallel,
+    );
+    if (!validation.ok) {
+      throw ProductionFailure(
+        validation.message,
+        code: validation.code,
+        missing: validation.missing,
+      );
+    }
+    final List<Map<String, Object?>> openHigh = <Map<String, Object?>>[
+      for (final Map<String, Object?> finding in validation.doc.findings)
+        if (textOf(finding['severity']) == 'high' &&
+            textOf(finding['status']) != 'closed')
+          finding,
+    ];
+    if (openHigh.isNotEmpty) {
+      throw ProductionFailure(
+        '计划仍有未解决 high findings：'
+        '${openHigh.map((Map<String, Object?> item) => textOf(item['id'])).join('、')}'
+        '（最多 3 轮；需修正或给 accept_high_finding DEC）',
+        code: 'plan_critic_open_high',
+      );
+    }
+    _validatePlanIds(existingIds, validation.doc.tasks);
+    return (doc: validation.doc, validation: validation);
   }
 
-  /// 计划校验：任务 id 不与已有任务撞车；依赖只能在本次清单里。
-  void _validatePlan(
-    ProductionStore store,
-    String lineId,
-    String prepTaskId,
-    ScopePlan plan,
+  ({PlanDocument doc, PlanDocValidation validation}) _validatedPlan(
+    PlanDocument doc, {
+    required Set<String> existingIds,
+    required int maxParallel,
+  }) {
+    final PlanDocValidation validation = validatePlanDocument(
+      doc,
+      existingIds: existingIds,
+      maxParallel: maxParallel,
+    );
+    if (!validation.ok) {
+      throw ProductionFailure(
+        validation.message,
+        code: validation.code,
+        missing: validation.missing,
+      );
+    }
+    return (doc: validation.doc, validation: validation);
+  }
+
+  /// 计划校验：任务 id 不与已有任务撞车。
+  ///
+  /// 跨计划依赖交给 [validateAndFixPlan]（允许指向已存在任务），这里不再重复判。
+  void _validatePlanIds(
+    Set<String> existingIds,
+    List<Map<String, Object?>> tasks,
   ) {
-    final Set<String> existing = <String>{
-      prepTaskId,
-      for (final TaskRecord task in store.listTasks(lineId)) task.id,
-    };
-    final Set<String> planned = <String>{
-      for (final PlanTaskSpec task in plan.tasks) task.id,
-    };
-    for (final PlanTaskSpec task in plan.tasks) {
-      for (final String dependency in task.dependsOn) {
-        if (!planned.contains(dependency)) {
-          throw ProductionFailure(
-            '任务 ${task.id} 依赖 $dependency，但它不在本次计划里（跨批次依赖请手工补）',
-            code: 'plan_incomplete',
-          );
-        }
-      }
-      if (existing.contains(task.id)) {
-        throw ProductionFailure(
-          '计划任务 id 与已有任务冲突：${task.id}',
-          code: 'plan_incomplete',
-        );
+    for (final Map<String, Object?> task in tasks) {
+      final String id = textOf(task['id']);
+      if (id.isNotEmpty && existingIds.contains(id)) {
+        throw ProductionFailure('计划任务 id 与已有任务冲突：$id', code: 'plan_incomplete');
       }
     }
   }
+
+  /// 修正补丁的保留性检查：requirements id / design 已填键 / 原任务 id 不许消失。
+  List<Map<String, Object?>> _preservationFindings(
+    PlanDocument before,
+    PlanDocument after,
+    int round,
+  ) {
+    final List<String> lost = <String>[];
+    final Set<String> beforeRequirements = <String>{
+      for (final Map<String, Object?> item in before.requirements)
+        if (textOf(item['id']).isNotEmpty) textOf(item['id']),
+    };
+    final Set<String> afterRequirements = <String>{
+      for (final Map<String, Object?> item in after.requirements)
+        if (textOf(item['id']).isNotEmpty) textOf(item['id']),
+    };
+    for (final String id in beforeRequirements.difference(afterRequirements)) {
+      lost.add('需求 $id');
+    }
+    for (final MapEntry<String, Object?> entry in before.design.entries) {
+      if (!_hasDesignValue(entry.value)) continue;
+      if (!_hasDesignValue(after.design[entry.key])) {
+        lost.add('design.${entry.key}');
+      }
+    }
+    final Set<String> beforeTasks = <String>{
+      for (final Map<String, Object?> item in before.tasks)
+        if (textOf(item['id']).isNotEmpty) textOf(item['id']),
+    };
+    final Set<String> afterTasks = <String>{
+      for (final Map<String, Object?> item in after.tasks)
+        if (textOf(item['id']).isNotEmpty) textOf(item['id']),
+    };
+    for (final String id in beforeTasks.difference(afterTasks)) {
+      lost.add('任务 $id');
+    }
+    if (lost.isEmpty) return const <Map<String, Object?>>[];
+    return <Map<String, Object?>>[
+      <String, Object?>{
+        'id': 'F-$round-patch-1',
+        'severity': 'high',
+        'status': 'open',
+        'task_id': '',
+        'message': '修正补丁删除了已确认内容：${lost.join('、')}',
+        'round': round,
+        'code': 'plan_patch_rewrote',
+        'source': 'patch',
+      },
+    ];
+  }
+
+  bool _hasDesignValue(Object? value) {
+    if (value is List) return value.isNotEmpty;
+    if (value is Map) return value.isNotEmpty;
+    return textOf(value).isNotEmpty;
+  }
+
+  List<Map<String, Object?>> _mergeFindings(
+    List<Map<String, Object?>> base,
+    List<Map<String, Object?>> incoming,
+  ) {
+    final Map<String, Map<String, Object?>> byId =
+        <String, Map<String, Object?>>{};
+    for (final Map<String, Object?> finding in <Map<String, Object?>>[
+      ...base,
+      ...incoming,
+    ]) {
+      final String id = textOf(finding['id']);
+      if (id.isEmpty) continue;
+      byId[id] = <String, Object?>{...?byId[id], ...finding};
+    }
+    return byId.values.toList();
+  }
+
+  /// 校验结果 → `validation.json`（batches/dag/size 由拆分器只读重算）。
+  Map<String, Object?> _validationJson(
+    PlanDocValidation validation,
+    Set<String> existingIds,
+    int maxParallel,
+  ) {
+    final PlanValidation base = validateAndFixPlan(
+      tasks: validation.doc.tasks,
+      existingIds: existingIds,
+      maxParallel: maxParallel,
+      fix: false,
+    );
+    return <String, Object?>{
+      'issues': <Map<String, Object?>>[
+        for (final PlanIssue issue in validation.issues) issue.toJson(),
+      ],
+      'batches': <Map<String, Object?>>[
+        for (final PlanBatch batch in base.batches) batch.toJson(),
+      ],
+      'dag': base.dag,
+      'size': base.size,
+    };
+  }
+
+  /// 计划文档的 in/out/not_doing（未知键原样保留在 [PlanDocument.extra]）。
+  ScopePlan _scopePlanOf(PlanDocument doc) => ScopePlan(
+    inScope: stringsOf(doc.extra['in']),
+    outOfScope: stringsOf(doc.extra['out']),
+    notDoing: stringsOf(doc.extra['not_doing']),
+    tasks: const <PlanTaskSpec>[],
+  );
+
+  /// 把拆分器修正后的任务表还原成 `ScopePlan`（只用于文档渲染与摘要）。
+  ScopePlan _fixedPlan(ScopePlan plan, List<Map<String, Object?>> tasks) =>
+      ScopePlan(
+        inScope: plan.inScope,
+        outOfScope: plan.outOfScope,
+        notDoing: plan.notDoing,
+        tasks: <PlanTaskSpec>[
+          for (final Map<String, Object?> task in tasks)
+            PlanTaskSpec(
+              id: textOf(task['id']),
+              title: textOf(task['title']),
+              kind: textOf(task['kind']).isEmpty
+                  ? 'conventional'
+                  : textOf(task['kind']),
+              dependsOn: stringsOf(task['depends_on']),
+              readScope: stringsOf(task['read_scope']),
+              writeScope: stringsOf(task['write_scope']),
+              acceptance: stringsOf(task['acceptance']),
+              estimatedFiles: intOf(task['estimated_files'], 1),
+              taskType: taskTypeOf(task['task_type']),
+              gate: plainMap(task['gate']),
+              estimatedLines: intOf(task['estimated_lines'], 0),
+              estimatedPackages: intOf(task['estimated_packages'], 0),
+              risk: textOf(task['risk']),
+              contract: plainValue(task['contract']),
+              splitReason: textOf(task['split_reason']),
+              rationale: textOf(task['rationale']),
+            ),
+        ],
+      );
 
   // ── 状态 ──────────────────────────────────────────────────────────
 
@@ -798,6 +1363,153 @@ class PreparationService {
         plainMap(line.data['limits'])['max_questions_per_round'],
       ),
     };
+  }
+
+  // ── 计划校验（只读）──────────────────────────────────────────────
+
+  /// `production.plan.validate`：只校验 / 修正内存计划，**不写盘**。
+  ///
+  /// body 带 `requirements` / `design` ⇒ 严格走 [validatePlanDocument]（PG-00~10）；
+  /// 否则走旧的任务拆分器（PG-03~07），保持旧调用方兼容。
+  Map<String, Object?> _planValidate(
+    ProductionStore store,
+    Map<String, Object?> arguments,
+  ) {
+    final String lineId = _arg(arguments, 'line_id');
+    store.getLine(lineId);
+    final Set<String> existingIds = <String>{
+      for (final TaskRecord task in store.listTasks(lineId)) task.id,
+    };
+    final Map<String, Object?> input = _planInputOf(arguments);
+    final bool structured =
+        input.containsKey('requirements') || input.containsKey('design');
+    if (!structured) {
+      final List<Map<String, Object?>> tasks = _planTasks(arguments['plan']);
+      final PlanValidation validation = validateAndFixPlan(
+        tasks: tasks,
+        existingIds: existingIds,
+        maxParallel: intOf(arguments['max_parallel'], 1),
+        fix: arguments['fix'] != false,
+      );
+      return <String, Object?>{
+        'ok': validation.ok,
+        'code': validation.code,
+        'message': validation.message,
+        'missing': validation.missing,
+        'issues': <Map<String, Object?>>[
+          for (final PlanIssue issue in validation.issues) issue.toJson(),
+        ],
+        'tasks': validation.tasks,
+        'batches': <Map<String, Object?>>[
+          for (final PlanBatch batch in validation.batches) batch.toJson(),
+        ],
+        'dag': validation.dag,
+        'size': validation.size,
+        'structured': false,
+        'findings': const <Object?>[],
+        'traceability': const <Object?>[],
+      };
+    }
+    final int maxParallel = intOf(arguments['max_parallel'], 1);
+    final PlanDocument doc = parsePlanDocument(input);
+    final PlanDocValidation validation = validatePlanDocument(
+      doc,
+      existingIds: existingIds,
+      maxParallel: maxParallel,
+      fixTasks: arguments['fix'] != false,
+    );
+    final PlanValidation base = validateAndFixPlan(
+      tasks: validation.doc.tasks,
+      existingIds: existingIds,
+      maxParallel: maxParallel,
+      fix: false,
+    );
+    return <String, Object?>{
+      'ok': validation.ok,
+      'code': validation.code,
+      'message': validation.message,
+      'missing': validation.missing,
+      'issues': <Map<String, Object?>>[
+        for (final PlanIssue issue in validation.issues) issue.toJson(),
+      ],
+      'tasks': validation.doc.tasks,
+      'batches': <Map<String, Object?>>[
+        for (final PlanBatch batch in base.batches) batch.toJson(),
+      ],
+      'dag': base.dag,
+      'size': base.size,
+      'structured': true,
+      'findings': validation.doc.findings,
+      'traceability': validation.doc.traceability,
+    };
+  }
+
+  /// `production.plan.get`：只读最新计划版本（`plans/plan-vN/plan.json`）。
+  Map<String, Object?> _planGet(
+    ProductionStore store,
+    Map<String, Object?> arguments,
+  ) {
+    final String lineId = _arg(arguments, 'line_id');
+    store.getLine(lineId);
+    final List<Map<String, Object?>> versions = store.listPlanVersions(lineId);
+    if (versions.isEmpty) {
+      return <String, Object?>{'version': '', 'plan': <String, Object?>{}};
+    }
+    final int version = intOf(versions.last['version'], 0);
+    return <String, Object?>{
+      'version': 'plan-v$version',
+      'plan': store.readPlanVersion(lineId, version),
+      'findings': store.readPlanFindings(lineId, version),
+    };
+  }
+
+  /// 计划校验入参：`plan` 对象 / 任务数组 + body 上的 7 块字段。
+  Map<String, Object?> _planInputOf(Map<String, Object?> arguments) {
+    final Map<String, Object?> input = arguments['plan'] is Map
+        ? plainMap(arguments['plan'])
+        : <String, Object?>{};
+    for (final String key in const <String>[
+      'requirements',
+      'design',
+      'invariants',
+      'gates',
+      'traceability',
+      'risks',
+      'unknowns',
+      'change_control',
+      'decisions',
+      'findings',
+      'rounds',
+    ]) {
+      if (arguments.containsKey(key) && !input.containsKey(key)) {
+        input[key] = arguments[key];
+      }
+    }
+    if (!input.containsKey('tasks')) {
+      final Object? raw = arguments['plan'];
+      if (raw is List) {
+        input['tasks'] = raw;
+      } else if (arguments['tasks'] is List) {
+        input['tasks'] = arguments['tasks'];
+      }
+    }
+    return input;
+  }
+
+  /// 命令入参里的计划：允许任务数组，或含 `tasks` 的计划对象。
+  List<Map<String, Object?>> _planTasks(Object? raw) {
+    Object? value = raw;
+    if (raw is Map) value = plainMap(raw)['tasks'];
+    if (value is! List) {
+      throw ProductionFailure(
+        'production.plan.validate 需要 plan（任务数组或含 tasks 的计划）',
+        code: 'invalid_arguments',
+      );
+    }
+    return <Map<String, Object?>>[
+      for (final Object? item in value)
+        if (item is Map) plainMap(item),
+    ];
   }
 
   // ── 内部工具 ──────────────────────────────────────────────────────
@@ -835,9 +1547,36 @@ class PreparationService {
       // 设置服务不可用 ⇒ 回退 line.yaml，不阻断准备阶段。
       fromSettings = null;
     }
-    final Object? fromLine = plainMap(line.data['limits'])['max_questions_per_round'];
+    final Object? fromLine = plainMap(
+      line.data['limits'],
+    )['max_questions_per_round'];
     return clampQuestionLimit(fromSettings ?? fromLine);
   }
+
+  /// 读一次 agent 记忆：未接线 / agent 为空 / 通道失败都按不可用处理，绝不抛。
+  Future<MemoryView> _readMemory(
+    String agentId,
+    String purpose,
+    Map<String, Object?> scope,
+  ) async {
+    final MemoryPort? port = memory;
+    if (port == null || agentId.trim().isEmpty) {
+      return const MemoryView(unavailable: true, code: 'memory_unavailable');
+    }
+    return port.read(
+      agentId: agentId,
+      purpose: purpose,
+      budgetChars: 4000,
+      scope: scope,
+    );
+  }
+
+  /// 可落盘的记忆元数据（**不含正文**）。
+  Map<String, Object?> _memoryMeta(MemoryView view) => <String, Object?>{
+    'memory_hash': view.hash,
+    'memory_sources': view.sources,
+    'memory_unavailable': view.unavailable,
+  };
 
   Map<String, Object?> _windowOf(ProductionStore store, String lineId) =>
       plainMap(store.readPrepare(lineId)['window']);
@@ -888,13 +1627,15 @@ class PreparationService {
     final List<QuestionState> questions = replayQuestions(inbox);
     final Map<String, Object?> prepare = store.readPrepare(lineId);
     final List<Map<String, Object?>> windows = <Map<String, Object?>>[
-      for (final Object? item in (prepare['windows'] as List<dynamic>? ??
-          const <dynamic>[]))
+      for (final Object? item
+          in (prepare['windows'] as List<dynamic>? ?? const <dynamic>[]))
         if (item is Map) plainMap(item),
     ];
     final Map<String, Object?> window = plainMap(prepare['window']);
     if (window.isNotEmpty &&
-        !windows.any((Map<String, Object?> w) => textOf(w['id']) == textOf(window['id']))) {
+        !windows.any(
+          (Map<String, Object?> w) => textOf(w['id']) == textOf(window['id']),
+        )) {
       windows.add(window);
     }
     store.writeAsset(
@@ -912,46 +1653,140 @@ class PreparationService {
     );
   }
 
-  Future<Map<String, Object?>> _queryDocs(
-    String repo,
-    String question,
-    Map<String, Object?> scope,
-  ) async {
-    final DocQuery? query = docQuery;
-    if (query == null) {
+  /// 检索通道缺失 ⇒ 直接 fail-closed（不把「没查到」当「没问题」）。
+  void _requireDocQuery() {
+    if (docQuery == null) {
       throw ProductionFailure(
         '准备阶段需要 tree.docnorm 检索通道（docnorm.query），当前未接线：拒绝凭空侦查',
         code: 'docnorm_unavailable',
       );
     }
-    try {
-      return await query(repo, question, scope);
-    } catch (error) {
-      throw ProductionFailure(
-        '文档检索失败（docnorm.query）：$error',
-        code: 'docnorm_unavailable',
-      );
-    }
   }
 
-  String _formatDocs(Map<String, Object?> payload) {
-    final List<Object?> results = payload['results'] is List
-        ? payload['results'] as List<Object?>
-        : const <Object?>[];
-    final StringBuffer buffer = StringBuffer();
-    for (final Object? item in results.take(8)) {
-      if (item is! Map) continue;
-      final Map<String, Object?> row = plainMap(item);
-      buffer.writeln(
-        '- [${textOf(row['doc'])}] ${textOf(row['heading'])}：'
-        '${textOf(row['snippet'])}',
-      );
+  /// 任务附件元数据（PC-3A 落盘前缺省为空列表）；正文/图片本体不进入检索。
+  List<Map<String, Object?>> _attachmentsOf(TaskRecord task) {
+    final Object? raw = task.data['attachments'];
+    if (raw is! List) return const <Map<String, Object?>>[];
+    return <Map<String, Object?>>[
+      for (final Object? item in raw)
+        if (item is Map) plainMap(item),
+    ];
+  }
+
+  /// 可送视觉模型的图片：只取 `vision_model` 归属的 image 附件。
+  ///
+  /// 上限：最多 4 张、单张 ≤ 4 MiB、累计原始字节 ≤ 8 MiB；读失败 / 超限
+  /// 跳过该张，不阻断侦查。返回项固定 `{'name', 'mime', 'base64'}`。
+  List<Map<String, Object?>> _digestImages(
+    ProductionStore store,
+    String lineId,
+    List<Map<String, Object?>> attachments,
+  ) {
+    final List<Map<String, Object?>> images = <Map<String, Object?>>[];
+    int totalBytes = 0;
+    for (final Map<String, Object?> item in attachments) {
+      if (images.length >= 4) break;
+      if (textOf(item['kind']) != 'image') continue;
+      if (textOf(item['summary_by']) != 'vision_model') continue;
+      final String relative = textOf(item['path']);
+      if (relative.isEmpty) continue;
+      if (intOf(item['size'], 0) > 4 * 1024 * 1024) continue;
+      final List<int> bytes;
+      try {
+        bytes = store.readWorkspaceBytes(
+          lineId,
+          relative,
+          maxBytes: 4 * 1024 * 1024,
+        );
+      } on ProductionFailure {
+        continue;
+      }
+      if (bytes.isEmpty) continue;
+      if (totalBytes + bytes.length > 8 * 1024 * 1024) break;
+      totalBytes += bytes.length;
+      final String name = textOf(item['name']);
+      final String mime = textOf(item['type']);
+      images.add(<String, Object?>{
+        'name': name.isNotEmpty ? name : relative.split('/').last,
+        'mime': mime.isNotEmpty ? mime : 'application/octet-stream',
+        'base64': base64Encode(bytes),
+      });
     }
-    final String mode = textOf(payload['mode']);
-    if (mode.isNotEmpty) {
-      buffer.writeln('（检索模式：$mode）');
+    return images;
+  }
+
+  List<Map<String, Object?>> _rowsOf(Map<String, Object?> payload) {
+    final Object? raw = payload['results'];
+    if (raw is! List) return const <Map<String, Object?>>[];
+    return <Map<String, Object?>>[
+      for (final Object? item in raw)
+        if (item is Map) plainMap(item),
+    ];
+  }
+
+  /// 双查询并行：原文（A）+ 关键词（B），各自 [queryTimeout]；
+  /// 总 [retrievalDeadline] 到点用已完成部分继续（partial），**不补第三轮**。
+  Future<_Retrieval> _retrieveDocs(
+    String repo,
+    String queryA,
+    String queryB,
+    Map<String, Object?> scope,
+  ) async {
+    final DocQuery query = docQuery!;
+    final Stopwatch watch = Stopwatch()..start();
+    final Map<String, List<Map<String, Object?>>> results =
+        <String, List<Map<String, Object?>>>{
+          'A': const <Map<String, Object?>>[],
+          'B': const <Map<String, Object?>>[],
+        };
+    ProductionFailure? fatal;
+
+    Future<void> run(String label, String text) async {
+      if (text.trim().isEmpty) return;
+      try {
+        final Map<String, Object?> payload = await query(
+          repo,
+          text,
+          scope,
+        ).timeout(queryTimeout);
+        results[label] = _rowsOf(payload);
+      } on ProductionFailure catch (error) {
+        if (error.code == 'docnorm_unavailable') fatal = error;
+        results[label] = const <Map<String, Object?>>[];
+      } catch (_) {
+        results[label] = const <Map<String, Object?>>[];
+      }
     }
-    return buffer.toString();
+
+    bool timedOut = false;
+    try {
+      await Future.wait(<Future<void>>[run('A', queryA), run('B', queryB)])
+          .timeout(retrievalDeadline);
+    } on TimeoutException {
+      timedOut = true;
+    }
+    watch.stop();
+    if (fatal != null) throw fatal!;
+
+    final List<Map<String, Object?>> rowsA = List<Map<String, Object?>>.of(
+      results['A']!,
+    );
+    final List<Map<String, Object?>> rowsB = List<Map<String, Object?>>.of(
+      results['B']!,
+    );
+    final List<ReconEvidence> evidence = mergeRetrievalEvidence(
+      primary: rowsA,
+      secondary: rowsB,
+    );
+    // 两路都必须有贡献；一路为空/超时 ⇒ degraded，但不静默只用另一路。
+    final bool degraded = rowsA.isEmpty || rowsB.isEmpty;
+    return _Retrieval(
+      evidence: evidence,
+      retrieveMs: watch.elapsedMilliseconds,
+      degraded: degraded ? 'single_query' : '',
+      partial: timedOut,
+      recallGap: evidence.isEmpty,
+    );
   }
 
   Future<Map<String, Object?>> _callLlm(
@@ -977,6 +1812,28 @@ class PreparationService {
     }
   }
 
+  /// 视觉通道（多模态 messages）；未接线 ⇒ fail-closed，由调用方决定是否退回文本。
+  Future<Map<String, Object?>> _callVisionLlm(
+    String point,
+    String system,
+    String prompt,
+    List<Map<String, Object?>> images,
+    Map<String, Object?> scope,
+    String modelId,
+  ) async {
+    final PreparationVisionLlm? runner = visionLlm;
+    if (runner == null) {
+      throw ProductionFailure('准备阶段需要视觉模型通道，当前未接线', code: 'llm_unavailable');
+    }
+    try {
+      return await runner(point, system, prompt, images, scope, modelId);
+    } on ProductionFailure {
+      rethrow;
+    } catch (error) {
+      throw ProductionFailure('视觉模型调用失败（$point）：$error', code: 'llm_failed');
+    }
+  }
+
   /// 主控（orchestrator）的模型：准备阶段的侦查与拆解都由它出（D6）。
   String _orchestratorModel(LineRecord line) => textOf(
     plainMap(plainMap(line.data['roles'])['orchestrator'])['model_id'],
@@ -992,6 +1849,23 @@ class PreparationService {
         : configured;
   }
 
+  /// 触发一次事件 tick；落档结果已写盘，事件通道失败不反过来报错。
+  Future<void> _notifyCycle(
+    Map<String, Object?> arguments,
+    Map<String, Object?> meta,
+    Map<String, Object?> scope,
+  ) async {
+    final ProductionCycleTrigger? hook = onCycle;
+    if (hook == null) return;
+    final String lineId = textOf(arguments['line_id']);
+    if (lineId.isEmpty) return;
+    try {
+      await hook(lineId, meta, scope);
+    } catch (_) {
+      // 下一次定时 tick 仍会兜底。
+    }
+  }
+
   String _arg(Map<String, Object?> arguments, String key) {
     final String value = textOf(arguments[key]);
     if (value.isEmpty) {
@@ -999,4 +1873,21 @@ class PreparationService {
     }
     return value;
   }
+}
+
+/// 一次双查询检索的结果（含降级/部分/召回缺口读数）。
+class _Retrieval {
+  const _Retrieval({
+    required this.evidence,
+    required this.retrieveMs,
+    required this.degraded,
+    required this.partial,
+    required this.recallGap,
+  });
+
+  final List<ReconEvidence> evidence;
+  final int retrieveMs;
+  final String degraded;
+  final bool partial;
+  final bool recallGap;
 }

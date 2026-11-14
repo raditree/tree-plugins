@@ -35,6 +35,9 @@ const List<String> kAgentHostCommands = <String>[
   'session.rename',
   // P4：产线调角色化员工（packer / executor / expert），工具与模型显式下发。
   'agent.worker.run',
+  // Agent 记忆（读写 `.self/memory.md`）：逻辑只在 tree.agent 存一份。
+  'agent.memory.get',
+  'agent.memory.record',
 ];
 
 const String kAgentToolsReadme =
@@ -44,5 +47,7 @@ const String kAgentToolsReadme =
     'llm.embed（模型池 kind=embedding，OpenAI 兼容 /embeddings，空 inputs 只回模型与维度）/ '
     'fs.read（按 agent 工作空间解析后读文件）/ tool.call（内置或贡献工具同一入口）/ '
     'agent.compact（与 REST /compact 同一实现）/ session.rename（改会话标题并广播）/ '
-    'agent.worker.run（产线员工：role + task + tools + model_id + reuse，回 worker_id 与最终报告）。 '
+    'agent.worker.run（产线员工：role + task + tools + model_id + reuse，回 worker_id 与最终报告）/ '
+    'agent.memory.get（读 agent 记忆：text / hash / sources，可按 budget_chars 只取最近记忆）/ '
+    'agent.memory.record（追加一条记忆摘要，同一 memory-id 幂等去重）。 '
     '失败回包是 {error, payload}：llm.call 的失败也带模型正文原文（可抢救，不白花）。';

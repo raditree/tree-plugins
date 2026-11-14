@@ -7,15 +7,32 @@
 library;
 
 /// 产线插件的可读失败；`code` 直接进执行站回包，供 UI / 调用方分支。
+///
+/// [missing] 是门控拒绝时缺的项（依赖 id / 占用槽位的任务 / 预算原因等），
+/// 与 `docs/pluginization/production-line-gates.md` §2 的 `{code,message,missing}`
+/// 回包口径一致；不提供 force / skip 参数。
 class ProductionFailure implements Exception {
-  ProductionFailure(this.message, {this.code = 'production_error'});
+  ProductionFailure(
+    this.message, {
+    this.code = 'production_error',
+    this.missing = const <String>[],
+  });
 
   final String message;
   final String code;
+  final List<String> missing;
 
   @override
   String toString() => message;
 }
+
+/// 任务跑完 / 准备落档后触发一次主控 tick（插件层接事件驱动；单测注入记录器）。
+typedef ProductionCycleTrigger =
+    Future<void> Function(
+      String lineId,
+      Map<String, Object?> meta,
+      Map<String, Object?> scope,
+    );
 
 /// 主控（执行期决策循环）的默认配置（D6-O §4.1）。
 ///
@@ -38,6 +55,180 @@ const Map<String, Object?> kTaskLoopDefaults = <String, Object?>{
   'stop_reason': '',
   'pending_question': '',
 };
+
+/// 任务类型（`task.yaml.task_type`）。
+///
+/// 旧任务没有这个键，读取时一律按 `code` 处理（不迁移、不报错）。
+/// `cleanup` 是结构整理阶段的唯一放行类型（LG-01 / TG-06）。
+const List<String> kTaskTypes = <String>[
+  'code',
+  'test',
+  'docs',
+  'spike',
+  'integration',
+  'chore',
+  'cleanup',
+];
+
+/// 任务的有效类型：缺键 ⇒ `code`。
+String taskTypeOf(Object? raw) {
+  final String value = textOf(raw);
+  return value.isEmpty ? 'code' : value;
+}
+
+/// 产线阶段（`line.yaml.phase`）：organizing → normalizing → indexing → ready。
+///
+/// 旧产线没有 `phase` 键，读取时按 `organizing` 处理；结构报告通过后
+/// `production.structure.reevaluate` 会把它推进到 `normalizing`。
+const List<String> kLinePhases = <String>[
+  'organizing',
+  'normalizing',
+  'indexing',
+  'ready',
+];
+
+/// 产线的有效阶段：缺键 / 空值 ⇒ `organizing`。
+String linePhaseOf(Object? raw) {
+  final String value = textOf(raw);
+  return value.isEmpty ? 'organizing' : value;
+}
+
+/// 附件元数据种类（`task.yaml.attachments[].kind`）。
+const List<String> kAttachmentKinds = <String>[
+  'text',
+  'image',
+  'pdf',
+  'office',
+  'binary',
+];
+
+/// 任务风险等级（`task.yaml.risk`）。
+const List<String> kTaskRisks = <String>['low', 'medium', 'high'];
+
+final RegExp _sha256Pattern = RegExp(r'^[a-fA-F0-9]{64}$');
+final RegExp _attachmentTypePattern =
+    RegExp(r'^[A-Za-z0-9][A-Za-z0-9.+-]*(/[A-Za-z0-9.+-]+)?$');
+
+/// 安全的工作空间相对路径（拒绝绝对路径、盘符、`..` 与空段）。
+bool isSafeRelativeTaskPath(String path) {
+  final String value = path.trim().replaceAll('\\', '/');
+  if (value.isEmpty) return false;
+  if (value.startsWith('/')) return false;
+  if (RegExp(r'^[A-Za-z]:').hasMatch(value)) return false;
+  for (final String segment in value.split('/')) {
+    if (segment.isEmpty || segment == '.' || segment == '..') return false;
+  }
+  return true;
+}
+
+/// 附件种类：显式 `kind` 优先，否则按 `type` 推断（只做确定性归类，不猜内容）。
+String attachmentKindOf(String type, {String kind = ''}) {
+  if (kind.isNotEmpty && kAttachmentKinds.contains(kind)) return kind;
+  final String value = type.toLowerCase();
+  if (value.startsWith('image/') ||
+      const <String>{'png', 'jpg', 'jpeg', 'webp', 'gif'}.contains(value)) {
+    return 'image';
+  }
+  if (value == 'pdf' || value == 'application/pdf') return 'pdf';
+  if (value.contains('officedocument') ||
+      value.contains('msword') ||
+      value.contains('ms-excel') ||
+      value.contains('ms-powerpoint') ||
+      const <String>{
+        'docx',
+        'xlsx',
+        'pptx',
+        'doc',
+        'xls',
+        'ppt',
+      }.contains(value)) {
+    return 'office';
+  }
+  if (value.startsWith('text/') ||
+      const <String>{
+        'md',
+        'markdown',
+        'txt',
+        'json',
+        'yaml',
+        'yml',
+        'csv',
+        'dart',
+        'py',
+        'ts',
+        'js',
+      }.contains(value)) {
+    return 'text';
+  }
+  return 'binary';
+}
+
+/// 规范化并校验附件元数据（只登记，不读写附件文件；文件通道在 Task 6）。
+///
+/// 元数据固定包含 `path / sha256 / size / type / kind`；未知键（如 `name` /
+/// `added_at`）原样保留，便于后续切片扩展。任一项不合法即 `attachment_invalid`。
+List<Map<String, Object?>> normalizeAttachments(Object? raw) {
+  if (raw == null) return const <Map<String, Object?>>[];
+  if (raw is! List) {
+    throw ProductionFailure(
+      'attachments 必须是数组（[{path,sha256,size,type,kind}]）',
+      code: 'attachment_invalid',
+      missing: const <String>['attachments'],
+    );
+  }
+  final List<Map<String, Object?>> out = <Map<String, Object?>>[];
+  final Set<String> paths = <String>{};
+  for (int i = 0; i < raw.length; i++) {
+    final Object? item = raw[i];
+    final String field = 'attachments[$i]';
+    if (item is! Map) {
+      throw ProductionFailure(
+        '附件元数据必须是对象：$field',
+        code: 'attachment_invalid',
+        missing: <String>[field],
+      );
+    }
+    final Map<String, Object?> map = plainMap(item);
+    final String path = textOf(map['path']).replaceAll('\\', '/');
+    final String sha256 = textOf(map['sha256']).toLowerCase();
+    final Object? rawSize = map['size'];
+    final int? size = rawSize is num
+        ? rawSize.toInt()
+        : int.tryParse(textOf(rawSize));
+    final String type = textOf(map['type']);
+    final String kind = textOf(map['kind']);
+    String? problem;
+    if (!isSafeRelativeTaskPath(path)) {
+      problem = '附件 path 必须是工作空间相对路径（拒绝绝对路径 / ..）：$path';
+    } else if (!_sha256Pattern.hasMatch(sha256)) {
+      problem = '附件 sha256 必须是 64 位十六进制：$sha256';
+    } else if (size == null || size < 0) {
+      problem = '附件 size 必须是非负整数：${rawSize ?? ''}';
+    } else if (type.isEmpty || !_attachmentTypePattern.hasMatch(type)) {
+      problem = '附件 type 必须是扩展名或 MIME：$type';
+    } else if (kind.isNotEmpty && !kAttachmentKinds.contains(kind)) {
+      problem = '附件 kind 只能是 ${kAttachmentKinds.join(' / ')}：$kind';
+    } else if (!paths.add(path)) {
+      problem = '附件 path 重复：$path';
+    }
+    if (problem != null) {
+      throw ProductionFailure(
+        problem,
+        code: 'attachment_invalid',
+        missing: <String>[field],
+      );
+    }
+    out.add(<String, Object?>{
+      ...map,
+      'path': path,
+      'sha256': sha256,
+      'size': size,
+      'type': type,
+      'kind': attachmentKindOf(type, kind: kind),
+    });
+  }
+  return out;
+}
 
 /// 任务状态（`wire` 与 `task.yaml` 的 `status` 逐字一致）。
 enum TaskStatus {
@@ -209,11 +400,47 @@ class TaskRecord {
   String get id => textOf(data['id']);
   String get title => textOf(data['title']);
   String get kind => textOf(data['kind']).isEmpty ? 'conventional' : textOf(data['kind']);
+  /// 任务类型（缺键 ⇒ `code`，旧任务兼容）。
+  String get taskType => taskTypeOf(data['task_type']);
+  /// 结构整理阶段的唯一放行类型。
+  bool get isCleanup => taskType == 'cleanup';
+  /// 出口门控（`task.yaml.gate`，当前只做透传；门控 runner 在后续切片）。
+  Map<String, Object?> get gate => plainMap(data['gate']);
+
+  /// 任务内容（Markdown）；旧任务缺键 ⇒ 空串。
+  String get brief => textOf(data['brief']);
+  /// `brief` 或准备阶段 `intake.goal` 是否非空（TG-01 判据）。
+  bool get hasBrief =>
+      brief.isNotEmpty || textOf(plainMap(data['intake'])['goal']).isNotEmpty;
+  /// 工作空间内已有文件引用（不复制）。
+  List<String> get references => stringsOf(data['references']);
+  /// 附件元数据（只读输入；文件通道在 Task 6）。
+  List<Map<String, Object?>> get attachments => <Map<String, Object?>>[
+    for (final Object? item
+        in (data['attachments'] is List
+            ? data['attachments'] as List
+            : const <Object?>[]))
+      if (item is Map) plainMap(item),
+  ];
+  /// 软冲突：不能并行但不必有依赖。
+  List<String> get conflictsWith => stringsOf(data['conflicts_with']);
+  String get serialGroup => textOf(data['serial_group']);
+  /// 拆分预算估算（旧任务缺键 ⇒ 1，与准备阶段口径一致）。
+  int get estimatedFiles => intOf(data['estimated_files'], 1);
+  /// `low / medium / high`；旧任务缺省为空。
+  String get risk => textOf(data['risk']);
+  /// 输入/输出/接口/不变量；允许字符串或对象。
+  Object? get contract => plainValue(data['contract']);
+  /// 为什么这样拆（引用理解卡 evidence_id）。
+  String get rationale => textOf(data['rationale']);
+
   TaskStatus get status => taskStatusOf(data['status']);
   int get priority => intOf(data['priority'], 50);
   List<String> get dependsOn => stringsOf(data['depends_on']);
   /// 写域：并行判据（§9.6）与执行边界（§9.2）共用。
   List<String> get writeScope => stringsOf(data['write_scope']);
+  /// 参考范围；`references` 会自动并入。
+  List<String> get readScope => stringsOf(data['read_scope']);
   /// 有效写域：空 = 工作空间根（D2）。
   List<String> get effectiveWriteScope => resolveWriteScope(data['write_scope']);
   String get createdAt => textOf(data['created_at']);
@@ -243,6 +470,10 @@ class LineRecord {
   String get name => textOf(data['name']);
   String get workspaceDir => textOf(data['workspace_dir']);
   String get status => textOf(data['status']).isEmpty ? 'idle' : textOf(data['status']);
+  /// 存储的阶段键（旧产线为空，读取方用 [effectivePhase]）。
+  String get phase => linePhaseOf(data['phase']);
+  /// 有效阶段：缺键 / 空值 ⇒ `organizing`（旧产线在结构报告通过前一律按整理中）。
+  String get effectivePhase => linePhaseOf(data['phase']);
   String get createdAt => textOf(data['created_at']);
 
   /// 执行身份（§16）：产线与 Agent 并列，打包 / 执行 / 专家都用这条身份，
@@ -255,6 +486,23 @@ class LineRecord {
   Map<String, Object?> get orchestrator => plainMap(data['orchestrator']);
 
   Map<String, Object?> toJson() => plainMap(data);
+}
+
+/// 产线运行态投影（后端唯一口径，UI 不再自行推断）。
+///
+/// - `paused`：`line.yaml.status=paused`（人工暂停 / 连续失败暂停）优先；
+/// - `working`：存在在途（packing / packed / running / gating）或 `queued` 任务；
+/// - `idle`：其余。
+///
+/// 只读投影，不改 `line.yaml.status`，也不引入新的 wire 值。
+String projectLineStatus(LineRecord line, Iterable<TaskRecord> tasks) {
+  if (line.status == 'paused') return 'paused';
+  for (final TaskRecord task in tasks) {
+    if (task.status.isInFlight || task.status == TaskStatus.queued) {
+      return 'working';
+    }
+  }
+  return 'idle';
 }
 
 /// 新建产线的默认配置（§7.2）；调用方显式传入的段做浅合并。
@@ -273,11 +521,21 @@ Map<String, Object?> buildLineMap(
       code: 'invalid_arguments',
     );
   }
+  final String phase = linePhaseOf(input['phase']);
+  if (!kLinePhases.contains(phase)) {
+    throw ProductionFailure(
+      '产线 phase 只能是 ${kLinePhases.join(' / ')}：$phase',
+      code: 'invalid_arguments',
+    );
+  }
   final Map<String, Object?> data = <String, Object?>{
     'id': id,
     'name': textOf(input['name']),
     'workspace_dir': textOf(input['workspace_dir']),
     'status': status,
+    // L0 阶段：新产线一律从整理中开始；phase 只由后端结构判定推进，
+    // 不接受调用方传 ready=true 之类的覆盖。
+    'phase': 'organizing',
     'roles': <String, Object?>{
       'orchestrator': <String, Object?>{
         'model_id': '',
@@ -445,21 +703,71 @@ Map<String, Object?> buildTaskMap(
       code: 'invalid_arguments',
     );
   }
+  final String taskType = taskTypeOf(input['task_type']);
+  if (!kTaskTypes.contains(taskType)) {
+    throw ProductionFailure(
+      '任务 task_type 只能是 ${kTaskTypes.join(' / ')}：$taskType',
+      code: 'invalid_arguments',
+    );
+  }
+  // cleanup 是结构整理阶段唯一放行的任务：必须有写域与验收（回滚/门控
+  // 在当前模型里作为可选键透传，完整门控 runner 在后续切片）。
+  if (taskType == 'cleanup') {
+    if (stringsOf(input['write_scope']).isEmpty) {
+      throw ProductionFailure(
+        'cleanup 任务必须显式给出 write_scope',
+        code: 'invalid_arguments',
+      );
+    }
+    if (stringsOf(input['acceptance']).isEmpty) {
+      throw ProductionFailure(
+        'cleanup 任务必须给出至少一条 acceptance',
+        code: 'invalid_arguments',
+      );
+    }
+  }
   final List<String> dependsOn = stringsOf(input['depends_on']);
   if (dependsOn.contains(id)) {
     throw ProductionFailure('任务不能依赖自己：$id', code: 'invalid_arguments');
+  }
+  final String brief = textOf(input['brief']);
+  final List<String> references = stringsOf(input['references']);
+  final List<Map<String, Object?>> attachments = normalizeAttachments(
+    input['attachments'],
+  );
+  final List<String> conflictsWith = stringsOf(input['conflicts_with']);
+  final String serialGroup = textOf(input['serial_group']);
+  final String risk = textOf(input['risk']);
+  final String rationale = textOf(input['rationale']);
+  // `references` 自动并入 `read_scope`（产品形态 §6.0.1）。
+  final List<String> readScope = <String>[...stringsOf(input['read_scope'])];
+  for (final String reference in references) {
+    if (!readScope.contains(reference)) readScope.add(reference);
   }
   return <String, Object?>{
     'id': id,
     'title': title,
     'kind': kind,
+    'task_type': taskType,
     'status': status.wire,
     // 需求模板是任务的组成部分（准备阶段读取），随 task.yaml 落盘。
     if (plainMap(input['intake']).isNotEmpty) 'intake': plainMap(input['intake']),
+    if (plainMap(input['gate']).isNotEmpty) 'gate': plainMap(input['gate']),
+    if (brief.isNotEmpty) 'brief': brief,
+    if (references.isNotEmpty) 'references': references,
+    if (attachments.isNotEmpty) 'attachments': attachments,
+    if (conflictsWith.isNotEmpty) 'conflicts_with': conflictsWith,
+    if (serialGroup.isNotEmpty) 'serial_group': serialGroup,
+    if (input.containsKey('estimated_files'))
+      'estimated_files': intOf(input['estimated_files'], 1),
+    if (risk.isNotEmpty) 'risk': risk,
+    if (input.containsKey('contract') && input['contract'] != null)
+      'contract': plainValue(input['contract']),
+    if (rationale.isNotEmpty) 'rationale': rationale,
     'priority': intOf(input['priority'], 50),
     'depends_on': dependsOn,
     'write_scope': resolveWriteScope(input['write_scope']),
-    'read_scope': stringsOf(input['read_scope']),
+    'read_scope': readScope,
     'acceptance': stringsOf(input['acceptance']),
     'artifacts': plainMap(input['artifacts']),
     'created_at': now,

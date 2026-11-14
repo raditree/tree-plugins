@@ -8,6 +8,7 @@ import '../agent/agent_engine.dart';
 import '../agent/agent_instance.dart';
 import '../agent/compaction_service.dart';
 import '../agent/conversation_service.dart';
+import '../agent/memory_service.dart';
 import '../agent/question_broker.dart';
 import '../agent/question_store.dart';
 import '../agent/subagent_service.dart';
@@ -233,6 +234,12 @@ class AgentRuntime {
     );
     specService = SpecService(store: store)
       ..ioFor = (String agentId) => workspaceIoFor(agentId, '');
+    // Agent 记忆（`agent.memory.get` / `agent.memory.record`）：与 spec 同一条
+    // 工作空间解析路径，sessionId 由调用方给出。
+    memory = MemoryService(
+      ioFor: (String agentId, String sessionId) =>
+          workspaceIoFor(agentId, sessionId),
+    );
 
     subagentService.runner = conversation.runSubagent;
     subagentService.onFinished = (String owner, String session, String notice, SubagentTag tag) {
@@ -264,6 +271,9 @@ class AgentRuntime {
   late final TeamService teamService;
   late final TeamMessageDispatcher messageDispatcher;
   late final SpecService specService;
+
+  /// Agent 记忆服务（`.self/memory.md`）；生产线经执行站命令消费。
+  late final MemoryService memory;
   late final SubagentService subagentService;
   late final CompactionService compaction;
   late final ConversationService conversation;
@@ -750,6 +760,8 @@ class AgentRuntime {
       case 'tool.call':
       case 'agent.compact':
       case 'session.rename':
+      case 'agent.memory.get':
+      case 'agent.memory.record':
         return _handleHostCommand(command, arguments, invocation, scope);
       case 'spec.list':
       case 'spec.read':
@@ -969,9 +981,39 @@ class AgentRuntime {
           invocation.agentId,
           invocation.sessionId,
         );
+      case 'agent.memory.get':
+        return memory.get(
+          agentId: _memoryAgentId(arguments, invocation),
+          sessionId: invocation.sessionId,
+          purpose: _text(arguments['purpose']),
+          budgetChars: _number(arguments['budget_chars'])?.toInt() ?? 4000,
+        );
+      case 'agent.memory.record':
+        return memory.record(
+          agentId: _memoryAgentId(arguments, invocation),
+          sessionId: invocation.sessionId,
+          summary: _text(arguments['summary']),
+          purpose: _text(arguments['purpose']),
+          sources: <String>[
+            for (final Object? item in (arguments['sources'] as List<dynamic>? ??
+                const <dynamic>[]))
+              if (item != null) item.toString(),
+          ],
+          lineId: _text(arguments['line_id']),
+          taskId: _text(arguments['task_id']),
+        );
       default:
         return <String, dynamic>{'error': '未知宿主命令：$command'};
     }
+  }
+
+  /// `agent.memory.*` 的目标 agent：显式 `agent_id` 优先，缺省回退调用方。
+  static String _memoryAgentId(
+    Map<String, dynamic> arguments,
+    ToolInvocation invocation,
+  ) {
+    final String explicit = _text(arguments['agent_id']);
+    return explicit.isEmpty ? invocation.agentId : explicit;
   }
 
   /// 一次性 LLM 调用（复用目标 agent 的模型与成员级覆盖）。

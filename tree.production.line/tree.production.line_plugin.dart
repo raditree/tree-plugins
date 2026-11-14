@@ -88,14 +88,26 @@ const String kStationReadme =
     '快照哈希不变不调模型，单线单 tick，连续 3 次失败暂停产线，决策落 '
     'runs(role=orchestrator) 台账；运行期问答 production.task.question|questions|answer'
     '（blocked + question_pending，回答回 queued）；REST 增 orchestrate / pause / '
-    'resume / orchestrator 与 tasks/{id}/answer。';
+    'resume / orchestrator 与 tasks/{id}/answer。'
+    'L0 就绪门：production.normalize.plan/apply/rollback/status 复用 docnorm.baseline'
+    '（plan 0 写盘；apply 写前备份 + before/after sha256，失败自动恢复，不自动 git '
+    'commit；rewrite 需 confirm_rewrite + allowlist）与 production.readiness.get'
+    '（LG-02~07 落 <line>/ready.json）；未就绪时非 cleanup 命令 409 line_not_ready。';
 
-final ProductionService _service = ProductionService();
+ProductionService _service = ProductionService();
 PreparationService? _preparation;
 ProductionExecutionService? _execution;
 ProductionAuditService? _audit;
 OrchestratorService? _orchestrator;
+ProductionNormalizationService? _normalization;
+ProductionReadinessService? _readiness;
 PluginKitServer? _activeServer;
+
+/// Task 9.1 任务状态广播：注册成功后的站 id（空 = 未注册，事件只留日志）。
+String _taskStateStationId = '';
+
+/// 任务状态事件所属的数据根（回调签名不带 data_dir，按最近一次请求兜底）。
+String _eventDataRoot = '';
 bool _settingsDefined = false;
 
 /// 事件 debounce：同一产线 1s 内的多次事件合并为一次 tick。
@@ -119,14 +131,28 @@ PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
 
 Future<void> _onReady(PluginKitServer server) async {
   _activeServer = server;
+  _eventDataRoot = Platform.environment['TREE_DATA_ROOT'] ?? '';
+  _service = ProductionService(onTaskState: _publishTaskState);
+  // Task 6.4：产线只通过窄端口借 `tree.agent` 的记忆；正文进提示词，落盘只有元数据。
+  final MemoryPort memoryPort = MemoryPort(
+    get: _memoryGet,
+    record: _memoryRecord,
+  );
   _preparation = PreparationService(
     llm: _callLlm,
+    visionLlm: _callVisionLlm,
     docQuery: _callDocQuery,
     limitReader: _readQuestionLimit,
+    onCycle: _onProductionCycle,
+    memory: memoryPort,
+    onTaskState: _publishTaskState,
   );
   _execution = ProductionExecutionService(
     workers: _callWorker,
     commands: _runCommand,
+    onCycle: _onProductionCycle,
+    memory: memoryPort,
+    onTaskState: _publishTaskState,
   );
   _audit = ProductionAuditService();
   _orchestrator = OrchestratorService(
@@ -134,6 +160,12 @@ Future<void> _onReady(PluginKitServer server) async {
     llm: _callLlm,
     dispatcher: _dispatchFromOrchestrator,
     execution: _execution,
+  );
+  // L0 就绪门：归一化复用 docnorm.baseline；readiness 额外核对去重状态。
+  _normalization = ProductionNormalizationService(docnorm: _callDocnorm);
+  _readiness = ProductionReadinessService(
+    docnorm: _callDocnorm,
+    dedupStatus: _dedupStatusFor,
   );
   server.channel.log(
     '已上线：v$kVersion（tree.production.line，P1 数据 + P3 准备阶段 + P4 打包执行 + P5 专家 + P6 项目整理）',
@@ -166,6 +198,8 @@ Future<void> _onReady(PluginKitServer server) async {
           ...kAuditCommands,
           ...kDedupCommands,
           ...kOrchestratorCommands,
+          ...kNormalizationCommands,
+          ...kReadinessCommands,
         ],
       },
     );
@@ -174,6 +208,32 @@ Future<void> _onReady(PluginKitServer server) async {
     );
   } catch (error) {
     server.channel.log('自建执行站失败：$error');
+  }
+  // Task 9.1：任务状态广播站。注册失败只记日志（UI 收不到推送，业务照常）。
+  try {
+    final Map<String, dynamic> broadcast = await server.channel.request(
+      M.stationRegister,
+      <String, dynamic>{
+        'kind': 'broadcast',
+        'name': kTaskStateStationName,
+        'description': '生产线任务状态事件（create / update / transition 后各一帧）',
+        'readme': kTaskStateReadme,
+        'shared': true,
+      },
+    );
+    if (broadcast['ok'] == true) {
+      _taskStateStationId = asString(broadcast['station_id']).isEmpty
+          ? kTaskStateStationId
+          : asString(broadcast['station_id']);
+    } else {
+      _taskStateStationId = '';
+    }
+    server.channel.log(
+      '任务状态广播站：${broadcast['ok'] == true ? _taskStateStationId : broadcast['error']}',
+    );
+  } catch (error) {
+    _taskStateStationId = '';
+    server.channel.log('任务状态广播站注册失败：$error');
   }
   // D6-O O5：崩溃恢复 + 定时兜底（没有 data_dir 的进程不做这两件事）。
   _startOrchestratorDrivers(server);
@@ -187,7 +247,11 @@ void _startOrchestratorDrivers(PluginKitServer server) {
   final String dataRoot = Platform.environment['TREE_DATA_ROOT'] ?? '';
   final OrchestratorService? orchestrator = _orchestrator;
   if (dataRoot.isEmpty || orchestrator == null) return;
-  final ProductionStore store = ProductionStore(dataRoot: dataRoot);
+  _eventDataRoot = dataRoot;
+  final ProductionStore store = ProductionStore(
+    dataRoot: dataRoot,
+    onTaskState: _publishTaskState,
+  );
   Future<void> recover() async {
     try {
       final List<LineRecord> lines = store.listLines();
@@ -244,6 +308,56 @@ Map<String, Object?> _scopeOf(LineRecord line) => <String, Object?>{
   if (line.executorTeamId.isNotEmpty) 'team_id': line.executorTeamId,
 };
 
+/// Task 9.1：任务状态广播。回调签名不带 data_dir，用最近一次请求的数据根。
+void _publishTaskState(String lineId, TaskRecord task) {
+  final String dataDir = _eventDataRoot.isNotEmpty
+      ? _eventDataRoot
+      : (Platform.environment['TREE_DATA_ROOT'] ?? '');
+  if (dataDir.isEmpty) {
+    _activeServer?.channel.log('任务状态事件缺少 data_dir，跳过（$lineId/${task.id}）');
+    return;
+  }
+  final String stationId = _taskStateStationId.isEmpty
+      ? kTaskStateStationId
+      : _taskStateStationId;
+  try {
+    publishTaskState(
+      store: ProductionStore(dataRoot: dataDir),
+      lineId: lineId,
+      task: task,
+      trigger: _taskStateTrigger,
+      log: (String message) => _activeServer?.channel.log(message),
+      stationId: stationId,
+    );
+  } catch (error) {
+    _activeServer?.channel.log('任务状态事件发布失败：$error');
+  }
+}
+
+/// 广播投递通道（`station/trigger`）；插件还没拿到 server 时给一个失败回包。
+Future<Map<String, dynamic>> _taskStateTrigger(
+  String stationId,
+  Object? payload,
+  Map<String, dynamic> meta,
+  Map<String, dynamic> scope, {
+  String? topic,
+}) {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) {
+    return Future<Map<String, dynamic>>.value(<String, dynamic>{
+      'ok': false,
+      'error': 'server_unavailable',
+    });
+  }
+  return server.channel.request(M.stationTrigger, <String, dynamic>{
+    'station_id': stationId,
+    if (topic != null && topic.isNotEmpty) 'topic': topic,
+    'payload': payload,
+    'meta': meta,
+    'scope': scope,
+  });
+}
+
 /// 主控决策后的派发：后台跑打包 / 执行，结束后 debounce 一次事件 tick。
 Future<void> _dispatchFromOrchestrator(
   String lineId,
@@ -254,7 +368,11 @@ Future<void> _dispatchFromOrchestrator(
 ) async {
   final String dataDir = asString(meta['data_dir']);
   if (dataDir.isEmpty) return;
-  final ProductionStore store = ProductionStore(dataRoot: dataDir);
+  _eventDataRoot = dataDir;
+  final ProductionStore store = ProductionStore(
+    dataRoot: dataDir,
+    onTaskState: _publishTaskState,
+  );
   try {
     await dispatchProductionTask(
       store: store,
@@ -274,6 +392,18 @@ Future<void> _dispatchFromOrchestrator(
   }
 }
 
+/// 任务执行结束 / 准备落档后触发一次事件 tick（共用 [_scheduleEventTick] 的
+/// 1s debounce，幂等；不在执行路径上等待 tick）。
+Future<void> _onProductionCycle(
+  String lineId,
+  Map<String, Object?> meta,
+  Map<String, Object?> scope,
+) async {
+  final String dataDir = asString(meta['data_dir']);
+  if (dataDir.isEmpty) return;
+  _scheduleEventTick(lineId, dataDir, scope);
+}
+
 /// 1s debounce：同一产线的多次事件合并为一次 tick（§6.4）。
 void _scheduleEventTick(
   String lineId,
@@ -285,10 +415,11 @@ void _scheduleEventTick(
     _eventTimers.remove(lineId);
     final OrchestratorService? orchestrator = _orchestrator;
     if (orchestrator == null) return;
+    _eventDataRoot = dataDir;
     unawaited(() async {
       try {
         await orchestrator.tick(
-          ProductionStore(dataRoot: dataDir),
+          ProductionStore(dataRoot: dataDir, onTaskState: _publishTaskState),
           lineId,
           meta: <String, Object?>{'data_dir': dataDir},
           scope: scope,
@@ -353,6 +484,68 @@ Future<Map<String, Object?>> _callLlm(
   );
 }
 
+/// 向 `tree.agent` 的 `llm.call` 要一份 JSON（多模态）：图片按 OpenAI 形状的
+/// `content` 数组送出去（`text` + `image_url`），回包解析与 `_callLlm` 同一口径。
+Future<Map<String, Object?>> _callVisionLlm(
+  String point,
+  String system,
+  String prompt,
+  List<Map<String, Object?>> images,
+  Map<String, Object?> scope,
+  String modelId,
+) async {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) {
+    throw ProductionFailure('插件尚未就绪：llm.call 通道不可用', code: 'llm_unavailable');
+  }
+  final Map<String, dynamic> payload = await server.channel.command(
+    'llm.call',
+    <String, dynamic>{
+      'messages': <Map<String, dynamic>>[
+        <String, dynamic>{'role': 'system', 'content': system},
+        <String, dynamic>{
+          'role': 'user',
+          'content': <Map<String, dynamic>>[
+            <String, dynamic>{'type': 'text', 'text': prompt},
+            for (final Map<String, Object?> image in images)
+              <String, dynamic>{
+                'type': 'image_url',
+                'image_url': <String, dynamic>{
+                  'url': 'data:${image['mime']};base64,${image['base64']}',
+                },
+              },
+          ],
+        },
+      ],
+      'temperature': 0.2,
+      if (modelId.trim().isNotEmpty) 'model_id': modelId.trim(),
+    },
+    '',
+    scope,
+  );
+  final Object? json = payload['json'];
+  if (json is Map) {
+    return <String, Object?>{
+      for (final MapEntry<dynamic, dynamic> entry in json.entries)
+        entry.key.toString(): entry.value,
+      if (payload['usage'] is Map) '_usage': payload['usage'],
+    };
+  }
+  final String text = asString(payload['text']);
+  final Object? decoded = _jsonFromText(text);
+  if (decoded is Map) {
+    return <String, Object?>{
+      for (final MapEntry<dynamic, dynamic> entry in decoded.entries)
+        entry.key.toString(): entry.value,
+      if (payload['usage'] is Map) '_usage': payload['usage'],
+    };
+  }
+  throw ProductionFailure(
+    '模型没有返回 JSON（$point）：${text.length > 200 ? '${text.substring(0, 200)}…' : text}',
+    code: 'llm_bad_json',
+  );
+}
+
 /// 从正文里抠第一个 JSON 对象（模型偶尔加代码围栏 / 前置说明）。
 Object? _jsonFromText(String text) {
   final String trimmed = text.trim();
@@ -386,11 +579,7 @@ Future<Map<String, Object?>> _callDocQuery(
   }
   final Map<String, dynamic> payload = await server.channel.command(
     'docnorm.query',
-    <String, dynamic>{
-      'repo': repo,
-      'question': question,
-      'mode': 'hybrid',
-    },
+    <String, dynamic>{'repo': repo, 'question': question, 'mode': 'hybrid'},
     '',
     scope,
   );
@@ -399,6 +588,145 @@ Future<Map<String, Object?>> _callDocQuery(
       entry.key: entry.value,
   };
 }
+
+/// 读 `tree.agent` 记忆（`agent.memory.get`）：通道缺失 / 异常一律降级为不可用。
+///
+/// 只回原始回包（含 `text` / `hash` / `sources`）；正文由 [MemoryPort] 只交给提示词，
+/// 落盘的只有 `hash` / `sources` 这些元数据。
+Future<Map<String, Object?>> _memoryGet(
+  String agentId,
+  String purpose,
+  int budgetChars,
+  Map<String, Object?> scope,
+) async {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) {
+    return <String, Object?>{
+      'error': '插件尚未就绪：agent.memory.get 通道不可用',
+      'code': 'memory_unavailable',
+    };
+  }
+  try {
+    final Map<String, dynamic> payload = await server.channel.command(
+      'agent.memory.get',
+      <String, dynamic>{
+        'agent_id': agentId,
+        'purpose': purpose,
+        'budget_chars': budgetChars,
+      },
+      '',
+      scope,
+    );
+    return <String, Object?>{
+      for (final MapEntry<String, dynamic> item in payload.entries)
+        item.key: item.value,
+    };
+  } catch (error) {
+    return <String, Object?>{
+      'error': 'agent.memory.get 不可用：$error',
+      'code': 'memory_unavailable',
+    };
+  }
+}
+
+/// 写一条 `tree.agent` 记忆（`agent.memory.record`）；失败同样只回不可用，不抛。
+Future<Map<String, Object?>> _memoryRecord(
+  Map<String, Object?> entry,
+  Map<String, Object?> scope,
+) async {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) {
+    return <String, Object?>{
+      'error': '插件尚未就绪：agent.memory.record 通道不可用',
+      'code': 'memory_unavailable',
+    };
+  }
+  try {
+    final Map<String, dynamic> payload = await server.channel.command(
+      'agent.memory.record',
+      <String, dynamic>{
+        for (final String key in const <String>[
+          'agent_id',
+          'purpose',
+          'summary',
+          'sources',
+          'line_id',
+          'task_id',
+        ])
+          if (entry[key] != null) key: entry[key],
+      },
+      '',
+      scope,
+    );
+    return <String, Object?>{
+      for (final MapEntry<String, dynamic> item in payload.entries)
+        item.key: item.value,
+    };
+  } catch (error) {
+    return <String, Object?>{
+      'error': 'agent.memory.record 不可用：$error',
+      'code': 'memory_unavailable',
+    };
+  }
+}
+
+/// 文档归一化 / 就绪探针：向 `tree.docnorm` 的执行站下命令。
+///
+/// 只在 L0 就绪门（plan / apply / readiness.get）使用；失败收敛成
+/// [ProductionFailure]，由命令门面回 `{code, message, missing}`。
+Future<Map<String, Object?>> _callDocnorm(
+  String command,
+  Map<String, Object?> arguments,
+  Map<String, Object?> scope,
+) async {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) {
+    throw ProductionFailure(
+      '插件尚未就绪：$command 通道不可用',
+      code: 'docnorm_unavailable',
+      missing: const <String>['docnorm'],
+    );
+  }
+  try {
+    final Map<String, dynamic> payload = await server.channel.command(
+      command,
+      <String, dynamic>{
+        for (final MapEntry<String, Object?> entry in arguments.entries)
+          entry.key: entry.value,
+      },
+      '',
+      scope,
+    );
+    return <String, Object?>{
+      for (final MapEntry<String, dynamic> entry in payload.entries)
+        entry.key: entry.value,
+    };
+  } on CmdFailureException catch (error) {
+    throw ProductionFailure(
+      '$command 失败：${error.message}',
+      code: error.code.isEmpty ? 'docnorm_failed' : error.code,
+      missing: const <String>['docnorm'],
+    );
+  } catch (error) {
+    throw ProductionFailure(
+      '$command 异常：$error',
+      code: 'docnorm_unavailable',
+      missing: const <String>['docnorm'],
+    );
+  }
+}
+
+/// 就绪门的代码索引证据：`production.dedup.status`（只读已落盘结果）。
+Future<Map<String, Object?>> _dedupStatusFor(
+  String lineId,
+  Map<String, Object?> meta,
+  Map<String, Object?> scope,
+) => _dedupServiceFor(scope).handle(
+  'production.dedup.status',
+  <String, Object?>{'line_id': lineId},
+  meta,
+  scope,
+);
 
 /// 产线调员工（`agent.worker.run`）：工具与模型由角色配置显式下发。
 Future<Map<String, Object?>> _callWorker(
@@ -586,10 +914,7 @@ Future<int?> _readQuestionLimit(Map<String, Object?> scope) async {
     if (!_settingsDefined) {
       await server.channel.command(
         'settings.define',
-        <String, dynamic>{
-          'binding': 'plugin',
-          'schema': _questionSchema(),
-        },
+        <String, dynamic>{'binding': 'plugin', 'schema': _questionSchema()},
         '',
         scope,
       );
@@ -817,10 +1142,7 @@ Future<DedupConfig> _readDedupConfig(Map<String, Object?> scope) async {
     if (!_settingsDefined) {
       await server.channel.command(
         'settings.define',
-        <String, dynamic>{
-          'binding': 'plugin',
-          'schema': _questionSchema(),
-        },
+        <String, dynamic>{'binding': 'plugin', 'schema': _questionSchema()},
         '',
         scope,
       );
@@ -833,14 +1155,12 @@ Future<DedupConfig> _readDedupConfig(Map<String, Object?> scope) async {
       scope,
     );
     final Map<String, Object?> values = <String, Object?>{
-      for (final MapEntry<String, dynamic> entry
-          in asMap(payload['values']).entries)
+      for (final MapEntry<String, dynamic> entry in asMap(
+        payload['values'],
+      ).entries)
         entry.key: entry.value,
     };
-    return DedupConfig.fromValues(
-      values,
-      environment: Platform.environment,
-    );
+    return DedupConfig.fromValues(values, environment: Platform.environment);
   } catch (_) {
     return DedupConfig.defaults;
   }
@@ -864,14 +1184,19 @@ Future<Map<String, dynamic>?> handleRequest(
 ) async {
   // 切片 2 / 3：REST 委派（§10.2 的读半边 + 写半边）；写操作走同一批命令门面。
   if (method == M.apiDelegate) {
+    final Map<String, dynamic> envelope = asMap(params);
+    final String dataDir = asString(envelope['data_dir']);
+    if (dataDir.isNotEmpty) _eventDataRoot = dataDir;
     return handleProductionDelegate(
-      asMap(params),
+      envelope,
       service: _service,
       audit: _audit,
       execution: _execution,
       preparation: _preparation,
       orchestrator: _orchestrator,
       dedupFor: _dedupServiceFor,
+      normalization: _normalization,
+      readiness: _readiness,
     );
   }
   if (method != M.stationRequest) return null;
@@ -895,16 +1220,22 @@ Future<Map<String, dynamic>?> handleRequest(
   }
   final Map<String, dynamic> payload = asMap(params['payload']);
   final String command = asString(payload['command']);
+  final String requestDataDir = asString(asMap(params['meta'])['data_dir']);
+  if (requestDataDir.isNotEmpty) _eventDataRoot = requestDataDir;
   final bool isPrepare = kPreparationCommands.contains(command);
   final bool isExecute = kExecutionCommands.contains(command);
   final bool isAudit = kAuditCommands.contains(command);
   final bool isDedup = kDedupCommands.contains(command);
   final bool isOrchestrator = kOrchestratorCommands.contains(command);
+  final bool isNormalization = kNormalizationCommands.contains(command);
+  final bool isReadiness = kReadinessCommands.contains(command);
   if (!isPrepare &&
       !isExecute &&
       !isAudit &&
       !isDedup &&
       !isOrchestrator &&
+      !isNormalization &&
+      !isReadiness &&
       !kProductionCommands.contains(command)) {
     return null;
   }
@@ -945,6 +1276,20 @@ Future<Map<String, dynamic>?> handleRequest(
             asMap(params['meta']),
             scope,
           )
+        : isNormalization
+        ? await _normalization!.handle(
+            command,
+            asMap(payload['arguments']),
+            asMap(params['meta']),
+            scope,
+          )
+        : isReadiness
+        ? await _readiness!.handle(
+            command,
+            asMap(payload['arguments']),
+            asMap(params['meta']),
+            scope,
+          )
         : _service.handle(
             command,
             asMap(payload['arguments']),
@@ -956,7 +1301,12 @@ Future<Map<String, dynamic>?> handleRequest(
     };
   } on ProductionFailure catch (error) {
     return <String, dynamic>{
-      'reply': <String, dynamic>{'error': error.message, 'code': error.code},
+      'reply': <String, dynamic>{
+        'error': error.message,
+        'message': error.message,
+        'code': error.code,
+        'missing': error.missing,
+      },
     };
   } catch (error) {
     return <String, dynamic>{
@@ -988,6 +1338,46 @@ Future<int> selfTest() async {
   final Directory temp = Directory.systemTemp.createTempSync(
     'tree_production_line_selftest_',
   );
+  // 结构 / 就绪门需要真实工作空间：给一条最小可扫描的包。
+  final Directory demoWs = Directory(
+    <String>[temp.path, 'ws'].join(Platform.pathSeparator),
+  )..createSync(recursive: true);
+  File(
+    <String>[demoWs.path, 'pubspec.yaml'].join(Platform.pathSeparator),
+  ).writeAsStringSync(
+    'name: demo_ws\n'
+    'description: 最小演示包：只提供 A\n'
+    'environment:\n  sdk: ^3.0.0\n',
+  );
+  Directory(
+    <String>[demoWs.path, 'lib'].join(Platform.pathSeparator),
+  ).createSync(recursive: true);
+  File(
+    <String>[demoWs.path, 'lib', 'a.dart'].join(Platform.pathSeparator),
+  ).writeAsStringSync('class A {}\n');
+  File(
+    <String>[demoWs.path, 'README.md'].join(Platform.pathSeparator),
+  ).writeAsStringSync('# demo_ws\n\n## 职责\n\n最小演示包：只提供 A。\n');
+  final ProductionStore selftestStore = ProductionStore(dataRoot: temp.path);
+
+  /// 自检里没有 docnorm / 索引：直接落一份“已就绪”快照，只为跑通 REST 写路径。
+  void markReady(String lineId) {
+    handleStructureCommand(
+      selftestStore,
+      'production.structure.reevaluate',
+      <String, Object?>{'line_id': lineId},
+    );
+    final LineRecord line = selftestStore.setLinePhase(lineId, 'ready');
+    selftestStore.writeReady(lineId, <String, Object?>{
+      'version': 1,
+      'line_id': lineId,
+      'ready': true,
+      'graph_version': lineReadinessVersionOf(selftestStore, line),
+      'missing': <String>[],
+      'at': selftestStore.nowText(),
+    });
+  }
+
   final FakeCore core = FakeCore(buildServer(exitOnShutdown: false));
   core.onMethod(
     M.stationRegister,
@@ -1010,10 +1400,7 @@ Future<int> selfTest() async {
     String? agent,
   }) async {
     core.ask(id, M.stationRequest, <String, dynamic>{
-      'payload': <String, dynamic>{
-        'command': command,
-        'arguments': arguments,
-      },
+      'payload': <String, dynamic>{'command': command, 'arguments': arguments},
       'meta': <String, dynamic>{
         'source_plugin_id': kPluginId,
         if (withData) 'data_dir': temp.path,
@@ -1091,11 +1478,7 @@ Future<int> selfTest() async {
     core.ask('hello', M.hello, <String, dynamic>{'plugin_id': kPluginId});
     await core.waitFor(<Object?>['hello']);
 
-    check.check(
-      core.outgoing(M.stationRegister).length,
-      1,
-      '启动后注册执行站',
-    );
+    check.check(core.outgoing(M.stationRegister).length, 2, '启动后注册执行站');
 
     // 数据根 fail-closed；team 只是调用方身份（§16 数据落全局作用域）。
     final Map<String, dynamic> noData = await call(
@@ -1104,18 +1487,18 @@ Future<int> selfTest() async {
       <String, Object?>{},
       withData: false,
     );
-    check.check(noData['code'], 'missing_data_dir', '缺 data_dir ⇒ missing_data_dir');
+    check.check(
+      noData['code'],
+      'missing_data_dir',
+      '缺 data_dir ⇒ missing_data_dir',
+    );
     final Map<String, dynamic> noTeam = await call(
       'no-team',
       'production.line.list',
       <String, Object?>{},
       team: null,
     );
-    check.check(
-      payloadOf(noTeam)['count'],
-      0,
-      '缺 team_id 仍可读（产线数据全局存放）',
-    );
+    check.check(payloadOf(noTeam)['count'], 0, '缺 team_id 仍可读（产线数据全局存放）');
 
     // 产线：建 / 列 / 查 + 落盘。
     final Map<String, dynamic> created = await call(
@@ -1124,6 +1507,7 @@ Future<int> selfTest() async {
       <String, Object?>{
         'id': 'pl_demo',
         'name': '标准开发流',
+        'workspace_dir': demoWs.path,
         'executor': <String, Object?>{
           'agent_id': 'agt_demo',
           'team_id': 'team_a',
@@ -1147,11 +1531,7 @@ Future<int> selfTest() async {
       'production.line.get',
       <String, Object?>{'line_id': 'pl_demo'},
     );
-    check.check(
-      asMap(payloadOf(fetched)['line'])['name'],
-      '标准开发流',
-      '产线详情',
-    );
+    check.check(asMap(payloadOf(fetched)['line'])['name'], '标准开发流', '产线详情');
     check.that(
       File('$lineRoot${Platform.pathSeparator}line.yaml').existsSync(),
       'line.yaml 落盘',
@@ -1168,6 +1548,7 @@ Future<int> selfTest() async {
     check.check(missingLine['code'], 'not_found', '缺产线 ⇒ not_found');
 
     // 任务：A(p10) ← B(p50) 依赖 A；C(p50) 独立。
+    markReady('pl_demo');
     await call('task-a', 'production.task.create', <String, Object?>{
       'line_id': 'pl_demo',
       'task': <String, Object?>{
@@ -1175,6 +1556,9 @@ Future<int> selfTest() async {
         'title': '底座',
         'status': 'queued',
         'priority': 10,
+        'brief': '实现底座 A',
+        'acceptance': <String>['A 可用'],
+        'write_scope': <String>['lib/a.dart'],
       },
     });
     await call('task-b', 'production.task.create', <String, Object?>{
@@ -1185,6 +1569,9 @@ Future<int> selfTest() async {
         'status': 'queued',
         'priority': 50,
         'depends_on': <String>['A'],
+        'brief': '在 A 上实现 B',
+        'acceptance': <String>['B 可用'],
+        'write_scope': <String>['lib/b.dart'],
       },
     });
     await call('task-c', 'production.task.create', <String, Object?>{
@@ -1194,6 +1581,9 @@ Future<int> selfTest() async {
         'title': '独立',
         'status': 'queued',
         'priority': 50,
+        'brief': '实现 C',
+        'acceptance': <String>['C 可用'],
+        'write_scope': <String>['lib/c.dart'],
       },
     });
     check.that(
@@ -1222,13 +1612,15 @@ Future<int> selfTest() async {
       '申报全部 REST 路由（读 + 写）',
     );
     final List<String> declaredMethods = <String>[
-      for (final dynamic route in declaredRoutes) asString(asMap(route)['method']),
+      for (final dynamic route in declaredRoutes)
+        asString(asMap(route)['method']),
     ]..sort();
-    check.check(
-      <String>{...declaredMethods}.toList()..sort(),
-      <String>['DELETE', 'GET', 'PATCH', 'POST'],
-      '申报覆盖 GET / POST / PATCH / DELETE',
-    );
+    check.check(<String>{...declaredMethods}.toList()..sort(), <String>[
+      'DELETE',
+      'GET',
+      'PATCH',
+      'POST',
+    ], '申报覆盖 GET / POST / PATCH / DELETE');
 
     final Map<String, dynamic> restLines = await rest(
       'rest-lines',
@@ -1274,11 +1666,7 @@ Future<int> selfTest() async {
       'GET',
       '/api/production/lines/pl_demo/artifacts',
     );
-    check.check(
-      restArtifacts['status'],
-      200,
-      'REST 产物树 200（未配工作空间也给空树）',
-    );
+    check.check(restArtifacts['status'], 200, 'REST 产物树 200（未配工作空间也给空树）');
     final Map<String, dynamic> restMissing = await rest(
       'rest-missing',
       'GET',
@@ -1291,8 +1679,14 @@ Future<int> selfTest() async {
       'rest-create',
       'POST',
       linesPattern,
-      body: <String, Object?>{'id': 'pl_rest', 'name': 'REST 写'},
+      body: <String, Object?>{
+        'id': 'pl_rest',
+        'name': 'REST 写',
+        'workspace_dir': demoWs.path,
+        'executor': <String, Object?>{'agent_id': 'agt_demo'},
+      },
     );
+    markReady('pl_rest');
     check.check(restCreate['status'], 200, 'POST /api/production/lines 200');
     check.check(
       asMap(asMap(restCreate['json'])['line'])['id'],
@@ -1318,6 +1712,8 @@ Future<int> selfTest() async {
         'id': 'RT1',
         'title': 'REST 任务',
         'status': 'queued',
+        'brief': 'REST 建任务',
+        'acceptance': <String>['可列出'],
         'write_scope': <String>['lib/a.dart'],
       },
     );
@@ -1390,9 +1786,12 @@ Future<int> selfTest() async {
     check.check(restDelete['json']['deleted'], true, 'DELETE 产线');
     check.that(
       !Directory(
-        <String>[temp.path, 'production_lines', 'production', 'pl_rest'].join(
-          Platform.pathSeparator,
-        ),
+        <String>[
+          temp.path,
+          'production_lines',
+          'production',
+          'pl_rest',
+        ].join(Platform.pathSeparator),
       ).existsSync(),
       '产线数据目录已删（项目资产不在数据根内）',
     );
@@ -1412,31 +1811,23 @@ Future<int> selfTest() async {
       'B',
       'B 因依赖被跳过',
     );
-    check.check(
-      nextPayload['queue'],
-      <String>['B', 'C', 'A'],
-      '队列按 priority / created_at / id 排序',
-    );
+    check.check(nextPayload['queue'], <String>[
+      'B',
+      'C',
+      'A',
+    ], '队列按 priority / created_at / id 排序');
 
     // 非法迁移与 blocked 理由。
     final Map<String, dynamic> illegal = await call(
       'illegal',
       'production.task.transition',
-      <String, Object?>{
-        'line_id': 'pl_demo',
-        'task_id': 'A',
-        'to': 'done',
-      },
+      <String, Object?>{'line_id': 'pl_demo', 'task_id': 'A', 'to': 'done'},
     );
     check.check(illegal['code'], 'invalid_transition', 'queued → done 非法');
     final Map<String, dynamic> noReason = await call(
       'blocked-no-reason',
       'production.task.transition',
-      <String, Object?>{
-        'line_id': 'pl_demo',
-        'task_id': 'A',
-        'to': 'blocked',
-      },
+      <String, Object?>{'line_id': 'pl_demo', 'task_id': 'A', 'to': 'blocked'},
     );
     check.check(noReason['code'], 'reason_required', 'blocked 必须带理由');
     await call('blocked', 'production.task.transition', <String, Object?>{
@@ -1464,11 +1855,7 @@ Future<int> selfTest() async {
         'production.task.transition',
         <String, Object?>{'line_id': 'pl_demo', 'task_id': 'A', 'to': to},
       );
-      check.check(
-        asMap(payloadOf(reply)['task'])['status'],
-        to,
-        'A → $to',
-      );
+      check.check(asMap(payloadOf(reply)['task'])['status'], to, 'A → $to');
     }
     final Map<String, dynamic> afterDone = payloadOf(
       await call('queue-next-2', 'production.queue.next', <String, Object?>{
@@ -1519,9 +1906,7 @@ Future<int> selfTest() async {
     check.check(asMap(cTask['task'])['status'], 'queued', 'C 已回 queued');
 
     // 索引：损坏后重建一次，第二次 0 写。
-    final File stateFile = File(
-      '$lineRoot${Platform.pathSeparator}state.json',
-    );
+    final File stateFile = File('$lineRoot${Platform.pathSeparator}state.json');
     stateFile.writeAsStringSync('{"broken": true}');
     final Map<String, dynamic> rebuilt = payloadOf(
       await call('rebuild', 'production.queue.rebuild', <String, Object?>{
@@ -1535,11 +1920,10 @@ Future<int> selfTest() async {
       }),
     );
     check.check(rebuiltAgain['changed'], false, '重建幂等（第二次 0 写）');
-    check.check(
-      jsonDecode(stateFile.readAsStringSync())['queue'],
-      <String>['B', 'C'],
-      'state.queue 与 task.yaml 对齐（A 已 done）',
-    );
+    check.check(jsonDecode(stateFile.readAsStringSync())['queue'], <String>[
+      'B',
+      'C',
+    ], 'state.queue 与 task.yaml 对齐（A 已 done）');
 
     // ── P3 准备阶段：假 docnorm / llm / settings，跑完整窗口 → 落档 ──
     final String ws = '${temp.path}${Platform.pathSeparator}ws';
@@ -1553,29 +1937,43 @@ Future<int> selfTest() async {
       final String command = asString(params['command']);
       switch (command) {
         case 'storage.ensure':
-          return <String, dynamic>{'ok': true, 'payload': <String, dynamic>{'ok': true}};
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{'ok': true},
+          };
         case 'storage.put':
           dedupDb['${asMap(params['arguments'])['collection']}\u0000'
-              '${asMap(params['arguments'])['key']}'] =
-              asMap(asMap(params['arguments'])['value']);
-          return <String, dynamic>{'ok': true, 'payload': <String, dynamic>{'ok': true}};
+              '${asMap(params['arguments'])['key']}'] = asMap(
+            asMap(params['arguments'])['value'],
+          );
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{'ok': true},
+          };
         case 'storage.get':
           return <String, dynamic>{
             'ok': true,
             'payload': <String, dynamic>{
               'ok': true,
-              'value': dedupDb['${asMap(params['arguments'])['collection']}\u0000'
-                  '${asMap(params['arguments'])['key']}'],
+              'value':
+                  dedupDb['${asMap(params['arguments'])['collection']}\u0000'
+                      '${asMap(params['arguments'])['key']}'],
             },
           };
         case 'storage.delete':
-          dedupDb.remove('${asMap(params['arguments'])['collection']}\u0000'
-              '${asMap(params['arguments'])['key']}');
-          return <String, dynamic>{'ok': true, 'payload': <String, dynamic>{'ok': true}};
+          dedupDb.remove(
+            '${asMap(params['arguments'])['collection']}\u0000'
+            '${asMap(params['arguments'])['key']}',
+          );
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{'ok': true},
+          };
         case 'storage.scan':
           final String prefix = asString(asMap(params['arguments'])['prefix']);
-          final String collection =
-              asString(asMap(params['arguments'])['collection']);
+          final String collection = asString(
+            asMap(params['arguments'])['collection'],
+          );
           final List<Map<String, Object?>> values = <Map<String, Object?>>[
             for (final MapEntry<String, Map<String, Object?>> entry
                 in dedupDb.entries)
@@ -1615,7 +2013,10 @@ Future<int> selfTest() async {
               dedupDb[key] = asMap(op['value']);
             }
           }
-          return <String, dynamic>{'ok': true, 'payload': <String, dynamic>{'ok': true}};
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{'ok': true},
+          };
         case 'settings.list':
           return <String, dynamic>{
             'ok': true,
@@ -1699,6 +2100,28 @@ Future<int> selfTest() async {
               },
             };
           }
+          if (text.contains('需求摘要员')) {
+            return <String, dynamic>{
+              'ok': true,
+              'payload': <String, dynamic>{
+                'json': <String, Object?>{
+                  'requirement_summary': '会话列表能按项目过滤',
+                  'keywords': <String, Object?>{
+                    'terms': <String>['会话列表', '项目过滤'],
+                    'synonyms': <String>['筛选'],
+                    'entities': <String>['Agent'],
+                    'files': <String>['lib/ui/agent_list.dart'],
+                    'apis': <String>[],
+                  },
+                  'constraints': <String>['不改数据库'],
+                  'attachment_summaries': <Object?>[],
+                  'ambiguities': <String>[],
+                },
+                'text': '{}',
+                'model': 'fake',
+              },
+            };
+          }
           if (text.contains('侦查员')) {
             return <String, dynamic>{
               'ok': true,
@@ -1742,14 +2165,22 @@ Future<int> selfTest() async {
                   <String, Object?>{
                     'id': 'T1',
                     'title': '改列表',
+                    'task_type': 'code',
                     'acceptance': <String>['用例全绿'],
                     'write_scope': <String>['lib/ui/agent_list.dart'],
+                    'gate': <String, Object?>{
+                      'commands': <String>['dart test'],
+                    },
                   },
                   <String, Object?>{
                     'id': 'T2',
                     'title': '补测试',
+                    'task_type': 'test',
                     'depends_on': <String>['T1'],
                     'acceptance': <String>['新用例覆盖过滤'],
+                    'gate': <String, Object?>{
+                      'commands': <String>['dart test'],
+                    },
                   },
                 ],
               },
@@ -1845,9 +2276,7 @@ Future<int> selfTest() async {
               return <String, dynamic>{
                 'ok': true,
                 'payload': <String, dynamic>{
-                  'text': gitCalls.isOdd
-                      ? ''
-                      : ' M lib/ui/agent_list.dart',
+                  'text': gitCalls.isOdd ? '' : ' M lib/ui/agent_list.dart',
                   'is_error': false,
                   'exit_code': 0,
                 },
@@ -1863,10 +2292,7 @@ Future<int> selfTest() async {
             };
           }
         default:
-          return <String, dynamic>{
-            'ok': false,
-            'error': '假核心不认的站命令：$command',
-          };
+          return <String, dynamic>{'ok': false, 'error': '假核心不认的站命令：$command'};
       }
     });
 
@@ -1905,16 +2331,22 @@ Future<int> selfTest() async {
     check.check(reconReply['dropped'], 3, '超限问题被截断且计数可见');
     check.that(
       File(
-        <String>[ws, 'docs', 'production_lines', 'pl_prep', 'recon.md'].join(
-          Platform.pathSeparator,
-        ),
+        <String>[
+          ws,
+          'docs',
+          'production_lines',
+          'pl_prep',
+          'recon.md',
+        ].join(Platform.pathSeparator),
       ).existsSync(),
       'recon.md 落项目资产',
     );
 
-    await call('prep-close', 'production.prepare.window.close', <String, Object?>{
-      'line_id': 'pl_prep',
-    });
+    await call(
+      'prep-close',
+      'production.prepare.window.close',
+      <String, Object?>{'line_id': 'pl_prep'},
+    );
     final Map<String, dynamic> blocked = await call(
       'prep-finalize-blocked',
       'production.prepare.finalize',
@@ -1936,16 +2368,13 @@ Future<int> selfTest() async {
     check.check(recommended['ready'], true, '答完即可落档');
 
     final Map<String, dynamic> finalized = payloadOf(
-      await call('prep-finalize', 'production.prepare.finalize', <String, Object?>{
-        'line_id': 'pl_prep',
-        'task_id': 'T_prep',
-      }),
+      await call(
+        'prep-finalize',
+        'production.prepare.finalize',
+        <String, Object?>{'line_id': 'pl_prep', 'task_id': 'T_prep'},
+      ),
     );
-    check.check(
-      asMap(finalized['task'])['status'],
-      'scoped',
-      '准备任务落档后 scoped',
-    );
+    check.check(asMap(finalized['task'])['status'], 'scoped', '准备任务落档后 scoped');
     check.check(
       (finalized['created_tasks'] as List<dynamic>).length,
       2,
@@ -1953,14 +2382,19 @@ Future<int> selfTest() async {
     );
     check.that(
       File(
-        <String>[ws, 'docs', 'production_lines', 'pl_prep', 'plan.md'].join(
-          Platform.pathSeparator,
-        ),
+        <String>[
+          ws,
+          'docs',
+          'production_lines',
+          'pl_prep',
+          'plan.md',
+        ].join(Platform.pathSeparator),
       ).existsSync(),
       'plan.md 落项目资产',
     );
 
     // ── P4 执行阶段：假员工 + 假本机命令，打包 → 执行 → 门控 → done ──
+    markReady('pl_prep');
     final Map<String, dynamic> packed = payloadOf(
       await call(
         'p4-pack',
@@ -1970,11 +2404,7 @@ Future<int> selfTest() async {
       ),
     );
     check.check(packed['status'], 'packed', 'P4 打包 → packed');
-    check.check(
-      asMap(packed['task'])['status'],
-      'packed',
-      'T1 状态 = packed',
-    );
+    check.check(asMap(packed['task'])['status'], 'packed', 'T1 状态 = packed');
     check.that(
       File(
         <String>[
@@ -2003,11 +2433,7 @@ Future<int> selfTest() async {
       ).existsSync(),
       'pack.md 落项目资产',
     );
-    check.check(
-      workerCalls.length,
-      1,
-      '打包调用一次员工',
-    );
+    check.check(workerCalls.length, 1, '打包调用一次员工');
     check.check(workerCalls.first['role'], 'packer', '打包角色 = packer');
     check.that(
       (workerCalls.first['tools'] as List<dynamic>).contains('read') &&
@@ -2016,19 +2442,13 @@ Future<int> selfTest() async {
     );
 
     final Map<String, dynamic> executed = payloadOf(
-      await call(
-        'p4-run',
-        'production.task.run',
-        <String, Object?>{'line_id': 'pl_prep', 'task_id': 'T1'},
-        agent: 'agt',
-      ),
+      await call('p4-run', 'production.task.run', <String, Object?>{
+        'line_id': 'pl_prep',
+        'task_id': 'T1',
+      }, agent: 'agt'),
     );
     check.check(executed['status'], 'done', 'P4 门控通过 → done');
-    check.check(
-      asMap(executed['task'])['status'],
-      'done',
-      'T1 状态 = done',
-    );
+    check.check(asMap(executed['task'])['status'], 'done', 'T1 状态 = done');
     check.check(
       asMap((executed['gate'] as List<dynamic>).single)['exit_code'],
       0,
@@ -2060,6 +2480,8 @@ Future<int> selfTest() async {
         'id': 'T3',
         'title': '身份校验用',
         'status': 'queued',
+        'brief': '身份校验',
+        'acceptance': <String>['能被拒绝'],
         'write_scope': <String>['lib/x.dart'],
       },
     });
@@ -2089,7 +2511,11 @@ Future<int> selfTest() async {
         asMap(collectReply['payload'])['tools'] as List<dynamic>? ??
         <dynamic>[];
     check.check(collected.length, 1, '向 tree.agent 收集站贡献 1 个工具');
-    check.check(asMap(collected.first)['name'], kAskExpertTool, '贡献的是 ask_expert');
+    check.check(
+      asMap(collected.first)['name'],
+      kAskExpertTool,
+      '贡献的是 ask_expert',
+    );
 
     // 默认关闭（pl_prep 是默认 roles.expert.enabled=false）。
     final Map<String, dynamic> expertOff = await call(
@@ -2122,12 +2548,15 @@ Future<int> selfTest() async {
         },
       },
     });
+    markReady('pl_expert');
     await call('p5-task', 'production.task.create', <String, Object?>{
       'line_id': 'pl_expert',
       'task': <String, Object?>{
         'id': 'E1',
         'title': '问专家',
         'status': 'queued',
+        'brief': '问专家 X',
+        'acceptance': <String>['拿到结论'],
         'write_scope': <String>['lib/a.dart'],
       },
     });
@@ -2185,11 +2614,7 @@ Future<int> selfTest() async {
       },
       agent: 'agt',
     );
-    check.check(
-      expertOver['code'],
-      'expert_limit_exceeded',
-      '超限拒绝（2/2）',
-    );
+    check.check(expertOver['code'], 'expert_limit_exceeded', '超限拒绝（2/2）');
     final Map<String, dynamic> expertNested = await call(
       'p5-nested',
       'production.task.expert',
@@ -2201,11 +2626,7 @@ Future<int> selfTest() async {
       },
       agent: 'agt',
     );
-    check.check(
-      expertNested['code'],
-      'expert_not_allowed',
-      '专家不能再召专家',
-    );
+    check.check(expertNested['code'], 'expert_not_allowed', '专家不能再召专家');
 
     // 专家工具表含 write ⇒ 直接拒绝（专家不落盘）。
     await call('p5-evil-line', 'production.line.create', <String, Object?>{
@@ -2219,12 +2640,15 @@ Future<int> selfTest() async {
         },
       },
     });
+    markReady('pl_evil');
     await call('p5-evil-task', 'production.task.create', <String, Object?>{
       'line_id': 'pl_evil',
       'task': <String, Object?>{
         'id': 'E2',
         'title': '越界',
         'status': 'queued',
+        'brief': '越界专家',
+        'acceptance': <String>['被拒绝'],
         'write_scope': <String>['lib/a.dart'],
       },
     });
@@ -2238,11 +2662,7 @@ Future<int> selfTest() async {
       },
       agent: 'agt',
     );
-    check.check(
-      expertEvil['code'],
-      'expert_tools_invalid',
-      '专家工具表不许有 write',
-    );
+    check.check(expertEvil['code'], 'expert_tools_invalid', '专家工具表不许有 write');
 
     // tools/call：非产线会话被拒；产线会话经执行站回到本插件。
     core.ask('p5-tool-bad', M.toolsCall, <String, dynamic>{
@@ -2295,15 +2715,12 @@ Future<int> selfTest() async {
     todoFile.parent.createSync(recursive: true);
     todoFile.writeAsStringSync('// TODO: 收尾\nclass X {}\n// FIXME: 边界\n');
     final String duplicateBody = 'x' * 2048;
-    File(
-      <String>[auditRoot, 'lib', 'dup_a.txt'].join(Platform.pathSeparator),
-    ).writeAsStringSync(duplicateBody);
-    File(
-      <String>[auditRoot, 'lib', 'dup_b.txt'].join(Platform.pathSeparator),
-    ).writeAsStringSync(duplicateBody);
-    File(
-      <String>[auditRoot, 'lib', 'big.txt'].join(Platform.pathSeparator),
-    ).writeAsStringSync('y' * 300000);
+    File(<String>[auditRoot, 'lib', 'dup_a.txt'].join(Platform.pathSeparator))
+        .writeAsStringSync(duplicateBody);
+    File(<String>[auditRoot, 'lib', 'dup_b.txt'].join(Platform.pathSeparator))
+        .writeAsStringSync(duplicateBody);
+    File(<String>[auditRoot, 'lib', 'big.txt'].join(Platform.pathSeparator))
+        .writeAsStringSync('y' * 300000);
     await call('audit-line', 'production.line.create', <String, Object?>{
       'id': 'pl_audit',
       'name': '项目整理',
@@ -2343,9 +2760,7 @@ Future<int> selfTest() async {
       4,
       '文档审计：缺 4 份项目记忆文档',
     );
-    final Map<String, dynamic> redundancy = asMap(
-      auditReport['redundancy'],
-    );
+    final Map<String, dynamic> redundancy = asMap(auditReport['redundancy']);
     check.check(
       (redundancy['duplicates'] as List<dynamic>? ?? <dynamic>[]).length,
       1,
@@ -2381,11 +2796,7 @@ Future<int> selfTest() async {
       true,
       'audit.md 含 TODO 台账',
     );
-    check.check(
-      todoFile.readAsStringSync(),
-      todoBefore,
-      '审计不改工作空间文件（只读）',
-    );
+    check.check(todoFile.readAsStringSync(), todoBefore, '审计不改工作空间文件（只读）');
 
     // ── P8 并行与预算：写域交叠拒绝并行 / 预算到点软停 ──
     await call('p8-line', 'production.line.create', <String, Object?>{
@@ -2394,6 +2805,7 @@ Future<int> selfTest() async {
       'workspace_dir': ws,
       'limits': <String, Object?>{'max_parallel_tasks': 2},
     });
+    markReady('pl_par');
     const Map<String, String> parallelScopes = <String, String>{
       'R1': 'lib/a',
       // 与 R1 目录交叠（lib/a/b.dart 落在 lib/a 下）⇒ 不允许并行。
@@ -2401,35 +2813,34 @@ Future<int> selfTest() async {
       'R3': 'lib/b',
     };
     for (final MapEntry<String, String> entry in parallelScopes.entries) {
-      await call('p8-task-${entry.key}', 'production.task.create', <String, Object?>{
-        'line_id': 'pl_par',
-        'task': <String, Object?>{
-          'id': entry.key,
-          'title': '并行 ${entry.key}',
-          'status': 'queued',
-          'write_scope': <String>[entry.value],
+      await call(
+        'p8-task-${entry.key}',
+        'production.task.create',
+        <String, Object?>{
+          'line_id': 'pl_par',
+          'task': <String, Object?>{
+            'id': entry.key,
+            'title': '并行 ${entry.key}',
+            'status': 'queued',
+            'brief': '并行 ${entry.key}',
+            'acceptance': <String>['可派发'],
+            'write_scope': <String>[entry.value],
+          },
         },
-      });
+      );
     }
     final Map<String, dynamic> planned = payloadOf(
       await call('p8-dispatch', 'production.queue.dispatch', <String, Object?>{
         'line_id': 'pl_par',
       }),
     );
-    check.check(
-      planned['batch_ids'],
-      <String>['R1', 'R3'],
-      '写域不相交的两个任务可并行',
-    );
+    check.check(planned['batch_ids'], <String>['R1', 'R3'], '写域不相交的两个任务可并行');
     check.check(planned['slots_free'], 2, '并行槽位读数（派发前）');
-    final Map<String, dynamic> overlapSkip = (planned['skipped'] as List<dynamic>)
-        .map((dynamic item) => asMap(item))
-        .firstWhere((Map<String, dynamic> item) => item['id'] == 'R2');
-    check.check(
-      overlapSkip['reason'],
-      'write_scope_overlap',
-      '写域交叠拒绝并行',
-    );
+    final Map<String, dynamic> overlapSkip =
+        (planned['skipped'] as List<dynamic>)
+            .map((dynamic item) => asMap(item))
+            .firstWhere((Map<String, dynamic> item) => item['id'] == 'R2');
+    check.check(overlapSkip['reason'], 'write_scope_overlap', '写域交叠拒绝并行');
     check.check(overlapSkip['with_task'], 'R1', '交叠对象可见');
     final Map<String, dynamic> limited = payloadOf(
       await call(
@@ -2452,12 +2863,15 @@ Future<int> selfTest() async {
         'expert': <String, Object?>{'model_id': 'fake/expert'},
       },
     });
+    markReady('pl_budget');
     await call('p8-budget-task', 'production.task.create', <String, Object?>{
       'line_id': 'pl_budget',
       'task': <String, Object?>{
         'id': 'B1',
         'title': '预算到点',
         'status': 'queued',
+        'brief': '预算到点',
+        'acceptance': <String>['软停'],
         'write_scope': <String>['lib/a.dart'],
       },
     });
@@ -2477,11 +2891,7 @@ Future<int> selfTest() async {
       'blocked',
       '软停后任务 blocked',
     );
-    check.check(
-      asMap(budgetPack['budget'])['exceeded'],
-      true,
-      '预算报告可见超限',
-    );
+    check.check(asMap(budgetPack['budget'])['exceeded'], true, '预算报告可见超限');
     final Map<String, dynamic> budgetReport = payloadOf(
       await call('p8-budget', 'production.task.budget', <String, Object?>{
         'line_id': 'pl_budget',
@@ -2495,11 +2905,7 @@ Future<int> selfTest() async {
       <String, Object?>{'line_id': 'pl_budget', 'task_id': 'B1'},
       agent: 'agt',
     );
-    check.check(
-      budgetAgain['code'],
-      'execute_state',
-      '软停后不静默继续（blocked 不再打包）',
-    );
+    check.check(budgetAgain['code'], 'execute_state', '软停后不静默继续（blocked 不再打包）');
 
     // ── D6-O 主控决策循环：一次 tick（stop）+ 游标 + 台账 ──
     await call('orch-line', 'production.line.create', <String, Object?>{
@@ -2512,21 +2918,22 @@ Future<int> selfTest() async {
         'executor': <String, Object?>{'model_id': 'fake/executor'},
       },
     });
+    markReady('pl_orch');
     await call('orch-task', 'production.task.create', <String, Object?>{
       'line_id': 'pl_orch',
       'task': <String, Object?>{
         'id': 'O1',
         'title': '主控停止',
         'status': 'queued',
+        'brief': '主控停止',
+        'acceptance': <String>['被停止'],
         'write_scope': <String>['lib/a.dart'],
       },
     });
     final Map<String, dynamic> orchTick = payloadOf(
-      await call(
-        'orch-tick',
-        'production.orchestrator.tick',
-        <String, Object?>{'line_id': 'pl_orch'},
-      ),
+      await call('orch-tick', 'production.orchestrator.tick', <String, Object?>{
+        'line_id': 'pl_orch',
+      }),
     );
     check.check(orchTick['status'], 'applied', '主控 tick 落盘');
     check.check(orchTick['action'], 'stop', '主控按回包执行 stop');
@@ -2571,9 +2978,9 @@ Future<int> selfTest() async {
       '主控决策落 runs 台账',
     );
     // ── P6+ 逻辑去重：首轮建基线，无变更二次 0 次 embedding ──
-    final String dedupWs =
-        '${temp.path}${Platform.pathSeparator}dedup_ws';
-    Directory('$dedupWs${Platform.pathSeparator}lib').createSync(recursive: true);
+    final String dedupWs = '${temp.path}${Platform.pathSeparator}dedup_ws';
+    Directory('$dedupWs${Platform.pathSeparator}lib')
+        .createSync(recursive: true);
     File('$dedupWs${Platform.pathSeparator}lib${Platform.pathSeparator}a.dart')
         .writeAsStringSync('''
 void alpha() {
@@ -2583,7 +2990,10 @@ void alpha() {
   }
 }
 ''');
-    Process.runSync('git', <String>['init', '--quiet'], workingDirectory: dedupWs);
+    Process.runSync('git', <String>[
+      'init',
+      '--quiet',
+    ], workingDirectory: dedupWs);
     Process.runSync('git', <String>['add', '-A'], workingDirectory: dedupWs);
     Process.runSync('git', <String>[
       '-c',

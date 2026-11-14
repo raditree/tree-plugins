@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:test/test.dart';
 import 'package:tree_production_line/tree_production_line.dart';
 
+import 'support/structure_fixture.dart';
+
 /// 假主控模型：按 [replies] 顺序回包；[gate] 非空时先等它放行（并发测试）。
 class _Llm {
   final List<Map<String, Object?>> replies = <Map<String, Object?>>[];
@@ -56,7 +58,7 @@ void main() {
   late OrchestratorService orchestrator;
   late DateTime now;
 
-  setUp(() {
+  setUp(() async {
     temp = Directory.systemTemp.createTempSync('tree_production_orch_');
     workspace = '${temp.path}${Platform.pathSeparator}ws';
     Directory(workspace).createSync(recursive: true);
@@ -92,6 +94,7 @@ void main() {
         'max_ticks_per_minute': 100,
       },
     });
+    await markLineReady(store, 'pl_t', temp, workspace: workspace);
   });
 
   tearDown(() {
@@ -209,6 +212,71 @@ void main() {
     final Map<String, Object?> idle = await tick(trigger: 'timer');
     expect(idle['reason'], 'idle');
     expect(llm.prompts.length, 1);
+  });
+
+  test('定时 tick：有 queued 任务时正常决策（不再因无在途任务跳过）', () async {
+    task('T1');
+    llm.replies.add(<String, Object?>{
+      'action': 'continue',
+      'reason': 'T1 可打包',
+      'task_ids': <String>['T1'],
+    });
+    final Map<String, Object?> result = await tick(trigger: 'timer');
+    expect(result['status'], 'applied');
+    expect(result['trigger'], 'timer');
+    expect(result['applied_tasks'], <String>['T1']);
+    expect(dispatcher.calls, <String>['pl_t/T1/pack']);
+    expect(llm.prompts.length, 1);
+  });
+
+  test('产线状态由后端投影：queued/在途=working，paused 优先，空线=idle', () async {
+    final ProductionService service = ProductionService(
+      environment: const <String, String>{},
+      clock: () => now,
+    );
+    Map<String, Object?> lineGet() => plainMap(
+      service.handle(
+        'production.line.get',
+        <String, Object?>{'line_id': 'pl_t'},
+        <String, Object?>{'data_dir': temp.path},
+        <String, Object?>{},
+      )['line'],
+    );
+
+    expect(lineGet()['status'], 'idle', reason: '没有任务 = 空闲');
+    task('T1');
+    expect(lineGet()['status'], 'working', reason: 'queued 任务 = 执行中');
+    final Map<String, Object?> list = service.handle(
+      'production.line.list',
+      <String, Object?>{},
+      <String, Object?>{'data_dir': temp.path},
+      <String, Object?>{},
+    );
+    expect(
+      plainMap((list['lines'] as List<dynamic>).single)['status'],
+      'working',
+    );
+    final Map<String, Object?> orchStatus = await call(
+      'production.orchestrator.status',
+      <String, Object?>{'line_id': 'pl_t'},
+    );
+    expect(orchStatus['status'], 'working');
+
+    // 走到终态：没有可推进任务 ⇒ idle。
+    for (final String to in <String>[
+      'packing',
+      'packed',
+      'running',
+      'gating',
+      'done',
+    ]) {
+      store.transition('pl_t', 'T1', to: to, reason: '夹具');
+    }
+    expect(lineGet()['status'], 'idle');
+
+    // 暂停优先于其它一切。
+    store.updateLine('pl_t', <String, Object?>{'status': 'paused'});
+    expect(lineGet()['status'], 'paused');
   });
 
   test('单线单 tick：已有 tick 在跑时新触发直接丢弃', () async {

@@ -3,6 +3,8 @@ import 'dart:io';
 import 'package:test/test.dart';
 import 'package:tree_production_line/tree_production_line.dart';
 
+import 'support/structure_fixture.dart';
+
 void main() {
   late Directory temp;
   late ProductionService service;
@@ -89,12 +91,17 @@ void main() {
     });
   });
 
-  test('命令门面走通建线 → 建任务 → 迁移 → 队列 → 恢复 → 台账', () {
+  test('命令门面走通建线 → 建任务 → 迁移 → 队列 → 恢复 → 台账', () async {
     final Map<String, Object?> line = call(
       'production.line.create',
       <String, Object?>{'id': 'pl_1', 'name': '标准开发流'},
     );
     expect((line['line'] as Map<String, Object?>)['id'], 'pl_1');
+    await markLineReady(
+      ProductionStore(dataRoot: temp.path, clock: () => fixed),
+      'pl_1',
+      temp,
+    );
 
     // 扁平参数与 `task` 子对象都接受。
     call('production.task.create', <String, Object?>{
@@ -102,6 +109,9 @@ void main() {
       'id': 'T1',
       'title': '底座',
       'status': 'queued',
+      'brief': '搭底座',
+      'acceptance': <String>['dart analyze 通过'],
+      'write_scope': <String>['lib/a'],
     });
     call('production.task.create', <String, Object?>{
       'line_id': 'pl_1',
@@ -109,6 +119,9 @@ void main() {
         'id': 'T2',
         'title': '后续',
         'status': 'queued',
+        'brief': '接后续',
+        'acceptance': <String>['测试全绿'],
+        'write_scope': <String>['lib/b'],
         'depends_on': <String>['T1'],
       },
     });

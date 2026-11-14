@@ -44,6 +44,200 @@ void main() {
     });
   });
 
+  group('理解摘要与双查询（§5.2）', () {
+    test('digest 提示词含需求五栏与附件元数据；缺 requirement_summary 拒绝', () {
+      final String prompt = digestUserPrompt(
+        intake: const <String, String>{
+          'goal': '会话列表能按项目过滤',
+          'current': '只有 flat 列表',
+          'acceptance': '选中项目后只剩该项目会话',
+          'forbidden': '不动数据库',
+          'deadline': '今天',
+        },
+        attachments: <Map<String, Object?>>[
+          <String, Object?>{
+            'id': 'A1',
+            'name': 'design.png',
+            'mime': 'image/png',
+            'size': 245760,
+          },
+        ],
+      );
+      expect(prompt, contains('目标：会话列表能按项目过滤'));
+      expect(prompt, contains('现状：只有 flat 列表'));
+      expect(prompt, contains('验收：选中项目后只剩该项目会话'));
+      expect(prompt, contains('禁区：不动数据库'));
+      expect(prompt, contains('期限：今天'));
+      expect(prompt, contains('id=A1'));
+      expect(prompt, contains('name=design.png'));
+      expect(prompt, contains('mime=image/png'));
+      expect(digestSystemPrompt(), contains('不要调用工具'));
+
+      final Digest digest = parseDigestJson(<String, Object?>{
+        'requirement_summary': '让会话列表按项目过滤',
+        'keywords': <String, Object?>{
+          'terms': <String>['会话列表', '项目过滤'],
+          'synonyms': <String>['session list'],
+          'entities': <String>['AgentList'],
+          'files': <String>['lib/ui/agent_list.dart'],
+          'apis': <String>['SessionFilter'],
+        },
+        'constraints': <String>['不动数据库'],
+        'attachment_summaries': <Object?>[
+          <String, Object?>{
+            'id': 'A1',
+            'summary': '左栏设计稿',
+            'keywords': <String>['项目下拉'],
+            'status': 'vision',
+          },
+        ],
+        'ambiguities': <String>['过滤状态是否持久化'],
+      });
+      expect(digest.requirementSummary, '让会话列表按项目过滤');
+      expect(
+        digest.keywords.all,
+        containsAll(<String>['会话列表', 'AgentList', 'SessionFilter']),
+      );
+      expect(digest.attachmentSummaries.single.keywords, <String>['项目下拉']);
+      expect(digest.ambiguities, <String>['过滤状态是否持久化']);
+      expect(
+        () => parseDigestJson(const <String, Object?>{}),
+        throwsA(
+          isA<ProductionFailure>().having(
+            (ProductionFailure e) => e.code,
+            'code',
+            'digest_empty',
+          ),
+        ),
+      );
+    });
+
+    test('查询 A 用原文、查询 B 用关键词；RRF 按 doc+heading 去重并截到 8', () {
+      final String queryA = requirementSearchQuery(const <String, String>{
+        'goal': '会话列表能按项目过滤',
+        'acceptance': '选中项目后只剩该项目会话',
+      });
+      expect(queryA, contains('目标：会话列表能按项目过滤'));
+      expect(queryA, contains('验收：选中项目后只剩该项目会话'));
+
+      const Digest digest = Digest(
+        requirementSummary: '让会话列表按项目过滤',
+        keywords: DigestKeywords(
+          terms: <String>['会话列表'],
+          entities: <String>['AgentList'],
+        ),
+      );
+      final String queryB = digestSearchQuery(digest);
+      expect(queryB, contains('会话列表'));
+      expect(queryB, contains('AgentList'));
+
+      final List<Map<String, Object?>> primary = <Map<String, Object?>>[
+        for (int i = 1; i <= 10; i++)
+          <String, Object?>{
+            'doc': 'docs/d$i.md',
+            'heading': 'H',
+            'snippet': 's$i',
+          },
+        <String, Object?>{
+          'doc': 'docs/d1.md',
+          'heading': 'H',
+          'snippet': 'dup',
+        },
+      ];
+      final List<ReconEvidence> evidence = mergeRetrievalEvidence(
+        primary: primary,
+        secondary: <Map<String, Object?>>[
+          <String, Object?>{
+            'doc': 'docs/d1.md',
+            'heading': 'H',
+            'snippet': 's1',
+          },
+          <String, Object?>{
+            'doc': 'docs/d2.md',
+            'heading': 'H2',
+            'snippet': 's2',
+          },
+        ],
+      );
+      expect(evidence, hasLength(8));
+      expect(evidence.first.id, 'E1');
+      final ReconEvidence shared = evidence.firstWhere(
+        (ReconEvidence item) =>
+            item.path == 'docs/d1.md' && item.heading == 'H',
+      );
+      expect(shared.queries, containsAll(<String>['A', 'B']));
+      expect(
+        evidence.where(
+          (ReconEvidence item) =>
+              item.path == 'docs/d1.md' && item.heading == 'H',
+        ),
+        hasLength(1),
+      );
+    });
+
+    test('旧 recon JSON 无 evidence_ids 仍可解析；缺失证据标 unknown，伪证据被丢弃', () {
+      final ReconDraft old = parseReconJson(<String, Object?>{
+        'regular': <Object?>['改列表'],
+        'questions': <Object?>[
+          <String, Object?>{
+            'text': '要不要分页',
+            'default': '不',
+            'recommended': '是',
+            'consequence': '不分页会更慢',
+          },
+        ],
+      }, maxQuestions: 3);
+      expect(old.regular.single.evidenceIds, isEmpty);
+      expect(old.regular.single.unknown, isTrue);
+      expect(old.questions.single.evidenceIds, isEmpty);
+
+      final ReconDraft draft = parseReconJson(
+        <String, Object?>{
+          'regular': <Object?>[
+            <String, Object?>{
+              'text': '有证据的要求',
+              'evidence_ids': <String>['E1', 'E9'],
+            },
+            <String, Object?>{'text': '没有证据的要求'},
+          ],
+          'questions': <Object?>[
+            <String, Object?>{
+              'text': '带证据的问题',
+              'evidence_ids': <String>['E2', 'E9'],
+            },
+          ],
+        },
+        maxQuestions: 3,
+        knownEvidence: <String>{'E1', 'E2'},
+      );
+      expect(draft.regular.first.evidenceIds, <String>['E1']);
+      expect(draft.regular.first.unknown, isFalse);
+      expect(draft.regular.last.evidenceIds, isEmpty);
+      expect(draft.regular.last.unknown, isTrue);
+      expect(draft.questions.single.evidenceIds, <String>['E2']);
+      expect(
+        (draft.toJson()['regular'] as List<dynamic>).last,
+        containsPair('unknown', true),
+      );
+
+      // 本次检索为空（空集合而非 null）时，模型自造的 evidence_id 一律丢弃。
+      final ReconDraft noEvidence = parseReconJson(
+        <String, Object?>{
+          'regular': <Object?>[
+            <String, Object?>{
+              'text': '凭空引用',
+              'evidence_ids': <String>['E1'],
+            },
+          ],
+        },
+        maxQuestions: 3,
+        knownEvidence: const <String>{},
+      );
+      expect(noEvidence.regular.single.evidenceIds, isEmpty);
+      expect(noEvidence.regular.single.unknown, isTrue);
+    });
+  });
+
   group('侦查解析（§8.3）', () {
     test('行序即编号；flags 截到 8；超限问题计数', () {
       final ReconDraft draft = parseReconJson(<String, Object?>{
@@ -137,7 +331,9 @@ void main() {
             limit: 2,
           );
       // 未答 1 条 ⇒ 新额度 1；"旧问题"重复、只剩 A 入选，B 被截断。
-      expect(planned.added.map((ReconQuestionSpec q) => q.text), <String>['新问题 A']);
+      expect(planned.added.map((ReconQuestionSpec q) => q.text), <String>[
+        '新问题 A',
+      ]);
       expect(planned.dropped, 1);
       expect(nextQuestionId(<String>['Q1', 'Q3']), 'Q4');
     });
@@ -202,8 +398,16 @@ void main() {
       expect(
         () => parseScopeJson(<String, Object?>{
           'tasks': <Object?>[
-            <String, Object?>{'id': 'T1', 'title': 'a', 'acceptance': <String>['x']},
-            <String, Object?>{'id': 'T1', 'title': 'b', 'acceptance': <String>['y']},
+            <String, Object?>{
+              'id': 'T1',
+              'title': 'a',
+              'acceptance': <String>['x'],
+            },
+            <String, Object?>{
+              'id': 'T1',
+              'title': 'b',
+              'acceptance': <String>['y'],
+            },
           ],
         }),
         failure('plan_incomplete'),
@@ -225,21 +429,34 @@ void main() {
 
   group('台账重放', () {
     test('同任务 answer 覆盖；不同任务的 Q1 不串号', () {
-      final List<QuestionState> questions = replayQuestions(<Map<String, Object?>>[
-        <String, Object?>{
-          'type': 'question', 'task_id': 'T0', 'qid': 'Q1', 'text': 'A',
-          'round': 1, 'window_id': 'win_1',
-        },
-        <String, Object?>{
-          'type': 'question', 'task_id': 'T9', 'qid': 'Q1', 'text': 'B',
-          'round': 1, 'window_id': 'win_1',
-        },
-        <String, Object?>{
-          'type': 'answer', 'task_id': 'T0', 'qid': 'Q1', 'value': '选了 A',
-          'source': '用户回答',
-        },
-        <String, Object?>{'type': 'window', 'id': 'win_1'},
-      ]);
+      final List<QuestionState> questions = replayQuestions(
+        <Map<String, Object?>>[
+          <String, Object?>{
+            'type': 'question',
+            'task_id': 'T0',
+            'qid': 'Q1',
+            'text': 'A',
+            'round': 1,
+            'window_id': 'win_1',
+          },
+          <String, Object?>{
+            'type': 'question',
+            'task_id': 'T9',
+            'qid': 'Q1',
+            'text': 'B',
+            'round': 1,
+            'window_id': 'win_1',
+          },
+          <String, Object?>{
+            'type': 'answer',
+            'task_id': 'T0',
+            'qid': 'Q1',
+            'value': '选了 A',
+            'source': '用户回答',
+          },
+          <String, Object?>{'type': 'window', 'id': 'win_1'},
+        ],
+      );
       expect(questions, hasLength(2));
       final QuestionState first = questions.firstWhere(
         (QuestionState q) => q.taskId == 'T0',
@@ -258,9 +475,7 @@ void main() {
       regular: const <ReconPoint>[
         ReconPoint(text: '改列表', note: 'lib/ui/agent_list.dart'),
       ],
-      special: const <ReconPoint>[
-        ReconPoint(text: '本地模型', note: '云端延迟高'),
-      ],
+      special: const <ReconPoint>[ReconPoint(text: '本地模型', note: '云端延迟高')],
       questions: const <ReconQuestionSpec>[],
       fallbacks: const <ReconPoint>[ReconPoint(text: '退回云端')],
       notes: const <ReconPoint>[ReconPoint(text: '数据库不可动')],

@@ -95,18 +95,321 @@ int clampQuestionLimit(Object? raw) {
   return value;
 }
 
+// ── 理解摘要与双查询证据（§5.2）────────────────────────────────────
+
+/// LLM #1 的关键词分组：查询 B 的原料（原文查询走查询 A）。
+class DigestKeywords {
+  const DigestKeywords({
+    this.terms = const <String>[],
+    this.synonyms = const <String>[],
+    this.entities = const <String>[],
+    this.files = const <String>[],
+    this.apis = const <String>[],
+  });
+
+  final List<String> terms;
+  final List<String> synonyms;
+  final List<String> entities;
+  final List<String> files;
+  final List<String> apis;
+
+  bool get isEmpty =>
+      terms.isEmpty &&
+      synonyms.isEmpty &&
+      entities.isEmpty &&
+      files.isEmpty &&
+      apis.isEmpty;
+
+  /// 去重后的全部关键词（保持模型给出的顺序）。
+  List<String> get all {
+    final List<String> out = <String>[];
+    final Set<String> seen = <String>{};
+    for (final String value in <String>[
+      ...terms,
+      ...synonyms,
+      ...entities,
+      ...files,
+      ...apis,
+    ]) {
+      if (seen.add(value)) out.add(value);
+    }
+    return out;
+  }
+
+  Map<String, Object?> toJson() => <String, Object?>{
+    'terms': terms,
+    'synonyms': synonyms,
+    'entities': entities,
+    'files': files,
+    'apis': apis,
+  };
+}
+
+/// 一条附件摘要（LLM #1 产出；附件正文/图片本体不进入上下文包）。
+class DigestAttachment {
+  const DigestAttachment({
+    required this.id,
+    required this.summary,
+    required this.status,
+    this.keywords = const <String>[],
+  });
+
+  final String id;
+  final String summary;
+  final String status;
+  final List<String> keywords;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+    'id': id,
+    'summary': summary,
+    'status': status,
+    'keywords': keywords,
+  };
+}
+
+/// LLM #1 的严格摘要产物（§5.2.2）。
+class Digest {
+  const Digest({
+    required this.requirementSummary,
+    required this.keywords,
+    this.constraints = const <String>[],
+    this.attachmentSummaries = const <DigestAttachment>[],
+    this.ambiguities = const <String>[],
+  });
+
+  final String requirementSummary;
+  final DigestKeywords keywords;
+  final List<String> constraints;
+  final List<DigestAttachment> attachmentSummaries;
+  final List<String> ambiguities;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+    'requirement_summary': requirementSummary,
+    'keywords': keywords.toJson(),
+    'constraints': constraints,
+    'attachment_summaries': <Map<String, Object?>>[
+      for (final DigestAttachment attachment in attachmentSummaries)
+        attachment.toJson(),
+    ],
+    'ambiguities': ambiguities,
+  };
+}
+
+/// 解析 LLM #1 的 JSON；缺 `requirement_summary` ⇒ `digest_empty`（fail-closed）。
+Digest parseDigestJson(Map<String, Object?> json) {
+  final String summary = textOf(json['requirement_summary']);
+  if (summary.isEmpty) {
+    throw ProductionFailure(
+      '摘要结果缺少 requirement_summary（拒绝凭空检索）',
+      code: 'digest_empty',
+    );
+  }
+  final Map<String, Object?> rawKeywords = plainMap(json['keywords']);
+  final List<DigestAttachment> attachments = <DigestAttachment>[];
+  final Object? rawAttachments = json['attachment_summaries'];
+  if (rawAttachments is List) {
+    for (final Object? item in rawAttachments) {
+      if (item is! Map) continue;
+      final Map<String, Object?> map = plainMap(item);
+      final String id = textOf(map['id']);
+      final String text = textOf(map['summary']);
+      if (id.isEmpty && text.isEmpty) continue;
+      attachments.add(
+        DigestAttachment(
+          id: id,
+          summary: text,
+          status: textOf(map['status']),
+          keywords: stringsOf(map['keywords']),
+        ),
+      );
+    }
+  }
+  return Digest(
+    requirementSummary: summary,
+    keywords: DigestKeywords(
+      terms: stringsOf(rawKeywords['terms']),
+      synonyms: stringsOf(rawKeywords['synonyms']),
+      entities: stringsOf(rawKeywords['entities']),
+      files: stringsOf(rawKeywords['files']),
+      apis: stringsOf(rawKeywords['apis']),
+    ),
+    constraints: stringsOf(json['constraints']),
+    attachmentSummaries: attachments,
+    ambiguities: stringsOf(json['ambiguities']),
+  );
+}
+
+/// 查询 A：需求原文（五栏中非空项，保留用户原始意图）。
+String requirementSearchQuery(Map<String, String> intake) {
+  final List<String> parts = <String>[];
+  const Map<String, String> labels = <String, String>{
+    'goal': '目标',
+    'current': '现状',
+    'acceptance': '验收',
+    'forbidden': '禁区',
+    'deadline': '期限',
+  };
+  for (final MapEntry<String, String> entry in labels.entries) {
+    final String value = textOf(intake[entry.key]);
+    if (value.isNotEmpty) parts.add('${entry.value}：$value');
+  }
+  return parts.join('\n');
+}
+
+/// 查询 B：LLM #1 的关键词（含附件摘要关键词）；为空时退回一句话摘要。
+String digestSearchQuery(Digest digest) {
+  final List<String> values = <String>[...digest.keywords.all];
+  for (final DigestAttachment attachment in digest.attachmentSummaries) {
+    values.addAll(attachment.keywords);
+  }
+  final List<String> out = <String>[];
+  final Set<String> seen = <String>{};
+  for (final String value in values) {
+    final String text = value.trim();
+    if (text.isEmpty || !seen.add(text)) continue;
+    out.add(text);
+  }
+  return out.isEmpty ? digest.requirementSummary : out.join(' ');
+}
+
+/// 一条检索证据（带稳定 `evidence_id`，供 LLM #2 逐条引用）。
+class ReconEvidence {
+  const ReconEvidence({
+    required this.id,
+    required this.kind,
+    required this.path,
+    required this.heading,
+    required this.snippet,
+    required this.score,
+    required this.queries,
+    this.line = 0,
+  });
+
+  final String id;
+  final String kind;
+  final String path;
+  final String heading;
+  final String snippet;
+
+  /// RRF 合并分（只用于稳定排序，不冒充原始相似度）。
+  final double score;
+
+  /// 贡献该证据的查询（`A` 原文 / `B` 关键词）。
+  final List<String> queries;
+  final int line;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+    'id': id,
+    'kind': kind,
+    'path': path,
+    'heading': heading,
+    'snippet': snippet,
+    'score': score,
+    'queries': queries,
+    if (line > 0) 'line': line,
+  };
+}
+
+class _EvidenceMergeEntry {
+  _EvidenceMergeEntry(this.row);
+
+  final Map<String, Object?> row;
+  final List<String> queries = <String>[];
+  double score = 0;
+}
+
+/// 双查询 RRF 合并：按 `doc + heading` 去重，分数 1/(k+rank) 累加，
+/// 稳定排序后截到 [limit] 条，并分配 `E1…En`（确定性、可重放）。
+List<ReconEvidence> mergeRetrievalEvidence({
+  required List<Map<String, Object?>> primary,
+  required List<Map<String, Object?>> secondary,
+  int limit = 8,
+  int rrfK = 60,
+}) {
+  final Map<String, _EvidenceMergeEntry> byKey =
+      <String, _EvidenceMergeEntry>{};
+  void add(List<Map<String, Object?>> rows, String query) {
+    final Set<String> seen = <String>{};
+    for (int index = 0; index < rows.length; index++) {
+      final Map<String, Object?> row = rows[index];
+      final String doc = textOf(row['doc']).isNotEmpty
+          ? textOf(row['doc'])
+          : textOf(row['path']);
+      final String heading = textOf(row['heading']);
+      if (doc.isEmpty && heading.isEmpty) continue;
+      final String key = '$doc|$heading';
+      if (!seen.add(key)) continue;
+      final _EvidenceMergeEntry entry = byKey.putIfAbsent(
+        key,
+        () => _EvidenceMergeEntry(row),
+      );
+      entry.score += 1.0 / (rrfK + index + 1);
+      if (!entry.queries.contains(query)) entry.queries.add(query);
+    }
+  }
+
+  add(primary, 'A');
+  add(secondary, 'B');
+  final List<_EvidenceMergeEntry> entries = byKey.values.toList()
+    ..sort((_EvidenceMergeEntry a, _EvidenceMergeEntry b) {
+      final int byScore = b.score.compareTo(a.score);
+      if (byScore != 0) return byScore;
+      final String aDoc = textOf(a.row['doc']).isNotEmpty
+          ? textOf(a.row['doc'])
+          : textOf(a.row['path']);
+      final String bDoc = textOf(b.row['doc']).isNotEmpty
+          ? textOf(b.row['doc'])
+          : textOf(b.row['path']);
+      final int byDoc = aDoc.compareTo(bDoc);
+      if (byDoc != 0) return byDoc;
+      return textOf(a.row['heading']).compareTo(textOf(b.row['heading']));
+    });
+  final int cap = limit < 1 ? 8 : limit;
+  final List<ReconEvidence> out = <ReconEvidence>[];
+  for (int index = 0; index < entries.length && index < cap; index++) {
+    final Map<String, Object?> row = entries[index].row;
+    out.add(
+      ReconEvidence(
+        id: 'E${index + 1}',
+        kind: textOf(row['kind']).isEmpty ? 'doc' : textOf(row['kind']),
+        path: textOf(row['doc']).isNotEmpty
+            ? textOf(row['doc'])
+            : textOf(row['path']),
+        heading: textOf(row['heading']),
+        snippet: textOf(row['snippet']),
+        score: entries[index].score,
+        queries: entries[index].queries,
+        line: intOf(row['line'], 0),
+      ),
+    );
+  }
+  return out;
+}
+
 // ── 侦查四块（§8.3）────────────────────────────────────────────────
 
 /// 侦查里的一条（`R/S/F/N` 共用）：正文 + 附加说明（落点 / 为什么 / 风险）。
+///
+/// `unknown=true` 表示模型没有给出可核验的 `evidence_ids`：只能进「未知 / 待确认」，
+/// 不得当结论展示（AG-02）。
 class ReconPoint {
-  const ReconPoint({required this.text, this.note = ''});
+  const ReconPoint({
+    required this.text,
+    this.note = '',
+    this.evidenceIds = const <String>[],
+    this.unknown = false,
+  });
 
   final String text;
   final String note;
+  final List<String> evidenceIds;
+  final bool unknown;
 
   Map<String, Object?> toJson() => <String, Object?>{
     'text': text,
     if (note.isNotEmpty) 'note': note,
+    if (evidenceIds.isNotEmpty) 'evidence_ids': evidenceIds,
+    if (unknown) 'unknown': true,
   };
 }
 
@@ -117,6 +420,7 @@ class ReconQuestionSpec {
     required this.defaultValue,
     required this.recommended,
     required this.consequence,
+    this.evidenceIds = const <String>[],
   });
 
   final String text;
@@ -127,12 +431,14 @@ class ReconQuestionSpec {
 
   /// 不选后果（一句话）。
   final String consequence;
+  final List<String> evidenceIds;
 
   Map<String, Object?> toJson() => <String, Object?>{
     'text': text,
     'default': defaultValue,
     'recommended': recommended,
     'consequence': consequence,
+    if (evidenceIds.isNotEmpty) 'evidence_ids': evidenceIds,
   };
 }
 
@@ -181,7 +487,25 @@ class ReconDraft {
   };
 }
 
-List<ReconPoint> _pointsOf(Object? raw, {String textKey = 'text'}) {
+List<String> _evidenceIdsOf(
+  Map<String, Object?> map,
+  Set<String>? knownEvidence,
+) {
+  final Object? raw = map['evidence_ids'] ?? map['evidence_id'];
+  final List<String> ids = raw is List
+      ? stringsOf(raw)
+      : (textOf(raw).isEmpty ? const <String>[] : <String>[textOf(raw)]);
+  return <String>[
+    for (final String id in ids)
+      if (knownEvidence == null || knownEvidence.contains(id)) id,
+  ];
+}
+
+List<ReconPoint> _pointsOf(
+  Object? raw, {
+  String textKey = 'text',
+  Set<String>? knownEvidence,
+}) {
   final List<Object?> list = raw is List ? raw : const <Object?>[];
   final List<ReconPoint> out = <ReconPoint>[];
   for (final Object? item in list) {
@@ -196,10 +520,22 @@ List<ReconPoint> _pointsOf(Object? raw, {String textKey = 'text'}) {
               textOf(map['why']),
               textOf(map['risk']),
             ].firstWhere((String value) => value.isNotEmpty, orElse: () => ''));
-      out.add(ReconPoint(text: text, note: note));
+      final List<String> evidenceIds = _evidenceIdsOf(map, knownEvidence);
+      out.add(
+        ReconPoint(
+          text: text,
+          note: note,
+          evidenceIds: evidenceIds,
+          // 证据先于结论：没有可核验 evidence_id 的条目只能进「未知 / 待确认」。
+          unknown: map['unknown'] == true || evidenceIds.isEmpty,
+        ),
+      );
     } else {
       final String text = textOf(item);
-      if (text.isNotEmpty) out.add(ReconPoint(text: text));
+      if (text.isNotEmpty) {
+        // 纯字符串是旧模型输出：没有 evidence_ids ⇒ 标未证实，不直接当结论。
+        out.add(ReconPoint(text: text, unknown: true));
+      }
     }
   }
   return out;
@@ -207,13 +543,21 @@ List<ReconPoint> _pointsOf(Object? raw, {String textKey = 'text'}) {
 
 /// 解析模型的侦查 JSON；**行序即编号**，渲染时统一重排为 R1…/S1…/Q1…/F1…/N1…
 ///
+/// [knownEvidence] 非 null 时只接受其中的 `evidence_id`（传空集合 = 本次没有
+/// 检索证据，任何引用都视为伪证据 ⇒ 该条进「未知 / 待确认」）；null = 纯解析
+/// 兼容旧调用。旧模型输出没有 `evidence_ids` 时按空列表处理，不报错。
+///
 /// 提问超过 [maxQuestions] 时截断并记入 [ReconDraft.droppedQuestions]
 /// （调用方把这个数字回给 UI，让"被截断"可见）。
 ReconDraft parseReconJson(
   Map<String, Object?> json, {
   required int maxQuestions,
+  Set<String>? knownEvidence,
 }) {
-  final List<ReconPoint> regular = _pointsOf(json['regular']);
+  final List<ReconPoint> regular = _pointsOf(
+    json['regular'],
+    knownEvidence: knownEvidence,
+  );
   if (regular.isEmpty) {
     throw ProductionFailure(
       '侦查结果缺少「常规要求」（模型没给 regular 或全为空）',
@@ -234,6 +578,7 @@ ReconDraft parseReconJson(
           defaultValue: textOf(map['default']),
           recommended: textOf(map['recommended']),
           consequence: textOf(map['consequence']),
+          evidenceIds: _evidenceIdsOf(map, knownEvidence),
         ),
       );
     }
@@ -242,10 +587,10 @@ ReconDraft parseReconJson(
   final int dropped = questions.length > limit ? questions.length - limit : 0;
   return ReconDraft(
     regular: regular,
-    special: _pointsOf(json['special']),
+    special: _pointsOf(json['special'], knownEvidence: knownEvidence),
     questions: questions.take(limit).toList(),
-    fallbacks: _pointsOf(json['fallbacks']),
-    notes: _pointsOf(json['notes']),
+    fallbacks: _pointsOf(json['fallbacks'], knownEvidence: knownEvidence),
+    notes: _pointsOf(json['notes'], knownEvidence: knownEvidence),
     flags: <String>[
       for (final String flag in stringsOf(json['flags']).take(8)) flag,
     ],
@@ -301,6 +646,14 @@ class PlanTaskSpec {
     required this.writeScope,
     required this.acceptance,
     required this.estimatedFiles,
+    this.taskType = 'code',
+    this.gate = const <String, Object?>{},
+    this.estimatedLines = 0,
+    this.estimatedPackages = 0,
+    this.risk = '',
+    this.contract,
+    this.splitReason = '',
+    this.rationale = '',
   });
 
   final String id;
@@ -312,6 +665,20 @@ class PlanTaskSpec {
   final List<String> acceptance;
   final int estimatedFiles;
 
+  /// 任务类型（缺键 ⇒ `code`，旧计划兼容）。
+  final String taskType;
+
+  /// 出口门控（`commands` / `checklist`；缺键 ⇒ 空表）。
+  final Map<String, Object?> gate;
+
+  /// 预计改动行 / 包数；0 = 未知（旧计划兼容）。
+  final int estimatedLines;
+  final int estimatedPackages;
+  final String risk;
+  final Object? contract;
+  final String splitReason;
+  final String rationale;
+
   Map<String, Object?> toJson() => <String, Object?>{
     'id': id,
     'title': title,
@@ -321,6 +688,14 @@ class PlanTaskSpec {
     'write_scope': writeScope,
     'acceptance': acceptance,
     'estimated_files': estimatedFiles,
+    'task_type': taskType,
+    'gate': gate,
+    'estimated_lines': estimatedLines,
+    'estimated_packages': estimatedPackages,
+    'risk': risk,
+    'contract': contract,
+    'split_reason': splitReason,
+    'rationale': rationale,
   };
 }
 
@@ -369,10 +744,7 @@ ScopePlan parseScopeJson(Map<String, Object?> json) {
     final Map<String, Object?> map = plainMap(item);
     final String title = textOf(map['title']);
     if (title.isEmpty) {
-      throw ProductionFailure(
-        '计划第 $index 个任务缺 title',
-        code: 'plan_incomplete',
-      );
+      throw ProductionFailure('计划第 $index 个任务缺 title', code: 'plan_incomplete');
     }
     String id = textOf(map['id']);
     if (id.isEmpty) id = 'T$index';
@@ -399,6 +771,14 @@ ScopePlan parseScopeJson(Map<String, Object?> json) {
         writeScope: stringsOf(map['write_scope']),
         acceptance: acceptance,
         estimatedFiles: intOf(map['estimated_files'], 1),
+        taskType: taskTypeOf(map['task_type']),
+        gate: plainMap(map['gate']),
+        estimatedLines: intOf(map['estimated_lines'], 0),
+        estimatedPackages: intOf(map['estimated_packages'], 0),
+        risk: textOf(map['risk']),
+        contract: plainValue(map['contract']),
+        splitReason: textOf(map['split_reason']),
+        rationale: textOf(map['rationale']),
       ),
     );
   }
@@ -427,6 +807,7 @@ class QuestionState {
     required this.round,
     required this.windowId,
     required this.askedAt,
+    this.evidenceIds = const <String>[],
   });
 
   /// 所属准备任务（同一个 `decisions.md` 里可能有多条任务的 Q）。
@@ -439,6 +820,7 @@ class QuestionState {
   final int round;
   final String windowId;
   final String askedAt;
+  final List<String> evidenceIds;
 
   bool answered = false;
   String answer = '';
@@ -459,6 +841,7 @@ class QuestionState {
     'answer': answer,
     'source': source,
     'answered_at': answeredAt,
+    if (evidenceIds.isNotEmpty) 'evidence_ids': evidenceIds,
   };
 }
 
@@ -500,6 +883,7 @@ List<QuestionState> replayQuestions(
           round: intOf(entry['round'], 1),
           windowId: textOf(entry['window_id']),
           askedAt: textOf(entry['asked_at']),
+          evidenceIds: stringsOf(entry['evidence_ids']),
         ),
       );
     } else if (type == 'answer') {
@@ -532,10 +916,11 @@ List<QuestionState> replayQuestions(
 }
 
 /// 未答问题（含"回答为空"的也算未答）。
-List<QuestionState> openQuestionsOf(List<QuestionState> questions) => <QuestionState>[
-  for (final QuestionState question in questions)
-    if (!question.answered || question.answer.trim().isEmpty) question,
-];
+List<QuestionState> openQuestionsOf(List<QuestionState> questions) =>
+    <QuestionState>[
+      for (final QuestionState question in questions)
+        if (!question.answered || question.answer.trim().isEmpty) question,
+    ];
 
 // ── 读取预算（§8.1）────────────────────────────────────────────────
 
@@ -569,6 +954,12 @@ class ReadBudget {
 String _bullets(List<String> lines) =>
     lines.isEmpty ? '（无）' : lines.map((String line) => '- $line').join('\n');
 
+/// 结论后的证据标记；没有 evidence_id 的条目显式标「未证实」，不冒充结论。
+String _evidenceMark(List<String> evidenceIds, {required bool unknown}) {
+  if (evidenceIds.isNotEmpty) return ' [${evidenceIds.join('、')}]';
+  return unknown ? '（未证实，需确认）' : '';
+}
+
 /// `recon.md`：四节顺序固定（§8.3）；元信息块在前，标旗不单开一节。
 String renderReconMd({
   required String taskId,
@@ -598,7 +989,8 @@ String renderReconMd({
           : <String>[
               for (int i = 0; i < recon.regular.length; i++)
                 '- **R${i + 1}** ${recon.regular[i].text}'
-                    '${recon.regular[i].note.isEmpty ? '' : '（落点：${recon.regular[i].note}）'}',
+                    '${recon.regular[i].note.isEmpty ? '' : '（落点：${recon.regular[i].note}）'}'
+                    '${_evidenceMark(recon.regular[i].evidenceIds, unknown: recon.regular[i].unknown)}',
             ].join('\n'),
     )
     ..writeln()
@@ -610,7 +1002,8 @@ String renderReconMd({
           : <String>[
               for (int i = 0; i < recon.special.length; i++)
                 '- **S${i + 1}** ${recon.special[i].text}'
-                    '${recon.special[i].note.isEmpty ? '' : '（为什么常规做不到：${recon.special[i].note}）'}',
+                    '${recon.special[i].note.isEmpty ? '' : '（为什么常规做不到：${recon.special[i].note}）'}'
+                    '${_evidenceMark(recon.special[i].evidenceIds, unknown: recon.special[i].unknown)}',
             ].join('\n'),
     )
     ..writeln()
@@ -624,7 +1017,8 @@ String renderReconMd({
                 '- **${question.qid}** ${question.text}'
                     '（默认：${question.defaultValue.isEmpty ? '无' : question.defaultValue}；'
                     '推荐：${question.recommended.isEmpty ? '无' : question.recommended}；'
-                    '不选后果：${question.consequence.isEmpty ? '未说明' : question.consequence}）',
+                    '不选后果：${question.consequence.isEmpty ? '未说明' : question.consequence}）'
+                    '${_evidenceMark(question.evidenceIds, unknown: false)}',
             ].join('\n'),
     )
     ..writeln()
@@ -634,10 +1028,12 @@ String renderReconMd({
       _bullets(<String>[
         for (int i = 0; i < recon.fallbacks.length; i++)
           '**F${i + 1}** ${recon.fallbacks[i].text}'
-              '${recon.fallbacks[i].note.isEmpty ? '' : '（${recon.fallbacks[i].note}）'}',
+              '${recon.fallbacks[i].note.isEmpty ? '' : '（${recon.fallbacks[i].note}）'}'
+              '${_evidenceMark(recon.fallbacks[i].evidenceIds, unknown: recon.fallbacks[i].unknown)}',
         for (int i = 0; i < recon.notes.length; i++)
           '**N${i + 1}** ${recon.notes[i].text}'
-              '${recon.notes[i].note.isEmpty ? '' : '（${recon.notes[i].note}）'}',
+              '${recon.notes[i].note.isEmpty ? '' : '（${recon.notes[i].note}）'}'
+              '${_evidenceMark(recon.notes[i].evidenceIds, unknown: recon.notes[i].unknown)}',
       ]),
     );
   return buffer.toString();
@@ -687,7 +1083,8 @@ String renderPlanMd({
     ..writeln();
   final List<String> edges = <String>[
     for (final PlanTaskSpec task in plan.tasks)
-      for (final String dependency in task.dependsOn) '$dependency → ${task.id}',
+      for (final String dependency in task.dependsOn)
+        '$dependency → ${task.id}',
   ];
   buffer.writeln(_bullets(edges));
   return buffer.toString();
@@ -716,19 +1113,24 @@ String renderDecisionsMd({
   required List<Map<String, Object?>> windows,
   required List<Map<String, Object?>> answers,
 }) {
-  final Map<String, List<QuestionState>> byWindow = <String, List<QuestionState>>{};
+  final Map<String, List<QuestionState>> byWindow =
+      <String, List<QuestionState>>{};
   for (final QuestionState question in questions) {
-    final String key = question.windowId.isEmpty ? 'win_unknown' : question.windowId;
+    final String key = question.windowId.isEmpty
+        ? 'win_unknown'
+        : question.windowId;
     (byWindow[key] ??= <QuestionState>[]).add(question);
   }
-  final Map<String, Map<String, Object?>> windowById = <String, Map<String, Object?>>{
-    for (final Map<String, Object?> window in windows)
-      textOf(window['id']): window,
-  };
+  final Map<String, Map<String, Object?>> windowById =
+      <String, Map<String, Object?>>{
+        for (final Map<String, Object?> window in windows)
+          textOf(window['id']): window,
+      };
   // 多条任务的 Q 都从 Q1 起：同一份文档里出现多个任务时加任务前缀，避免歧义。
-  final bool multiTask = <String>{
-    for (final QuestionState question in questions) question.taskId,
-  }.length > 1;
+  final bool multiTask =
+      <String>{for (final QuestionState question in questions) question.taskId}
+          .length >
+      1;
   String label(QuestionState question) =>
       multiTask && question.taskId.isNotEmpty
       ? '${question.taskId}/${question.qid}'
@@ -744,9 +1146,7 @@ String renderDecisionsMd({
     final int round = intOf(window['round'], 1);
     final String openedAt = textOf(window['opened_at']);
     buffer
-      ..writeln(
-        '## 窗口 $key（第 $round 轮${openedAt.isEmpty ? '' : '，$openedAt'}）',
-      )
+      ..writeln('## 窗口 $key（第 $round 轮${openedAt.isEmpty ? '' : '，$openedAt'}）')
       ..writeln();
     for (final QuestionState question in byWindow[key]!) {
       if (question.answered) {
@@ -787,11 +1187,86 @@ String renderDecisionsMd({
 
 // ── 提示词（模型契约）──────────────────────────────────────────────
 
+/// LLM #1：先摘要，再检索；只输出严格 JSON，不调工具、不写 Markdown。
+String digestSystemPrompt() =>
+    '你是标准开发流的需求摘要员。只输出一个 JSON 对象，不要 Markdown 代码围栏、'
+    '不要解释、不要调用工具。结构：'
+    '{"requirement_summary":"一句话",'
+    '"keywords":{"terms":[],"synonyms":[],"entities":[],"files":[],"apis":[]},'
+    '"constraints":[],"attachment_summaries":[{"id","summary","keywords":[],"status"}],'
+    '"ambiguities":[]}。'
+    '规则：requirement_summary 一句话说清用户要什么与边界；'
+    'keywords 只能来自需求原文与附件元数据/摘要，不得臆造；'
+    'constraints 写禁区、兼容、期限；'
+    'attachment_summaries 没有附件时返回空数组，有附件时只写摘要与关键词，不编造内容；'
+    'ambiguities 列影响范围/成本数量级但尚未说明的问题。';
+
+/// 项目记忆在提示词里的硬上限（长文截断，避免把记忆当第二份需求）。
+const int kProjectMemoryPromptLimit = 4000;
+
+/// 记忆正文截断（只在提示词里用；正文本身不落盘）。
+String clipProjectMemory(String text) => text.length <= kProjectMemoryPromptLimit
+    ? text
+    : '${text.substring(0, kProjectMemoryPromptLimit)}\n…（截断）';
+
+String digestUserPrompt({
+  required Map<String, String> intake,
+  List<Map<String, Object?>> attachments = const <Map<String, Object?>>[],
+  String projectMemory = '',
+}) {
+  final StringBuffer buffer = StringBuffer()
+    ..writeln('需求五栏：')
+    ..writeln('目标：${intake['goal'] ?? ''}')
+    ..writeln('现状：${intake['current'] ?? ''}')
+    ..writeln('验收：${intake['acceptance'] ?? ''}')
+    ..writeln('禁区：${intake['forbidden'] ?? ''}')
+    ..writeln('期限：${intake['deadline'] ?? ''}')
+    ..writeln();
+  // 记忆只是背景：显式声明不得当需求证据，长文截断到 4000 字。
+  if (projectMemory.trim().isNotEmpty) {
+    buffer
+      ..writeln('项目记忆（来自 agent memory，只是背景，不得当作需求证据）：')
+      ..writeln(clipProjectMemory(projectMemory.trim()))
+      ..writeln();
+  }
+  buffer.writeln('附件元数据（可能为空；只做摘要，不读附件正文）：');
+  if (attachments.isEmpty) {
+    buffer.writeln('（无）');
+  } else {
+    for (final Map<String, Object?> attachment in attachments) {
+      final List<String> fields = <String>[];
+      for (final String key in const <String>[
+        'id',
+        'name',
+        'file',
+        'mime',
+        'type',
+        'size',
+        'sha256',
+        'status',
+      ]) {
+        final String value = textOf(attachment[key]);
+        if (value.isNotEmpty) fields.add('$key=$value');
+      }
+      buffer.writeln('- ${fields.isEmpty ? '（空元数据）' : fields.join(', ')}');
+    }
+  }
+  buffer
+    ..writeln()
+    ..writeln('请输出要求摘要、关键词、约束、附件摘要与歧义（严格 JSON）。');
+  return buffer.toString();
+}
+
 String reconSystemPrompt({required int maxQuestions}) =>
     '你是标准开发流的侦查员（只读文档，不读代码）。只输出一个 JSON 对象，不要 Markdown 代码围栏。'
-    '结构：{"regular":[{"text","landing"}],"special":[{"text","why"}],'
-    '"questions":[{"text","default","recommended","consequence"}],'
-    '"fallbacks":[{"text"}],"notes":[{"text"}],"flags":["相对路径"]}。'
+    '结构：{"regular":[{"text","landing","evidence_ids":["E1"],"unknown":false}],'
+    '"special":[{"text","why","evidence_ids":["E1"]}],'
+    '"questions":[{"text","default","recommended","consequence","evidence_ids":["E1"]}],'
+    '"fallbacks":[{"text","evidence_ids":["E1"]}],"notes":[{"text","evidence_ids":["E1"]}],'
+    '"flags":["相对路径"]}。'
+    '证据规则：每条 regular / special / fallbacks / notes 必须引用上下文里存在的 evidence_id；'
+    '引用不存在或没有证据时写 "unknown": true，只能作为「未知 / 待确认」，不得当作结论；'
+    'questions 有证据时带 evidence_ids，没有证据就不带。'
     '规则：regular 写成熟技术栈/既有实现能直接解决的要求，landing 写落点文件或目录；'
     'special 写传统方案做不到或代价异常的要求，why 必须写清为什么；'
     'questions 只问影响范围 / 不可逆 / 成本数量级，最多 $maxQuestions 条，每条给默认、推荐、不选后果；'
@@ -803,8 +1278,10 @@ String reconUserPrompt({
   required String taskId,
   required String title,
   required Map<String, String> intake,
-  required String memory,
+  String memory = '',
   List<String> tools = const <String>[],
+  Digest? digest,
+  List<ReconEvidence> evidence = const <ReconEvidence>[],
 }) {
   final StringBuffer buffer = StringBuffer()
     ..writeln('产线：${lineName.isEmpty ? taskId : lineName}')
@@ -820,11 +1297,54 @@ String reconUserPrompt({
       ..writeln('主控可用工具：${tools.join(', ')}（规划落点必须落在这些能力内）')
       ..writeln();
   }
+  if (digest != null) {
+    buffer
+      ..writeln('需求摘要（LLM #1）：')
+      ..writeln('一句话：${digest.requirementSummary}')
+      ..writeln(
+        '关键词：${digest.keywords.all.isEmpty ? '（无）' : digest.keywords.all.join('、')}',
+      )
+      ..writeln(
+        '约束：${digest.constraints.isEmpty ? '（无）' : digest.constraints.join('；')}',
+      );
+    if (digest.attachmentSummaries.isNotEmpty) {
+      buffer.writeln('附件摘要：');
+      for (final DigestAttachment attachment in digest.attachmentSummaries) {
+        buffer.writeln(
+          '- ${attachment.id.isEmpty ? '附件' : attachment.id}：${attachment.summary}'
+          '${attachment.keywords.isEmpty ? '' : '（关键词：${attachment.keywords.join('、')}）'}',
+        );
+      }
+    }
+    buffer.writeln(
+      '歧义：${digest.ambiguities.isEmpty ? '（无）' : digest.ambiguities.join('；')}',
+    );
+    buffer.writeln();
+  }
+  buffer.writeln('项目文档检索（evidence；只能引用这些 evidence_id）：');
+  if (evidence.isEmpty) {
+    buffer.writeln('（无）');
+  } else {
+    for (final ReconEvidence item in evidence) {
+      buffer.writeln(
+        '- [${item.id}] ${item.kind} ${item.path}'
+        '${item.heading.isEmpty ? '' : '#${item.heading}'}'
+        '${item.line > 0 ? ':${item.line}' : ''}：${item.snippet}',
+      );
+    }
+  }
+  if (memory.trim().isNotEmpty) {
+    buffer
+      ..writeln()
+      ..writeln('旧文档上下文（兼容）：')
+      ..writeln(memory.trim());
+  }
   buffer
-    ..writeln('项目文档检索（docnorm.query 的结果，可能为空）：')
-    ..writeln(memory.trim().isEmpty ? '（无）' : memory.trim())
     ..writeln()
-    ..writeln('只做文档层侦查；不要读代码、不要跑构建、不要改文件。');
+    ..writeln(
+      '只做文档层侦查；不要读代码、不要跑构建、不要改文件。'
+      '没有 evidence_id 的结论必须标 unknown=true，不得凭空断言。',
+    );
   return buffer.toString();
 }
 
@@ -859,7 +1379,9 @@ List<String> distributionSummary({
   required int openQuestions,
   required int questionLimit,
 }) {
-  final int special = tasks.where((PlanTaskSpec task) => task.kind == 'special').length;
+  final int special = tasks
+      .where((PlanTaskSpec task) => task.kind == 'special')
+      .length;
   final int conventional = tasks.length - special;
   return <String>[
     '任务 ${tasks.length} 个（常规 $conventional / 特殊 $special）',

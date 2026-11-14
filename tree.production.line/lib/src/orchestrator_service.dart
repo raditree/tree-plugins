@@ -15,8 +15,10 @@ import 'execution_service.dart';
 import 'models.dart';
 import 'orchestrator.dart';
 import 'preparation.dart';
+import 'readiness.dart';
 import 'service.dart';
 import 'store.dart';
+import 'structure_service.dart';
 
 /// 主控决策的模型调用（插件层接 `llm.call`；单测注入假实现）。
 typedef OrchestratorLlm =
@@ -123,9 +125,13 @@ class OrchestratorService {
     }
     final List<TaskRecord> tasks = store.listTasks(lineId);
     if (tasks.isEmpty) return _skipped(lineId, 'no_tasks', trigger);
-    if (trigger == 'timer' &&
-        !tasks.any((TaskRecord task) => task.status.isInFlight)) {
-      // 定时只是兜底：没有在途任务不空转（§3.1 / §5.4）；事件 / 恢复照常决策。
+    // LG-01 / TG-06：organizing 阶段只有 cleanup 任务可以推进（tick 也过门）。
+    requireStructureAllowsTasks(store, line, tasks);
+    // LG-07 / TG-05：归一化与索引未就绪前不得推进非 cleanup 任务。
+    requireLineAllowsTasks(store, line, tasks);
+    if (trigger == 'timer' && !_hasAdvanceableTask(tasks)) {
+      // 定时兜底：只有在**确实没活可干**时才跳过（§3.1 / §5.4）；
+      // queued / packed / blocked 等可推进任务照样交给主控决策。
       return _skipped(lineId, 'idle', trigger);
     }
     final Future<Map<String, Object?>>? running = _inFlight[lineId];
@@ -486,6 +492,7 @@ class OrchestratorService {
   /// 主控状态：配置 + 游标 + 最近决策 + 未答运行期问题（只读）。
   Map<String, Object?> status(ProductionStore store, String lineId) {
     final LineRecord line = store.getLine(lineId);
+    final List<TaskRecord> tasks = store.listTasks(lineId);
     final Map<String, Object?> state = store.readOrchestratorState(lineId);
     final List<Map<String, Object?>> runs = <Map<String, Object?>>[
       for (final Map<String, Object?> run in store.listRuns(lineId))
@@ -496,7 +503,8 @@ class OrchestratorService {
     );
     return <String, Object?>{
       'line_id': lineId,
-      'status': line.status,
+      // 后端投影（idle / working / paused）：UI 不再按任务数自行推断。
+      'status': projectLineStatus(line, tasks),
       'config': OrchestratorConfig.of(line).toJson(),
       'state': state,
       'last_decision': plainMap(state['last_decision']),
@@ -598,6 +606,19 @@ class OrchestratorService {
     if (decision.guard.isNotEmpty) 'guard': decision.guard,
     'snapshot_hash': snapshotHash,
   };
+
+  /// 定时 tick 的“有活可干”判据：在途 / queued / packed / blocked（可重试 / 可打断）。
+  bool _hasAdvanceableTask(List<TaskRecord> tasks) {
+    for (final TaskRecord task in tasks) {
+      final TaskStatus status = task.status;
+      if (status.isInFlight ||
+          status == TaskStatus.queued ||
+          status == TaskStatus.blocked) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   bool _rateLimited(String lineId, OrchestratorConfig config) {
     if (config.maxTicksPerMinute <= 0) return false;

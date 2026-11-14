@@ -5,6 +5,8 @@ import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_production_line/tree_production_line.dart';
 
+import 'support/structure_fixture.dart';
+
 /// 新产线模板不再编造模型（D7）：测试夹具显式给四个角色配模型。
 const Map<String, Object?> _testRoles = <String, Object?>{
   'orchestrator': <String, Object?>{'model_id': 'chat/main'},
@@ -98,9 +100,10 @@ void main() {
   late ProductionStore store;
   late _Workers workers;
   late _Commands commands;
+  late List<String> cycles;
   late ProductionExecutionService service;
 
-  setUp(() {
+  setUp(() async {
     temp = Directory.systemTemp.createTempSync('tree_production_p4_');
     workspace = p.join(temp.path, 'ws');
     Directory(workspace).createSync(recursive: true);
@@ -126,7 +129,18 @@ void main() {
         'open': <String>['旧版本行为未验证'],
       });
     commands = _Commands();
-    service = ProductionExecutionService(workers: workers.run, commands: commands.run);
+    cycles = <String>[];
+    service = ProductionExecutionService(
+      workers: workers.run,
+      commands: commands.run,
+      onCycle: (
+        String lineId,
+        Map<String, Object?> meta,
+        Map<String, Object?> scope,
+      ) async {
+        cycles.add(lineId);
+      },
+    );
     store.createLine(<String, Object?>{
       'id': 'pl_t',
       'name': '测试产线',
@@ -134,6 +148,7 @@ void main() {
       'limits': <String, Object?>{'retries': 1},
       'roles': _testRoles,
     });
+    await markLineReady(store, 'pl_t', temp, workspace: workspace);
   });
 
   tearDown(() {
@@ -183,6 +198,7 @@ void main() {
     );
     expect(packed['status'], 'packed');
     expect((packed['task'] as Map<String, Object?>)['status'], 'packed');
+    expect(cycles, isEmpty, reason: '打包结束不属于“任务执行结束”，不触发 tick');
     expect(
       File(
         p.join(
@@ -213,6 +229,7 @@ void main() {
     );
     expect(ran['status'], 'done');
     expect((ran['task'] as Map<String, Object?>)['status'], 'done');
+    expect(cycles, <String>['pl_t'], reason: '执行结束后补一次主控 tick');
     expect(workers.calls.map((WorkerCall call) => call.role), <String>[
       'packer',
       'executor',
@@ -316,6 +333,87 @@ void main() {
     expect((second['task'] as Map<String, Object?>)['status'], 'blocked');
     expect(second['error'], contains('门控失败'));
     expect(store.getTask('pl_t', 'T1').status, TaskStatus.blocked);
+  });
+
+  test('出口清单 evidence 强制：文件不存在不 done，补齐后 done', () async {
+    Directory(p.join(workspace, 'reports')).createSync(recursive: true);
+    File(p.join(workspace, 'reports', 'req.log')).writeAsStringSync('ok');
+    store.createTask('pl_t', <String, Object?>{
+      'id': 'G1',
+      'title': '出口清单',
+      'status': 'queued',
+      'write_scope': <String>['lib/a.dart'],
+      'read_scope': <String>['lib/'],
+      'acceptance': <String>['dart analyze 无新增'],
+      'gate': <String, Object?>{
+        'checklist': <Map<String, Object?>>[
+          <String, Object?>{
+            'text': '- [ ] 目标测试全绿',
+            'evidence': 'reports/test.log',
+          },
+          <String, Object?>{
+            'text': '- [ ] 需求可追踪',
+            'evidence': 'reports/req.log',
+          },
+        ],
+      },
+    });
+    await call('production.task.pack', <String, Object?>{
+      'line_id': 'pl_t',
+      'task_id': 'G1',
+    });
+
+    final Map<String, Object?> first = await call(
+      'production.task.run',
+      <String, Object?>{'line_id': 'pl_t', 'task_id': 'G1'},
+    );
+    expect(first['status'], 'retry');
+    expect((first['task'] as Map<String, Object?>)['status'], 'packed');
+    final List<dynamic> firstGate = first['gate'] as List<dynamic>;
+    expect(
+      firstGate.any(
+        (dynamic item) =>
+            '${(item as Map<String, Object?>)['command']}'.startsWith('evidence:'),
+      ),
+      isTrue,
+    );
+    expect(
+      firstGate.any(
+        (dynamic item) =>
+            (item as Map<String, Object?>)['output'] ==
+            '证据文件不存在：reports/test.log',
+      ),
+      isTrue,
+    );
+
+    final Map<String, Object?> second = await call(
+      'production.task.run',
+      <String, Object?>{'line_id': 'pl_t', 'task_id': 'G1'},
+    );
+    expect(second['status'], 'blocked');
+    expect(store.getTask('pl_t', 'G1').status, TaskStatus.blocked);
+
+    // 补齐证据后重跑：清单两项都通过，才允许 done。
+    File(p.join(workspace, 'reports', 'test.log')).writeAsStringSync('ok');
+    store.transition('pl_t', 'G1', to: 'queued', reason: '补齐证据');
+    await call('production.task.pack', <String, Object?>{
+      'line_id': 'pl_t',
+      'task_id': 'G1',
+    });
+    final Map<String, Object?> third = await call(
+      'production.task.run',
+      <String, Object?>{'line_id': 'pl_t', 'task_id': 'G1'},
+    );
+    expect(third['status'], 'done');
+    final List<dynamic> checklist =
+        plainMap(third['run'])['checklist'] as List<dynamic>;
+    expect(checklist.length, 2);
+    expect(
+      checklist.every(
+        (dynamic item) => (item as Map<String, Object?>)['ok'] == true,
+      ),
+      isTrue,
+    );
   });
 
   test('打包失败：空片段 / 越出读域 → blocked，不产生 pack.json', () async {
@@ -435,6 +533,7 @@ void main() {
       'status': 'queued',
       'write_scope': <String>['lib/a.dart'],
     });
+    await markLineReady(store, 'pl_e', temp, workspace: workspace);
   }
 
   test('专家默认关闭：未启用直接拒绝，不调员工', () async {
@@ -582,6 +681,7 @@ void main() {
       'status': 'queued',
       'write_scope': <String>['lib/a.dart'],
     });
+    await markLineReady(store, 'pl_bad', temp, workspace: workspace);
     await expectLater(
       call('production.task.expert', <String, Object?>{
         'line_id': 'pl_bad',
@@ -652,6 +752,7 @@ void main() {
       'status': 'queued',
       'write_scope': <String>['lib/a.dart'],
     });
+    await markLineReady(store, 'pl_b', temp, workspace: workspace);
     workers.tokens = <String, Object?>{'prompt': 5, 'completion': 10};
     final Map<String, Object?> packed = await call(
       'production.task.pack',
@@ -725,6 +826,7 @@ void main() {
       'status': 'queued',
       'write_scope': <String>['lib/a.dart'],
     });
+    await markLineReady(store, 'pl_pre', temp, workspace: workspace);
     // usage 是运行期字段（createTask 不接收），按真实路径写回。
     store.putTask('pl_pre', 'P1', <String, Object?>{
       'usage': <String, Object?>{
@@ -772,6 +874,7 @@ void main() {
       'write_scope': <String>['lib/a.dart'],
       'read_scope': <String>['lib/'],
     });
+    await markLineReady(store, 'pl_run', temp, workspace: workspace);
     final Map<String, Object?> packed = await call(
       'production.task.pack',
       <String, Object?>{'line_id': 'pl_run', 'task_id': 'R1'},
@@ -913,5 +1016,165 @@ void main() {
         ),
       );
     });
+  });
+
+  test('打包读取 agent 记忆：pack.json 只落 hash/sources，正文只进提示词', () async {
+    const String memoryHash =
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    String? gotPurpose;
+    service = ProductionExecutionService(
+      workers: workers.run,
+      commands: commands.run,
+      memory: MemoryPort(
+        get:
+            (
+              String agentId,
+              String purpose,
+              int budgetChars,
+              Map<String, Object?> scope,
+            ) async {
+              gotPurpose = purpose;
+              return <String, Object?>{
+                'ok': true,
+                'agent_id': agentId,
+                'purpose': purpose,
+                'path': '.self/memory.md',
+                'text': '上次改动：只动 lib/a.dart',
+                'hash': memoryHash,
+                'chars': 13,
+                'truncated': false,
+                'sources': <String>['line/pl_t/task/T1'],
+              };
+            },
+        record:
+            (Map<String, Object?> entry, Map<String, Object?> scope) async =>
+                <String, Object?>{'ok': true, 'hash': memoryHash},
+      ),
+    );
+    store.updateLine('pl_t', <String, Object?>{
+      'executor': <String, Object?>{'agent_id': 'agt_exec'},
+    });
+    queuedTask('T1');
+    final Map<String, Object?> packed = await call(
+      'production.task.pack',
+      <String, Object?>{'line_id': 'pl_t', 'task_id': 'T1'},
+    );
+    expect(packed['status'], 'packed');
+    expect(gotPurpose, 'production.task.pack');
+    expect(workers.calls.single.task, contains('上次改动：只动 lib/a.dart'));
+
+    final File packFile = File(
+      p.join(
+        temp.path,
+        'production_lines',
+        'production',
+        'pl_t',
+        'tasks',
+        'T1',
+        'pack.json',
+      ),
+    );
+    final Map<String, Object?> packJson =
+        jsonDecode(packFile.readAsStringSync()) as Map<String, Object?>;
+    expect(packJson['memory_hash'], memoryHash);
+    expect(packJson['memory_sources'], <String>['line/pl_t/task/T1']);
+    expect(packJson.containsKey('memory_unavailable'), isFalse);
+    expect(
+      packFile.readAsStringSync(),
+      isNot(contains('上次改动：只动 lib/a.dart')),
+      reason: '记忆正文不落 pack.json',
+    );
+
+    // 收尾：门控通过后写一条任务记忆，run 台账只记 hash/sources。
+    final Map<String, Object?> ran = await call(
+      'production.task.run',
+      <String, Object?>{'line_id': 'pl_t', 'task_id': 'T1'},
+    );
+    expect(ran['status'], 'done');
+    final Map<String, Object?> run = plainMap(ran['run']);
+    expect(run['memory_hash'], memoryHash);
+    expect(run['memory_sources'], <String>['line/pl_t/task/T1']);
+  });
+
+  test('记忆不可用：pack.json 标 memory_unavailable，任务照常 packed', () async {
+    service = ProductionExecutionService(
+      workers: workers.run,
+      commands: commands.run,
+      memory: MemoryPort(
+        get:
+            (
+              String agentId,
+              String purpose,
+              int budgetChars,
+              Map<String, Object?> scope,
+            ) async => <String, Object?>{
+              'error': '记忆服务没起来',
+              'code': 'memory_unavailable',
+            },
+      ),
+    );
+    store.updateLine('pl_t', <String, Object?>{
+      'executor': <String, Object?>{'agent_id': 'agt_exec'},
+    });
+    queuedTask('T1');
+    final Map<String, Object?> packed = await call(
+      'production.task.pack',
+      <String, Object?>{'line_id': 'pl_t', 'task_id': 'T1'},
+    );
+    expect(packed['status'], 'packed');
+    expect((packed['task'] as Map<String, Object?>)['status'], 'packed');
+    final Map<String, Object?> packJson =
+        jsonDecode(
+              File(
+                p.join(
+                  temp.path,
+                  'production_lines',
+                  'production',
+                  'pl_t',
+                  'tasks',
+                  'T1',
+                  'pack.json',
+                ),
+              ).readAsStringSync(),
+            )
+            as Map<String, Object?>;
+    expect(packJson['memory_unavailable'], isTrue);
+    expect(packJson.containsKey('memory'), isFalse);
+  });
+
+  test('上一批漂移哨兵失败 ⇒ 非 cleanup 打包被拒；cleanup 不受影响', () async {
+    store.writeDrift('pl_t', <String, Object?>{
+      'ok': false,
+      'code': 'drift_scope',
+      'batch_id': 'B1',
+    });
+    queuedTask('T1');
+    await expectLater(
+      call('production.task.pack', <String, Object?>{
+        'line_id': 'pl_t',
+        'task_id': 'T1',
+      }),
+      throwsA(
+        isA<ProductionFailure>().having(
+          (ProductionFailure e) => e.code,
+          'code',
+          'drift_scope',
+        ),
+      ),
+    );
+
+    store.createTask('pl_t', <String, Object?>{
+      'id': 'TC',
+      'title': '清理',
+      'task_type': 'cleanup',
+      'status': 'queued',
+      'write_scope': <String>['lib/a.dart'],
+      'acceptance': <String>['清理完成'],
+    });
+    final Map<String, Object?> packed = await call(
+      'production.task.pack',
+      <String, Object?>{'line_id': 'pl_t', 'task_id': 'TC'},
+    );
+    expect(packed['status'], 'packed');
   });
 }

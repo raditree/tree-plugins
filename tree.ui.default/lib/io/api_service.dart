@@ -68,10 +68,7 @@ class AgentDeleteBlocked implements Exception {
 /// 给出可操作的三选一（覆盖保存 / 放弃我的改动并刷新 / 取消），就得把它和网络错误、
 /// 400 拒绝分开。
 class FileWriteConflict implements Exception {
-  const FileWriteConflict({
-    required this.detail,
-    this.currentSize,
-  });
+  const FileWriteConflict({required this.detail, this.currentSize});
 
   /// 可直接展示的中文原因
   final String detail;
@@ -258,12 +255,12 @@ class ApiService {
   }) async {
     final Uri uri = Uri.parse('$baseUrl/api/files/$workspaceId/content')
         .replace(
-      queryParameters: <String, String>{
-        'path': path,
-        if (teamId.isNotEmpty) 'team_id': teamId,
-        if (force) 'force': '1',
-      },
-    );
+          queryParameters: <String, String>{
+            'path': path,
+            if (teamId.isNotEmpty) 'team_id': teamId,
+            if (force) 'force': '1',
+          },
+        );
     final http.Response response;
     try {
       response = await http.put(
@@ -633,7 +630,8 @@ class ApiService {
     return HistoryPage(
       messages: messages
           .map(
-            (dynamic e) => Map<String, dynamic>.from(e as Map<dynamic, dynamic>),
+            (dynamic e) =>
+                Map<String, dynamic>.from(e as Map<dynamic, dynamic>),
           )
           .toList(),
       hasMore: data['has_more'] == true,
@@ -658,8 +656,9 @@ class ApiService {
       sessionId: sessionId,
       limit: kInitialDisplayRows,
     );
-    List<Map<String, dynamic>> rows =
-        List<Map<String, dynamic>>.of(tail.messages);
+    List<Map<String, dynamic>> rows = List<Map<String, dynamic>>.of(
+      tail.messages,
+    );
     int start = tail.offset;
     while (start > 0 && rows.length < kInitialDisplayRows) {
       final String oldestId = '${rows.isEmpty ? '' : (rows.first['id'] ?? '')}';
@@ -804,7 +803,10 @@ class ApiService {
   /// 核心的两道闸门（有下级必须显式级联 / 正在运行先停止）以 409 + 结构化响应体
   /// 返回，这里解析成 [AgentDeleteBlocked]，UI 才能给出可操作提示——旧实现只看
   /// 状态码，用户只会看到"删除失败（HTTP 409）"，不知道为什么、该怎么办。
-  static Future<void> deleteAgent(String agentId, {bool cascade = false}) async {
+  static Future<void> deleteAgent(
+    String agentId, {
+    bool cascade = false,
+  }) async {
     final Uri uri = Uri.parse(
       '$baseUrl/api/agents/$agentId${cascade ? '?cascade=1' : ''}',
     );
@@ -828,9 +830,7 @@ class ApiService {
                 in (body['cascade_required'] as List<dynamic>?) ??
                     const <dynamic>[])
               if (item is Map)
-                item.map(
-                  (dynamic k, dynamic v) => MapEntry(k.toString(), v),
-                ),
+                item.map((dynamic k, dynamic v) => MapEntry(k.toString(), v)),
           ],
           running: <String>[
             for (final dynamic item
@@ -1028,9 +1028,7 @@ class ApiService {
   static Future<Map<String, dynamic>> getProviderModels(
     String providerId,
   ) async {
-    return _getJson(
-      '/api/providers/${Uri.encodeComponent(providerId)}/models',
-    );
+    return _getJson('/api/providers/${Uri.encodeComponent(providerId)}/models');
   }
 
   // ==================== 流式帧率（token 获取 + 推送刷新，均常开） ====================
@@ -1497,6 +1495,228 @@ class ApiService {
     query: _teamQuery(teamId),
   );
 
+  /// 计划文档（`plans/plan-vN/plan.json`）：7 块 + findings；
+  /// [version] 为空读最新版本，否则读指定版本（plan diff 用）。
+  static Future<Map<String, dynamic>> getProductionPlan(
+    String lineId, {
+    int? version,
+    String teamId = '',
+  }) => _getJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/plan',
+    query: <String, String>{
+      ..._teamQuery(teamId),
+      if (version != null && version > 0) 'version': '$version',
+    },
+  );
+
+  /// 任务详情（任务 JSON 原始字段，含 recon / gate / last_gate / attachments…）。
+  static Future<Map<String, dynamic>> getProductionTask(
+    String lineId,
+    String taskId, {
+    String teamId = '',
+  }) => _getJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}'
+    '/tasks/${Uri.encodeComponent(taskId)}',
+    query: _teamQuery(teamId),
+  );
+
+  /// 编辑任务字段（PATCH；不带 `to/status` 时后端按任务字段编辑）。
+  static Future<Map<String, dynamic>> updateProductionTask(
+    String lineId,
+    String taskId,
+    Map<String, dynamic> patch, {
+    String teamId = '',
+  }) => _patchJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}'
+    '/tasks/${Uri.encodeComponent(taskId)}',
+    body: patch,
+    query: _teamQuery(teamId),
+  );
+
+  /// 附件登记：先把文件上传到工作空间（`.input/...`），再把相对路径交给产线。
+  ///
+  /// [source] 必须是工作空间相对路径；返回 `{attachment, task, warnings, ...}`。
+  static Future<Map<String, dynamic>> attachProductionTask(
+    String lineId,
+    String taskId, {
+    required String source,
+    String name = '',
+    String type = '',
+    bool vision = false,
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}'
+    '/tasks/${Uri.encodeComponent(taskId)}/attachments',
+    body: <String, dynamic>{
+      'source': source,
+      'name': name,
+      'type': type,
+      'vision': vision,
+    },
+    query: _teamQuery(teamId),
+  );
+
+  /// 批量派发（默认 dry run）：返回 `batch_ids / skipped / batch / slots_*`。
+  static Future<Map<String, dynamic>> bulkDispatchProductionTasks(
+    String lineId, {
+    bool dryRun = true,
+    int? limit,
+    String stage = 'auto',
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/dispatch',
+    body: <String, dynamic>{
+      'dry_run': dryRun,
+      if (limit != null && limit > 0) 'limit': limit,
+      if (stage.trim().isNotEmpty && stage != 'auto') 'stage': stage.trim(),
+    },
+    query: _teamQuery(teamId),
+  );
+
+  /// 最近一次批次漂移报告（BG-01~08）。
+  static Future<Map<String, dynamic>> getProductionDrift(
+    String lineId, {
+    String teamId = '',
+  }) => _getJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/drift',
+    query: _teamQuery(teamId),
+  );
+
+  /// 跑一次批次漂移哨兵（显式动作；fail 会停止下一批）。
+  static Future<Map<String, dynamic>> runProductionDrift(
+    String lineId, {
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/drift',
+    body: <String, dynamic>{},
+    query: _teamQuery(teamId),
+  );
+
+  /// 重新侦查（准备四步第 ② 步）。
+  ///
+  /// 与 `production.prepare.recon` 同一语义；后端未开放该路由时，UI 会把
+  /// 404 翻成可读提示，并保留任务上已有的理解卡。
+  static Future<Map<String, dynamic>> reconProductionTask(
+    String lineId,
+    String taskId, {
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}'
+    '/tasks/${Uri.encodeComponent(taskId)}/recon',
+    body: <String, dynamic>{},
+    query: _teamQuery(teamId),
+  );
+
+  /// 落档（准备四步第 ④ 步）：`production.prepare.finalize` 的 REST 等价。
+  static Future<Map<String, dynamic>> finalizeProductionTask(
+    String lineId,
+    String taskId, {
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}'
+    '/tasks/${Uri.encodeComponent(taskId)}/finalize',
+    body: <String, dynamic>{},
+    query: _teamQuery(teamId),
+  );
+
+  // ── 产线就绪 / 结构整理 / 文档归一化（L0 硬门；§5.1 / §5.2 / §6）──────
+
+  /// 复合就绪门：`{ready, phase, progress, missing[], gates[], checked_at}`。
+  static Future<Map<String, dynamic>> getProductionReadiness(
+    String lineId, {
+    String teamId = '',
+  }) => _getJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/readiness',
+    query: _teamQuery(teamId),
+  );
+
+  /// 结构报告 + 就绪门：`{structure, readiness}`。
+  static Future<Map<String, dynamic>> getProductionStructure(
+    String lineId, {
+    String teamId = '',
+  }) => _getJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/structure',
+    query: _teamQuery(teamId),
+  );
+
+  /// 重新评估结构（cleanup 跑完后重审，high 项清零 / 豁免后放行）。
+  static Future<Map<String, dynamic>> reevaluateProductionStructure(
+    String lineId, {
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/structure/reevaluate',
+    body: <String, dynamic>{},
+    query: _teamQuery(teamId),
+  );
+
+  /// 逐项豁免一条结构 finding（没有全局跳过开关）。
+  static Future<Map<String, dynamic>> waiveProductionStructureFinding(
+    String lineId, {
+    required String findingId,
+    required String owner,
+    String reason = '',
+    String expiresAt = '',
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/structure/waive',
+    body: <String, dynamic>{
+      'finding_id': findingId,
+      'owner': owner,
+      'reason': reason,
+      'expires_at': expiresAt,
+    },
+    query: _teamQuery(teamId),
+  );
+
+  /// 文档归一化状态：GET `/normalize`（只读，不写盘）。
+  static Future<Map<String, dynamic>> getProductionNormalize(
+    String lineId, {
+    String teamId = '',
+  }) => _getJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/normalize',
+    query: _teamQuery(teamId),
+  );
+
+  /// 归一化预检：`commit=false` 时 0 写盘，只回 diff / 动作 / 跳过项。
+  static Future<Map<String, dynamic>> planProductionNormalize(
+    String lineId, {
+    bool commit = false,
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/normalize/plan',
+    body: <String, dynamic>{'commit': commit},
+    query: _teamQuery(teamId),
+  );
+
+  /// 确认后串行写盘；rewrite 必须显式二次确认 + allowlist（不自动 git commit）。
+  static Future<Map<String, dynamic>> applyProductionNormalize(
+    String lineId, {
+    String runId = '',
+    bool confirmRewrite = false,
+    List<String>? rewriteAllowlist,
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/normalize/apply',
+    body: <String, dynamic>{
+      if (runId.trim().isNotEmpty) 'run_id': runId.trim(),
+      if (confirmRewrite) 'confirm_rewrite': true,
+      if (rewriteAllowlist != null && rewriteAllowlist.isNotEmpty)
+        'rewrite_allowlist': rewriteAllowlist,
+    },
+    query: _teamQuery(teamId),
+  );
+
+  /// 按 runId 回滚归一化写入，回滚后重新阻塞直到重建完成。
+  static Future<Map<String, dynamic>> rollbackProductionNormalize(
+    String lineId, {
+    required String runId,
+    String teamId = '',
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/normalize/rollback',
+    body: <String, dynamic>{'run_id': runId},
+    query: _teamQuery(teamId),
+  );
+
   static Map<String, String> _teamQuery(String teamId) => <String, String>{
     if (teamId.trim().isNotEmpty) 'team_id': teamId.trim(),
   };
@@ -1516,9 +1736,7 @@ class ApiService {
   ///
   /// UI 的「退出应用」用它：只关自己会让其余窗口留在没有托盘的孤岛里。
   static Future<Map<String, dynamic>> closeUiWindows(String pluginId) {
-    return _deleteJson(
-      '/api/plugin/windows/${Uri.encodeComponent(pluginId)}',
-    );
+    return _deleteJson('/api/plugin/windows/${Uri.encodeComponent(pluginId)}');
   }
 
   /// 读取插件清单（**持久态**）与每条的运行态：GET /api/plugin/configs
@@ -1606,10 +1824,13 @@ class ApiService {
     final String encoded = Uri.encodeComponent(id);
     final String path = '/api/plugin/configs/$encoded/restart';
     if (mode == 'cold') return _postJson(path);
-    return _postJson(path, body: <String, dynamic>{
-      'mode': mode,
-      if (mode == 'hot') 'keep_state': keepState,
-    });
+    return _postJson(
+      path,
+      body: <String, dynamic>{
+        'mode': mode,
+        if (mode == 'hot') 'keep_state': keepState,
+      },
+    );
   }
 
   /// 内置插件目录：GET /api/plugin/builtins
@@ -1752,7 +1973,9 @@ class ApiService {
   /// `plugins/` 里的文件 → 落盘条目。内置项只删文件、条目保留并置 `enabled: false`
   /// （回到“待从仓库装”那一格，不从面板消失）。闸门等不到退出确认时核心回
   /// 400 + 中文原因（文件与条目一个都没动），这里抛成异常给详情页就地显示。
-  static Future<Map<String, dynamic>> uninstallPluginRelease(String pluginId) async {
+  static Future<Map<String, dynamic>> uninstallPluginRelease(
+    String pluginId,
+  ) async {
     final String encoded = Uri.encodeComponent(pluginId.trim());
     return _postJson(
       ApiPaths.pluginReleaseUninstall.replaceFirst('{pluginId}', encoded),
@@ -2305,8 +2528,7 @@ class ApiService {
     String agentId,
     String content, {
     String? sessionId,
-    List<Map<String, dynamic>> attachments =
-        const <Map<String, dynamic>>[],
+    List<Map<String, dynamic>> attachments = const <Map<String, dynamic>>[],
   }) async {
     return _postJson(
       ApiPaths.agentMessages.replaceFirst('{agentId}', agentId),
@@ -2324,9 +2546,7 @@ class ApiService {
   /// A5 起 WS 上行 `stop` 同样已被核心移除，停止只有这一条通路。
   /// 旧借口的 `session_id` 在 agent 级取消里被忽略，因此不再传。
   static Future<Map<String, dynamic>> cancelAgent(String agentId) async {
-    return _postJson(
-      ApiPaths.agentCancel.replaceFirst('{agentId}', agentId),
-    );
+    return _postJson(ApiPaths.agentCancel.replaceFirst('{agentId}', agentId));
   }
 
   /// 一键重置 agent 工作空间里的系统提示词 / Spec。
@@ -2441,8 +2661,9 @@ class ApiService {
   /// 真正的结果在 `success` 字段；漏判会让"点了没反应"看起来像成功。
   static void _expectOperationOk(Map<String, dynamic> data, String action) {
     if (data['success'] == false) {
-      final String detail =
-          (data['detail'] ?? data['error'] ?? '').toString().trim();
+      final String detail = (data['detail'] ?? data['error'] ?? '')
+          .toString()
+          .trim();
       throw Exception(detail.isEmpty ? '$action失败' : detail);
     }
   }

@@ -31,6 +31,7 @@ import '../widgets/plugin_panel.dart';
 import '../widgets/production_line_panel.dart';
 import '../widgets/production_line_model_info_panel.dart';
 import '../widgets/production_line_workbench.dart';
+import '../widgets/production_task_detail_panel.dart';
 import '../widgets/question_panel.dart';
 import '../widgets/right_panel_host.dart';
 import '../widgets/teammates_window_page.dart';
@@ -493,6 +494,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   /// 各是一个**按需打开的窗口**，引导「带我过去」用这两个字段把对应窗叫出来。
   String? _rightWindowId;
   int _rightWindowRevision = 0;
+
+  /// 右栏「生产线任务」窗口当前指向（工作台点任务时写入）。
+  String _productionTaskLineId = '';
+  String _productionTaskTaskId = '';
 
   /// 打开「设置」窗时是否要滚到「自定义模型」一节（引导第 1 步）。
   bool _settingsFocusModels = false;
@@ -1188,6 +1193,15 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 _selectedProductionLine = line;
                 _productionRefreshToken++;
               });
+            },
+            onOpenTask: (String taskId) {
+              final String lineId = '${_selectedProductionLine?['id'] ?? ''}';
+              if (lineId.isEmpty) return;
+              setState(() {
+                _productionTaskLineId = lineId;
+                _productionTaskTaskId = taskId;
+              });
+              _requestRightWindow('productionTask');
             },
           ),
         ],
@@ -1961,6 +1975,37 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         preferredWidth: 460,
         bodyBuilder: (BuildContext context) =>
             DetailPanel(workspaceId: workspaceId, teamId: agentId),
+      ),
+      RightPanelEntry(
+        id: 'productionTask',
+        label: '生产线任务',
+        icon: Icons.assignment_outlined,
+        // 任务详情：12px 正文 + 证据路径，460 够读
+        preferredWidth: 520,
+        bodyBuilder: (BuildContext context) {
+          final ColorScheme scheme = Theme.of(context).colorScheme;
+          final String lineId = _productionTaskLineId.trim().isNotEmpty
+              ? _productionTaskLineId
+              : '${line?['id'] ?? ''}';
+          final String taskId = _productionTaskTaskId.trim();
+          if (lineId.isEmpty || taskId.isEmpty) {
+            return Center(
+              child: Text(
+                '在工作台点一条任务，详情会在这里打开',
+                style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+              ),
+            );
+          }
+          final Map<String, dynamic>? lineData =
+              '${line?['id'] ?? ''}' == lineId ? line : null;
+          return ProductionTaskDetailPanel(
+            key: ValueKey<String>('production-task-$lineId-$taskId'),
+            lineId: lineId,
+            taskId: taskId,
+            teamId: _selectedAgent?.teamScopeId ?? '',
+            workspace: '${lineData?['workspace_dir'] ?? ''}',
+          );
+        },
       ),
       RightPanelEntry(
         id: 'settings',

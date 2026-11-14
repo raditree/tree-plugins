@@ -16,6 +16,8 @@ dependencies:
   # 会话存储（显示/详细两分，见 docs/conversation-sembast-and-collapse-recon.md）：
   # 纯 Dart 嵌入式数据库，零 native 依赖；追加日志+检查点，崩溃模型与 jsonl 同构。
   sembast: ^3.9.0
+  # Agent 记忆的 memory-id / 文件指纹（sha256 小写十六进制）。
+  crypto: ^3.0.6
 
 dev_dependencies:
   lints: ^6.0.0

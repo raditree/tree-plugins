@@ -57,10 +57,16 @@ class StationClient {
   /// 一份常量；改名必须先改 `docs/pluginization/agent_pluginization.md`）。
   static const String agentEventsStation = 'plugin.tree.agent.broadcast.events';
 
+  /// **产线任务状态站**（Task 9）：`{type:'production.task_state', line_id,
+  /// seq, snapshot_seq, task, line}`；seq 单调递增，gap = 漏帧。
+  static const String productionTaskStateStation =
+      'plugin.tree.production.line.broadcast.task_state';
+
   /// 默认订阅集合。
   static const Set<String> defaultStations = <String>{
     pluginStateStation,
     agentEventsStation,
+    productionTaskStateStation,
   };
 
   final WebSocketService Function() _connectionFactory;
@@ -112,8 +118,7 @@ class StationClient {
     _started = true;
     _stations.addAll(stations ?? defaultStations);
 
-    final WebSocketService ws =
-        (connectionFactory ?? _connectionFactory)();
+    final WebSocketService ws = (connectionFactory ?? _connectionFactory)();
     _ws = ws;
     ws.onMessage = handleFrame;
     ws.onConnectionChange = (bool connected) {
@@ -161,11 +166,7 @@ class StationClient {
     }
   }
 
-  void _sendSubscription(
-    WebSocketService ws,
-    String type,
-    String stationId,
-  ) {
+  void _sendSubscription(WebSocketService ws, String type, String stationId) {
     ws.send(<String, dynamic>{
       'type': type,
       'data': <String, dynamic>{
@@ -192,7 +193,9 @@ class StationClient {
     final String id = stationId.trim();
     if (id.isEmpty || !_stations.remove(id)) return;
     // 该站的 topic 水位不再有意义：留着只会在下次订阅时误丢首帧。
-    _lastSeq.removeWhere((String topic, int _) => topic.startsWith('terminal.'));
+    _lastSeq.removeWhere(
+      (String topic, int _) => topic.startsWith('terminal.'),
+    );
     _cancelRetry(id);
     _retryAttempts.remove(id);
     _subscribed.remove(id);
@@ -274,7 +277,8 @@ class StationClient {
     }
     _subscribed.remove(id);
     _offlineStationId = id;
-    offlineReason.value = '实时通道未建立：'
+    offlineReason.value =
+        '实时通道未建立：'
         '${ack.message.trim().isEmpty ? ack.code : ack.message.trim()}';
     debugPrint('[Station] 订阅 $id 被拒（${ack.code}）：${ack.message}');
     if (_retryableCodes.contains(ack.code)) {

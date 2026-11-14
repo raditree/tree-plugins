@@ -16,10 +16,16 @@ import 'models.dart';
 import 'budget.dart';
 import 'execution.dart';
 import 'expert.dart';
+import 'gate_runner.dart';
+import 'lease.dart';
+import 'memory_port.dart';
 import 'orchestrator.dart';
+import 'plan_document.dart';
 import 'preparation.dart';
 import 'service.dart';
 import 'store.dart';
+import 'readiness.dart';
+import 'structure_service.dart';
 
 /// P4 / P5 / P8 对外开放的命令族（同一个执行站 `production`）。
 const List<String> kExecutionCommands = <String>[
@@ -32,6 +38,7 @@ const List<String> kExecutionCommands = <String>[
   'production.task.questions',
   'production.task.answer',
   'production.task.budget',
+  'production.gate.run',
 ];
 
 /// 角色默认工具（与 recon §9.1 / §9.2 / §9.4 一致；插件间不互相 import）。
@@ -84,27 +91,19 @@ class ExecutorBinding {
   final bool legacyFallback;
 }
 
-typedef WorkerRunner =
-    Future<Map<String, Object?>> Function(
-      WorkerCall call,
-      Map<String, Object?> scope,
-    );
+typedef WorkerRunner = Future<Map<String, Object?>> Function(
+  WorkerCall call,
+  Map<String, Object?> scope,
+);
 
 /// 一条命令的结果（门控 / `git status` 共用）。
-class CommandResult {
-  const CommandResult({required this.ok, this.exitCode = 0, this.output = ''});
-
-  final bool ok;
-  final int exitCode;
-  final String output;
-}
-
-typedef CommandRunner =
-    Future<CommandResult> Function(
-      String command, {
-      required String workspace,
-      required Map<String, Object?> scope,
-    });
+///
+/// 类型定义在 `execution.dart`（独立 gate runner 也用它），这里保留 typedef 入口。
+typedef CommandRunner = Future<CommandResult> Function(
+  String command, {
+  required String workspace,
+  required Map<String, Object?> scope,
+});
 
 class ProductionExecutionService {
   ProductionExecutionService({
@@ -112,17 +111,29 @@ class ProductionExecutionService {
     DateTime Function()? clock,
     this.workers,
     this.commands,
+    this.onCycle,
+    this.memory,
+    this.onTaskState,
   }) : _environment = environment ?? Platform.environment,
        _clock = clock ?? DateTime.now;
 
   final Map<String, String> _environment;
   final DateTime Function() _clock;
 
+  /// 任务状态变化的事件监听（Task 9.1；旁路，失败不影响业务）。
+  final TaskStateListener? onTaskState;
+
   /// 员工运行器；null = 未接线（打包 / 执行 fail-closed）。
   final WorkerRunner? workers;
 
   /// 命令执行器（`git status` + 门控）；null = 未接线（门控 fail-closed）。
   final CommandRunner? commands;
+
+  /// 一次任务执行结束后触发主控 tick（插件层接事件驱动；null = 不触发）。
+  final ProductionCycleTrigger? onCycle;
+
+  /// `tree.agent` 记忆端口；null = 不启用（打包 / 收尾照常，元数据标不可用）。
+  final MemoryPort? memory;
 
   String get _now => _clock().toIso8601String();
 
@@ -140,12 +151,23 @@ class ProductionExecutionService {
     final ProductionStore store = ProductionStore(
       dataRoot: target.dataRoot,
       clock: _clock,
+      onTaskState: onTaskState,
     );
     switch (command) {
       case 'production.task.pack':
         return _pack(store, arguments, scope);
       case 'production.task.run':
-        return _run(store, arguments, scope);
+        {
+          final Map<String, Object?> result = await _run(
+            store,
+            arguments,
+            scope,
+          );
+          // 执行结束（done / blocked / retry / 软停）后补一次主控 tick；
+          // 事件 tick 由插件层 debounce，幂等，不递归等待。
+          await _notifyCycle(arguments, meta, scope);
+          return result;
+        }
       case 'production.task.expert':
         return _expert(store, arguments, scope);
       case 'production.task.message':
@@ -160,11 +182,10 @@ class ProductionExecutionService {
         return _answer(store, arguments);
       case 'production.task.budget':
         return _taskBudget(store, arguments);
+      case 'production.gate.run':
+        return _gateRun(store, arguments, scope);
       default:
-        throw ProductionFailure(
-          '未知执行阶段命令：$command',
-          code: 'unknown_command',
-        );
+        throw ProductionFailure('未知执行阶段命令：$command', code: 'unknown_command');
     }
   }
 
@@ -177,14 +198,41 @@ class ProductionExecutionService {
   ) async {
     final String lineId = _arg(arguments, 'line_id');
     final String taskId = _arg(arguments, 'task_id');
+    final String idempotencyKey = textOf(arguments['idempotency_key']);
     final LineRecord line = store.getLine(lineId);
     TaskRecord task = store.getTask(lineId, taskId);
-    if (task.status != TaskStatus.queued &&
-        task.status != TaskStatus.packing) {
+    // SG-02：带 idempotency_key 的重复派发直接回放上次结果，不重复执行。
+    if (idempotencyKey.isNotEmpty) {
+      final Map<String, Object?>? claimed = store.claimCommand(
+        lineId,
+        taskId,
+        command: 'production.task.pack',
+        key: idempotencyKey,
+      );
+      if (claimed != null) return plainMap(claimed['result']);
+    }
+    if (task.status != TaskStatus.queued && task.status != TaskStatus.packing) {
       throw ProductionFailure(
         '只有 queued / packing 可以打包（当前 ${task.status.wire}）',
         code: 'execute_state',
       );
+    }
+    // LG-01 / TG-06：结构未通过时只允许 cleanup 任务进入打包。
+    requireStructureReady(store, line, taskType: task.taskType);
+    // LG-07 / TG-05：归一化与索引未就绪前不得打包（organizing 的 cleanup 例外）。
+    requireLineReady(store, line, taskType: task.taskType);
+    // BG-01~08：上一批漂移哨兵未通过 ⇒ 停止下一批（cleanup 不受影响）。
+    if (task.taskType != 'cleanup') {
+      final Map<String, Object?> drift = store.readDrift(lineId);
+      if (drift['ok'] == false) {
+        final String code = textOf(drift['code']);
+        throw ProductionFailure(
+          '上一批次漂移哨兵未通过（${code.isEmpty ? 'drift_blocked' : code}）：'
+          '先处理漂移再继续',
+          code: code.isEmpty ? 'drift_blocked' : code,
+          missing: <String>[taskId],
+        );
+      }
     }
     // D2：空写域 = 工作空间根（`**`），不再在这里拒绝。
     final List<String> writeScope = task.effectiveWriteScope;
@@ -203,6 +251,16 @@ class ProductionExecutionService {
         code: 'model_required',
       );
     }
+    // SG-01：打包前先拿租约；后续每次落盘都带本租约的 fencing。
+    final TaskLease lease = store.acquireLease(
+      lineId,
+      taskId,
+      owner: binding.agentId,
+      runId: store.nextRunId(taskId, 'packer'),
+    );
+    final int fencing = lease.fencing;
+    void checkLease() => store.assertLease(lineId, taskId, fencing);
+    try {
     // P8：预算到点即软停（不发起员工调用，保留当前产出）。
     final TaskBudget budget = budgetOf(plainMap(line.data['limits']));
     final BudgetState startBudget = budgetStateOf(budget, usageOf(task));
@@ -214,13 +272,23 @@ class ProductionExecutionService {
         stage: 'pack',
         role: 'packer',
         state: startBudget,
+        fencing: fencing,
       );
     }
     if (task.status == TaskStatus.queued) {
+      checkLease();
       store.transition(lineId, taskId, to: TaskStatus.packing.wire);
     }
     final int attempt = intOf(task.data['pack_attempts'], 0) + 1;
-    task = store.putTask(lineId, taskId, <String, Object?>{'pack_attempts': attempt});
+    task = store.putTask(lineId, taskId, <String, Object?>{
+      'pack_attempts': attempt,
+    });
+    // 记忆只喂打包提示词；落盘的只有 hash / sources / unavailable（读失败不阻断打包）。
+    final MemoryView agentMemory = await _readMemory(
+      textOf(plainMap(line.data['executor'])['agent_id']),
+      'production.task.pack',
+      scope,
+    );
     final String startedAt = _now;
     final int startedMs = _clock().millisecondsSinceEpoch;
     Map<String, Object?> result;
@@ -236,6 +304,7 @@ class ProductionExecutionService {
             intake: _intakeText(task),
             plan: _readAsset(store, lineId, task, 'plan'),
             memory: _memoryText(store, lineId, line),
+            agentMemory: agentMemory.text,
             readScope: stringsOf(task.data['read_scope']),
             writeScope: writeScope,
             expertAvailable: _expertRole(line)['enabled'] == true,
@@ -246,10 +315,7 @@ class ProductionExecutionService {
         _workerScope(binding, lineId, taskId),
       );
     } catch (error) {
-      result = <String, Object?>{
-        'status': 'failed',
-        'error': '员工运行异常：$error',
-      };
+      result = <String, Object?>{'status': 'failed', 'error': '员工运行异常：$error'};
     }
     final int elapsed = _clock().millisecondsSinceEpoch - startedMs;
     final String workerError = _workerErrorOf(result);
@@ -277,7 +343,14 @@ class ProductionExecutionService {
     });
     final BudgetState endBudget = budgetStateOf(budget, usageOf(task));
     if (workerError.isNotEmpty) {
-      return _failPack(store, lineId, taskId, run, workerError);
+      return _failPack(
+        store,
+        lineId,
+        taskId,
+        run,
+        workerError,
+        fencing: fencing,
+      );
     }
     final Map<String, Object?>? json = jsonObjectFromText(report);
     if (json == null) {
@@ -287,6 +360,7 @@ class ProductionExecutionService {
         taskId,
         run,
         '打包模型没有返回 JSON：${_clip(report, 300)}',
+        fencing: fencing,
       );
     }
     final PackSpec pack;
@@ -298,9 +372,25 @@ class ProductionExecutionService {
         stringsOf(plainMap(line.data['policy'])['deny_globs']),
       );
     } on ProductionFailure catch (error) {
-      return _failPack(store, lineId, taskId, run, error.message);
+      return _failPack(
+        store,
+        lineId,
+        taskId,
+        run,
+        error.message,
+        fencing: fencing,
+      );
     }
-    store.writePack(lineId, taskId, pack.toJson());
+    checkLease();
+    store.writePack(lineId, taskId, <String, Object?>{
+      ...pack.toJson(),
+      // 只落元数据：记忆正文绝不进 pack.json。
+      'memory_hash': agentMemory.unavailable ? '' : agentMemory.hash,
+      'memory_sources': agentMemory.unavailable
+          ? const <String>[]
+          : agentMemory.sources,
+      if (agentMemory.unavailable) 'memory_unavailable': true,
+    });
     final String packAsset = 'tasks/$taskId/pack.md';
     store.writeAsset(
       lineId,
@@ -339,16 +429,33 @@ class ProductionExecutionService {
         role: 'packer',
         state: endBudget,
         run: run,
+        fencing: fencing,
       );
     }
+    checkLease();
     store.transition(lineId, taskId, to: TaskStatus.packed.wire);
+    checkLease();
     store.writeRun(lineId, run);
-    return <String, Object?>{
+    store.releaseLease(lineId, taskId, fencing);
+    final Map<String, Object?> packedResult = <String, Object?>{
       'task': store.getTask(lineId, taskId).toJson(),
       'pack': pack.toJson(),
       'run': run,
       'status': 'packed',
     };
+    if (idempotencyKey.isNotEmpty) {
+      store.recordCommand(
+        lineId,
+        taskId,
+        command: 'production.task.pack',
+        key: idempotencyKey,
+        result: packedResult,
+      );
+    }
+    return packedResult;
+    } finally {
+      store.releaseLease(lineId, taskId, fencing);
+    }
   }
 
   Map<String, Object?> _failPack(
@@ -356,8 +463,10 @@ class ProductionExecutionService {
     String lineId,
     String taskId,
     Map<String, Object?> run,
-    String error,
-  ) {
+    String error, {
+    required int fencing,
+  }) {
+    store.assertLease(lineId, taskId, fencing);
     final Map<String, Object?> failed = <String, Object?>{
       ...run,
       'status': 'failed',
@@ -366,6 +475,7 @@ class ProductionExecutionService {
     store.writeRun(lineId, failed);
     final TaskRecord current = store.getTask(lineId, taskId);
     if (canTransition(current.status, TaskStatus.blocked)) {
+      store.assertLease(lineId, taskId, fencing);
       store.transition(
         lineId,
         taskId,
@@ -376,6 +486,7 @@ class ProductionExecutionService {
     store.putTask(lineId, taskId, <String, Object?>{
       'last_error': {'stage': 'pack', 'error': error, 'at': _now},
     });
+    store.releaseLease(lineId, taskId, fencing);
     return <String, Object?>{
       'task': store.getTask(lineId, taskId).toJson(),
       'run': failed,
@@ -393,14 +504,38 @@ class ProductionExecutionService {
   ) async {
     final String lineId = _arg(arguments, 'line_id');
     final String taskId = _arg(arguments, 'task_id');
+    // SG-04：执行者不能自签门控；门控命令只认任务 `gate.commands` / 打包基线。
+    if (arguments.containsKey('gate')) {
+      throw ProductionFailure(
+        'production.task.run 不接受调用方直接指定门控（gate）：'
+        '门控由独立 runner 跑任务 gate.commands / 打包基线',
+        code: 'gate_source_invalid',
+        missing: <String>[taskId],
+      );
+    }
+    final String idempotencyKey = textOf(arguments['idempotency_key']);
     final LineRecord line = store.getLine(lineId);
     TaskRecord task = store.getTask(lineId, taskId);
+    // SG-02：带 idempotency_key 的重复执行直接回放上次结果，不重复跑模型 / 门控。
+    if (idempotencyKey.isNotEmpty) {
+      final Map<String, Object?>? claimed = store.claimCommand(
+        lineId,
+        taskId,
+        command: 'production.task.run',
+        key: idempotencyKey,
+      );
+      if (claimed != null) return plainMap(claimed['result']);
+    }
     if (task.status != TaskStatus.packed) {
       throw ProductionFailure(
         '只有 packed 可以执行（当前 ${task.status.wire}）：先 production.task.pack',
         code: 'execute_state',
       );
     }
+    // LG-01 / TG-06：结构未通过时只允许 cleanup 任务进入执行。
+    requireStructureReady(store, line, taskType: task.taskType);
+    // LG-07 / TG-05：归一化与索引未就绪前不得执行（organizing 的 cleanup 例外）。
+    requireLineReady(store, line, taskType: task.taskType);
     final Map<String, Object?> pack = store.readPack(lineId, taskId);
     if (pack.isEmpty) {
       throw ProductionFailure(
@@ -433,6 +568,17 @@ class ProductionExecutionService {
         code: 'model_required',
       );
     }
+    // SG-01：执行前拿租约；run_id 与 gates/<run_id>/gate.json 对齐。
+    final TaskLease lease = store.acquireLease(
+      lineId,
+      taskId,
+      owner: binding.agentId,
+      runId: store.nextRunId(taskId, 'executor'),
+    );
+    final int fencing = lease.fencing;
+    final String runId = lease.runId;
+    void checkLease() => store.assertLease(lineId, taskId, fencing);
+    try {
     // P8：预算到点即软停（不发起员工调用、不跑门控）。
     final TaskBudget budget = budgetOf(plainMap(line.data['limits']));
     final BudgetState startBudget = budgetStateOf(budget, usageOf(task));
@@ -444,6 +590,7 @@ class ProductionExecutionService {
         stage: 'run',
         role: 'executor',
         state: startBudget,
+        fencing: fencing,
       );
     }
     final Map<String, Object?> workerScope = _workerScope(
@@ -466,6 +613,7 @@ class ProductionExecutionService {
     }
     final Set<String> beforeFiles = parseChangedFiles(before.output).toSet();
 
+    checkLease();
     store.transition(lineId, taskId, to: TaskStatus.running.wire);
     task = store.putTask(lineId, taskId, <String, Object?>{
       'run_attempts': intOf(task.data['run_attempts'], 0) + 1,
@@ -493,15 +641,12 @@ class ProductionExecutionService {
         workerScope,
       );
     } catch (error) {
-      result = <String, Object?>{
-        'status': 'failed',
-        'error': '员工运行异常：$error',
-      };
+      result = <String, Object?>{'status': 'failed', 'error': '员工运行异常：$error'};
     }
     final int elapsed = _clock().millisecondsSinceEpoch - startedMs;
     final String workerError = _workerErrorOf(result);
     Map<String, Object?> run = _runMap(
-      runId: store.nextRunId(taskId, 'executor'),
+      runId: runId,
       taskId: taskId,
       role: 'executor',
       modelId: modelId,
@@ -530,6 +675,7 @@ class ProductionExecutionService {
         run: run,
         reason: '执行模型失败：$workerError',
         status: 'blocked',
+        fencing: fencing,
       );
     }
     // 写域判据：执行前后的改动差集必须全部落在 write_scope 内，且不命中禁区。
@@ -547,6 +693,7 @@ class ProductionExecutionService {
         run: run,
         reason: '无法读取执行后的改动（git status 失败）：${_clip(after.output, 300)}',
         status: 'blocked',
+        fencing: fencing,
       );
     }
     final List<String> changed = <String>[
@@ -574,6 +721,7 @@ class ProductionExecutionService {
         run: run,
         reason: reason,
         status: 'write_scope_violation',
+        fencing: fencing,
       );
     }
     store.putTask(lineId, taskId, <String, Object?>{'changed_files': changed});
@@ -591,45 +739,75 @@ class ProductionExecutionService {
           'status': 'ok',
           'changed_files': changed,
         },
+        fencing: fencing,
       );
     }
+    checkLease();
     store.transition(lineId, taskId, to: TaskStatus.gating.wire);
 
-    // 门控：任何一条失败都不得进 done。
-    final List<String> gate = gateCommandsOf(
-      arguments['gate'],
+    // 门控（SG-04）：独立 runner 跑命令 + 核对证据，结果写 gates/<runId>/gate.json。
+    // 命令来源只认任务 `gate.commands` 与打包基线，执行者不能传参自签。
+    final List<String> gateCommands = gateCommandsOf(
+      plainMap(task.data['gate'])['commands'],
       <String>[
-        for (final Object? item in (pack['baseline'] as List<dynamic>? ??
-            const <dynamic>[]))
+        for (final Object? item
+            in (pack['baseline'] as List<dynamic>? ?? const <dynamic>[]))
           if (item is Map) textOf(plainMap(item)['command']),
       ],
     );
-    final List<Map<String, Object?>> gateResults = <Map<String, Object?>>[];
-    bool gateFailed = false;
-    for (final String command in gate) {
-      if (command.trim().isEmpty) continue;
-      final CommandResult result = await _command(
+    final Map<String, Object?> gateSpec = plainMap(task.data['gate']);
+    final List<Map<String, Object?>> checklist = normalizeGateItems(
+      gateSpec['checklist'] ?? gateSpec['items'],
+    );
+    final Map<String, Object?> gateReport = await const GateRunner().run(
+      runnerId: runId,
+      runId: runId,
+      commands: gateCommands,
+      checklist: checklist,
+      workspace: workspace,
+      commandRunner: (String command) => _command(
         commandRunner,
         command,
         workspace: workspace,
         scope: workerScope,
-      );
+      ),
+      store: store,
+      lineId: lineId,
+      taskId: taskId,
+      fencing: fencing,
+    );
+    final List<Map<String, Object?>> gateResults = <Map<String, Object?>>[
+      for (final Object? item
+          in (gateReport['commands'] as List<dynamic>? ?? const <dynamic>[]))
+        if (item is Map) plainMap(item),
+    ];
+    final List<Map<String, Object?>> checklistResults =
+        <Map<String, Object?>>[
+          for (final Object? item
+              in (gateReport['checklist'] as List<dynamic>? ??
+                  const <dynamic>[]))
+            if (item is Map) plainMap(item),
+        ];
+    for (final Map<String, Object?> item in checklistResults) {
+      if (item['ok'] == true) continue;
+      final String failure = textOf(item['error']).isEmpty
+          ? '门控证据未通过：${textOf(item['evidence'])}'
+          : textOf(item['error']);
       gateResults.add(<String, Object?>{
-        'command': command,
-        'ok': result.ok,
-        'exit_code': result.exitCode,
-        'output': _clip(result.output, 4000),
+        'command': 'evidence:${textOf(item['text'])}',
+        'ok': false,
+        'exit_code': -1,
+        'output': failure,
       });
-      if (!result.ok) {
-        gateFailed = true;
-        break;
-      }
     }
+    final bool gateFailed = gateReport['ok'] != true;
     run = <String, Object?>{
       ...run,
       'status': gateFailed ? 'failed' : 'ok',
       'changed_files': changed,
       'gate': gateResults,
+      if (checklistResults.isNotEmpty) 'checklist': checklistResults,
+      'gate_run_id': runId,
       'artifacts': <String>['tasks/$taskId/pack.json'],
     };
     if (gateFailed) {
@@ -640,6 +818,7 @@ class ProductionExecutionService {
           if (item['ok'] != true)
             '${item['command']}：${_clip(textOf(item['output']), 300)}',
       ].join('；');
+      checkLease();
       store.writeRun(lineId, run);
       store.putTask(lineId, taskId, <String, Object?>{
         'gate_attempts': attempts,
@@ -650,7 +829,9 @@ class ProductionExecutionService {
         },
       });
       if (attempts <= maxRetries) {
+        checkLease();
         store.transition(lineId, taskId, to: TaskStatus.packed.wire);
+        store.releaseLease(lineId, taskId, fencing);
         return <String, Object?>{
           'task': store.getTask(lineId, taskId).toJson(),
           'run': run,
@@ -669,22 +850,58 @@ class ProductionExecutionService {
         reason: '门控失败（已重试 $maxRetries 次）：$summary',
         status: 'blocked',
         extra: <String, Object?>{'gate': gateResults, 'attempts': attempts},
+        fencing: fencing,
       );
     }
+    // 门控全过才写一条任务记忆；记忆失败 / 未接线一律不影响 done。
+    final MemoryWrite memoryWrite = await _recordMemory(
+      agentId: textOf(plainMap(line.data['executor'])['agent_id']),
+      summary: '${task.title}：门控 ${gateResults.length} 条全部通过',
+      sources: <String>['line/$lineId/task/$taskId'],
+      lineId: lineId,
+      taskId: taskId,
+      scope: scope,
+    );
+    if (memoryWrite.unavailable) {
+      run = <String, Object?>{...run, 'memory_unavailable': true};
+    } else if (memoryWrite.ok) {
+      run = <String, Object?>{
+        ...run,
+        'memory_hash': memoryWrite.hash,
+        'memory_sources': memoryWrite.sources,
+      };
+    }
+    checkLease();
     store.writeRun(lineId, run);
+    checkLease();
     store.transition(lineId, taskId, to: TaskStatus.done.wire);
     store.putTask(lineId, taskId, <String, Object?>{
       'gate_attempts': 0,
       'gate': gateResults,
       'done_at': _now,
+      'last_run_id': runId,
     });
-    return <String, Object?>{
+    store.releaseLease(lineId, taskId, fencing);
+    final Map<String, Object?> doneResult = <String, Object?>{
       'task': store.getTask(lineId, taskId).toJson(),
       'run': run,
       'status': 'done',
       'gate': gateResults,
       'changed_files': changed,
     };
+    if (idempotencyKey.isNotEmpty) {
+      store.recordCommand(
+        lineId,
+        taskId,
+        command: 'production.task.run',
+        key: idempotencyKey,
+        result: doneResult,
+      );
+    }
+    return doneResult;
+    } finally {
+      store.releaseLease(lineId, taskId, fencing);
+    }
   }
 
   Map<String, Object?> _blockRun({
@@ -694,8 +911,10 @@ class ProductionExecutionService {
     required Map<String, Object?> run,
     required String reason,
     required String status,
+    required int fencing,
     Map<String, Object?> extra = const <String, Object?>{},
   }) {
+    store.assertLease(lineId, taskId, fencing);
     final Map<String, Object?> failed = <String, Object?>{
       ...run,
       'status': 'failed',
@@ -704,6 +923,7 @@ class ProductionExecutionService {
     store.writeRun(lineId, failed);
     final TaskRecord current = store.getTask(lineId, taskId);
     if (canTransition(current.status, TaskStatus.blocked)) {
+      store.assertLease(lineId, taskId, fencing);
       store.transition(
         lineId,
         taskId,
@@ -714,6 +934,7 @@ class ProductionExecutionService {
     store.putTask(lineId, taskId, <String, Object?>{
       'last_error': {'stage': 'run', 'error': reason, 'at': _now},
     });
+    store.releaseLease(lineId, taskId, fencing);
     return <String, Object?>{
       'task': store.getTask(lineId, taskId).toJson(),
       'run': failed,
@@ -807,10 +1028,7 @@ class ProductionExecutionService {
         workerScope,
       );
     } catch (error) {
-      result = <String, Object?>{
-        'status': 'failed',
-        'error': '专家运行异常：$error',
-      };
+      result = <String, Object?>{'status': 'failed', 'error': '专家运行异常：$error'};
     }
     final int elapsed = _clock().millisecondsSinceEpoch - startedMs;
     final String workerModel = textOf(result['model_id']).isEmpty
@@ -850,9 +1068,7 @@ class ProductionExecutionService {
     }
     final ExpertAnswer answer;
     try {
-      answer = parseExpertAnswer(
-        jsonObjectFromText(textOf(result['report'])),
-      );
+      answer = parseExpertAnswer(jsonObjectFromText(textOf(result['report'])));
     } on ProductionFailure catch (error) {
       final Map<String, Object?> failed = <String, Object?>{
         ...withQuestion(run),
@@ -921,9 +1137,14 @@ class ProductionExecutionService {
         'text': text,
       },
     );
-    final List<Map<String, Object?>> thread = store.readMessages(lineId, taskId);
+    final List<Map<String, Object?>> thread = store.readMessages(
+      lineId,
+      taskId,
+    );
     final int questions = thread
-        .where((Map<String, Object?> item) => textOf(item['kind']) == 'question')
+        .where(
+          (Map<String, Object?> item) => textOf(item['kind']) == 'question',
+        )
         .length;
     bool blocked = false;
     // §9.3：打回超过 3 次 ⇒ 自动 blocked，避免无限来回烧 token。
@@ -954,7 +1175,10 @@ class ProductionExecutionService {
     final String lineId = _arg(arguments, 'line_id');
     final String taskId = _arg(arguments, 'task_id');
     store.getTask(lineId, taskId);
-    final List<Map<String, Object?>> thread = store.readMessages(lineId, taskId);
+    final List<Map<String, Object?>> thread = store.readMessages(
+      lineId,
+      taskId,
+    );
     return <String, Object?>{
       'messages': thread,
       'count': thread.length,
@@ -1041,10 +1265,7 @@ class ProductionExecutionService {
       reason: 'question_pending',
     );
     return <String, Object?>{
-      'question': <String, Object?>{
-        ...question,
-        'status': 'open',
-      },
+      'question': <String, Object?>{...question, 'status': 'open'},
       'task': store.getTask(lineId, taskId).toJson(),
     };
   }
@@ -1172,6 +1393,72 @@ class ProductionExecutionService {
     };
   }
 
+  /// `production.gate.run`：独立跑一次门控并写 `gate.json`，不改任务状态。
+  ///
+  /// 供“独立门控 runner”场景：命令与清单只取任务 `gate.*`（回退打包基线），
+  /// 不接受调用方传 `gate`；`runner_id` 缺省 `gate_runner`（用于防篡改判定）。
+  Future<Map<String, Object?>> _gateRun(
+    ProductionStore store,
+    Map<String, Object?> arguments,
+    Map<String, Object?> scope,
+  ) async {
+    final String lineId = _arg(arguments, 'line_id');
+    final String taskId = _arg(arguments, 'task_id');
+    final LineRecord line = store.getLine(lineId);
+    final TaskRecord task = store.getTask(lineId, taskId);
+    final CommandRunner? commandRunner = commands;
+    if (commandRunner == null) {
+      throw ProductionFailure(
+        '门控需要命令执行通道（local.exec.command），当前未接线',
+        code: 'command_unavailable',
+      );
+    }
+    final String workspace = store.workspaceDirOf(lineId);
+    final Map<String, Object?> pack = store.readPack(lineId, taskId);
+    final Map<String, Object?> gateSpec = plainMap(task.data['gate']);
+    final List<String> gateCommands = gateCommandsOf(
+      gateSpec['commands'],
+      <String>[
+        for (final Object? item
+            in (pack['baseline'] as List<dynamic>? ?? const <dynamic>[]))
+          if (item is Map) textOf(plainMap(item)['command']),
+      ],
+    );
+    final List<Map<String, Object?>> checklist = normalizeGateItems(
+      gateSpec['checklist'] ?? gateSpec['items'],
+    );
+    final String requestedRunId = textOf(arguments['run_id']);
+    final String runId = requestedRunId.isEmpty
+        ? store.nextRunId(taskId, 'gate')
+        : requestedRunId;
+    final String runnerId = textOf(arguments['runner_id']).isEmpty
+        ? 'gate_runner'
+        : textOf(arguments['runner_id']);
+    final Map<String, Object?> workerScope = _workerScope(
+      _bindingOf(line, scope),
+      lineId,
+      taskId,
+    );
+    final TaskLease? lease = TaskLease.tryParse(task.data['lease']);
+    return const GateRunner().run(
+      runnerId: runnerId,
+      runId: runId,
+      commands: gateCommands,
+      checklist: checklist,
+      workspace: workspace,
+      commandRunner: (String command) => _command(
+        commandRunner,
+        command,
+        workspace: workspace,
+        scope: workerScope,
+      ),
+      store: store,
+      lineId: lineId,
+      taskId: taskId,
+      fencing: lease?.fencing ?? 0,
+    );
+  }
+
   /// 预算软停：保留当前产出，任务标 `budget_exceeded` 并转 `blocked`。
   ///
   /// [run] 为空 = 调用前就超限（没发起员工）；非空 = 本次产出照常记账，
@@ -1183,6 +1470,7 @@ class ProductionExecutionService {
     required String stage,
     required String role,
     required BudgetState state,
+    required int fencing,
     Map<String, Object?>? run,
   }) {
     final String reason = '预算到点软停（$stage）：${state.reasons.join('；')}';
@@ -1201,14 +1489,12 @@ class ProductionExecutionService {
             'error': reason,
             'artifacts': <Object?>[],
           }
-        : <String, Object?>{
-            ...run,
-            'budget_exceeded': true,
-            'error': reason,
-          };
+        : <String, Object?>{...run, 'budget_exceeded': true, 'error': reason};
+    store.assertLease(lineId, taskId, fencing);
     store.writeRun(lineId, finalRun);
     final TaskRecord current = store.getTask(lineId, taskId);
     if (canTransition(current.status, TaskStatus.blocked)) {
+      store.assertLease(lineId, taskId, fencing);
       store.transition(
         lineId,
         taskId,
@@ -1221,6 +1507,7 @@ class ProductionExecutionService {
       'budget': renderBudgetState(state),
       'last_error': {'stage': stage, 'error': reason, 'at': _now},
     });
+    store.releaseLease(lineId, taskId, fencing);
     return <String, Object?>{
       'task': store.getTask(lineId, taskId).toJson(),
       'run': finalRun,
@@ -1236,16 +1523,10 @@ class ProductionExecutionService {
   ///
   /// 老产线缺 `executor` 时回退调用方 `scope.agent_id` 一个版本（兼容窗口）；
   /// 两者都没有就 fail-closed，并把补齐方法写进错误里。
-  ExecutorBinding _bindingOf(
-    LineRecord line,
-    Map<String, Object?> scope,
-  ) {
+  ExecutorBinding _bindingOf(LineRecord line, Map<String, Object?> scope) {
     final String configured = line.executorAgentId;
     if (configured.isNotEmpty) {
-      return ExecutorBinding(
-        agentId: configured,
-        teamId: line.executorTeamId,
-      );
+      return ExecutorBinding(agentId: configured, teamId: line.executorTeamId);
     }
     final String fallback = textOf(scope['agent_id']);
     if (fallback.isEmpty) {
@@ -1330,12 +1611,50 @@ class ProductionExecutionService {
     }
   }
 
+  /// 读一次 agent 记忆：未接线 / agent 为空 / 通道失败都按不可用处理，绝不抛。
+  Future<MemoryView> _readMemory(
+    String agentId,
+    String purpose,
+    Map<String, Object?> scope,
+  ) async {
+    final MemoryPort? port = memory;
+    if (port == null || agentId.trim().isEmpty) {
+      return const MemoryView(unavailable: true, code: 'memory_unavailable');
+    }
+    return port.read(
+      agentId: agentId,
+      purpose: purpose,
+      budgetChars: 4000,
+      scope: scope,
+    );
+  }
+
+  /// 写一条任务记忆（purpose 固定 `production.task.done`）；失败不抛、不改执行结果。
+  Future<MemoryWrite> _recordMemory({
+    required String agentId,
+    required String summary,
+    required List<String> sources,
+    required String lineId,
+    required String taskId,
+    required Map<String, Object?> scope,
+  }) async {
+    final MemoryPort? port = memory;
+    if (port == null || agentId.trim().isEmpty) {
+      return const MemoryWrite(unavailable: true, code: 'memory_unavailable');
+    }
+    return port.record(
+      agentId: agentId,
+      purpose: 'production.task.done',
+      summary: summary,
+      sources: sources,
+      lineId: lineId,
+      taskId: taskId,
+      scope: scope,
+    );
+  }
+
   /// 「项目记忆」= line.yaml.docs.memory_manifest 里的几份文档（缺失跳过）。
-  String _memoryText(
-    ProductionStore store,
-    String lineId,
-    LineRecord line,
-  ) {
+  String _memoryText(ProductionStore store, String lineId, LineRecord line) {
     final List<String> manifest = stringsOf(
       plainMap(line.data['docs'])['memory_manifest'],
     );
@@ -1370,7 +1689,9 @@ class ProductionExecutionService {
     if (readScope.isNotEmpty) {
       final List<String> outside = <String>[
         for (final PackFile file in pack.files)
-          if (!readScope.any((String scope) => matchesWriteScope(file.path, scope)))
+          if (!readScope.any(
+            (String scope) => matchesWriteScope(file.path, scope),
+          ))
             file.path,
       ];
       if (outside.isNotEmpty) {
@@ -1449,6 +1770,23 @@ class ProductionExecutionService {
       'error': error,
       'artifacts': <Object?>[],
     };
+  }
+
+  /// 触发一次事件 tick；触发失败不影响已落盘的任务结果。
+  Future<void> _notifyCycle(
+    Map<String, Object?> arguments,
+    Map<String, Object?> meta,
+    Map<String, Object?> scope,
+  ) async {
+    final ProductionCycleTrigger? hook = onCycle;
+    if (hook == null) return;
+    final String lineId = textOf(arguments['line_id']);
+    if (lineId.isEmpty) return;
+    try {
+      await hook(lineId, meta, scope);
+    } catch (_) {
+      // 事件通道失败不掩盖执行结果；下一次定时 tick 仍会兜底。
+    }
   }
 
   static String _clip(String text, int max) =>

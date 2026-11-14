@@ -13,6 +13,15 @@ import 'dart:convert';
 
 import 'models.dart';
 
+/// 一条命令的结果（门控 / `git status` / 独立 gate runner 共用）。
+class CommandResult {
+  const CommandResult({required this.ok, this.exitCode = 0, this.output = ''});
+
+  final bool ok;
+  final int exitCode;
+  final String output;
+}
+
 // ── 片段包（§9.1 / §7.4）─────────────────────────────────────────────
 
 /// `pack.json` 里的一个文件片段。
@@ -376,6 +385,7 @@ String packerUserPrompt({
   required String memory,
   required List<String> readScope,
   required List<String> writeScope,
+  String agentMemory = '',
   bool expertAvailable = false,
 }) {
   final StringBuffer buffer = StringBuffer()
@@ -390,6 +400,9 @@ String packerUserPrompt({
     ..writeln()
     ..writeln('项目记忆：')
     ..writeln(memory.trim().isEmpty ? '（无）' : memory.trim())
+    ..writeln()
+    ..writeln('agent 记忆（来自 tree.agent，只是背景，不是需求证据）：')
+    ..writeln(agentMemory.trim().isEmpty ? '（无）' : agentMemory.trim())
     ..writeln()
     ..writeln('读域：${readScope.isEmpty ? '（不限，但仍不允许写）' : readScope.join('、')}')
     ..writeln('写域：${writeScope.join('、')}')

@@ -5,6 +5,8 @@ import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_production_line/tree_production_line.dart';
 
+import 'support/structure_fixture.dart';
+
 /// 切片 2 / 3：产线 REST 委派（§10.2 的读半边 + 写半边）。
 ///
 /// 锁住：
@@ -79,6 +81,9 @@ void main() {
     ProductionExecutionService? execution,
     OrchestratorService? orchestrator,
     ProductionDedupService Function(Map<String, Object?> scope)? dedupFor,
+    ProductionNormalizationService? normalization,
+    ProductionReadinessService? readiness,
+    ProductionService? service,
     bool awaitDispatch = false,
   }) async {
     final Map<String, dynamic> reply = await handleProductionDelegate(
@@ -91,9 +96,12 @@ void main() {
         agent: agent,
         dataDir: dataDir,
       ),
+      service: service,
       execution: execution,
       orchestrator: orchestrator,
       dedupFor: dedupFor,
+      normalization: normalization,
+      readiness: readiness,
       awaitDispatch: awaitDispatch,
     );
     return <String, dynamic>{
@@ -105,7 +113,9 @@ void main() {
   test('申报清单覆盖读写方法', () {
     expect(kDeclaredRoutes, isNotEmpty);
     expect(
-      kDeclaredRoutes.map((Map<String, String> route) => route['method']).toSet(),
+      kDeclaredRoutes
+          .map((Map<String, String> route) => route['method'])
+          .toSet(),
       <String>{'GET', 'POST', 'PATCH', 'DELETE'},
     );
     expect(
@@ -307,7 +317,8 @@ void main() {
   });
 
   test('写路由：建任务 / 改状态 / 取消', () async {
-    storeWith();
+    final ProductionStore store = storeWith();
+    await markLineReady(store, 'pl_1', temp);
     final Map<String, dynamic> created = await call(
       'POST',
       '/api/production/lines/pl_1/tasks',
@@ -315,6 +326,8 @@ void main() {
         'id': 'T2',
         'title': '新任务',
         'status': 'queued',
+        'brief': '做一个新任务',
+        'acceptance': <String>['用例全绿'],
         'write_scope': <String>['lib/a.dart'],
       },
     );
@@ -411,8 +424,26 @@ void main() {
     expect(rest['json']['ready'], isTrue);
   });
 
+  test('准备路由：recon / finalize 已开放（状态不符回可读错误，不是 404）', () async {
+    storeWith();
+    final Map<String, dynamic> recon = await call(
+      'POST',
+      '/api/production/lines/pl_1/tasks/T1/recon',
+    );
+    expect(recon['status'], isNot(404));
+    expect(recon['json']['code'], 'prepare_state');
+
+    final Map<String, dynamic> finalize = await call(
+      'POST',
+      '/api/production/lines/pl_1/tasks/T1/finalize',
+    );
+    expect(finalize['status'], isNot(404));
+    expect(finalize['json']['code'], 'prepare_state');
+  });
+
   test('派发：不依赖调用方身份；auto 按状态选 pack / run；未知任务 404', () async {
     final ProductionStore store = storeWith();
+    await markLineReady(store, 'pl_1', temp);
     final _FakeExecution execution = _FakeExecution();
 
     // §16：派发身份取自 line.yaml.executor，REST 层不再要求 query.agent_id。
@@ -457,8 +488,95 @@ void main() {
     expect(wrongState['json']['code'], 'execute_state');
   });
 
+  test('手动派发过依赖/并行/写域/预算护栏，拒绝带 code/message/missing', () async {
+    final ProductionStore store = storeWith();
+    await markLineReady(store, 'pl_1', temp);
+    final _FakeExecution execution = _FakeExecution();
+
+    // TG-02 依赖未完成：不进入执行通道。
+    store.createTask('pl_1', <String, Object?>{
+      'id': 'T2',
+      'title': '依赖 T1',
+      'status': 'queued',
+      'depends_on': <String>['T1'],
+    });
+    final Map<String, dynamic> dependency = await call(
+      'POST',
+      '/api/production/lines/pl_1/tasks/T2/dispatch',
+      execution: execution,
+    );
+    expect(dependency['status'], 409);
+    expect(dependency['json']['code'], 'task_dependency_open');
+    expect(dependency['json']['message'], isNotEmpty);
+    expect(dependency['json']['missing'], <String>['T1']);
+    expect(execution.calledCommands, isEmpty);
+
+    // TG-03 写域交叠：与在途任务同一目录。
+    store.putTask('pl_1', 'T1', <String, Object?>{
+      'write_scope': <String>['lib/a'],
+    });
+    store.transition('pl_1', 'T1', to: 'packing', reason: '夹具');
+    store.createTask('pl_1', <String, Object?>{
+      'id': 'T3',
+      'title': '写同一目录',
+      'status': 'queued',
+      'write_scope': <String>['lib/a/b.dart'],
+    });
+    final Map<String, dynamic> scope = await call(
+      'POST',
+      '/api/production/lines/pl_1/tasks/T3/dispatch',
+      execution: execution,
+    );
+    expect(scope['status'], 409);
+    expect(scope['json']['code'], 'task_scope_conflict');
+    expect(scope['json']['missing'], <String>['T1']);
+
+    // TG-04 并行槽位：写入域不相交也要等槽位。
+    store.createTask('pl_1', <String, Object?>{
+      'id': 'T4',
+      'title': '并行槽位',
+      'status': 'queued',
+      'write_scope': <String>['lib/b'],
+    });
+    final Map<String, dynamic> parallel = await call(
+      'POST',
+      '/api/production/lines/pl_1/tasks/T4/dispatch',
+      execution: execution,
+    );
+    expect(parallel['status'], 409);
+    expect(parallel['json']['code'], 'task_parallel_limit');
+    expect(parallel['json']['missing'], <String>['T1']);
+
+    // TG-04 预算到点：不再发起派发。
+    for (final String to in <String>['packed', 'running', 'gating', 'done']) {
+      store.transition('pl_1', 'T1', to: to, reason: '夹具');
+    }
+    store.updateLine('pl_1', <String, Object?>{
+      'limits': <String, Object?>{'max_tokens_per_task': 10},
+    });
+    store.createTask('pl_1', <String, Object?>{
+      'id': 'T5',
+      'title': '预算到点',
+      'status': 'queued',
+      'write_scope': <String>['lib/c'],
+    });
+    store.putTask('pl_1', 'T5', <String, Object?>{
+      'usage': <String, Object?>{'prompt_tokens': 6, 'completion_tokens': 4},
+    });
+    final Map<String, dynamic> budget = await call(
+      'POST',
+      '/api/production/lines/pl_1/tasks/T5/dispatch',
+      execution: execution,
+    );
+    expect(budget['status'], 409);
+    expect(budget['json']['code'], 'task_budget_exceeded');
+    expect((budget['json']['missing'] as List<dynamic>), isNotEmpty);
+    expect(execution.calledCommands, isEmpty);
+  });
+
   test('主控路由：orchestrate / status / pause / resume', () async {
     final ProductionStore store = storeWith();
+    await markLineReady(store, 'pl_1', temp);
     store.updateLine('pl_1', <String, Object?>{
       'roles': <String, Object?>{
         'orchestrator': <String, Object?>{'model_id': 'chat/main'},
@@ -532,11 +650,7 @@ void main() {
     );
     await execution.handle(
       'production.task.question',
-      <String, Object?>{
-        'line_id': 'pl_1',
-        'task_id': 'T1',
-        'text': '旧行为要保留吗？',
-      },
+      <String, Object?>{'line_id': 'pl_1', 'task_id': 'T1', 'text': '旧行为要保留吗？'},
       <String, Object?>{'data_dir': temp.path},
       <String, Object?>{},
     );
@@ -602,6 +716,223 @@ void main() {
     );
     expect(unknown['status'], 404);
   });
+
+  test('就绪门路由：GET readiness / structure 带 readiness / 未接线 503', () async {
+    storeWith();
+    final _FakeReadiness readiness = _FakeReadiness(
+      reply: <String, Object?>{
+        'line_id': 'pl_1',
+        'ready': false,
+        'missing': <String>['LG-02'],
+      },
+    );
+
+    final Map<String, dynamic> snapshot = await call(
+      'GET',
+      '/api/production/lines/pl_1/readiness',
+      readiness: readiness,
+    );
+    expect(snapshot['status'], 200);
+    expect(snapshot['json']['ready'], isFalse);
+    expect(snapshot['json']['missing'], <String>['LG-02']);
+
+    final Map<String, dynamic> unavailable = await call(
+      'GET',
+      '/api/production/lines/pl_1/readiness',
+    );
+    expect(unavailable['status'], 503);
+    expect(unavailable['json']['code'], 'readiness_unavailable');
+
+    final Map<String, dynamic> notFound = await call(
+      'GET',
+      '/api/production/lines/pl_nope/readiness',
+      readiness: ProductionReadinessService(
+        environment: const <String, String>{},
+      ),
+    );
+    expect(notFound['status'], 404);
+
+    final Map<String, dynamic> structure = await call(
+      'GET',
+      '/api/production/lines/pl_1/structure',
+      readiness: readiness,
+    );
+    expect(structure['status'], 200);
+    expect(structure['json']['structure'], isA<Map<String, dynamic>>());
+    expect(structure['json']['readiness']['ready'], isFalse);
+
+    // 就绪探测失败：structure 仍 200，readiness 退化为空表。
+    final Map<String, dynamic> degraded = await call(
+      'GET',
+      '/api/production/lines/pl_1/structure',
+      readiness: _FakeReadiness(
+        error: ProductionFailure('未就绪', code: 'line_not_ready'),
+      ),
+    );
+    expect(degraded['status'], 200);
+    expect(degraded['json']['readiness'], isEmpty);
+
+    final Map<String, dynamic> structureMissing = await call(
+      'GET',
+      '/api/production/lines/pl_nope/structure',
+      readiness: readiness,
+    );
+    expect(structureMissing['status'], 404);
+  });
+
+  test('结构路由：reevaluate 200 / waive 找不到条目 404 / 未知产线 404', () async {
+    final Directory workspace = Directory(p.join(temp.path, 'ws'))
+      ..createSync(recursive: true);
+    storeWith(workspaceDir: workspace.path);
+
+    final Map<String, dynamic> reevaluated = await call(
+      'POST',
+      '/api/production/lines/pl_1/structure/reevaluate',
+    );
+    expect(reevaluated['status'], 200);
+    expect(reevaluated['json']['ready'], isTrue);
+
+    final Map<String, dynamic> waived = await call(
+      'POST',
+      '/api/production/lines/pl_1/structure/waive',
+      body: <String, Object?>{
+        'finding_id': 'F404',
+        'owner': 'owner_a',
+        'reason': '暂不修',
+        'expires_at': '2027-01-01',
+      },
+    );
+    expect(waived['status'], 404);
+    expect(waived['json']['code'], 'not_found');
+
+    final Map<String, dynamic> reevaluateMissing = await call(
+      'POST',
+      '/api/production/lines/pl_nope/structure/reevaluate',
+    );
+    expect(reevaluateMissing['status'], 404);
+
+    final Map<String, dynamic> waiveMissing = await call(
+      'POST',
+      '/api/production/lines/pl_nope/structure/waive',
+      body: <String, Object?>{
+        'finding_id': 'F1',
+        'owner': 'a',
+        'reason': 'r',
+        'expires_at': '2027-01-01',
+      },
+    );
+    expect(waiveMissing['status'], 409);
+    expect(waiveMissing['json']['code'], 'structure_report_missing');
+  });
+
+  test('归一化路由：status / plan / apply / rollback 透传，未接线 503，计划缺失 409', () async {
+    storeWith();
+    final _FakeNormalization normalization = _FakeNormalization();
+
+    final Map<String, dynamic> status = await call(
+      'GET',
+      '/api/production/lines/pl_1/normalize',
+      normalization: normalization,
+    );
+    expect(status['status'], 200);
+    expect(normalization.commands.last, 'production.normalize.status');
+
+    final Map<String, dynamic> plan = await call(
+      'POST',
+      '/api/production/lines/pl_1/normalize/plan',
+      normalization: normalization,
+      body: <String, Object?>{'sections': <Object?>[], 'indexes': <Object?>[]},
+    );
+    expect(plan['status'], 200);
+    expect(normalization.commands.last, 'production.normalize.plan');
+    expect(normalization.arguments.last['commit'], isFalse);
+    expect(normalization.arguments.last['line_id'], 'pl_1');
+
+    final Map<String, dynamic> applied = await call(
+      'POST',
+      '/api/production/lines/pl_1/normalize/apply',
+      normalization: normalization,
+      body: <String, Object?>{'confirm_rewrite': true},
+    );
+    expect(applied['status'], 200);
+    expect(normalization.commands.last, 'production.normalize.apply');
+    expect(normalization.arguments.last['confirm_rewrite'], isTrue);
+
+    final Map<String, dynamic> rolledBack = await call(
+      'POST',
+      '/api/production/lines/pl_1/normalize/rollback',
+      normalization: normalization,
+    );
+    expect(rolledBack['status'], 200);
+    expect(normalization.commands.last, 'production.normalize.rollback');
+
+    final Map<String, dynamic> unavailable = await call(
+      'GET',
+      '/api/production/lines/pl_1/normalize',
+    );
+    expect(unavailable['status'], 503);
+    expect(unavailable['json']['code'], 'normalization_unavailable');
+
+    final Map<String, dynamic> conflict = await call(
+      'POST',
+      '/api/production/lines/pl_1/normalize/apply',
+      normalization: _FakeNormalization(
+        error: ProductionFailure('没有计划', code: 'normalization_plan_missing'),
+      ),
+    );
+    expect(conflict['status'], 409);
+    expect(conflict['json']['code'], 'normalization_plan_missing');
+
+    final Map<String, dynamic> notFound = await call(
+      'GET',
+      '/api/production/lines/pl_nope/normalize',
+      normalization: ProductionNormalizationService(
+        environment: const <String, String>{},
+      ),
+    );
+    expect(notFound['status'], 404);
+  });
+}
+
+/// 假就绪门：直接回固定快照或抛固定失败（api 层只验路由与形状）。
+class _FakeReadiness extends ProductionReadinessService {
+  _FakeReadiness({this.reply = const <String, Object?>{}, this.error});
+
+  final Map<String, Object?> reply;
+  final ProductionFailure? error;
+
+  @override
+  Future<Map<String, Object?>> handle(
+    String command,
+    Map<String, Object?> arguments,
+    Map<String, Object?> meta,
+    Map<String, Object?> scope,
+  ) async {
+    if (error != null) throw error!;
+    return reply;
+  }
+}
+
+/// 假归一化门面：记录命令与参数，按需抛固定失败。
+class _FakeNormalization extends ProductionNormalizationService {
+  _FakeNormalization({this.error});
+
+  final ProductionFailure? error;
+  final List<String> commands = <String>[];
+  final List<Map<String, Object?>> arguments = <Map<String, Object?>>[];
+
+  @override
+  Future<Map<String, Object?>> handle(
+    String command,
+    Map<String, Object?> arguments,
+    Map<String, Object?> meta,
+    Map<String, Object?> scope,
+  ) async {
+    commands.add(command);
+    this.arguments.add(arguments);
+    if (error != null) throw error!;
+    return <String, Object?>{'command': command};
+  }
 }
 
 /// 假的执行门面：记录派发命令，不做真打包 / 执行。

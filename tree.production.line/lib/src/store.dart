@@ -20,9 +20,11 @@ library;
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 import 'package:yaml/yaml.dart';
 
+import 'lease.dart';
 import 'models.dart';
 import 'queue.dart';
 import 'yaml_codec.dart';
@@ -30,14 +32,21 @@ import 'yaml_codec.dart';
 /// 全局产线作用域（固定目录名）：产线数据不随团队 / Agent 漂移。
 const String kProductionScope = 'production';
 
+/// 任务状态变化的旁路监听（Task 9.1 事件广播；投递失败不得影响业务）。
+typedef TaskStateListener = void Function(String lineId, TaskRecord task);
+
 class ProductionStore {
   ProductionStore({
     required this.dataRoot,
     DateTime Function()? clock,
+    this.onTaskState,
   }) : _clock = clock ?? DateTime.now;
 
   final String dataRoot;
   final DateTime Function() _clock;
+
+  /// `createTask` / `updateTask` / `transition` 成功后的同步回调。
+  final TaskStateListener? onTaskState;
 
   static int _tempSeq = 0;
   static final RegExp _segmentPattern = RegExp(r'^[A-Za-z0-9_.-]+$');
@@ -56,13 +65,99 @@ class ProductionStore {
   String _tasksDir(String lineId) => p.join(lineDir(lineId), 'tasks');
   String _runsDir(String lineId) => p.join(lineDir(lineId), 'runs');
 
-  String _taskFile(String lineId, String taskId) => p.join(
-    _tasksDir(lineId),
-    _segment(taskId, 'task_id'),
-    'task.yaml',
-  );
+  String _taskFile(String lineId, String taskId) =>
+      p.join(_tasksDir(lineId), _segment(taskId, 'task_id'), 'task.yaml');
+
+  String _taskDir(String lineId, String taskId) =>
+      p.join(_tasksDir(lineId), _segment(taskId, 'task_id'));
+
+  /// 事件日志：`<line>/events.jsonl`（追加写、坏行跳过）。
+  String eventsFile(String lineId) => p.join(lineDir(lineId), 'events.jsonl');
 
   String nowText() => _clock().toIso8601String();
+
+  /// 事件序号水位（`state.json.event_seq`）；不存在 ⇒ 0。
+  int readEventSeq(String lineId) {
+    final File file = File(_stateFile(lineId));
+    if (!file.existsSync()) return 0;
+    return intOf(_tryReadJson(file)['event_seq'], 0);
+  }
+
+  /// 分配下一个事件序号并原子写回（单调递增，跨进程重启保持）。
+  int nextEventSeq(String lineId) {
+    getLine(lineId);
+    final File file = File(_stateFile(lineId));
+    final Map<String, Object?> state = file.existsSync()
+        ? _tryReadJson(file)
+        : const <String, Object?>{};
+    final int seq = intOf(state['event_seq'], 0) + 1;
+    final Map<String, Object?> next = <String, Object?>{
+      'version': 1,
+      'line_id': lineId,
+      'scope': kProductionScope,
+      ...state,
+      'event_seq': seq,
+    };
+    _writeText(file, '${const JsonEncoder.withIndent('  ').convert(next)}\n');
+    return seq;
+  }
+
+  // ── 事件日志（SG-03）：<line>/events.jsonl ─────────────────────────
+
+  /// 追加一条状态事件（JSONL，flush；坏行读取时跳过）。
+  ///
+  /// 事件是**旁路台账**：写失败不影响状态迁移，读取方按“缺行 = 没发生”处理。
+  Map<String, Object?> appendEvent(
+    String lineId, {
+    required String type,
+    String taskId = '',
+    String from = '',
+    String to = '',
+    int fencing = 0,
+    Map<String, Object?> detail = const <String, Object?>{},
+  }) {
+    final Map<String, Object?> entry = <String, Object?>{
+      'version': 1,
+      'type': type,
+      'line_id': lineId,
+      'task_id': taskId,
+      'from': from,
+      'to': to,
+      'fencing': fencing,
+      'detail': plainMap(detail),
+      'at': nowText(),
+    };
+    final File file = File(eventsFile(lineId));
+    try {
+      file.parent.createSync(recursive: true);
+      file.writeAsStringSync(
+        '${json.encode(entry)}\n',
+        mode: FileMode.append,
+        flush: true,
+      );
+    } on FileSystemException {
+      // 事件是旁路：磁盘满 / 权限问题只丢事件，不改业务写盘结果。
+    }
+    return entry;
+  }
+
+  /// 读事件日志（JSONL，坏行跳过）。
+  List<Map<String, Object?>> readEvents(String lineId) {
+    final File file = File(eventsFile(lineId));
+    if (!file.existsSync()) return <Map<String, Object?>>[];
+    final List<Map<String, Object?>> out = <Map<String, Object?>>[];
+    for (final String line in file.readAsLinesSync()) {
+      final String text = line.trim();
+      if (text.isEmpty) continue;
+      try {
+        final Object? decoded = json.decode(text);
+        if (decoded is Map) out.add(plainMap(decoded));
+      } catch (_) {
+        // 坏行跳过：一行脏数据不许毁掉整份事件日志。
+      }
+    }
+    return out;
+  }
 
   // ── 产线 ──────────────────────────────────────────────────────────
 
@@ -192,6 +287,74 @@ class ProductionStore {
     return LineRecord(next);
   }
 
+  /// 写产线阶段（`line.yaml.phase`）。只允许 [kLinePhases]；值未变时不写盘。
+  ///
+  /// 阶段由后端计算（结构报告判定），REST 的 PATCH 不开放这个键；旧产线缺键
+  /// 一律按 `organizing` 读取。
+  LineRecord setLinePhase(String lineId, String phase) {
+    final LineRecord line = getLine(lineId);
+    if (!kLinePhases.contains(phase)) {
+      throw ProductionFailure(
+        '产线 phase 只能是 ${kLinePhases.join(' / ')}：$phase',
+        code: 'invalid_arguments',
+      );
+    }
+    if (line.effectivePhase == phase) return line;
+    final Map<String, Object?> next = <String, Object?>{
+      ...line.data,
+      'phase': phase,
+      'updated_at': nowText(),
+    };
+    _writeText(File(_lineFile(lineId)), encodeYaml(next));
+    return LineRecord(next);
+  }
+
+  /// 结构报告文件：`<line>/structure.json`（插件数据，不是项目资产）。
+  String structureFile(String lineId) =>
+      p.join(lineDir(lineId), 'structure.json');
+
+  /// 复合就绪门快照：`<line>/ready.json`（LG-07 证据；由 readiness.get 生成）。
+  String readyFile(String lineId) => p.join(lineDir(lineId), 'ready.json');
+
+  /// 读就绪快照；不存在 / 坏 JSON ⇒ 空表（调用方按未就绪处理）。
+  Map<String, Object?> readReady(String lineId) {
+    final File file = File(readyFile(lineId));
+    if (!file.existsSync()) return <String, Object?>{};
+    return _tryReadJson(file);
+  }
+
+  /// 写就绪快照（原子写；只有 readiness.get 的判定能写）。
+  Map<String, Object?> writeReady(String lineId, Map<String, Object?> data) {
+    getLine(lineId);
+    final Map<String, Object?> snapshot = plainMap(data);
+    _writeText(
+      File(readyFile(lineId)),
+      '${const JsonEncoder.withIndent('  ').convert(snapshot)}\n',
+    );
+    return snapshot;
+  }
+
+  /// 读结构报告；不存在 / 坏 JSON ⇒ 空表（由调用方判 `structure_not_ready`）。
+  Map<String, Object?> readStructure(String lineId) {
+    final File file = File(structureFile(lineId));
+    if (!file.existsSync()) return <String, Object?>{};
+    return _tryReadJson(file);
+  }
+
+  /// 写结构报告（原子写；固定 JSON 缩进便于人读 diff）。
+  Map<String, Object?> writeStructure(
+    String lineId,
+    Map<String, Object?> report,
+  ) {
+    getLine(lineId);
+    final Map<String, Object?> data = plainMap(report);
+    _writeText(
+      File(structureFile(lineId)),
+      '${const JsonEncoder.withIndent('  ').convert(data)}\n',
+    );
+    return data;
+  }
+
   /// 删除产线：**只删插件数据**，项目资产（`docs/production_lines/<line>`）保留。
   ///
   /// 有在途任务时拒绝（409 `line_busy`）：正在打包 / 执行的任务被抽掉数据根
@@ -219,9 +382,7 @@ class ProductionStore {
       'line_id': lineId,
       'deleted': true,
       if (assetsKept.isNotEmpty) 'assets_kept': assetsKept,
-      'note': assetsKept.isEmpty
-          ? ''
-          : '插件数据已删除；项目资产仍保留在工作空间（需人工确认是否清理）',
+      'note': assetsKept.isEmpty ? '' : '插件数据已删除；项目资产仍保留在工作空间（需人工确认是否清理）',
     };
   }
 
@@ -257,13 +418,15 @@ class ProductionStore {
         manifest: '',
       );
     }
-    final String stamp = _clock()
-        .toIso8601String()
-        .replaceAll(RegExp(r'[:.]'), '-');
-    final String snapshotRoot = p.join(linesRoot, '.snapshots', stamp);
-    final List<FileSystemEntity> scopes = root.listSync()..sort(
-      (FileSystemEntity a, FileSystemEntity b) => a.path.compareTo(b.path),
+    final String stamp = _clock().toIso8601String().replaceAll(
+      RegExp(r'[:.]'),
+      '-',
     );
+    final String snapshotRoot = p.join(linesRoot, '.snapshots', stamp);
+    final List<FileSystemEntity> scopes = root.listSync()
+      ..sort(
+        (FileSystemEntity a, FileSystemEntity b) => a.path.compareTo(b.path),
+      );
     for (final FileSystemEntity entity in scopes) {
       if (entity is! Directory) continue;
       final String scopeName = p.basename(entity.path);
@@ -273,9 +436,10 @@ class ProductionStore {
           scopeName.startsWith('.')) {
         continue;
       }
-      final List<FileSystemEntity> lineDirs = entity.listSync()..sort(
-        (FileSystemEntity a, FileSystemEntity b) => a.path.compareTo(b.path),
-      );
+      final List<FileSystemEntity> lineDirs = entity.listSync()
+        ..sort(
+          (FileSystemEntity a, FileSystemEntity b) => a.path.compareTo(b.path),
+        );
       for (final FileSystemEntity lineEntity in lineDirs) {
         if (lineEntity is! Directory) continue;
         final String lineId = p.basename(lineEntity.path);
@@ -316,7 +480,8 @@ class ProductionStore {
             'line_id': lineId,
             'source': _portable(lineEntity.path),
             'reason': 'executor_required',
-            'message': '旧产线没有 executor.agent_id，且无法从目录名推断：'
+            'message':
+                '旧产线没有 executor.agent_id，且无法从目录名推断：'
                 '请带 agent_id 再迁移（或在配置页选执行 Agent）',
           });
           continue;
@@ -346,7 +511,10 @@ class ProductionStore {
           'line_id': lineId,
           'from': _portable(lineEntity.path),
           'to': _portable(targetDir),
-          'executor': <String, Object?>{'agent_id': resolvedAgent, 'team_id': resolvedTeam},
+          'executor': <String, Object?>{
+            'agent_id': resolvedAgent,
+            'team_id': resolvedTeam,
+          },
           if (snapshotDir.isNotEmpty) 'snapshot': _portable(snapshotDir),
         });
       }
@@ -360,21 +528,13 @@ class ProductionStore {
       }
     }
     String manifest = '';
-    if (!dryRun && (migrated.isNotEmpty || conflicts.isNotEmpty || skipped.isNotEmpty)) {
-      final File file = File(
-        p.join(linesRoot, '_migrations', '$stamp.json'),
-      );
+    if (!dryRun &&
+        (migrated.isNotEmpty || conflicts.isNotEmpty || skipped.isNotEmpty)) {
+      final File file = File(p.join(linesRoot, '_migrations', '$stamp.json'));
       manifest = file.path;
       _writeText(
         file,
-        '${const JsonEncoder.withIndent('  ').convert(<String, Object?>{
-          'version': 1,
-          'scope': kProductionScope,
-          'at': nowText(),
-          'migrated': migrated,
-          'conflicts': conflicts,
-          'skipped': skipped,
-        })}\n',
+        '${const JsonEncoder.withIndent('  ').convert(<String, Object?>{'version': 1, 'scope': kProductionScope, 'at': nowText(), 'migrated': migrated, 'conflicts': conflicts, 'skipped': skipped})}\n',
       );
     }
     return _migrationResult(
@@ -414,7 +574,9 @@ class ProductionStore {
     getLine(lineId);
     // D1：id 由插件生成（UI 不下发）；同毫秒重复时追加 -2 / -3，避免 task_exists。
     final String rawId = textOf(input['id']);
-    final String id = rawId.isEmpty ? _nextTaskId(lineId) : _segment(rawId, 'task_id');
+    final String id = rawId.isEmpty
+        ? _nextTaskId(lineId)
+        : _segment(rawId, 'task_id');
     final File file = File(_taskFile(lineId, id));
     if (file.existsSync()) {
       throw ProductionFailure('任务已存在：$id', code: 'task_exists');
@@ -426,7 +588,47 @@ class ProductionStore {
     );
     _writeText(file, encodeYaml(data));
     rebuild(lineId);
-    return TaskRecord(data);
+    final TaskRecord record = TaskRecord(data);
+    _notifyTaskState(lineId, record);
+    appendEvent(
+      lineId,
+      type: 'create',
+      taskId: id,
+      to: textOf(data['status']),
+      detail: <String, Object?>{'title': textOf(data['title'])},
+    );
+    return record;
+  }
+
+  /// 编辑任务字段（`production.task.update` 的落点）。
+  ///
+  /// [patch] 由调用方完成白名单 / 状态边界 / 预检后传入；这里只做浅合并、
+  /// 刷新 `updated_at` 与索引。`packed` 编辑时调用方会同时把 status 改回 `queued`，
+  /// 并在写后调用 [deletePack] 使旧片段包失效。
+  TaskRecord updateTask(
+    String lineId,
+    String taskId,
+    Map<String, Object?> patch,
+  ) {
+    final TaskRecord task = getTask(lineId, taskId);
+    final Map<String, Object?> next = <String, Object?>{
+      ...task.data,
+      ...plainMap(patch),
+      'updated_at': nowText(),
+    };
+    _writeText(File(_taskFile(lineId, taskId)), encodeYaml(next));
+    rebuild(lineId);
+    final TaskRecord record = TaskRecord(next);
+    _notifyTaskState(lineId, record);
+    return record;
+  }
+
+  /// 删除 `tasks/<task_id>/pack.json`（片段包失效）；不存在 ⇒ false。
+  bool deletePack(String lineId, String taskId) {
+    final File file = File(_packFile(lineId, taskId));
+    if (!file.existsSync()) return false;
+    file.deleteSync();
+    return true;
   }
 
   /// 任务 id 生成：`T<millis>`，冲突时追加 `-2`、`-3`（D1）。
@@ -525,11 +727,35 @@ class ProductionStore {
     }
     _writeText(File(_taskFile(lineId, taskId)), encodeYaml(data));
     rebuild(lineId);
+    final TaskRecord record = TaskRecord(data);
+    _notifyTaskState(lineId, record);
+    appendEvent(
+      lineId,
+      type: 'transition',
+      taskId: taskId,
+      from: from.wire,
+      to: target.wire,
+      fencing: intOf(plainMap(task.data['lease'])['fencing'], 0),
+      detail: <String, Object?>{
+        if (blockedReason.isNotEmpty) 'reason': blockedReason,
+      },
+    );
     return <String, Object?>{
       'task': plainMap(data),
       'from': from.wire,
       'to': target.wire,
     };
+  }
+
+  /// 通知旁路监听；监听方异常不得影响已经落盘的业务结果。
+  void _notifyTaskState(String lineId, TaskRecord task) {
+    final TaskStateListener? listener = onTaskState;
+    if (listener == null) return;
+    try {
+      listener(lineId, task);
+    } catch (_) {
+      // 事件是旁路：投递失败只影响推送，不影响状态迁移。
+    }
   }
 
   // ── 队列 ──────────────────────────────────────────────────────────
@@ -658,14 +884,13 @@ class ProductionStore {
       'tasks': indexTasks,
       'queue': queue,
       'dispatchable': dispatchable,
+      // 事件序号是独立水位，不是可重建索引的一部分：重建时原样带过去。
+      if (previous['event_seq'] is num) 'event_seq': previous['event_seq'],
       // 主控游标不是可重建索引的一部分：重建时原样带过去，别把它冲掉。
       if (previous['orchestrator'] is Map)
         'orchestrator': plainMap(previous['orchestrator']),
     };
-    _writeText(
-      file,
-      '${const JsonEncoder.withIndent('  ').convert(index)}\n',
-    );
+    _writeText(file, '${const JsonEncoder.withIndent('  ').convert(index)}\n');
     return result;
   }
 
@@ -686,10 +911,20 @@ class ProductionStore {
         ...task.data,
         'status': TaskStatus.queued.wire,
         'updated_at': nowText(),
-      }..remove('blocked_reason');
+      }..remove('blocked_reason')
+        ..remove('lease');
       _writeText(File(_taskFile(lineId, task.id)), encodeYaml(data));
       final Map<String, Object?> run = _interruptedRun(task.id, role, status);
       _writeRun(lineId, run);
+      appendEvent(
+        lineId,
+        type: 'recovery',
+        taskId: task.id,
+        from: status.wire,
+        to: TaskStatus.queued.wire,
+        fencing: intOf(plainMap(task.data['lease'])['fencing'], 0),
+        detail: <String, Object?>{'run_id': run['run_id'], 'role': role},
+      );
       recovered.add(<String, Object?>{
         'task_id': task.id,
         'from': status.wire,
@@ -702,6 +937,254 @@ class ProductionStore {
       'recovered': recovered,
       'count': recovered.length,
     };
+  }
+
+  // ── 对账（SG-03）：state.json 由 task.yaml 重建 ────────────────────
+
+  /// 核对 `state.json.tasks` 与 `task.yaml` 的状态 / 依赖。
+  ///
+  /// 先读旧快照再 `rebuild`（以 task.yaml 为准重写），所以返回的 [mismatches]
+  /// 是修复前的差异；`fixed` 表示这次确实修过。幂等：第二次调用 0 mismatch。
+  Map<String, Object?> reconcile(String lineId) {
+    getLine(lineId);
+    final File stateFile = File(_stateFile(lineId));
+    final bool hadState = stateFile.existsSync();
+    final Map<String, Object?> previous = hadState
+        ? _tryReadJson(stateFile)
+        : const <String, Object?>{};
+    final List<Map<String, Object?>> beforeTasks = <Map<String, Object?>>[
+      for (final Object? item
+          in (previous['tasks'] is List
+              ? previous['tasks'] as List<dynamic>
+              : const <dynamic>[]))
+        if (item is Map) plainMap(item),
+    ];
+    final bool hadIndex = previous['tasks'] is List;
+    final Map<String, Object?> rebuildResult = rebuild(lineId);
+    final List<TaskRecord> tasks = listTasks(lineId);
+    final Map<String, TaskRecord> byId = <String, TaskRecord>{
+      for (final TaskRecord task in tasks) task.id: task,
+    };
+    final Map<String, Map<String, Object?>> beforeById =
+        <String, Map<String, Object?>>{
+          for (final Map<String, Object?> item in beforeTasks)
+            textOf(item['id']): item,
+        };
+    final List<Map<String, Object?>> mismatches = <Map<String, Object?>>[];
+    if (hadIndex) {
+      for (final MapEntry<String, Map<String, Object?>> entry
+          in beforeById.entries) {
+        final String id = entry.key;
+        final TaskRecord? task = byId[id];
+        if (id.isEmpty) continue;
+        if (task == null) {
+          mismatches.add(<String, Object?>{
+            'task_id': id,
+            'field': 'orphan_in_state',
+            'state': entry.value,
+            'task': null,
+          });
+          continue;
+        }
+        final String stateStatus = textOf(entry.value['status']);
+        if (stateStatus != task.status.wire) {
+          mismatches.add(<String, Object?>{
+            'task_id': id,
+            'field': 'status',
+            'state': stateStatus,
+            'task': task.status.wire,
+          });
+        }
+        final List<String> stateDeps = stringsOf(entry.value['depends_on']);
+        if (jsonEncode(stateDeps) != jsonEncode(task.dependsOn)) {
+          mismatches.add(<String, Object?>{
+            'task_id': id,
+            'field': 'depends_on',
+            'state': stateDeps,
+            'task': task.dependsOn,
+          });
+        }
+      }
+      for (final TaskRecord task in tasks) {
+        if (beforeById.containsKey(task.id)) continue;
+        mismatches.add(<String, Object?>{
+          'task_id': task.id,
+          'field': 'missing_in_state',
+          'state': null,
+          'task': task.status.wire,
+        });
+      }
+    }
+    return <String, Object?>{
+      'line_id': lineId,
+      'ok': mismatches.isEmpty,
+      'mismatches': mismatches,
+      'fixed': mismatches.isNotEmpty || rebuildResult['changed'] == true,
+    };
+  }
+
+  // ── 租约 + fencing（SG-01）────────────────────────────────────────
+
+  /// 获取任务租约：未过期且 owner 不同 ⇒ `duplicate_execution`。
+  ///
+  /// `fencing` 从上一次水位 +1（`lease_fencing` 跨释放保留，旧 token 不会复活）。
+  TaskLease acquireLease(
+    String lineId,
+    String taskId, {
+    required String owner,
+    required String runId,
+    Duration ttl = const Duration(minutes: 10),
+  }) {
+    final TaskRecord task = getTask(lineId, taskId);
+    final DateTime now = _clock();
+    final TaskLease lease = acquireTaskLease(
+      existing: task.data['lease'],
+      owner: owner.trim().isEmpty ? 'executor' : owner.trim(),
+      runId: runId,
+      now: now,
+      ttl: ttl,
+      previousFencing: intOf(task.data['lease_fencing'], 0),
+    );
+    _writeTaskData(lineId, taskId, <String, Object?>{
+      ...task.data,
+      'lease': lease.toJson(),
+      'lease_fencing': lease.fencing,
+    });
+    return lease;
+  }
+
+  /// 校验 fencing：缺失 / 不匹配 / 已过期 ⇒ `lease_lost`。
+  void assertLease(String lineId, String taskId, int fencing) {
+    final TaskRecord task = getTask(lineId, taskId);
+    assertTaskLease(
+      existing: task.data['lease'],
+      fencing: fencing,
+      now: _clock(),
+      taskId: taskId,
+    );
+  }
+
+  /// 只释放 fencing 匹配的租约；不匹配 ⇒ null（不动盘）。
+  TaskLease? releaseLease(String lineId, String taskId, int fencing) {
+    final TaskRecord task = getTask(lineId, taskId);
+    final TaskLease? lease = matchTaskLease(
+      existing: task.data['lease'],
+      fencing: fencing,
+    );
+    if (lease == null) return null;
+    final Map<String, Object?> data = <String, Object?>{...task.data}
+      ..remove('lease');
+    _writeTaskData(lineId, taskId, data);
+    return lease;
+  }
+
+  /// 写整份 task.yaml（内部元数据用：不改状态、不发广播）。
+  void _writeTaskData(
+    String lineId,
+    String taskId,
+    Map<String, Object?> data,
+  ) {
+    _writeText(File(_taskFile(lineId, taskId)), encodeYaml(data));
+    rebuild(lineId);
+  }
+
+  // ── 幂等命令（SG-02）：tasks/<task>/commands/<sha256>.json ────────
+
+  String _commandFile(String lineId, String taskId, String command, String key) {
+    final String digest = sha256
+        .convert(utf8.encode('$command|$key'))
+        .toString();
+    return p.join(_taskDir(lineId, taskId), 'commands', '$digest.json');
+  }
+
+  /// 查询幂等记录：已存在 ⇒ 返回该记录（含 `result`）；否则 null。
+  Map<String, Object?>? claimCommand(
+    String lineId,
+    String taskId, {
+    required String command,
+    required String key,
+  }) {
+    getTask(lineId, taskId);
+    final File file = File(_commandFile(lineId, taskId, command, key));
+    if (!file.existsSync()) return null;
+    final Map<String, Object?> record = _tryReadJson(file);
+    return record.isEmpty ? null : record;
+  }
+
+  /// 落幂等结果（执行成功后调用；重复写同 key 覆盖为最新结果）。
+  Map<String, Object?> recordCommand(
+    String lineId,
+    String taskId, {
+    required String command,
+    required String key,
+    required Map<String, Object?> result,
+  }) {
+    getTask(lineId, taskId);
+    final Map<String, Object?> record = <String, Object?>{
+      'version': 1,
+      'command': command,
+      'key': key,
+      'at': nowText(),
+      'result': plainMap(result),
+    };
+    _writeText(
+      File(_commandFile(lineId, taskId, command, key)),
+      '${const JsonEncoder.withIndent('  ').convert(record)}\n',
+    );
+    return record;
+  }
+
+  // ── 门控证据（SG-04）：tasks/<task>/gates/<run_id>/gate.json ──────
+
+  /// 门控结果文件路径（绝对路径）。
+  String gateFile(String lineId, String taskId, String runId) => p.join(
+    _taskDir(lineId, taskId),
+    'gates',
+    _segment(runId, 'run_id'),
+    'gate.json',
+  );
+
+  /// 读门控结果；不存在 / 坏 JSON ⇒ 空表。
+  Map<String, Object?> readGate(
+    String lineId,
+    String taskId,
+    String runId,
+  ) {
+    if (runId.trim().isEmpty) return <String, Object?>{};
+    final File file = File(gateFile(lineId, taskId, runId));
+    if (!file.existsSync()) return <String, Object?>{};
+    return _tryReadJson(file);
+  }
+
+  /// 写门控结果并封签；已 sealed 且 `runner_id` 不同 ⇒ `gate_tampered`。
+  Map<String, Object?> writeGate(
+    String lineId,
+    String taskId,
+    String runId,
+    Map<String, Object?> gate,
+  ) {
+    getTask(lineId, taskId);
+    final File file = File(gateFile(lineId, taskId, runId));
+    if (file.existsSync()) {
+      final Map<String, Object?> existing = _tryReadJson(file);
+      if (existing['sealed'] == true &&
+          textOf(existing['runner_id']) != textOf(gate['runner_id'])) {
+        throw ProductionFailure(
+          '门控结果已由 ${existing['runner_id']} 封签，拒绝覆盖：$runId',
+          code: 'gate_tampered',
+          missing: <String>[taskId],
+        );
+      }
+    }
+    final Map<String, Object?> data = <String, Object?>{
+      ...plainMap(gate),
+      'sealed': true,
+    };
+    _writeText(
+      file,
+      '${const JsonEncoder.withIndent('  ').convert(data)}\n',
+    );
+    return data;
   }
 
   // ── 运行台账 ──────────────────────────────────────────────────────
@@ -721,9 +1204,8 @@ class ProductionStore {
       runs.add(run);
     }
     runs.sort((Map<String, Object?> a, Map<String, Object?> b) {
-      final int byTime = textOf(
-        b['started_at'],
-      ).compareTo(textOf(a['started_at']));
+      final int byTime = textOf(b['started_at'])
+          .compareTo(textOf(a['started_at']));
       return byTime != 0
           ? byTime
           : textOf(b['run_id']).compareTo(textOf(a['run_id']));
@@ -738,7 +1220,8 @@ class ProductionStore {
   ) {
     final String startedAt = nowText();
     final Map<String, Object?> run = <String, Object?>{
-      'run_id': 'run_${taskId}_${status.wire}_${_clock().millisecondsSinceEpoch}',
+      'run_id':
+          'run_${taskId}_${status.wire}_${_clock().millisecondsSinceEpoch}',
       'task_id': taskId,
       'role': role,
       'model_id': '',
@@ -776,11 +1259,8 @@ class ProductionStore {
 
   // ── 片段包（P4）：tasks/<task_id>/pack.json ───────────────────────
 
-  String _packFile(String lineId, String taskId) => p.join(
-    _tasksDir(lineId),
-    _segment(taskId, 'task_id'),
-    'pack.json',
-  );
+  String _packFile(String lineId, String taskId) =>
+      p.join(_tasksDir(lineId), _segment(taskId, 'task_id'), 'pack.json');
 
   /// 写 `pack.json`（机读真值；人读版 `pack.md` 走项目资产）。
   Map<String, Object?> writePack(
@@ -857,16 +1337,9 @@ class ProductionStore {
   // ── 准备阶段（P3）：inbox / prepare.json / 项目资产 / 工作空间读取 ──
 
   /// 写回一条任务（保留未知键；写后刷新索引）。
-  TaskRecord putTask(
-    String lineId,
-    String taskId,
-    Map<String, Object?> data,
-  ) {
+  TaskRecord putTask(String lineId, String taskId, Map<String, Object?> data) {
     final TaskRecord task = getTask(lineId, taskId);
-    final Map<String, Object?> next = <String, Object?>{
-      ...task.data,
-      ...data,
-    };
+    final Map<String, Object?> next = <String, Object?>{...task.data, ...data};
     _writeText(File(_taskFile(lineId, taskId)), encodeYaml(next));
     rebuild(lineId);
     return TaskRecord(next);
@@ -918,15 +1391,11 @@ class ProductionStore {
       'scope': kProductionScope,
       'orchestrator': orchestrator,
     };
-    _writeText(
-      file,
-      '${const JsonEncoder.withIndent('  ').convert(next)}\n',
-    );
+    _writeText(file, '${const JsonEncoder.withIndent('  ').convert(next)}\n');
     return orchestrator;
   }
 
-  String _prepareFile(String lineId) =>
-      p.join(lineDir(lineId), 'prepare.json');
+  String _prepareFile(String lineId) => p.join(lineDir(lineId), 'prepare.json');
 
   String _inboxFile(String lineId) => p.join(lineDir(lineId), 'inbox.jsonl');
 
@@ -945,6 +1414,166 @@ class ProductionStore {
       '${const JsonEncoder.withIndent('  ').convert(plainMap(data))}\n',
     );
   }
+
+  // ── 计划版本（PC-3E）：<line>/plans/plan-vN/ ──────────────────────
+
+  /// 计划版本根目录：`<line>/plans`。
+  String plansDir(String lineId) => p.join(lineDir(lineId), 'plans');
+
+  /// 下一个计划版本：扫描 `plans/plan-v(\d+)`，取最大 +1（没有 ⇒ 1）。
+  int nextPlanVersion(String lineId) {
+    getLine(lineId);
+    final RegExp pattern = RegExp(r'^plan-v(\d+)$');
+    int maxVersion = 0;
+    final Directory dir = Directory(plansDir(lineId));
+    if (dir.existsSync()) {
+      for (final FileSystemEntity entity in dir.listSync()) {
+        if (entity is! Directory) continue;
+        final RegExpMatch? match = pattern.firstMatch(p.basename(entity.path));
+        if (match == null) continue;
+        final int version = int.tryParse(match.group(1) ?? '') ?? 0;
+        if (version > maxVersion) maxVersion = version;
+      }
+    }
+    return maxVersion + 1;
+  }
+
+  /// 原子写 `plans/plan-v<version>/plan.json` 与 `validation.json`。
+  ///
+  /// [validation] 只取 `issues` / `batches` / `dag` / `size` 四个键。
+  Map<String, Object?> writePlanVersion(
+    String lineId,
+    int version,
+    Map<String, Object?> plan, {
+    Map<String, Object?> validation = const <String, Object?>{},
+  }) {
+    getLine(lineId);
+    if (version < 1) {
+      throw ProductionFailure('计划版本必须 ≥1：$version', code: 'invalid_arguments');
+    }
+    final String dir = p.join(plansDir(lineId), 'plan-v$version');
+    final Map<String, Object?> planData = plainMap(plan);
+    _writeText(
+      File(p.join(dir, 'plan.json')),
+      '${const JsonEncoder.withIndent('  ').convert(planData)}\n',
+    );
+    _writeText(
+      File(p.join(dir, 'validation.json')),
+      '${const JsonEncoder.withIndent('  ').convert(<String, Object?>{'issues': plainValue(validation['issues']) ?? <Object?>[], 'batches': plainValue(validation['batches']) ?? <Object?>[], 'dag': plainMap(validation['dag']), 'size': plainMap(validation['size'])})}\n',
+    );
+    return <String, Object?>{
+      'version': version,
+      'dir': _portable(dir),
+      'plan': planData,
+    };
+  }
+
+  /// 写 `plans/plan-v<version>/findings.json`（计划迭代的 findings 台账）。
+  void writePlanFindings(
+    String lineId,
+    int version,
+    List<Map<String, Object?>> findings,
+  ) {
+    getLine(lineId);
+    if (version < 1) {
+      throw ProductionFailure('计划版本必须 ≥1：$version', code: 'invalid_arguments');
+    }
+    final String dir = p.join(plansDir(lineId), 'plan-v$version');
+    _writeText(
+      File(p.join(dir, 'findings.json')),
+      '${const JsonEncoder.withIndent('  ').convert(<String, Object?>{
+        'version': 1,
+        'findings': <Map<String, Object?>>[for (final Map<String, Object?> item in findings) plainMap(item)],
+      })}\n',
+    );
+  }
+
+  /// 读某个计划版本的 `plan.json`；不存在 / 坏 JSON ⇒ 空表。
+  Map<String, Object?> readPlanVersion(String lineId, int version) {
+    getLine(lineId);
+    final File file = File(
+      p.join(plansDir(lineId), 'plan-v$version', 'plan.json'),
+    );
+    return file.existsSync() ? _tryReadJson(file) : <String, Object?>{};
+  }
+
+  /// 读某个计划版本的 findings；不存在 / 坏 JSON ⇒ 空列表。
+  List<Map<String, Object?>> readPlanFindings(String lineId, int version) {
+    getLine(lineId);
+    final File file = File(
+      p.join(plansDir(lineId), 'plan-v$version', 'findings.json'),
+    );
+    if (!file.existsSync()) return <Map<String, Object?>>[];
+    final Map<String, Object?> data = _tryReadJson(file);
+    return <Map<String, Object?>>[
+      for (final Object? item
+          in (data['findings'] as List<dynamic>? ?? const <dynamic>[]))
+        if (item is Map) plainMap(item),
+    ];
+  }
+
+  /// 列出计划版本（按版本升序）；`created_at` 取 `plan.json.saved_at`。
+  List<Map<String, Object?>> listPlanVersions(String lineId) {
+    getLine(lineId);
+    final RegExp pattern = RegExp(r'^plan-v(\d+)$');
+    final Directory dir = Directory(plansDir(lineId));
+    if (!dir.existsSync()) return <Map<String, Object?>>[];
+    final List<Map<String, Object?>> versions = <Map<String, Object?>>[];
+    for (final FileSystemEntity entity in dir.listSync()) {
+      if (entity is! Directory) continue;
+      final RegExpMatch? match = pattern.firstMatch(p.basename(entity.path));
+      if (match == null) continue;
+      final int version = int.tryParse(match.group(1) ?? '') ?? 0;
+      final File planFile = File(p.join(entity.path, 'plan.json'));
+      final Map<String, Object?> plan = planFile.existsSync()
+          ? _tryReadJson(planFile)
+          : const <String, Object?>{};
+      versions.add(<String, Object?>{
+        'version': version,
+        'dir': _portable(entity.path),
+        'created_at': textOf(plan['saved_at']),
+      });
+    }
+    versions.sort(
+      (Map<String, Object?> a, Map<String, Object?> b) =>
+          intOf(a['version'], 0).compareTo(intOf(b['version'], 0)),
+    );
+    return versions;
+  }
+
+  // ── 批次漂移（PC-3F）：<line>/drift.json / batches/<id>/gates/ ─────
+
+  /// 最近一次批次门报告：`<line>/drift.json`（供 UI 首屏展示）。
+  String driftFile(String lineId) => p.join(lineDir(lineId), 'drift.json');
+
+  /// 读最近一次批次门报告；不存在 / 坏 JSON ⇒ 空表。
+  Map<String, Object?> readDrift(String lineId) {
+    final File file = File(driftFile(lineId));
+    if (!file.existsSync()) return <String, Object?>{};
+    return _tryReadJson(file);
+  }
+
+  /// 原子写最近一次批次门报告；缺 `checked_at` 时补齐。
+  Map<String, Object?> writeDrift(String lineId, Map<String, Object?> report) {
+    getLine(lineId);
+    final Map<String, Object?> snapshot = plainMap(report);
+    if (textOf(snapshot['checked_at']).isEmpty) {
+      snapshot['checked_at'] = nowText();
+    }
+    _writeText(
+      File(driftFile(lineId)),
+      '${const JsonEncoder.withIndent('  ').convert(snapshot)}\n',
+    );
+    return snapshot;
+  }
+
+  /// 批次门证据目录：`<line>/batches/<batchId>/gates`（绝对路径）。
+  String batchGatesDir(String lineId, String batchId) => p.join(
+    lineDir(lineId),
+    'batches',
+    _segment(batchId, 'batch_id'),
+    'gates',
+  );
 
   /// 读决策台账（JSONL，坏行跳过）。
   List<Map<String, Object?>> readInbox(String lineId) {
@@ -995,6 +1624,27 @@ class ProductionStore {
     return p.normalize(dir);
   }
 
+  /// 任务附件目录（工作空间相对路径，统一 `/` 分隔）。
+  ///
+  /// 落在插件自己的 `.input` 下，不进项目资产、也不进 `docs/**`：
+  /// `.input/production_lines/<line>/tasks/<task>/attachments`。
+  String attachmentDir(String lineId, String taskId) => p.posix.join(
+    '.input',
+    'production_lines',
+    _segment(lineId, 'line_id'),
+    'tasks',
+    _segment(taskId, 'task_id'),
+    'attachments',
+  );
+
+  /// 任务附件目录的绝对路径（工作空间未配置 / 非绝对路径 ⇒ 可读失败）。
+  String attachmentAbsoluteDir(String lineId, String taskId) => p.normalize(
+    p.joinAll(<String>[
+      workspaceDirOf(lineId),
+      ...attachmentDir(lineId, taskId).split('/'),
+    ]),
+  );
+
   /// 项目资产根：`<workspace>/<docs.asset_dir>/<line_id>`（§7.1）。
   String assetRoot(String lineId) {
     final LineRecord line = getLine(lineId);
@@ -1031,6 +1681,30 @@ class ProductionStore {
       );
     }
     return file.readAsStringSync();
+  }
+
+  /// 读工作空间内的二进制文件（准备阶段送视觉模型用）。
+  ///
+  /// [maxBytes] 是硬上限（默认 8 MiB）：超限直接 `file_too_large`，
+  /// 避免把整张大图读进内存再判断。
+  List<int> readWorkspaceBytes(
+    String lineId,
+    String relative, {
+    int maxBytes = 8 * 1024 * 1024,
+  }) {
+    final String workspace = workspaceDirOf(lineId);
+    final String path = _safeWorkspacePath(workspace, relative);
+    final File file = File(path);
+    if (!file.existsSync()) {
+      throw ProductionFailure('文件不存在：$relative', code: 'not_found');
+    }
+    if (file.lengthSync() > maxBytes) {
+      throw ProductionFailure(
+        '文件超过 $maxBytes 字节，拒绝整读：$relative',
+        code: 'file_too_large',
+      );
+    }
+    return file.readAsBytesSync();
   }
 
   /// 工作空间内的有界检索（准备阶段的 `grep`，每会话 ≤ 2 轮）。
@@ -1101,7 +1775,9 @@ class ProductionStore {
           continue;
         }
         if (entity is! File) continue;
-        if (!extensions.contains(p.extension(entity.path).replaceFirst('.', ''))) {
+        if (!extensions.contains(
+          p.extension(entity.path).replaceFirst('.', ''),
+        )) {
           continue;
         }
         if (entity.lengthSync() > 512 * 1024) continue;
@@ -1115,7 +1791,9 @@ class ProductionStore {
         for (int i = 0; i < lines.length; i++) {
           if (!expression.hasMatch(lines[i])) continue;
           matches.add(<String, Object?>{
-            'path': p.relative(entity.path, from: workspace).replaceAll('\\', '/'),
+            'path': p
+                .relative(entity.path, from: workspace)
+                .replaceAll('\\', '/'),
             'line': i + 1,
             'text': lines[i].trim(),
           });
@@ -1147,7 +1825,9 @@ class ProductionStore {
       throw ProductionFailure('$what必须是相对路径：$value', code: 'invalid_arguments');
     }
     final String path = p.normalize(p.join(root, value));
-    final String prefix = root.endsWith(p.separator) ? root : '$root${p.separator}';
+    final String prefix = root.endsWith(p.separator)
+        ? root
+        : '$root${p.separator}';
     if (path != root && !path.startsWith(prefix)) {
       throw ProductionFailure('$what越出根目录：$value', code: 'invalid_arguments');
     }
