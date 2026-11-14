@@ -488,12 +488,15 @@ Future<Map<String, dynamic>> _dispatch(
   if (_matches(auditPattern, path) && method == 'GET') {
     final String lineId = _pathParam(auditPattern, path, 'lineId');
     // REST 是只读面：`write=false` 只出报告，不落 audit.md（落盘留给写接口）。
-    // `limit` = 每批文件数；不传则用插件默认（500）。
+    // `limit` = 每批文件数；`refresh=true` 才重扫（按缓存增量），否则优先回缓存。
     final int limit = intOf(_queryOf(query, 'limit'), 0);
+    final String refreshRaw = textOf(_queryOf(query, 'refresh')).toLowerCase();
+    final bool refresh = refreshRaw == 'true' || refreshRaw == '1';
     return _ok(
       await audit.handle('production.audit.run', <String, Object?>{
         'line_id': lineId,
         'write': false,
+        'refresh': refresh,
         if (limit > 0) 'limit': limit,
       }, meta, scope),
     );

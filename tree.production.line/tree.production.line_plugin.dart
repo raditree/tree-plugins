@@ -28,7 +28,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.production.line';
 const String kDisplayName = 'Tree 标准开发流生产线';
-const String kVersion = '0.10.0';
+const String kVersion = '0.11.0';
 
 const String kStationName = 'production';
 
@@ -2357,10 +2357,21 @@ Future<int> selfTest() async {
       ),
       '冗余候选：超大文件',
     );
+    final Map<String, dynamic> auditCached = payloadOf(
+      await call('audit-cached', 'production.audit.run', <String, Object?>{
+        'line_id': 'pl_audit',
+        'write': false,
+      }),
+    );
+    check.check(auditCached['cached'], true, '整理报告命中落盘缓存');
+    check.check(auditCached['stale'], false, '无变化时缓存不标 stale');
+
     final String todoBefore = todoFile.readAsStringSync();
     final Map<String, dynamic> auditWritten = payloadOf(
       await call('audit-run', 'production.audit.run', <String, Object?>{
         'line_id': 'pl_audit',
+        // 第一次 write=false 已完成并落缓存；显式 refresh 才重扫并写 audit.md。
+        'refresh': true,
       }),
     );
     check.check(auditWritten['written'], true, '默认写 audit.md');

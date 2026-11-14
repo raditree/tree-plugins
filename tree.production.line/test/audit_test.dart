@@ -295,6 +295,65 @@ void main() {
       );
     });
 
+    test('完成后落缓存：无变化 0 次重扫；有变化标 stale；refresh 增量更新', () async {
+      writeFile('lib/todo.dart', '// TODO: 缓存\nclass X {}');
+      final Map<String, Object?> first = await call(<String, Object?>{
+        'line_id': 'pl_a',
+      });
+      expect(first['cached'], false);
+      final File cache = File(
+        p.join(store.lineDir('pl_a'), kAuditCacheFile),
+      );
+      expect(cache.existsSync(), isTrue, reason: '完成态应落 audit_cache.json');
+
+      final Map<String, Object?> second = await call(<String, Object?>{
+        'line_id': 'pl_a',
+      });
+      expect(second['cached'], isTrue);
+      expect(second['stale'], false);
+      expect(second['written'], false);
+      expect(
+        (second['report'] as Map<String, Object?>)['todos'],
+        (first['report'] as Map<String, Object?>)['todos'],
+        reason: '无变化时直接复用缓存报告',
+      );
+
+      writeFile('lib/new.dart', '// FIXME: 新文件\nclass Y {}');
+      final Map<String, Object?> stale = await call(<String, Object?>{
+        'line_id': 'pl_a',
+      });
+      expect(stale['cached'], isTrue);
+      expect(stale['stale'], isTrue);
+      expect((stale['changed'] as num).toInt(), 1);
+      expect(
+        ((stale['report'] as Map<String, Object?>)['todos'] as List<Object?>)
+            .length,
+        1,
+        reason: 'stale 查询不重扫，仍回旧报告',
+      );
+
+      final Map<String, Object?> refreshed = await call(<String, Object?>{
+        'line_id': 'pl_a',
+        'refresh': true,
+      });
+      expect(refreshed['cached'], false);
+      final Map<String, Object?> report =
+          refreshed['report'] as Map<String, Object?>;
+      final List<Object?> todos = report['todos'] as List<Object?>;
+      expect(todos.length, 2, reason: '旧 TODO 复用缓存，新 FIXME 增量加入');
+      expect(
+        todos.any(
+          (Object? item) =>
+              '${(item as Map<String, Object?>)['marker']}' == 'FIXME',
+        ),
+        isTrue,
+      );
+      expect(
+        (report['notes'] as List<Object?>).join('\n'),
+        contains('本次增量扫描 1'),
+      );
+    });
+
     test('显式 task_id 必须存在；缺团队仍可扫描（全局作用域）', () async {
       writeFile('lib/a.dart', 'void a() {}\n');
       await expectLater(
