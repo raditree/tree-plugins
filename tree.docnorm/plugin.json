@@ -1,8 +1,8 @@
 {
   "id": "tree.docnorm",
   "name": "Tree 文档归一化",
-  "version": "0.8.0",
-  "description": "headless 插件：扫描目标仓库、识别包与子包、抽取公开声明与 API 面（DN-2）；侦查文档契约并按三层规则源做 DocPolicy 检查（DN-3）；plan 只读归集 git 内容变更并给出注入单元与 context_cap/stage_budget 两额度估计（DN-4）；generate 经执行站 llm.call 生成缺失章节提案（三模式×三档、只补缺、失败即 degraded，DN-5）；baseline / reanalyze --changed 建 L0 事实（doc_contract/pkg_index/doc_state 入 tree.storage）并按提案只追加缺章节（DN-6）；audit 确定性产四类建议并补全 pkg_index 的收束事实 / quality / stale，阈值读仓库策略（DN-7）；commit 按 docs 域 / 最具体包 / unmatched 分批提交（风格探测、门禁默认只列、不 push / amend，DN-8）；graph.build 默认只建 belongs_to / references / mentions 三类确定性边，rag=true 追加 GraphRAG 索引（分块 / llm.call 抽取 / yograph Leiden 社区 / 社区报告 / llm.embed 向量，无 embedding 时 mode=lexical，DN-9）；export 把集合导成 .docnorm/export/*.jsonl 快照（按 key 排序可直接 diff，DN-9）；query 只读检索（BM25 + cosine / 实体链接 1~2 跳 / 社区报告 reduce，mode 显式），check --edges 追加六类关联边检查（DN-10）。对目标仓库只读，写盘必须显式 commit。",
+  "version": "0.9.0",
+  "description": "headless 插件：扫描目标仓库、识别包与子包、抽取公开声明与 API 面（DN-2）；侦查文档契约并按三层规则源做 DocPolicy 检查（DN-3）；plan 只读归集 git 内容变更并给出注入单元与 context_cap/stage_budget 两额度估计（DN-4）；generate 经执行站 llm.call 生成缺失章节提案（三模式×三档、只补缺、失败即 degraded，DN-5）；baseline / reanalyze --changed 建 L0 事实（doc_contract/pkg_index/doc_state 入 tree.storage）并按提案只追加缺章节（DN-6）；audit 确定性产四类建议并补全 pkg_index 的收束事实 / quality / stale，阈值读仓库策略（DN-7）；commit 按 docs 域 / 最具体包 / unmatched 分批提交（风格探测、门禁默认只列、不 push / amend，DN-8）；graph.build 默认只建 belongs_to / references / mentions 三类确定性边，rag=true 追加 GraphRAG 索引（分块 / llm.call 抽取 / yograph Leiden 社区 / 社区报告 / llm.embed 向量，无 embedding 时 mode=lexical，DN-9）；export 把集合导成 .docnorm/export/*.jsonl 快照（按 key 排序可直接 diff，DN-9）；query 只读检索（BM25 + cosine / 实体链接 1~2 跳 / 社区报告 reduce，mode 显式），check --edges 追加六类关联边检查（DN-10）。插件设置（D28 / K 系列）：经 tree.settings 注册并读取 stage_budget / context_cap / context_ratio / full_code_ratio / model_max_seqlen / token_scale，优先级 设置服务 > env > .docnorm/config.json > 默认；设置服务缺失时 fail-open 到 env/config。对目标仓库只读，写盘必须显式 commit。",
   "runtime": "headless",
   "files": [
     "tree_docnorm.exe"

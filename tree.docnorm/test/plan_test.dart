@@ -91,46 +91,77 @@ void main() {
     expect(budget['within_context_cap'], isTrue);
   }, skip: gitAvailable ? false : 'git 不可用');
 
-  test('配置优先级：config < env < overrides，context_cap 与模型上限取 min', () async {
-    fixture();
-    write(
-      '.docnorm/config.json',
-      '{"model_max_seqlen": 1000, "context_ratio": 0.7, "stage_budget": 1}',
-    );
-    await commitAll();
-    write('lib/a.dart', 'class Alpha {}\nclass Beta {}\nclass Gamma {}\n');
+  test(
+    '配置优先级：config < env < settings < overrides，context_cap 与模型上限取 min',
+    () async {
+      fixture();
+      write(
+        '.docnorm/config.json',
+        '{"model_max_seqlen": 1000, "context_ratio": 0.7, "stage_budget": 1}',
+      );
+      await commitAll();
+      write('lib/a.dart', 'class Alpha {}\nclass Beta {}\nclass Gamma {}\n');
 
-    final Map<String, Object?> configured = await runPlan(
-      temp.path,
-      environment: const <String, String>{},
-    );
-    final Map<String, Object?> config =
-        configured['config'] as Map<String, Object?>;
-    expect(config['sources'], contains('.docnorm/config.json'));
-    expect(config['context_cap'], 700);
-    final Map<String, Object?> budget =
-        configured['budget'] as Map<String, Object?>;
-    expect(budget['stage_budget'], 1);
-    expect(budget['within_stage_budget'], isFalse);
-    expect(budget['over_stage_by'] as int, greaterThan(0));
+      final Map<String, Object?> configured = await runPlan(
+        temp.path,
+        environment: const <String, String>{},
+      );
+      final Map<String, Object?> config =
+          configured['config'] as Map<String, Object?>;
+      expect(config['sources'], contains('.docnorm/config.json'));
+      expect(config['context_cap'], 700);
+      final Map<String, Object?> budget =
+          configured['budget'] as Map<String, Object?>;
+      expect(budget['stage_budget'], 1);
+      expect(budget['within_stage_budget'], isFalse);
+      expect(budget['over_stage_by'] as int, greaterThan(0));
 
-    final Map<String, Object?> fromEnv = await runPlan(
-      temp.path,
-      environment: const <String, String>{'TREE_DOCNORM_CONTEXT_CAP': '10'},
-    );
-    expect((fromEnv['config'] as Map<String, Object?>)['context_cap'], 10);
-    expect(
-      (fromEnv['config'] as Map<String, Object?>)['sources'],
-      contains('env:TREE_DOCNORM_CONTEXT_CAP'),
-    );
+      final Map<String, Object?> fromEnv = await runPlan(
+        temp.path,
+        environment: const <String, String>{'TREE_DOCNORM_CONTEXT_CAP': '10'},
+      );
+      expect((fromEnv['config'] as Map<String, Object?>)['context_cap'], 10);
+      expect(
+        (fromEnv['config'] as Map<String, Object?>)['sources'],
+        contains('env:TREE_DOCNORM_CONTEXT_CAP'),
+      );
 
-    final Map<String, Object?> overridden = await runPlan(
-      temp.path,
-      environment: const <String, String>{'TREE_DOCNORM_CONTEXT_CAP': '10'},
-      overrides: <String, Object?>{'context_cap': 20},
-    );
-    expect((overridden['config'] as Map<String, Object?>)['context_cap'], 20);
-  }, skip: gitAvailable ? false : 'git 不可用');
+      final Map<String, Object?> fromSettings = await runPlan(
+        temp.path,
+        environment: const <String, String>{'TREE_DOCNORM_CONTEXT_CAP': '10'},
+        settings: <String, Object?>{'context_cap': 30, 'stage_budget': 2},
+      );
+      expect(
+        (fromSettings['config'] as Map<String, Object?>)['context_cap'],
+        30,
+      );
+      expect(
+        (fromSettings['config'] as Map<String, Object?>)['sources'],
+        contains('settings:context_cap'),
+      );
+      expect(
+        (fromSettings['budget'] as Map<String, Object?>)['stage_budget'],
+        2,
+      );
+
+      // 设置服务里 context_cap=0 表示“按模型上限自动算”，不能当成显式上限。
+      final Map<String, Object?> zeroCap = await runPlan(
+        temp.path,
+        environment: const <String, String>{},
+        settings: <String, Object?>{'context_cap': 0},
+      );
+      expect((zeroCap['config'] as Map<String, Object?>)['context_cap'], 700);
+
+      final Map<String, Object?> overridden = await runPlan(
+        temp.path,
+        environment: const <String, String>{'TREE_DOCNORM_CONTEXT_CAP': '10'},
+        settings: <String, Object?>{'context_cap': 30},
+        overrides: <String, Object?>{'context_cap': 20},
+      );
+      expect((overridden['config'] as Map<String, Object?>)['context_cap'], 20);
+    },
+    skip: gitAvailable ? false : 'git 不可用',
+  );
 
   test('测试文件走 assertions 模式；显式 full 超限时降级', () async {
     fixture();

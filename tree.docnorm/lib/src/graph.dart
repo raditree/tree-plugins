@@ -32,6 +32,7 @@ Future<Map<String, Object?>> runGraphBuild(
   bool rag = false,
   LlmCall? llm,
   RagEmbedCall? embed,
+  Map<String, Object?> settings = const <String, Object?>{},
   Map<String, Object?> overrides = const <String, Object?>{},
   Map<String, String>? environment,
   String embeddingModel = '',
@@ -206,6 +207,7 @@ Future<Map<String, Object?>> runGraphBuild(
     final DocnormConfig config = DocnormConfig.load(
       index,
       environment: environment,
+      settings: settings,
       overrides: overrides,
     );
     ragResult = await buildRagIndex(

@@ -49,6 +49,7 @@ typedef LlmCall = Future<GenerateReply> Function(GenerateRequest request);
 Future<Map<String, Object?>> runGenerate(
   String repo, {
   required LlmCall llm,
+  Map<String, Object?> settings = const <String, Object?>{},
   Map<String, Object?> overrides = const <String, Object?>{},
   String mode = 'auto',
   String tier = 'auto',
@@ -59,6 +60,7 @@ Future<Map<String, Object?>> runGenerate(
 
   final PlanContext context = await loadPlanContext(
     repo,
+    settings: settings,
     overrides: overrides,
     environment: environment,
   );

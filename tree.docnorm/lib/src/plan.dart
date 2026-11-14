@@ -72,12 +72,14 @@ class DocnormConfig {
     'stage_budget': stageBudget,
   };
 
-  /// 配置优先级：`.docnorm/config.json` < 环境变量 < 调用方 overrides。
+  /// 配置优先级：`.docnorm/config.json` < 环境变量 < 插件设置 < 调用方 overrides。
   ///
-  /// K（tree.settings）落地后这里再接设置服务；当前按 D28 的降级口径。
+  /// [settings] 只包含用户在 `tree.settings` 里覆盖过的值（未覆盖的不出现），
+  /// 所以 [sources] 仍能指出文件 / 环境变量 / 设置服务各自的来源。
   static DocnormConfig load(
     RepoIndex index, {
     Map<String, String>? environment,
+    Map<String, Object?> settings = const <String, Object?>{},
     Map<String, Object?> overrides = const <String, Object?>{},
   }) {
     final Map<String, String> env = environment ?? Platform.environment;
@@ -118,6 +120,16 @@ class DocnormConfig {
     fromEnv('context_cap', 'TREE_DOCNORM_CONTEXT_CAP');
     fromEnv('full_code_ratio', 'TREE_DOCNORM_FULL_CODE_RATIO');
     fromEnv('stage_budget', 'TREE_DOCNORM_STAGE_BUDGET');
+
+    for (final MapEntry<String, Object?> entry in settings.entries) {
+      // context_cap = 0 是“按模型上限自动算”，等价于不配置。
+      if (entry.value == null ||
+          (entry.key == 'context_cap' && entry.value == 0)) {
+        continue;
+      }
+      raw[entry.key] = entry.value;
+      sources.add('settings:${entry.key}');
+    }
 
     for (final MapEntry<String, Object?> entry in overrides.entries) {
       raw[entry.key] = entry.value;
@@ -203,6 +215,7 @@ class PlanContext {
 /// 一次加载仓库 / 配置 / 扫描 / 变更归集 / 注入单元（只读）。
 Future<PlanContext> loadPlanContext(
   String repo, {
+  Map<String, Object?> settings = const <String, Object?>{},
   Map<String, Object?> overrides = const <String, Object?>{},
   Map<String, String>? environment,
 }) async {
@@ -211,6 +224,7 @@ Future<PlanContext> loadPlanContext(
   final DocnormConfig config = DocnormConfig.load(
     index,
     environment: environment,
+    settings: settings,
     overrides: overrides,
   );
   final ScanResult scan = await scanIndex(index);
@@ -261,6 +275,7 @@ Future<PlanContext> loadPlanContext(
 ///   模式选择与 `context_cap` 分开报告，不做静默裁剪。
 Future<Map<String, Object?>> runPlan(
   String repo, {
+  Map<String, Object?> settings = const <String, Object?>{},
   Map<String, Object?> overrides = const <String, Object?>{},
   String mode = 'auto',
   Map<String, String>? environment,
@@ -269,6 +284,7 @@ Future<Map<String, Object?>> runPlan(
 
   final PlanContext context = await loadPlanContext(
     repo,
+    settings: settings,
     overrides: overrides,
     environment: environment,
   );

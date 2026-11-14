@@ -16,7 +16,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.docnorm';
 const String kDisplayName = 'Tree 文档归一化';
-const String kVersion = '0.8.0';
+const String kVersion = '0.9.0';
 const String kStationName = 'docnorm';
 const List<String> kDocnormCommands = <String>[
   'docnorm.scan',
@@ -56,6 +56,177 @@ const String kStationReadme =
 /// 当前握手完成的插件服务（由 [_onReady] 填入），用于向 tree.storage 下站命令。
 PluginKitServer? _activeServer;
 
+/// 设置 schema 已在 `tree.settings` 的全局库（v2 `binding=plugin`）注册成功。
+bool _settingsPluginReady = false;
+
+/// 老版 `tree.settings`（只有 team 绑定）下已注册 schema 的团队。
+final Set<String> _settingsTeams = <String>{};
+
+/// 失败日志只打一次，避免每条命令都刷同一句。
+bool _settingsFailureLogged = false;
+
+/// 与 `.docnorm/config.json` 同名的六个可调参数（顺序即设置页字段顺序）。
+const List<String> kDocnormSettingKeys = <String>[
+  'stage_budget',
+  'context_cap',
+  'context_ratio',
+  'full_code_ratio',
+  'model_max_seqlen',
+  'token_scale',
+];
+
+/// `tree.settings` 的设置 schema（D28 / K 系列）：预算 / 上下文 / 模型参数。
+///
+/// 键名与 `.docnorm/config.json` 完全一致；插件读取时按
+/// `设置服务 > 环境变量 > config > 内置默认` 合并。
+Map<String, Object?> docnormSettingsSchema() => <String, Object?>{
+  'schema_version': 1,
+  'groups': <Map<String, Object?>>[
+    <String, Object?>{'id': 'budget', 'title': '预算', 'order': 10},
+    <String, Object?>{'id': 'context', 'title': '上下文', 'order': 20},
+    <String, Object?>{'id': 'model', 'title': '模型', 'order': 30},
+  ],
+  'fields': <Map<String, Object?>>[
+    <String, Object?>{
+      'key': 'stage_budget',
+      'group': 'budget',
+      'type': 'int',
+      'title': '阶段预算',
+      'default': 400000,
+      'min': 1000,
+      'max': 4000000,
+      'help': '单个阶段的累计 token 上限，超出即停止并标 degraded。',
+    },
+    <String, Object?>{
+      'key': 'context_cap',
+      'group': 'context',
+      'type': 'int',
+      'title': '上下文上限',
+      'default': 0,
+      'min': 0,
+      'max': 2000000,
+      'help': '0 表示按模型上限自动计算；非 0 时与模型上限取较小值。',
+    },
+    <String, Object?>{
+      'key': 'context_ratio',
+      'group': 'context',
+      'type': 'double',
+      'title': '上下文占比',
+      'default': 0.7,
+      'min': 0.05,
+      'max': 1.0,
+      'help': 'context_cap = min(显式上限, 模型上限 × 本比例)。',
+    },
+    <String, Object?>{
+      'key': 'full_code_ratio',
+      'group': 'context',
+      'type': 'double',
+      'title': '全代码注入占比',
+      'default': 0.7,
+      'min': 0.05,
+      'max': 1.0,
+      'help': '单次注入全代码的估计上限 = context_cap × 本比例。',
+    },
+    <String, Object?>{
+      'key': 'model_max_seqlen',
+      'group': 'model',
+      'type': 'int',
+      'title': '模型单次上限',
+      'default': 128000,
+      'min': 1000,
+      'max': 2000000,
+      'help': '用于估算的模型最大序列长度（token）。',
+    },
+    <String, Object?>{
+      'key': 'token_scale',
+      'group': 'model',
+      'type': 'double',
+      'title': '字符/Token 比例',
+      'default': 4.0,
+      'min': 0.1,
+      'max': 20.0,
+      'help': '字符数换算 token 的比例，默认约 4 字符 / token。',
+    },
+  ],
+};
+
+/// 注册设置 schema：优先 v2 的全局库（`binding=plugin`，不按团队切碎）；
+/// 老版 `tree.settings` 只认 team 绑定，退回按本次请求的 team 注册。
+///
+/// 返回实际可用的绑定（`plugin` / `team` / 空串=不可用）。设置不是业务数据，
+/// 任何失败都只记一次日志，不阻断命令。
+Future<String> _ensureSettingsSchema(Map<String, dynamic> scope) async {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) return '';
+  if (_settingsPluginReady) return 'plugin';
+  final Map<String, Object?> schema = docnormSettingsSchema();
+  try {
+    await server.channel.command('settings.define', <String, dynamic>{
+      'binding': 'plugin',
+      'schema': schema,
+    });
+    _settingsPluginReady = true;
+    return 'plugin';
+  } catch (_) {
+    // 老版服务会因缺 team_id 拒绝；继续走 team 绑定。
+  }
+  final String teamId = asString(scope['team_id']);
+  if (teamId.isEmpty) return '';
+  if (_settingsTeams.contains(teamId)) return 'team';
+  try {
+    await server.channel.command(
+      'settings.define',
+      <String, dynamic>{'schema': schema},
+      '',
+      scope,
+    );
+    _settingsTeams.add(teamId);
+    return 'team';
+  } catch (error) {
+    if (!_settingsFailureLogged) {
+      _settingsFailureLogged = true;
+      server.channel.log('注册插件设置 schema 失败（不影响命令执行）：$error');
+    }
+    return '';
+  }
+}
+
+/// 读设置覆盖值；设置服务不可用时 fail-open 到环境变量 / config。
+///
+/// 只回 `has_value=true` 的项，未覆盖的项交给 env / `.docnorm/config.json`，
+/// 这样 `config.sources` 才能如实标出来源。
+Future<Map<String, Object?>> _settingsOverrides(
+  Map<String, dynamic> scope,
+) async {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) return const <String, Object?>{};
+  final String binding = await _ensureSettingsSchema(scope);
+  if (binding.isEmpty) return const <String, Object?>{};
+  try {
+    final Map<String, dynamic> payload = await server.channel.command(
+      'settings.list',
+      <String, dynamic>{if (binding == 'plugin') 'binding': 'plugin'},
+      '',
+      binding == 'plugin' ? const <String, dynamic>{} : scope,
+    );
+    final Map<String, dynamic> values = asMap(payload['values']);
+    final Map<String, Object?> overrides = <String, Object?>{};
+    for (final String key in kDocnormSettingKeys) {
+      final Map<String, dynamic> view = asMap(values[key]);
+      if (view['has_value'] == true && view['value'] != null) {
+        overrides[key] = view['value'];
+      }
+    }
+    return overrides;
+  } catch (error) {
+    if (!_settingsFailureLogged) {
+      _settingsFailureLogged = true;
+      server.channel.log('读取插件设置失败（退回 env/config）：$error');
+    }
+    return const <String, Object?>{};
+  }
+}
+
 PluginKitServer buildServer({bool exitOnShutdown = true}) => PluginKitServer(
   channel: PluginChannel.stdio(kPluginId),
   pluginId: kPluginId,
@@ -85,6 +256,8 @@ Future<void> _onReady(PluginKitServer server) async {
   } catch (error) {
     server.channel.log('自建执行站失败：$error');
   }
+  // 启动即注册设置 schema（v2 全局库；老版服务等第一条带 team 的命令再注册）。
+  await _ensureSettingsSchema(const <String, dynamic>{});
 }
 
 Future<Map<String, dynamic>?> handleRequest(
@@ -106,6 +279,8 @@ Future<Map<String, dynamic>?> handleRequest(
         },
       };
     }
+    // 任何命令都顺带确保设置 schema 已注册（启动时可能 tree.settings 还没上线）。
+    await _ensureSettingsSchema(asMap(params['scope']));
     if (command == 'docnorm.scan') {
       final ScanResult result = await scanRepository(repo);
       return <String, dynamic>{
@@ -113,9 +288,13 @@ Future<Map<String, dynamic>?> handleRequest(
       };
     }
     if (command == 'docnorm.plan') {
+      final Map<String, Object?> settings = await _settingsOverrides(
+        asMap(params['scope']),
+      );
       final Map<String, Object?> result = await runPlan(
         repo,
         mode: asString(arguments['mode']),
+        settings: settings,
         overrides: arguments['config'] is Map
             ? asMap(arguments['config'])
             : const <String, Object?>{},
@@ -126,6 +305,7 @@ Future<Map<String, dynamic>?> handleRequest(
     }
     if (command == 'docnorm.generate') {
       final Map<String, dynamic> scope = asMap(params['scope']);
+      final Map<String, Object?> settings = await _settingsOverrides(scope);
       Future<GenerateReply> llm(GenerateRequest request) =>
           _callLlm(request, scope);
       final Map<String, Object?> result = await runGenerate(
@@ -133,6 +313,7 @@ Future<Map<String, dynamic>?> handleRequest(
         llm: llm,
         mode: asString(arguments['mode']),
         tier: asString(arguments['tier']),
+        settings: settings,
         overrides: arguments['config'] is Map
             ? asMap(arguments['config'])
             : const <String, Object?>{},
@@ -169,6 +350,7 @@ Future<Map<String, dynamic>?> handleRequest(
     }
     if (command == 'docnorm.graph.build') {
       final Map<String, dynamic> scope = asMap(params['scope']);
+      final Map<String, Object?> settings = await _settingsOverrides(scope);
       Future<Map<String, dynamic>> storage(
         String name,
         Map<String, dynamic> args,
@@ -185,6 +367,7 @@ Future<Map<String, dynamic>?> handleRequest(
         rag: arguments['rag'] == true,
         llm: llm,
         embed: embed,
+        settings: settings,
         overrides: arguments['config'] is Map
             ? asMap(arguments['config'])
             : const <String, Object?>{},
@@ -573,6 +756,12 @@ thresholds:
     int storageWrites = 0;
     int llmCalls = 0;
     int embedCalls = 0;
+    // 假 tree.settings：记录 define 次数，list 只回有覆盖值的项。
+    Map<String, dynamic>? settingsSchema;
+    final Map<String, Object?> settingValues = <String, Object?>{
+      'stage_budget': 300000,
+    };
+    int settingsDefines = 0;
     core.onMethod(M.stationCommand, (Map<String, dynamic> params) {
       final String command = asString(params['command']);
       final Map<String, dynamic> args = asMap(params['arguments']);
@@ -581,6 +770,35 @@ thresholds:
         collection,
       );
       switch (command) {
+        case 'settings.define':
+          settingsDefines += 1;
+          settingsSchema = asMap(args['schema']);
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'plugin_id': kPluginId,
+              'schema_version': 1,
+              'unchanged': false,
+            },
+          };
+        case 'settings.list':
+          final Map<String, Object?> defaults = <String, Object?>{
+            for (final Object? raw
+                in (settingsSchema?['fields'] as List<dynamic>? ?? <dynamic>[]))
+              asString(asMap(raw)['key']): asMap(raw)['default'],
+          };
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'values': <String, Object?>{
+                for (final MapEntry<String, Object?> entry in defaults.entries)
+                  entry.key: <String, Object?>{
+                    'value': settingValues[entry.key] ?? entry.value,
+                    'has_value': settingValues.containsKey(entry.key),
+                  },
+              },
+            },
+          };
         case 'llm.call':
           llmCalls += 1;
           final List<dynamic> messages = args['messages'] is List
@@ -1034,6 +1252,15 @@ thresholds:
       check.that(
         (asMap(planPayload['budget'])['context_cap'] as num? ?? 0) > 0,
         'plan 给出 context_cap',
+      );
+      final Map<String, dynamic> planConfig = asMap(planPayload['config']);
+      check.check(settingsDefines, 1, '启动时向 tree.settings 注册 schema');
+      check.check(planConfig['stage_budget'], 300000, '设置服务覆盖内置默认值');
+      check.that(
+        (planConfig['sources'] as List<dynamic>? ?? <dynamic>[]).contains(
+          'settings:stage_budget',
+        ),
+        'config.sources 标出设置服务来源',
       );
 
       final Map<String, dynamic> generateReply = await askCommand(
