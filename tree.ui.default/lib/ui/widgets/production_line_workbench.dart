@@ -57,12 +57,16 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
   List<Map<String, dynamic>> _runs = <Map<String, dynamic>>[];
   Map<String, dynamic>? _artifacts;
   Map<String, dynamic>? _audit;
+  Map<String, dynamic>? _dedup;
 
   /// 主控状态（D6-O）：配置 / 最近动作 / 连续失败 / 未答运行期问题。
   Map<String, dynamic>? _orchestrator;
 
   /// 整理报告每批文件数（一次请求一批；改完点「继续扫描」跑下一批）。
   final TextEditingController _auditBatch = TextEditingController(text: '500');
+
+  /// 逻辑去重每批文件数（一次请求一批；点「运行下一批」继续）。
+  final TextEditingController _dedupBatch = TextEditingController(text: '50');
 
   /// 单条产线 / 任务的写操作进行中（按钮转圈、防重复提交）。
   final Set<String> _actionBusy = <String>{};
@@ -111,6 +115,7 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
   @override
   void dispose() {
     _auditBatch.dispose();
+    _dedupBatch.dispose();
     super.dispose();
   }
 
@@ -205,6 +210,46 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
     } finally {
       if (mounted) setState(() => _actionBusy.remove('$lineId/audit'));
     }
+  }
+
+  /// 逻辑去重：GET 只读上次结果；GET 不触发 embedding。
+  Future<void> _loadDedup() async {
+    final String? lineId = _lineId;
+    if (lineId == null) return;
+    if (_dedup != null) {
+      setState(() => _dedup = null);
+      return;
+    }
+    await _act('$lineId/dedup-read', () async {
+      final Map<String, dynamic> data = await ApiService.getProductionDedup(
+        lineId,
+        teamId: _teamId,
+      );
+      if (mounted) setState(() => _dedup = data);
+    });
+  }
+
+  /// 逻辑去重：显式推进一批（embedding 付费动作）。
+  Future<void> _runDedup({String mode = 'incremental'}) async {
+    final String? lineId = _lineId;
+    if (lineId == null) return;
+    final int limit = (int.tryParse(_dedupBatch.text.trim()) ?? 50).clamp(
+      1,
+      500,
+    );
+    await _act('$lineId/dedup-run', () async {
+      await ApiService.runProductionDedup(
+        lineId,
+        teamId: _teamId,
+        mode: mode,
+        limit: limit,
+      );
+      final Map<String, dynamic> data = await ApiService.getProductionDedup(
+        lineId,
+        teamId: _teamId,
+      );
+      if (mounted) setState(() => _dedup = data);
+    });
   }
 
   /// 统一收口：忙碌标记 + 可读错误（SnackBar，不打断工作台状态）。
@@ -845,6 +890,7 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
     );
     final Map<String, dynamic>? artifacts = _artifacts;
     final Map<String, dynamic>? audit = _audit;
+    final Map<String, dynamic>? dedup = _dedup;
     return ListView(
       key: const Key('production-workbench'),
       padding: const EdgeInsets.only(bottom: 16),
@@ -906,11 +952,29 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
                 onPressed: () => _loadAudit(),
                 child: Text(audit == null ? '整理报告' : '收起报告'),
               ),
+              SizedBox(
+                width: 84,
+                child: TextField(
+                  key: Key('production-dedup-batch-$lineId'),
+                  controller: _dedupBatch,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: '去重批',
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ),
+              TextButton(
+                onPressed: _loadDedup,
+                child: Text(dedup == null ? '逻辑去重' : '收起去重'),
+              ),
             ],
           ),
         ),
         if (artifacts != null) ..._buildArtifacts(cs, artifacts),
         if (audit != null) ..._buildAudit(cs, lineId, audit),
+        if (dedup != null) ..._buildDedup(cs, lineId, dedup),
       ],
     );
   }
@@ -1201,6 +1265,75 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
       ],
       for (final dynamic note in notes) _muted(cs, '$note'),
     ];
+  }
+
+  /// 逻辑去重结果（GET 只读；运行 / 重建是显式动作）。
+  List<Widget> _buildDedup(
+    ColorScheme cs,
+    String lineId,
+    Map<String, dynamic> data,
+  ) {
+    final Map<String, dynamic> run = productionMap(data['run']);
+    final Map<String, dynamic> counts = productionMap(run['counts']);
+    final List<Map<String, dynamic>> pairs = productionListOf(
+      data,
+      'top_pairs',
+    );
+    final List<dynamic> reasons =
+        run['reasons'] as List<dynamic>? ?? <dynamic>[];
+    final bool busyRun = _actionBusy.contains('$lineId/dedup-run');
+    final int files = (counts['files'] as num?)?.toInt() ?? 0;
+    final int chunks = (counts['chunks'] as num?)?.toInt() ?? 0;
+    final int vectors = (counts['vectors'] as num?)?.toInt() ?? 0;
+    final int results = (counts['results'] as num?)?.toInt() ?? 0;
+    final String mode = '${run['mode'] ?? ''}';
+    final bool degraded = run['degraded'] == true;
+    return <Widget>[
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 6, 8, 2),
+        child: Row(
+          children: <Widget>[
+            Expanded(
+              child: Text(
+                mode.isEmpty
+                    ? '逻辑去重：尚未运行'
+                    : '逻辑去重：$mode · 文件 $files · 块 $chunks · 向量 $vectors · 结果 $results',
+                style: const TextStyle(fontSize: 11),
+              ),
+            ),
+            TextButton(
+              key: Key('production-dedup-run-$lineId'),
+              onPressed: busyRun ? null : () => _runDedup(),
+              child: Text(busyRun ? '运行中…' : '运行下一批'),
+            ),
+            TextButton(
+              key: Key('production-dedup-rebuild-$lineId'),
+              onPressed: busyRun ? null : () => _runDedup(mode: 'rebuild'),
+              child: const Text('全量重建'),
+            ),
+          ],
+        ),
+      ),
+      if (degraded)
+        for (final dynamic reason in reasons) _muted(cs, '降级：$reason'),
+      for (final Map<String, dynamic> pair in pairs.take(10))
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 1, 16, 1),
+          child: Text(
+            '${_pairLabel(pair['a'])}  ↔  ${_pairLabel(pair['b'])}'
+            '  ·  ${((pair['score'] as num?)?.toDouble() ?? 0).toStringAsFixed(4)}'
+            '${pair['exact'] == true ? ' · 字节相同' : ''}',
+            style: const TextStyle(fontSize: 11),
+          ),
+        ),
+    ];
+  }
+
+  String _pairLabel(Object? raw) {
+    final Map<String, dynamic> item = productionMap(raw);
+    final String path = '${item['path'] ?? ''}';
+    final String scope = '${item['scope'] ?? ''}';
+    return scope.isEmpty ? path : '$path:$scope';
   }
 
   Widget _sectionTitle(ColorScheme cs, String title, String count) => Padding(

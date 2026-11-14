@@ -15,7 +15,8 @@ class PluginSettingsCard extends StatefulWidget {
 
   /// 设置库归属（= 当前选中的 Agent / 团队 id）。
   ///
-  /// `tree.settings` 是 team 粒度：核心只从 query 透传 team_id，空值会被拒绝。
+  /// v2 起设置页默认编辑 `binding=plugin` 的全局值；teamId 只作可选团队覆盖的
+  /// 上下文，不再阻塞加载。
   final String teamId;
 
   @override
@@ -48,16 +49,6 @@ class _PluginSettingsCardState extends State<PluginSettingsCard> {
 
   Future<void> _load() async {
     final String teamId = widget.teamId.trim();
-    if (teamId.isEmpty) {
-      if (mounted) {
-        setState(() {
-          _loading = false;
-          _loadError = null;
-          _schemas = <Map<String, dynamic>>[];
-        });
-      }
-      return;
-    }
     if (mounted) {
       setState(() {
         _loading = true;
@@ -222,15 +213,6 @@ class _PluginSettingsCardState extends State<PluginSettingsCard> {
 
   @override
   Widget build(BuildContext context) {
-    if (widget.teamId.trim().isEmpty) {
-      return Padding(
-        padding: const EdgeInsets.all(16),
-        child: Text(
-          '先在左侧选择一个 Agent（团队），再配置插件参数。',
-          style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
-        ),
-      );
-    }
     if (_loading) {
       return const Padding(
         padding: EdgeInsets.all(16),
@@ -273,7 +255,7 @@ class _PluginSettingsCardState extends State<PluginSettingsCard> {
       childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
       initiallyExpanded: true,
       title: Text(pluginId),
-      subtitle: Text('schema v${schema['schema_version'] ?? 1}'),
+      subtitle: Text('schema v${schema['schema_version'] ?? 1} · 全局（所有团队）'),
       children: <Widget>[
         ..._buildGroups(context, pluginId, schema),
         if (error.isNotEmpty)

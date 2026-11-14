@@ -1118,13 +1118,15 @@ class ApiService {
   ///
   /// 调用 `GET /api/plugin-settings/schema`，返回 `{schemas: [...]}`；路由由
   /// `tree.settings` 插件承接，前缀刻意避开核心的 `/api/settings/*`。
-  /// [teamId] 是设置库的归属（核心只从 query 透传）；缺省会被设置服务拒绝。
+  /// 默认 `binding=plugin`（全局设置）；传 `binding=team` 才按 [teamId] 读团队覆盖。
   static Future<Map<String, dynamic>> getPluginSettingsSchema({
     String teamId = '',
+    String binding = 'plugin',
   }) async {
     return _getJson(
       '/api/plugin-settings/schema',
       query: <String, String>{
+        if (binding.trim().isNotEmpty) 'binding': binding.trim(),
         if (teamId.trim().isNotEmpty) 'team_id': teamId.trim(),
       },
     );
@@ -1134,11 +1136,13 @@ class ApiService {
   static Future<Map<String, dynamic>> getPluginSettingsValues(
     String pluginId, {
     String teamId = '',
+    String binding = 'plugin',
   }) async {
     return _getJson(
       '/api/plugin-settings/values',
       query: <String, String>{
         'plugin_id': pluginId,
+        if (binding.trim().isNotEmpty) 'binding': binding.trim(),
         if (teamId.trim().isNotEmpty) 'team_id': teamId.trim(),
       },
     );
@@ -1149,10 +1153,15 @@ class ApiService {
     String pluginId,
     Map<String, dynamic> values, {
     String teamId = '',
+    String binding = 'plugin',
   }) async {
     return _patchJson(
       '/api/plugin-settings/values',
-      body: <String, dynamic>{'plugin_id': pluginId, 'values': values},
+      body: <String, dynamic>{
+        'plugin_id': pluginId,
+        'values': values,
+        'binding': binding,
+      },
       query: <String, String>{
         if (teamId.trim().isNotEmpty) 'team_id': teamId.trim(),
       },
@@ -1164,10 +1173,15 @@ class ApiService {
     String pluginId,
     List<String> keys, {
     String teamId = '',
+    String binding = 'plugin',
   }) async {
     return _postJson(
       '/api/plugin-settings/reset',
-      body: <String, dynamic>{'plugin_id': pluginId, 'keys': keys},
+      body: <String, dynamic>{
+        'plugin_id': pluginId,
+        'keys': keys,
+        'binding': binding,
+      },
       query: <String, String>{
         if (teamId.trim().isNotEmpty) 'team_id': teamId.trim(),
       },
@@ -1456,6 +1470,29 @@ class ApiService {
       ..._teamQuery(teamId),
       if (limit != null && limit > 0) 'limit': '$limit',
     },
+  );
+
+  static Future<Map<String, dynamic>> getProductionDedup(
+    String lineId, {
+    String teamId = '',
+  }) => _getJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/dedup',
+    query: _teamQuery(teamId),
+  );
+
+  /// 推进一批逻辑去重（显式付费动作）；[mode] = incremental | rebuild。
+  static Future<Map<String, dynamic>> runProductionDedup(
+    String lineId, {
+    String teamId = '',
+    String mode = 'incremental',
+    int? limit,
+  }) => _postJson(
+    '/api/production/lines/${Uri.encodeComponent(lineId)}/dedup',
+    body: <String, dynamic>{
+      'mode': mode,
+      if (limit != null && limit > 0) 'limit': limit,
+    },
+    query: _teamQuery(teamId),
   );
 
   static Map<String, String> _teamQuery(String teamId) => <String, String>{
