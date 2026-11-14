@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:tree_ui_default/ui/app_radius.dart';
 import 'package:tree_ui_default/ui/models/message.dart';
 import 'package:tree_ui_default/ui/services/detail_selection.dart';
 import 'package:tree_ui_default/ui/widgets/detail_panel.dart';
@@ -723,6 +724,40 @@ void main() {
         isTrue,
       );
       expect(page.contains('if (!_rightCollapsed) return;'), isTrue);
+    });
+  });
+
+  group('详情页整页圆角（用户 2026-11-13：「详情页这个没给圆角吗？补上」）', () {
+    testWidgets('整页是一张 AppRadius.md 圆角卡，内容裁进圆角里',
+        (WidgetTester tester) async {
+      DetailSelection.instance.toggle(toolMessage(
+        name: 'terminal',
+        args: const <String, dynamic>{'cmd': 'flutter test'},
+        result: 'All tests passed!',
+      ));
+      await tester.pumpWidget(const MaterialApp(
+        home: Scaffold(
+          body: SizedBox(width: 320, height: 600, child: DetailPanel()),
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      final Container card = tester.widget<Container>(
+        find
+            .descendant(
+              of: find.byType(DetailPanel),
+              matching: find.byType(Container),
+            )
+            .first,
+      );
+      expect(card.clipBehavior, Clip.antiAlias,
+          reason: '圆角要真的裁住页头与正文（否则内容会盖掉角）');
+      final BoxDecoration deco = card.decoration! as BoxDecoration;
+      expect(
+        (deco.borderRadius! as BorderRadius).topLeft.x,
+        AppRadius.md,
+        reason: '详情页按「容器」档 16 收边，与卡片 / 对话框同一套尺子',
+      );
     });
   });
 }

@@ -781,17 +781,30 @@ class _ModelInfoPanelState extends State<ModelInfoPanel> {
       items: _models.map((Map<String, dynamic> m) {
         final String modelKey = modelKeyOf(m);
         final String modelId = m['model_id'] as String? ?? modelKey;
+        final String name = (m['name'] as String? ?? '').trim();
+        final String displayName = name.isEmpty ? modelId : name;
         return DropdownMenuItem<String>(
           value: modelKey,
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: <Widget>[
               Flexible(
-                child: Text(
-                  m['name'] as String? ?? modelId,
-                  overflow: TextOverflow.ellipsis,
-                ),
+                child: Text(displayName, overflow: TextOverflow.ellipsis),
               ),
+              // provider/model_id：同名模型不同端点时靠它区分（键即资源身份）。
+              if (modelKey != displayName) ...<Widget>[
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    modelKey,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: Theme.of(context).colorScheme.outline,
+                    ),
+                  ),
+                ),
+              ],
             ],
           ),
         );

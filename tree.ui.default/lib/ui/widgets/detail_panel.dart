@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../app_radius.dart';
 import '../models/message.dart';
 import '../services/detail_selection.dart';
 import 'thinking_card.dart';
@@ -24,7 +25,8 @@ class DetailPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final ColorScheme cs = Theme.of(context).colorScheme;
+    final ThemeData theme = Theme.of(context);
+    final ColorScheme cs = theme.colorScheme;
     return ListenableBuilder(
       listenable: DetailSelection.instance,
       builder: (BuildContext context, Widget? child) {
@@ -33,19 +35,32 @@ class DetailPanel extends StatelessWidget {
         final Widget? injected = DetailSelection.instance.injected;
         if (injected != null) return injected;
         final ChatMessage? message = DetailSelection.instance.message;
-        if (message == null) return _buildEmpty(cs);
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
-            _buildHeader(cs, message),
-            Divider(height: 1, color: Theme.of(context).dividerColor),
-            Expanded(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
-                child: _buildBody(message),
-              ),
-            ),
-          ],
+        // 整页是一张圆角卡（用户 2026-11-13：「详情页这个没给圆角吗？补上」）：
+        // 以前页头与正文直接铺在栏底上，四周都是直角；改用与卡片同一档的
+        // [AppRadius.md] + 中性描边，跟窗口 chip / 其余卡片同一套语言。
+        return Container(
+          margin: const EdgeInsets.all(6),
+          clipBehavior: Clip.antiAlias,
+          decoration: BoxDecoration(
+            color: cs.surface,
+            borderRadius: BorderRadius.circular(AppRadius.md),
+            border: Border.all(color: theme.dividerColor),
+          ),
+          child: message == null
+              ? _buildEmpty(cs)
+              : Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: <Widget>[
+                    _buildHeader(cs, message),
+                    Divider(height: 1, color: theme.dividerColor),
+                    Expanded(
+                      child: SingleChildScrollView(
+                        padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
+                        child: _buildBody(message),
+                      ),
+                    ),
+                  ],
+                ),
         );
       },
     );
