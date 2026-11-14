@@ -1,6 +1,7 @@
 import 'spec_tool.dart';
 import 'terminal_hook_manager.dart';
 import 'tool_policy.dart';
+import 'tool_run_registry.dart';
 import 'tool_runner.dart';
 import '../station/tool_contributions.dart';
 import '../workspace/station_command.dart';
@@ -20,6 +21,7 @@ class StationToolRunner implements ToolRunner {
     this.specRunner,
     this.hooks,
     this.policyFor,
+    this.toolRuns,
   });
 
   final StationCommandClient client;
@@ -51,6 +53,13 @@ class StationToolRunner implements ToolRunner {
   /// [agentId] 当前生效的策略（未接线 = 全量默认）。
   ToolPolicy policyOf(String agentId) =>
       policyFor?.call(agentId) ?? ToolPolicy.unrestricted;
+
+  /// 运行中工具登记表（右栏「正在执行的 tool」/ `tool_runs` / `query_status` 的
+  /// **唯一**数据源）。null = 不登记（测试 / 未接线），行为与从前一致。
+  ///
+  /// 为什么挂在**这一层**：内置工具与宿主 `tool.call` 都经 [run] 这一个入口，
+  /// 在这里 start/finish 才能保证"工具一开始跑就有一行"、结束后一定收掉。
+  final ToolRunRegistry? toolRuns;
 
   /// 本 agent 可用的工具声明（白名单里没有的工具**不出现**）。
   ///
@@ -123,6 +132,10 @@ class StationToolRunner implements ToolRunner {
             'properties': <String, dynamic>{
               'path': <String, dynamic>{'type': 'string'},
               'max_depth': <String, dynamic>{'type': 'integer'},
+              'include_hidden': <String, dynamic>{
+                'type': 'boolean',
+                'description': 'true = 连 .git / .dart_tool 这类隐藏项一起列（缺省排除）',
+              },
             },
             'required': <String>['path'],
           },
@@ -137,6 +150,14 @@ class StationToolRunner implements ToolRunner {
               'path': <String, dynamic>{'type': 'string'},
               'regex': <String, dynamic>{'type': 'boolean'},
               'ignore_case': <String, dynamic>{'type': 'boolean'},
+              'include_hidden': <String, dynamic>{
+                'type': 'boolean',
+                'description': 'true = 搜索 .git / .dart_tool 这类隐藏项（缺省排除）',
+              },
+              'include_ignored': <String, dynamic>{
+                'type': 'boolean',
+                'description': 'true = 搜索 node_modules / build / dist 等依赖产物目录（缺省跳过）',
+              },
             },
             'required': <String>['pattern'],
           },
@@ -226,6 +247,17 @@ class StationToolRunner implements ToolRunner {
     }
     final Map<String, dynamic> scope =
         scopeFor(invocation.agentId, invocation.sessionId);
+    // 工具一开始执行就登记（右栏「正在执行的 tool」因此能在卡住时看到它）；
+    // `tool_runs` 自己不登记，避免列表里出现"正在查工具列表"的自我引用。
+    final ToolRunRegistry? registry = toolRuns;
+    final ToolRun? running = registry != null && invocation.name != 'tool_runs'
+        ? registry.start(
+            tool: invocation.name,
+            arguments: invocation.arguments,
+            agentId: invocation.agentId,
+            sessionId: invocation.sessionId,
+          )
+        : null;
     try {
       switch (invocation.name) {
         case 'read':
@@ -257,6 +289,8 @@ class StationToolRunner implements ToolRunner {
       }
     } catch (error) {
       return ToolOutcome('工具执行失败：$error', isError: true);
+    } finally {
+      if (running != null) registry!.finish(running);
     }
   }
 
@@ -338,6 +372,7 @@ class StationToolRunner implements ToolRunner {
   ) async {
     final Map<String, dynamic> result = await client('local.file.list', <String, dynamic>{
       'path': (invocation.arguments['path'] ?? '.').toString(),
+      'include_hidden': invocation.arguments['include_hidden'] == true,
       if (invocation.arguments['max_depth'] != null)
         'max_depth': invocation.arguments['max_depth'],
     }, scope);
@@ -358,6 +393,8 @@ class StationToolRunner implements ToolRunner {
         'path': invocation.arguments['path'],
       'regex': invocation.arguments['regex'] == true,
       'ignore_case': invocation.arguments['ignore_case'] == true,
+      'include_hidden': invocation.arguments['include_hidden'] == true,
+      'include_ignored': invocation.arguments['include_ignored'] == true,
     }, scope);
     final Object? matches = result['matches'];
     if (matches is! List || matches.isEmpty) return const ToolOutcome('（无匹配）');

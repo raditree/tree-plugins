@@ -179,6 +179,8 @@ class AgentRuntime {
       client: _stationCommand,
       scopeFor: _stationScopeFor,
       policyFor: toolPolicyFor,
+      // 运行中工具登记表：右栏「正在执行的 tool」与 `tool_runs` 的数据源。
+      toolRuns: toolRuns,
     );
     final AgentEngine resolvedEngine =
         engine ??

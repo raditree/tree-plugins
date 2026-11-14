@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_agent_loop/src/tool/station_tool_runner.dart';
+import 'package:tree_agent_loop/src/tool/tool_run_registry.dart';
 import 'package:tree_agent_loop/src/tool/tool_runner.dart';
 
 import 'test_workspace_io.dart';
@@ -94,6 +96,38 @@ void main() {
         .map((ToolSpec spec) => spec.name)
         .toList();
     expect(names, <String>['read', 'write', 'list', 'grep', 'terminal', 'edit']);
+  });
+
+  test('工具执行期间登记到运行中登记表，结束后收掉（右栏可见）', () async {
+    final ToolRunRegistry registry = ToolRunRegistry();
+    final Completer<void> gate = Completer<void>();
+    final StationToolRunner runner = StationToolRunner(
+      client: (String command, Map<String, dynamic> arguments,
+          Map<String, dynamic> scope) async {
+        if (command == 'local.file.grep') await gate.future;
+        return <String, dynamic>{'matches': <Map<String, dynamic>>[]};
+      },
+      scopeFor: (String agentId, String sessionId) => <String, dynamic>{
+        'agent_id': agentId,
+        'mode_key': 'local',
+      },
+      toolRuns: registry,
+    );
+    final Future<ToolOutcome> pending = runner.run(
+      const ToolInvocation(
+        id: 'call_1',
+        name: 'grep',
+        arguments: <String, dynamic>{'pattern': 'needle'},
+        agentId: 'agt',
+        sessionId: 'ses',
+      ),
+    );
+    await Future<void>.delayed(Duration.zero);
+    expect(registry.list().single.tool, 'grep');
+    expect(registry.list().single.agentId, 'agt');
+    gate.complete();
+    await pending;
+    expect(registry.length, 0, reason: '工具返回后登记项必须收掉');
   });
 
   test('edit：唯一匹配替换；重复匹配需 replace_all', () async {

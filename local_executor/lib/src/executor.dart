@@ -62,6 +62,29 @@ const int _kMaxReadBytes = 8 * 1024 * 1024;
 /// `local.file.read` 返回文本的上限（512 KiB，与 SSH 侧同口径）。
 const int _kMaxReadTextChars = 512 * 1024;
 
+/// grep 默认跳过的依赖 / 构建产物目录（非隐藏目录里最常把一次搜索拖成分钟级的）。
+///
+/// 显式传 `include_ignored: true` 可关掉这层过滤；隐藏目录（`.` 开头）由
+/// `include_hidden` 单独控制。
+const Set<String> _kGrepIgnoredDirs = <String>{
+  'node_modules',
+  'bower_components',
+  'build',
+  'dist',
+  'out',
+  'target',
+  'coverage',
+  'vendor',
+};
+
+/// 单次 grep 默认最多扫描的文件数：到点截断并如实回 `truncated`，
+/// 避免在超大树上把执行器的事件循环占住几分钟（心跳会被判丢）。
+const int _kMaxGrepFiles = 20000;
+
+/// 单次 grep 默认跳过的单文件大小（2 MiB）：大文件通常是产物 / 数据，
+/// 读进来做正则既慢又几乎没有搜索价值。
+const int _kMaxGrepFileBytes = 2 * 1024 * 1024;
+
 /// 核心拼出的自建站 id（与 `PluginBus.selfBuiltStationId` 同形；自检/测试可用）。
 String localWorkspaceStationId(String pluginId) =>
     'plugin.$pluginId.execute.$kLocalWorkspaceStationName';
@@ -378,6 +401,7 @@ class LocalExecutor {
     final String base = _resolve(root, relative);
     final int maxDepth = ((args['max_depth'] as num?)?.toInt() ?? 2).clamp(0, 32);
     final int maxEntries = ((args['max_entries'] as num?)?.toInt() ?? 500).clamp(1, 5000);
+    final bool includeHidden = args['include_hidden'] == true;
     final List<String> entries = <String>[];
     // 与 `entries` 同序的元信息（文件面板要 size / mtime；`entries` 保持纯字符串
     // 是为了兼容既有调用方：tree.agent 的 WorkspaceIO 只吃字符串表）。
@@ -397,6 +421,11 @@ class LocalExecutor {
         ..sort((FileSystemEntity a, FileSystemEntity b) => a.path.compareTo(b.path));
       for (final FileSystemEntity child in children) {
         if (entries.length >= maxEntries) return;
+        // 默认排除 `.git` / `.dart_tool` / `.output` 这类隐藏项（与 grep 同口径）；
+        // 显式要看隐藏项时传 include_hidden=true。
+        if (!includeHidden && p.basename(child.path).startsWith('.')) {
+          continue;
+        }
         final String rel = _relative(root, child.path);
         if (child is Directory) {
           entries.add('$rel/');
@@ -573,24 +602,43 @@ class LocalExecutor {
     final String base = _resolve(root, relative);
     final int maxDepth = ((args['max_depth'] as num?)?.toInt() ?? 0).clamp(0, 64);
     final int maxResults = ((args['max_results'] as num?)?.toInt() ?? 200).clamp(1, 5000);
+    final int maxFiles =
+        ((args['max_files'] as num?)?.toInt() ?? _kMaxGrepFiles).clamp(
+          1,
+          200000,
+        );
+    final int maxFileBytes =
+        ((args['max_file_bytes'] as num?)?.toInt() ?? _kMaxGrepFileBytes).clamp(
+          1,
+          64 * 1024 * 1024,
+        );
     final bool includeHidden = args['include_hidden'] == true;
+    final bool includeIgnored = args['include_ignored'] == true;
     final List<Map<String, dynamic>> matches = <Map<String, dynamic>>[];
     int scanned = 0;
     bool truncated = false;
-    void scanFile(File file) {
-      if (matches.length >= maxResults) return;
+
+    Future<void> scanFile(File file) async {
+      if (matches.length >= maxResults || scanned >= maxFiles) return;
       final String rel = _relative(root, file.path);
-      if (!includeHidden &&
-          p.split(rel).any((String part) => part.startsWith('.'))) {
+      try {
+        if (await file.length() > maxFileBytes) return;
+      } catch (_) {
         return;
       }
-      String text;
+      List<int> bytes;
       try {
-        text = utf8.decode(file.readAsBytesSync());
+        bytes = await file.readAsBytes();
       } catch (_) {
         return;
       }
       scanned++;
+      String text;
+      try {
+        text = utf8.decode(bytes);
+      } catch (_) {
+        return;
+      }
       final List<String> lines = text.split('\n');
       for (int i = 0; i < lines.length; i++) {
         if (matcher.hasMatch(lines[i])) {
@@ -607,22 +655,32 @@ class LocalExecutor {
       }
     }
 
-    void walk(Directory dir, int depth) {
-      if (matches.length >= maxResults) return;
-      for (final FileSystemEntity child in dir.listSync(followLinks: false)) {
+    Future<void> walk(Directory dir, int depth) async {
+      if (matches.length >= maxResults || scanned >= maxFiles) return;
+      // **异步遍历 + 异步读文件**：每读一个文件都让出事件循环，执行器的心跳与
+      // 其它 station 请求因此不会被一次 grep 长时间堵住（同步 listSync/readSync
+      // 在超大树上会把整个插件判成"心跳丢失"）。
+      await for (final FileSystemEntity child in dir.list(followLinks: false)) {
+        if (matches.length >= maxResults || scanned >= maxFiles) return;
+        final String name = p.basename(child.path);
+        if (!includeHidden && name.startsWith('.')) continue;
         if (child is Directory) {
+          if (!includeIgnored &&
+              _kGrepIgnoredDirs.contains(name.toLowerCase())) {
+            continue;
+          }
           if (depth >= maxDepth && maxDepth > 0) continue;
-          walk(child, depth + 1);
+          await walk(child, depth + 1);
         } else if (child is File) {
-          scanFile(child);
+          await scanFile(child);
         }
       }
     }
 
     if (FileSystemEntity.typeSync(base) == FileSystemEntityType.directory) {
-      walk(Directory(base), 0);
+      await walk(Directory(base), 0);
     } else if (FileSystemEntity.typeSync(base) == FileSystemEntityType.file) {
-      scanFile(File(base));
+      await scanFile(File(base));
     } else {
       throw ExecutorError(
         '路径不存在：$relative',
@@ -633,7 +691,7 @@ class LocalExecutor {
       'pattern': pattern,
       'count': matches.length,
       'matches': matches,
-      'truncated': truncated,
+      'truncated': truncated || scanned >= maxFiles,
       'scanned_file_count': scanned,
     };
   }
