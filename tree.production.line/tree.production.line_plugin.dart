@@ -28,7 +28,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.production.line';
 const String kDisplayName = 'Tree 标准开发流生产线';
-const String kVersion = '0.11.0';
+const String kVersion = '0.11.1';
 
 const String kStationName = 'production';
 

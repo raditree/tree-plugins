@@ -10,7 +10,6 @@ library;
 
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
@@ -30,6 +29,33 @@ const List<String> kDedupCommands = <String>[
 
 const String kDedupStateFile = 'dedup_state.json';
 const int kDedupStateVersion = 1;
+
+/// 进程内索引快照：run 内向量在 compare 前已写完，后续批次直接复用。
+///
+/// 20k 块 × 1536 维 Float32 ≈ 120 MB；finalize / 新 run 时清理，避免跨 run 堆积。
+final Map<String, _DedupIndex> _indexCache = <String, _DedupIndex>{};
+
+String _indexCacheKey(String repoKey, String runId) => '$repoKey|$runId';
+
+void _dropIndexRun(String repoKey, String runId) {
+  _indexCache.remove(_indexCacheKey(repoKey, runId));
+}
+
+void _dropIndexRepo(String repoKey) {
+  _indexCache.removeWhere((String key, _DedupIndex _) => key.startsWith('$repoKey|'));
+}
+
+class _DedupIndex {
+  const _DedupIndex({
+    required this.candidates,
+    required this.byId,
+    required this.truncated,
+  });
+
+  final List<DedupCandidate> candidates;
+  final Map<String, DedupCandidate> byId;
+  final bool truncated;
+}
 
 /// 只对这些代码扩展名做函数级分块。
 const Set<String> kDedupExtensions = <String>{
@@ -324,6 +350,8 @@ class ProductionDedupService {
       startedAt: _clock().toIso8601String(),
       filesPerRun: limit > 0 ? limit : config.filesPerRequest,
     )..maxFileBytes = config.maxFileBytes;
+    // 新 run 的索引会随 embed 重建，旧快照立即失效。
+    _dropIndexRepo(repoKey);
     for (final String path in deleted) {
       await _deleteFile(store, state, path);
     }
@@ -622,76 +650,50 @@ class ProductionDedupService {
       }
       await store.tx(ops);
       state.embedded += pending.length;
+      // 索引里新增了向量：已缓存的快照不再完整，下一轮 compare 重新构建。
+      if (pending.isNotEmpty) _dropIndexRun(state.repoKey, state.runId);
     }
   }
 
   /// compare：新/变更 chunk 与全库索引做 top-k。
+  ///
+  /// 索引按 `repoKey|runId` 常驻内存：一个 run 内向量在 compare 前已写完，
+  /// 后续每批不必重新翻 storage、重新解析 JSON；
+  /// 只做归一化点积 + 哈希直达，按源块定期让出事件循环（保心跳）。
   Future<void> _compareChunks(
     _DedupState state,
     DedupStore store,
     DedupConfig config,
   ) async {
     if (state.compareQueue.isEmpty) return;
-    final List<StoredRecord> chunkRecords = await store.listAll(
-      'dedup_chunks',
-      '${state.repoKey}#chunk:',
-    );
-    final Map<String, Map<String, Object?>> chunks = <String, Map<String, Object?>>{
-      for (final StoredRecord record in chunkRecords) textOf(record.value['id']): record.value,
-    };
-    final Map<String, Float64List> vectors = <String, Float64List>{};
-    for (final StoredRecord record
-        in await store.listAll('dedup_vectors', '${state.repoKey}#vec:')) {
-      final String vecKey = textOf(record.value['vec_key']);
-      final Object? raw = record.value['vector'];
-      if (vecKey.isEmpty || raw is! List) continue;
-      final List<double> values = <double>[
-        for (final Object? item in raw)
-          if (item is num) item.toDouble(),
-      ];
-      if (values.isNotEmpty) vectors[vecKey] = Float64List.fromList(values);
+    final String cacheKey = _indexCacheKey(state.repoKey, state.runId);
+    _DedupIndex? index = _indexCache[cacheKey];
+    if (index == null) {
+      index = await _buildIndex(state, store, config);
+      _indexCache[cacheKey] = index;
     }
-    final List<DedupCandidate> candidates = <DedupCandidate>[];
-    int indexCount = 0;
-    for (final MapEntry<String, Map<String, Object?>> entry in chunks.entries) {
-      if (indexCount >= config.maxIndexChunks) break;
-      if (entry.value['vector_ok'] != true) continue;
-      final Float64List? vector = vectors[textOf(entry.value['vec_key'])];
-      if (vector == null) continue;
-      candidates.add(
-        DedupCandidate(
-          id: entry.key,
-          path: textOf(entry.value['path']),
-          scope: textOf(entry.value['scope']),
-          hash: textOf(entry.value['hash']),
-          vector: vector,
-        ),
-      );
-      indexCount += 1;
-    }
-    if (indexCount >= config.maxIndexChunks) {
+    if (index.truncated) {
       state.reasons.add('索引块数达到上限 ${config.maxIndexChunks}，只比较前 N 块');
       state.degraded = true;
     }
+
     final int take = state.compareQueue.length <= config.comparePerRequest
         ? state.compareQueue.length
         : config.comparePerRequest;
     final List<String> ids = state.compareQueue.sublist(0, take);
     final List<Map<String, Object?>> ops = <Map<String, Object?>>[];
-    for (final String id in ids) {
-      final Map<String, Object?>? chunk = chunks[id];
+    for (int i = 0; i < ids.length; i++) {
+      final String id = ids[i];
+      final DedupCandidate? chunk = index.byId[id];
       if (chunk == null) continue;
-      final Float64List? vector = vectors[textOf(chunk['vec_key'])];
-      if (vector == null) continue;
       final List<DedupMatch> matches = topMatches(
         selfId: id,
-        selfPath: textOf(chunk['path']),
-        selfHash: textOf(chunk['hash']),
-        vector: vector,
-        candidates: candidates,
+        selfPath: chunk.path,
+        selfHash: chunk.hash,
+        vector: chunk.vector,
+        candidates: index.candidates,
         k: config.topK,
         threshold: config.threshold,
-        maxIndex: config.maxIndexChunks,
       );
       if (matches.isEmpty) continue;
       ops.add(<String, Object?>{
@@ -702,8 +704,8 @@ class ProductionDedupService {
           'schema': 1,
           'repo': state.repoKey,
           'id': id,
-          'path': textOf(chunk['path']),
-          'scope': textOf(chunk['scope']),
+          'path': chunk.path,
+          'scope': chunk.scope,
           'matches': <Map<String, Object?>>[
             for (final DedupMatch match in matches) match.toJson(),
           ],
@@ -715,9 +717,74 @@ class ProductionDedupService {
       });
       state.compared += 1;
       state.pairs += matches.length;
+      // 全库暴力比对是 CPU 密集：每 10 个源块让出一次事件循环，ping 才回得去。
+      if (i % 10 == 9) await Future<void>.delayed(Duration.zero);
     }
     state.compareQueue.removeRange(0, ids.length);
     if (ops.isNotEmpty) await store.tx(ops);
+  }
+
+  /// 读一次 chunks + vectors，构造成可直接点积的内存索引。
+  Future<_DedupIndex> _buildIndex(
+    _DedupState state,
+    DedupStore store,
+    DedupConfig config,
+  ) async {
+    final List<StoredRecord> chunkRecords = await store.listAll(
+      'dedup_chunks',
+      '${state.repoKey}#chunk:',
+    );
+    // 按 chunk id 排序：上限截断与候选顺序都可复现。
+    chunkRecords.sort(
+      (StoredRecord a, StoredRecord b) =>
+          textOf(a.value['id']).compareTo(textOf(b.value['id'])),
+    );
+    final Map<String, List<double>> vectors = <String, List<double>>{};
+    for (final StoredRecord record
+        in await store.listAll('dedup_vectors', '${state.repoKey}#vec:')) {
+      final String vecKey = textOf(record.value['vec_key']);
+      final Object? raw = record.value['vector'];
+      if (vecKey.isEmpty || raw is! List) continue;
+      final List<double> values = <double>[
+        for (final Object? item in raw)
+          if (item is num) item.toDouble(),
+      ];
+      if (values.isNotEmpty) vectors[vecKey] = values;
+    }
+
+    final List<DedupCandidate> candidates = <DedupCandidate>[];
+    bool truncated = false;
+    for (final StoredRecord record in chunkRecords) {
+      final Map<String, Object?> chunk = record.value;
+      if (chunk['vector_ok'] != true) continue;
+      final List<double>? vector = vectors[textOf(chunk['vec_key'])];
+      if (vector == null) continue;
+      candidates.add(
+        DedupCandidate(
+          id: textOf(chunk['id']),
+          path: textOf(chunk['path']),
+          scope: textOf(chunk['scope']),
+          hash: textOf(chunk['hash']),
+          vector: normalizeToFloat32(vector),
+        ),
+      );
+      if (candidates.length >= config.maxIndexChunks) {
+        truncated = true;
+        break;
+      }
+      // 大仓首次建索引也要让出事件循环，避免长时间阻塞心跳。
+      if (candidates.length % 500 == 0) {
+        await Future<void>.delayed(Duration.zero);
+      }
+    }
+    return _DedupIndex(
+      candidates: candidates,
+      byId: <String, DedupCandidate>{
+        for (final DedupCandidate candidate in candidates)
+          candidate.id: candidate,
+      },
+      truncated: truncated,
+    );
   }
 
   Future<void> _finalize(
@@ -725,6 +792,7 @@ class ProductionDedupService {
     DedupStore store, {
     required String repoKey,
   }) async {
+    _dropIndexRun(repoKey, state.runId);
     // 孤儿向量：先收集仍被 chunk 引用的 vec_key，再删未被引用的向量。
     final List<StoredRecord> chunks = await store.listAll(
       'dedup_chunks',

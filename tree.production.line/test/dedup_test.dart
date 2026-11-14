@@ -134,25 +134,24 @@ void run() {
           path: 'b.dart',
           scope: 'b',
           hash: 'hb',
-          vector: normalizeVector(<double>[1, 0.01, 0, 0]),
+          vector: normalizeToFloat32(<double>[1, 0.01, 0, 0]),
         ),
         DedupCandidate(
           id: 'ch-a',
           path: 'a.dart',
           scope: 'a',
           hash: 'ha',
-          vector: normalizeVector(<double>[1, 0, 0, 0]),
+          vector: normalizeToFloat32(<double>[1, 0, 0, 0]),
         ),
       ];
       final List<DedupMatch> matches = topMatches(
         selfId: 'ch-self',
         selfPath: 's.dart',
         selfHash: 'hs',
-        vector: normalizeVector(v),
+        vector: normalizeToFloat32(v),
         candidates: candidates,
         k: 2,
         threshold: 0.5,
-        maxIndex: 100,
       );
       expect(matches.first.id, 'ch-a');
       expect(matches.first.score, closeTo(1, 0.000001));

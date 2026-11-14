@@ -22,6 +22,31 @@ Float64List normalizeVector(List<double> values) {
   return out;
 }
 
+/// 归一化并降为 Float32：索引常驻内存时体积减半，点积仍是逐元素乘加。
+Float32List normalizeToFloat32(List<double> values) {
+  double sum = 0;
+  for (final double value in values) {
+    sum += value * value;
+  }
+  if (sum <= 0) return Float32List(values.length);
+  final double scale = 1 / math.sqrt(sum);
+  final Float32List out = Float32List(values.length);
+  for (int i = 0; i < values.length; i++) {
+    out[i] = values[i] * scale;
+  }
+  return out;
+}
+
+/// 归一化向量的点积 = 余弦相似度（不再重复算两边范数）。
+double dotProduct(Float32List a, Float32List b) {
+  if (a.isEmpty || a.length != b.length) return 0;
+  double dot = 0;
+  for (int i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+  }
+  return dot;
+}
+
 /// 余弦相似度（两边都应已归一化；这里仍做一次范数保护）。
 double cosineSimilarity(Float64List a, Float64List b) {
   if (a.isEmpty || b.isEmpty || a.length != b.length) return 0;
@@ -51,7 +76,9 @@ class DedupCandidate {
   final String path;
   final String scope;
   final String hash;
-  final Float64List vector;
+
+  /// 已 L2 归一化的 Float32 向量：点积即余弦。
+  final Float32List vector;
 }
 
 /// 命中一条。
@@ -80,41 +107,59 @@ class DedupMatch {
 }
 
 /// 对一个源块做全库 top-k；`selfId` 不参与。
+///
+/// 优化点：
+/// - 向量在入索引时已归一化，这里只做点积（原来每对都重算两边范数）；
+/// - 内容哈希相同直接记 1.0，不再算向量；
+/// - 用长度 ≤ k 的有序表增量维护，避免收集全部命中再整体排序；
+/// - 排序口径不变：分数降序，同分按 chunk id 升序。
 List<DedupMatch> topMatches({
   required String selfId,
   required String selfPath,
   required String selfHash,
-  required Float64List vector,
+  required Float32List vector,
   required List<DedupCandidate> candidates,
   required int k,
   required double threshold,
-  required int maxIndex,
 }) {
+  if (k <= 0) return const <DedupMatch>[];
   final List<DedupMatch> matches = <DedupMatch>[];
-  int scanned = 0;
   for (final DedupCandidate candidate in candidates) {
     if (candidate.id == selfId) continue;
-    if (scanned >= maxIndex) break;
-    scanned += 1;
-    final double score = cosineSimilarity(vector, candidate.vector);
+    final bool exact = candidate.hash == selfHash;
+    final double score = exact ? 1.0 : dotProduct(vector, candidate.vector);
     if (score < threshold) continue;
-    matches.add(
+    _offerMatch(
+      matches,
       DedupMatch(
         id: candidate.id,
         path: candidate.path,
         scope: candidate.scope,
         score: score,
-        exact: candidate.hash == selfHash,
+        exact: exact,
       ),
+      k,
     );
   }
-  matches.sort((DedupMatch a, DedupMatch b) {
-    final int byScore = b.score.compareTo(a.score);
-    if (byScore != 0) return byScore;
-    return a.id.compareTo(b.id);
-  });
-  return matches.length <= k ? matches : matches.sublist(0, k);
+  return matches;
 }
+
+/// 增量维护 top-k：先按“分数降序、id 升序”找插入位，插完裁掉尾部。
+void _offerMatch(List<DedupMatch> top, DedupMatch match, int k) {
+  int at = 0;
+  while (at < top.length && !_better(match, top[at])) {
+    at += 1;
+  }
+  if (at >= k) return;
+  top.insert(at, match);
+  if (top.length > k) top.removeLast();
+}
+
+bool _better(DedupMatch a, DedupMatch b) {
+  if (a.score != b.score) return a.score > b.score;
+  return a.id.compareTo(b.id) < 0;
+}
+
 
 /// 从已落盘的 per-chunk 结果里汇总 top pairs（status 用，确定性排序）。
 List<Map<String, Object?>> topPairs(
