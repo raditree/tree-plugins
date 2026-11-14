@@ -476,4 +476,102 @@ void main() {
     );
     expect(compacted['compacted'], isTrue);
   });
+
+  test('plugin 绑定：不带 team 可读写，库落 plugin_storage/<namespace>', () async {
+    final Map<String, dynamic> meta = <String, dynamic>{
+      'source_plugin_id': 'tree.docnorm',
+      'data_dir': temp.path,
+    };
+    final Map<String, dynamic> put = await service.handle(
+      'storage.put',
+      <String, dynamic>{
+        'binding': 'plugin',
+        'collection': 'c',
+        'key': 'k',
+        'value': <String, dynamic>{'v': 1},
+      },
+      meta,
+      <String, dynamic>{},
+    );
+    expect(put['binding'], 'plugin');
+    expect(put['team_id'], '');
+    expect(
+      File(
+        '${temp.path}${Platform.pathSeparator}plugin_storage'
+        '${Platform.pathSeparator}tree.docnorm'
+        '${Platform.pathSeparator}data.semdb',
+      ).existsSync(),
+      isTrue,
+    );
+    final Map<String, dynamic> get = await service.handle(
+      'storage.get',
+      <String, dynamic>{'binding': 'plugin', 'collection': 'c', 'key': 'k'},
+      meta,
+      <String, dynamic>{},
+    );
+    expect(get['value'], <String, dynamic>{'v': 1});
+  });
+
+  test('plugin 绑定与 team 绑定同 namespace 互不可见', () async {
+    final Map<String, dynamic> meta = <String, dynamic>{
+      'source_plugin_id': 'tree.docnorm',
+      'data_dir': temp.path,
+    };
+    await service.handle(
+      'storage.put',
+      <String, dynamic>{
+        'collection': 'c',
+        'key': 'k',
+        'value': <String, dynamic>{'scope': 'team'},
+      },
+      meta,
+      teamScope,
+    );
+    final Map<String, dynamic> global = await service.handle(
+      'storage.get',
+      <String, dynamic>{'binding': 'plugin', 'collection': 'c', 'key': 'k'},
+      meta,
+      <String, dynamic>{},
+    );
+    expect(global['value'], isNull, reason: 'plugin 库不应读到 team 库的值');
+    await service.handle(
+      'storage.put',
+      <String, dynamic>{
+        'binding': 'plugin',
+        'collection': 'c',
+        'key': 'k',
+        'value': <String, dynamic>{'scope': 'plugin'},
+      },
+      meta,
+      <String, dynamic>{},
+    );
+    final Map<String, dynamic> teamValue = await service.handle(
+      'storage.get',
+      <String, dynamic>{'collection': 'c', 'key': 'k'},
+      meta,
+      teamScope,
+    );
+    expect(teamValue['value'], <String, dynamic>{'scope': 'team'});
+  });
+
+  test('binding 非法 ⇒ invalid_arguments', () async {
+    await expectLater(
+      service.handle(
+        'storage.get',
+        <String, dynamic>{'binding': 'global', 'collection': 'c', 'key': 'k'},
+        <String, dynamic>{
+          'source_plugin_id': 'tree.docnorm',
+          'data_dir': temp.path,
+        },
+        <String, dynamic>{},
+      ),
+      throwsA(
+        isA<StorageFailure>().having(
+          (StorageFailure e) => e.code,
+          'code',
+          'invalid_arguments',
+        ),
+      ),
+    );
+  });
 }

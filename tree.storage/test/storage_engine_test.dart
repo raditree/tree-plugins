@@ -28,22 +28,22 @@ void main() {
 
   test('建库路径：每团队 × 每命名空间一个库，目录与文件名按 safeSegment', () {
     expect(
-      engine.databasePath(teamId: team, namespace: 'tree.docnorm'),
+      engine.databasePath(scope: StorageScope.team(team), namespace: 'tree.docnorm'),
       p.join(temp.path, 'storage', team, 'tree.docnorm', 'data.semdb'),
     );
     expect(
-      engine.databasePath(teamId: 'team_b', namespace: 'tree.docnorm'),
-      isNot(engine.databasePath(teamId: team, namespace: 'tree.docnorm')),
+      engine.databasePath(scope: StorageScope.team('team_b'), namespace: 'tree.docnorm'),
+      isNot(engine.databasePath(scope: StorageScope.team(team), namespace: 'tree.docnorm')),
     );
     expect(
-      () => engine.databasePath(teamId: '', namespace: 'ns'),
+      () => engine.databasePath(scope: StorageScope.team(''), namespace: 'ns'),
       throwsA(isA<StorageFailure>()),
     );
   });
 
   test('CRUD 往返：rev 单调、删除幂等、不存在取回 null', () async {
     Map<String, dynamic> result = await engine.put(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
       key: 'k1',
@@ -51,7 +51,7 @@ void main() {
     );
     expect(result['rev'], 1);
     result = await engine.put(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
       key: 'k1',
@@ -60,7 +60,7 @@ void main() {
     expect(result['rev'], 2);
 
     final Map<String, dynamic> got = await engine.get(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
       key: 'k1',
@@ -70,7 +70,7 @@ void main() {
 
     expect(
       (await engine.get(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: 'none',
@@ -79,7 +79,7 @@ void main() {
     );
     expect(
       (await engine.delete(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: 'none',
@@ -88,7 +88,7 @@ void main() {
     );
     expect(
       (await engine.delete(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: 'k1',
@@ -97,7 +97,7 @@ void main() {
     );
     expect(
       (await engine.get(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: 'k1',
@@ -109,7 +109,7 @@ void main() {
   test('ensure：更高版本可升、降级拒绝、同版本幂等', () async {
     expect(
       (await engine.ensure(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'docs',
         schemaVersion: 2,
@@ -118,7 +118,7 @@ void main() {
     );
     await expectLater(
       engine.ensure(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'docs',
         schemaVersion: 1,
@@ -133,7 +133,7 @@ void main() {
     );
     expect(
       (await engine.ensure(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'docs',
         schemaVersion: 2,
@@ -142,7 +142,7 @@ void main() {
     );
     await expectLater(
       engine.ensure(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'docs',
         schemaVersion: 0,
@@ -164,7 +164,7 @@ void main() {
       ('c', 'split', 2),
     ]) {
       await engine.put(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: key,
@@ -172,7 +172,7 @@ void main() {
       );
     }
     final Map<String, dynamic> page = await engine.query(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
       filter: <String, dynamic>{'tag': 'reuse'},
@@ -184,7 +184,7 @@ void main() {
     expect(keysOf(page), <String>['b']);
 
     final Map<String, dynamic> capped = await engine.query(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
       limit: 9999,
@@ -193,7 +193,7 @@ void main() {
     expect(capped['count'], 3);
 
     final Map<String, dynamic> empty = await engine.query(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'anything',
     );
@@ -207,7 +207,7 @@ void main() {
       ('doc-01', 'split'),
     ]) {
       await engine.put(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: key,
@@ -215,7 +215,7 @@ void main() {
       );
     }
     final Map<String, dynamic> scanned = await engine.scan(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
       prefix: 'sug-',
@@ -225,7 +225,7 @@ void main() {
     expect(scanned['has_more'], true, reason: '前缀下还有 sug-02');
 
     final Map<String, dynamic> all = await engine.scan(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
     );
@@ -233,14 +233,14 @@ void main() {
     expect(all['has_more'], false);
 
     final Map<String, dynamic> reuse = await engine.count(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
       filter: <String, dynamic>{'tag': 'reuse'},
     );
     expect(reuse['count'], 2);
     final Map<String, dynamic> split = await engine.count(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
       filter: <String, dynamic>{'tag': 'split'},
@@ -250,14 +250,14 @@ void main() {
 
   test('命名空间隔离：同团队内两个 namespace 各自一库，互不可见', () async {
     await engine.put(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns_a',
       collection: 'items',
       key: 'same',
       value: <String, dynamic>{'who': 'a'},
     );
     await engine.put(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns_b',
       collection: 'items',
       key: 'same',
@@ -265,7 +265,7 @@ void main() {
     );
     expect(
       (await engine.get(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns_a',
         collection: 'items',
         key: 'same',
@@ -274,7 +274,7 @@ void main() {
     );
     expect(
       (await engine.get(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns_b',
         collection: 'items',
         key: 'same',
@@ -282,25 +282,25 @@ void main() {
       <String, dynamic>{'who': 'b'},
     );
     expect(
-      File(engine.databasePath(teamId: team, namespace: 'ns_a')).existsSync(),
+      File(engine.databasePath(scope: StorageScope.team(team), namespace: 'ns_a')).existsSync(),
       isTrue,
     );
     expect(
-      File(engine.databasePath(teamId: team, namespace: 'ns_b')).existsSync(),
+      File(engine.databasePath(scope: StorageScope.team(team), namespace: 'ns_b')).existsSync(),
       isTrue,
     );
   });
 
   test('TC-ST-13：两个团队各写各的库文件（同 namespace 不互相覆盖）', () async {
     await engine.put(
-      teamId: 'team_a',
+      scope: StorageScope.team('team_a'),
       namespace: 'ns',
       collection: 'items',
       key: 'same',
       value: <String, dynamic>{'who': 'a'},
     );
     await engine.put(
-      teamId: 'team_b',
+      scope: StorageScope.team('team_b'),
       namespace: 'ns',
       collection: 'items',
       key: 'same',
@@ -308,7 +308,7 @@ void main() {
     );
     expect(
       (await engine.get(
-        teamId: 'team_a',
+        scope: StorageScope.team('team_a'),
         namespace: 'ns',
         collection: 'items',
         key: 'same',
@@ -317,7 +317,7 @@ void main() {
     );
     expect(
       (await engine.get(
-        teamId: 'team_b',
+        scope: StorageScope.team('team_b'),
         namespace: 'ns',
         collection: 'items',
         key: 'same',
@@ -325,8 +325,8 @@ void main() {
       <String, dynamic>{'who': 'b'},
     );
 
-    final String a = engine.databasePath(teamId: 'team_a', namespace: 'ns');
-    final String b = engine.databasePath(teamId: 'team_b', namespace: 'ns');
+    final String a = engine.databasePath(scope: StorageScope.team('team_a'), namespace: 'ns');
+    final String b = engine.databasePath(scope: StorageScope.team('team_b'), namespace: 'ns');
     expect(a, isNot(b));
     expect(File(a).existsSync(), isTrue);
     expect(File(b).existsSync(), isTrue);
@@ -334,7 +334,7 @@ void main() {
 
   test('持久化：关闭后重开，已提交数据可读', () async {
     await engine.put(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
       key: 'k1',
@@ -344,7 +344,7 @@ void main() {
     final StorageEngine reopened = StorageEngine(dataRoot: temp.path);
     try {
       final Map<String, dynamic> got = await reopened.get(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: 'k1',
@@ -366,7 +366,7 @@ void main() {
       '__meta',
     ]) {
       await expectLater(
-        engine.ensure(teamId: team, namespace: 'ns', collection: collection),
+        engine.ensure(scope: StorageScope.team(team), namespace: 'ns', collection: collection),
         throwsA(
           isA<StorageFailure>().having(
             (StorageFailure e) => e.code,
@@ -379,7 +379,7 @@ void main() {
     }
     await expectLater(
       engine.put(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: '  ',
@@ -403,14 +403,14 @@ void main() {
 
   test('TC-ST-02：if_rev 匹配才写，冲突不覆盖且信息带 expected/actual', () async {
     await engine.put(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
       key: 'k',
       value: <String, dynamic>{'v': 1},
     );
     final Map<String, dynamic> updated = await engine.put(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
       key: 'k',
@@ -420,7 +420,7 @@ void main() {
     expect(updated['rev'], 2);
     await expectLater(
       engine.put(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: 'k',
@@ -439,7 +439,7 @@ void main() {
     );
     expect(
       (await engine.get(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: 'k',
@@ -448,7 +448,7 @@ void main() {
     );
     // 不存在的记录 rev=0：if_rev=0 可以新建。
     final Map<String, dynamic> created = await engine.put(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
       key: 'fresh',
@@ -461,7 +461,7 @@ void main() {
   test('TC-ST-03：tx 任一 op 失败整批回滚；成功时 committed + 逐项结果', () async {
     await expectLater(
       engine.tx(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         ops: <Map<String, dynamic>>[
           <String, dynamic>{
@@ -491,7 +491,7 @@ void main() {
     );
     expect(
       (await engine.get(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: 'ok',
@@ -501,7 +501,7 @@ void main() {
     );
 
     final Map<String, dynamic> committed = await engine.tx(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       ops: <Map<String, dynamic>>[
         <String, dynamic>{
@@ -524,7 +524,7 @@ void main() {
     expect((committed['results'] as List<dynamic>).length, 4);
     expect(
       (await engine.get(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: 'b',
@@ -533,7 +533,7 @@ void main() {
     );
     expect(
       (await engine.get(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: 'a',
@@ -552,14 +552,14 @@ void main() {
           'value': <String, dynamic>{'n': i},
         },
     ];
-    await engine.tx(teamId: team, namespace: 'ns', ops: ops);
+    await engine.tx(scope: StorageScope.team(team), namespace: 'ns', ops: ops);
 
     final List<String> seen = <String>[];
     String cursor = '';
     int pages = 0;
     do {
       final Map<String, dynamic> page = await engine.query(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'pages',
         limit: 7,
@@ -575,7 +575,7 @@ void main() {
     expect(pages, 18);
     expect(
       (await engine.query(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'pages',
         limit: 500,
@@ -586,7 +586,7 @@ void main() {
 
     await expectLater(
       engine.query(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'pages',
         limit: 7,
@@ -602,14 +602,14 @@ void main() {
     );
 
     final Map<String, dynamic> first = await engine.query(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'pages',
       limit: 7,
     );
     await expectLater(
       engine.query(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'pages',
         limit: 7,
@@ -633,7 +633,7 @@ void main() {
       ('c', 3),
     ]) {
       await engine.put(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: key,
@@ -641,7 +641,7 @@ void main() {
       );
     }
     final Map<String, dynamic> exported = await engine.export(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
     );
@@ -659,7 +659,7 @@ void main() {
 
     for (final String key in <String>['a', 'b', 'c']) {
       await engine.delete(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: key,
@@ -667,7 +667,7 @@ void main() {
     }
     expect(
       (await engine.query(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
       ))['count'],
@@ -675,13 +675,13 @@ void main() {
     );
 
     final Map<String, dynamic> imported = await engine.importData(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       path: path,
     );
     expect(imported['imported'], 3);
     final Map<String, dynamic> got = await engine.get(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
       key: 'b',
@@ -690,7 +690,7 @@ void main() {
     expect(got['rev'], 1);
 
     await expectLater(
-      engine.importData(teamId: team, namespace: 'ns', path: path),
+      engine.importData(scope: StorageScope.team(team), namespace: 'ns', path: path),
       throwsA(
         isA<StorageFailure>().having(
           (StorageFailure e) => e.code,
@@ -701,7 +701,7 @@ void main() {
     );
     expect(
       (await engine.importData(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         path: path,
         replace: true,
@@ -712,7 +712,7 @@ void main() {
 
   test('TC-ST-05：篡改 sha256 / 路径穿越 ⇒ 拒绝且不落半截', () async {
     await engine.put(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
       key: 'a',
@@ -720,7 +720,7 @@ void main() {
     );
     final String path =
         (await engine.export(
-              teamId: team,
+              scope: StorageScope.team(team),
               namespace: 'ns',
               collection: 'items',
             ))['path']
@@ -735,7 +735,7 @@ void main() {
         .writeAsStringSync('{"key":"x","rev":1,"value":{"n":9}}\n');
     await expectLater(
       engine.importData(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         path: tampered.path,
         collection: 'items',
@@ -751,7 +751,7 @@ void main() {
     );
     expect(
       (await engine.get(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: 'a',
@@ -762,7 +762,7 @@ void main() {
 
     await expectLater(
       engine.importData(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         path: p.join(temp.parent.path, 'outside'),
       ),
@@ -778,7 +778,7 @@ void main() {
 
   test('TC-ST-05：跨命名空间 / 跨团队的导出物拒绝导入', () async {
     await engine.put(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'other',
       collection: 'items',
       key: 'a',
@@ -786,13 +786,13 @@ void main() {
     );
     final String path =
         (await engine.export(
-              teamId: team,
+              scope: StorageScope.team(team),
               namespace: 'other',
               collection: 'items',
             ))['path']
             as String;
     await expectLater(
-      engine.importData(teamId: team, namespace: 'ns', path: path),
+      engine.importData(scope: StorageScope.team(team), namespace: 'ns', path: path),
       throwsA(
         isA<StorageFailure>()
             .having((StorageFailure e) => e.code, 'code', 'import_invalid')
@@ -804,7 +804,7 @@ void main() {
       ),
     );
     await expectLater(
-      engine.importData(teamId: 'team_b', namespace: 'other', path: path),
+      engine.importData(scope: StorageScope.team('team_b'), namespace: 'other', path: path),
       throwsA(
         isA<StorageFailure>()
             .having((StorageFailure e) => e.code, 'code', 'import_invalid')
@@ -820,7 +820,7 @@ void main() {
   test('TC-ST-11：单条 >1 MiB / 整批 >8 MiB / >200 ops ⇒ 整批拒绝', () async {
     await expectLater(
       engine.tx(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         ops: <Map<String, dynamic>>[
           <String, dynamic>{
@@ -841,7 +841,7 @@ void main() {
     );
     expect(
       (await engine.get(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'big',
         key: 'a',
@@ -852,7 +852,7 @@ void main() {
     final String chunk = 'y' * (900 * 1024);
     await expectLater(
       engine.tx(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         ops: <Map<String, dynamic>>[
           for (int i = 0; i < 10; i++)
@@ -874,7 +874,7 @@ void main() {
     );
     expect(
       (await engine.query(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'big',
       ))['count'],
@@ -883,7 +883,7 @@ void main() {
 
     await expectLater(
       engine.tx(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         ops: <Map<String, dynamic>>[
           for (int i = 0; i < 201; i++)
@@ -907,25 +907,25 @@ void main() {
 
   test('TC-ST-07：purge 必须确认；确认后只删自己的库，不影响其它 namespace', () async {
     await engine.put(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'items',
       key: 'k',
       value: <String, dynamic>{'v': 1},
     );
     await engine.put(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns_keep',
       collection: 'items',
       key: 'k',
       value: <String, dynamic>{'v': 2},
     );
-    final String path = engine.databasePath(teamId: team, namespace: 'ns');
-    final String keep = engine.databasePath(teamId: team, namespace: 'ns_keep');
+    final String path = engine.databasePath(scope: StorageScope.team(team), namespace: 'ns');
+    final String keep = engine.databasePath(scope: StorageScope.team(team), namespace: 'ns_keep');
     expect(File(path).existsSync(), isTrue);
 
     await expectLater(
-      engine.purge(teamId: team, namespace: 'ns', confirm: false),
+      engine.purge(scope: StorageScope.team(team), namespace: 'ns', confirm: false),
       throwsA(
         isA<StorageFailure>().having(
           (StorageFailure e) => e.code,
@@ -937,7 +937,7 @@ void main() {
     expect(File(path).existsSync(), isTrue);
 
     final Map<String, dynamic> result = await engine.purge(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       confirm: true,
     );
@@ -947,7 +947,7 @@ void main() {
     // 后续读不炸（会按需重建空库）。
     expect(
       (await engine.get(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'items',
         key: 'k',
@@ -958,23 +958,23 @@ void main() {
 
   test('ST-5：stats 报集合条目数/版本/文件字节与路径；compact 可重开', () async {
     await engine.ensure(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'docs',
       schemaVersion: 2,
     );
     await engine.put(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
       collection: 'docs',
       key: 'k1',
       value: <String, dynamic>{'v': 1},
     );
     final Map<String, dynamic> stats = await engine.stats(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
     );
-    expect(stats['path'], engine.databasePath(teamId: team, namespace: 'ns'));
+    expect(stats['path'], engine.databasePath(scope: StorageScope.team(team), namespace: 'ns'));
     expect(stats['bytes'] as int, greaterThan(0));
     final Map<String, dynamic> docs = (stats['collections'] as List<dynamic>)
         .map((Object? entry) => (entry as Map).cast<String, dynamic>())
@@ -985,18 +985,98 @@ void main() {
     expect(docs['schema_version'], 2);
 
     final Map<String, dynamic> compacted = await engine.compact(
-      teamId: team,
+      scope: StorageScope.team(team),
       namespace: 'ns',
     );
     expect(compacted['compacted'], isTrue);
     expect(
       (await engine.get(
-        teamId: team,
+        scope: StorageScope.team(team),
         namespace: 'ns',
         collection: 'docs',
         key: 'k1',
       ))['value'],
       <String, dynamic>{'v': 1},
+    );
+  });
+
+  test('plugin 绑定：路径、CRUD、stats、purge 均不依赖 team', () async {
+    const StorageScope global = StorageScope.plugin();
+    expect(
+      engine.databasePath(scope: global, namespace: 'tree.docnorm'),
+      p.join(temp.path, 'plugin_storage', 'tree.docnorm', 'data.semdb'),
+    );
+    await engine.put(
+      scope: global,
+      namespace: 'tree.docnorm',
+      collection: 'items',
+      key: 'k1',
+      value: <String, dynamic>{'v': 1},
+    );
+    expect(
+      (await engine.get(
+        scope: global,
+        namespace: 'tree.docnorm',
+        collection: 'items',
+        key: 'k1',
+      ))['value'],
+      <String, dynamic>{'v': 1},
+    );
+    final Map<String, dynamic> stats = await engine.stats(
+      scope: global,
+      namespace: 'tree.docnorm',
+    );
+    expect(stats['binding'], 'plugin');
+    expect(stats['team_id'], '');
+    expect(
+      (stats['path'] as String).contains('plugin_storage'),
+      isTrue,
+    );
+    final Map<String, dynamic> purged = await engine.purge(
+      scope: global,
+      namespace: 'tree.docnorm',
+      confirm: true,
+    );
+    expect(purged['purged'], isTrue);
+    expect(
+      File(
+        engine.databasePath(scope: global, namespace: 'tree.docnorm'),
+      ).existsSync(),
+      isFalse,
+    );
+  });
+
+  test('plugin 绑定导出物带 binding，不能导入 team 绑定', () async {
+    const StorageScope global = StorageScope.plugin();
+    await engine.put(
+      scope: global,
+      namespace: 'ns',
+      collection: 'items',
+      key: 'k1',
+      value: <String, dynamic>{'v': 1},
+    );
+    final Map<String, dynamic> exported = await engine.export(
+      scope: global,
+      namespace: 'ns',
+      collection: 'items',
+    );
+    final Map<String, dynamic> manifest =
+        exported['manifest'] as Map<String, dynamic>;
+    expect(manifest['binding'], 'plugin');
+    expect(manifest['team_id'], '');
+    await expectLater(
+      engine.importData(
+        scope: StorageScope.team(team),
+        namespace: 'ns',
+        path: exported['path'] as String,
+      ),
+      throwsA(
+        isA<StorageFailure>().having(
+          (StorageFailure e) => e.code,
+          'code',
+          'import_invalid',
+        ),
+      ),
     );
   });
 }

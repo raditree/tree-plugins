@@ -4,6 +4,8 @@
 // - headless 插件，对其它插件只暴露**自建执行站**命令族 `storage.*`；
 // - 每团队 × 每命名空间一个库
 //   `<data_root>/storage/<team_id>/<namespace>/data.semdb`（Sembast、纯 Dart）；
+// - 或插件级全局库 `<data_root>/plugin_storage/<namespace>/data.semdb`
+//   （请求带 `binding: plugin`，不要求 team_id）；
 // - 命名空间缺省 = 调用方 plugin_id；跨命名空间由 `TREE_STORAGE_ALLOWED_PLUGINS` 白名单控制；
 // - 本文件只做接线：命令实现在 `package:tree_storage`，生产与 `--selftest` 同一套代码。
 //
@@ -21,16 +23,17 @@ const String kPluginId = 'tree.storage';
 /// 面板展示名。
 const String kDisplayName = 'Tree 集合存储';
 
-const String kVersion = '0.1.0';
+const String kVersion = '0.2.0';
 
 /// 自建执行站名（命令族唯一前缀 `storage.`，其它插件不得申报同名命令）。
 const String kStationName = 'storage';
 
 const String kStationReadme =
     '插件集合存储：storage.ensure/put/get/delete/query/tx/export/import/stats/'
-    'compact/purge。每团队 × 每插件一个库 '
-    '<data_root>/storage/<team_id>/<namespace>/data.semdb；team_id 只认核心解析的 '
-    'scope，namespace 缺省=调用方 plugin_id，跨命名空间需在 '
+    'compact/purge。binding=team（默认）时每团队 × 每插件一个库 '
+    '<data_root>/storage/<team_id>/<namespace>/data.semdb，team_id 只认核心解析的 '
+    'scope；binding=plugin 时落 <data_root>/plugin_storage/<namespace>/data.semdb，'
+    '不要求 team_id。namespace 缺省=调用方 plugin_id，跨命名空间需在 '
     'TREE_STORAGE_ALLOWED_PLUGINS 白名单中。调用方身份只认核心透传的 '
     'meta.source_plugin_id。';
 
@@ -213,6 +216,39 @@ Future<int> selfTest() async {
       team: null,
     );
     check.check(noTeam['code'], 'team_required', '缺 team_id ⇒ team_required');
+
+    // plugin 级绑定：不带 team 也能读写，库落 plugin_storage/<namespace>。
+    Map<String, dynamic> pluginReply = await call(
+      'plugin-put',
+      'storage.put',
+      <String, dynamic>{
+        'binding': 'plugin',
+        'collection': 'dedup_meta',
+        'key': 'k',
+        'value': <String, dynamic>{'v': 1},
+      },
+      team: null,
+    );
+    check.check(payloadOf(pluginReply)['binding'], 'plugin', 'plugin 绑定回包带 binding');
+    check.check(payloadOf(pluginReply)['team_id'], '', 'plugin 绑定 team_id 为空');
+    pluginReply = await call(
+      'plugin-get',
+      'storage.get',
+      <String, dynamic>{
+        'binding': 'plugin',
+        'collection': 'dedup_meta',
+        'key': 'k',
+      },
+      team: null,
+    );
+    check.check(payloadOf(pluginReply)['value'], <String, dynamic>{'v': 1}, 'plugin 绑定可读回');
+    pluginReply = await call(
+      'plugin-bad-binding',
+      'storage.get',
+      <String, dynamic>{'binding': 'global', 'collection': 'c', 'key': 'k'},
+      team: null,
+    );
+    check.check(pluginReply['code'], 'invalid_arguments', '非法 binding 被拒');
 
     // ensure：v2 建集合；降级到 v1 拒绝；同版本幂等。
     Map<String, dynamic> reply = await call(

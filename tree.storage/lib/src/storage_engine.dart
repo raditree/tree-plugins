@@ -39,11 +39,29 @@ String safeSegment(Object? raw, {required String what}) {
   return value;
 }
 
-/// 单命名空间库：`<dataRoot>/storage/<teamId>/<namespace>/data.semdb`。
+/// 数据绑定维度：`team`（默认，按团队隔离）或 `plugin`（插件级全局）。
 ///
-/// 实例粒度是 `granularity: team`（平台按团队各起一个实例），路径必须带 `team_id`，
-/// 否则多团队实例会打开同一个库文件。一个命名空间 = 一个库；不同插件各库独立，
-/// 互不影响（一个插件的大扫描不拖垮别人，单库损坏也不全盘失效）。
+/// 团队库落在 `<dataRoot>/storage/<teamId>/<namespace>`；插件级库落在
+/// `<dataRoot>/plugin_storage/<namespace>`，不随团队/代理/会话漂移。
+class StorageScope {
+  const StorageScope.team(this.teamId) : binding = 'team';
+
+  const StorageScope.plugin() : binding = 'plugin', teamId = '';
+
+  final String binding;
+  final String teamId;
+
+  bool get isPlugin => binding == 'plugin';
+
+  /// `_databases` 缓存键（与具体库文件路径解耦前的稳定标识）。
+  String get cacheKey => isPlugin ? 'plugin' : 'team:$teamId';
+}
+
+/// 单命名空间库：团队绑定 `<dataRoot>/storage/<teamId>/<namespace>/data.semdb`，
+/// 插件级绑定 `<dataRoot>/plugin_storage/<namespace>/data.semdb`。
+///
+/// 实例粒度仍是 `granularity: team`；plugin 级只是库路径维度，所有访问都经
+/// 本执行站，插件级库不会被多个调用方进程同时打开。
 ///
 /// 切片：ST-1 单库 CRUD；ST-2 CAS / cursor / tx；ST-3 导出导入；ST-5 维护命令。
 class StorageEngine {
@@ -85,15 +103,21 @@ class StorageEngine {
 
   final Map<String, Future<Database>> _databases = <String, Future<Database>>{};
 
-  /// 库文件路径（每团队 × 每插件一个库）。
-  String databasePath({required String teamId, required String namespace}) {
-    final String team = safeSegment(teamId, what: 'team_id');
+  /// 库文件路径（团队 × 插件，或插件级全局）。
+  String databasePath({
+    required StorageScope scope,
+    required String namespace,
+  }) {
     final String space = safeSegment(namespace, what: 'namespace');
+    if (scope.isPlugin) {
+      return p.join(dataRoot, 'plugin_storage', space, 'data.semdb');
+    }
+    final String team = safeSegment(scope.teamId, what: 'team_id');
     return p.join(dataRoot, 'storage', team, space, 'data.semdb');
   }
 
-  Future<Database> _database(String teamId, String namespace) async {
-    final String path = databasePath(teamId: teamId, namespace: namespace);
+  Future<Database> _database(StorageScope scope, String namespace) async {
+    final String path = databasePath(scope: scope, namespace: namespace);
     final String key = p.dirname(path);
     try {
       return await _databases.putIfAbsent(key, () => _open(path));
@@ -127,7 +151,7 @@ class StorageEngine {
   /// 已存在且库里版本更高 ⇒ 拒绝（不隐式降级）；更高版本会记下来（迁移由所有者插件
   /// 自己先做完再调 ensure）。同版本重复调用幂等。
   Future<Map<String, dynamic>> ensure({
-    required String teamId,
+    required StorageScope scope,
     required String namespace,
     required String collection,
     int schemaVersion = 1,
@@ -139,7 +163,7 @@ class StorageEngine {
         code: 'invalid_arguments',
       );
     }
-    final Database database = await _database(teamId, namespace);
+    final Database database = await _database(scope, namespace);
     final Map<String, Object?>? existing = await _meta
         .record(name)
         .get(database);
@@ -169,6 +193,7 @@ class StorageEngine {
     log?.call('ensure namespace=$namespace collection=$name v=$schemaVersion');
     return <String, dynamic>{
       'ok': true,
+      ..._scopeJson(scope),
       'namespace': namespace,
       'collection': name,
       'schema_version': schemaVersion,
@@ -180,7 +205,7 @@ class StorageEngine {
   /// [ifRev] 给出时做 CAS：当前 rev 必须等于它（不存在的记录 rev=0），
   /// 不匹配 ⇒ `rev_conflict`（不覆盖）。
   Future<Map<String, dynamic>> put({
-    required String teamId,
+    required StorageScope scope,
     required String namespace,
     required String collection,
     required String key,
@@ -189,7 +214,7 @@ class StorageEngine {
   }) async {
     final String name = _collectionSegment(collection);
     final String recordKey = _keyOf(key);
-    final Database database = await _database(teamId, namespace);
+    final Database database = await _database(scope, namespace);
     final StoreRef<String, Map<String, Object?>> store = storeOf(name);
     final int rev = await database.transaction<int>((Transaction txn) async {
       final Map<String, Object?>? existing = await store
@@ -214,6 +239,7 @@ class StorageEngine {
     );
     return <String, dynamic>{
       'ok': true,
+      ..._scopeJson(scope),
       'namespace': namespace,
       'collection': name,
       'key': recordKey,
@@ -223,20 +249,21 @@ class StorageEngine {
 
   /// 按 key 取一条；不存在 ⇒ `value: null`（不是错误）。
   Future<Map<String, dynamic>> get({
-    required String teamId,
+    required StorageScope scope,
     required String namespace,
     required String collection,
     required String key,
   }) async {
     final String name = _collectionSegment(collection);
     final String recordKey = _keyOf(key);
-    final Database database = await _database(teamId, namespace);
+    final Database database = await _database(scope, namespace);
     final Map<String, Object?>? existing = await storeOf(name)
         .record(recordKey)
         .get(database);
     if (existing == null) {
       return <String, dynamic>{
         'ok': true,
+        ..._scopeJson(scope),
         'namespace': namespace,
         'collection': name,
         'key': recordKey,
@@ -246,6 +273,7 @@ class StorageEngine {
     }
     return <String, dynamic>{
       'ok': true,
+      ..._scopeJson(scope),
       'namespace': namespace,
       'collection': name,
       'key': recordKey,
@@ -256,14 +284,14 @@ class StorageEngine {
 
   /// 按 key 删一条；不存在 ⇒ `deleted: false`（幂等）。
   Future<Map<String, dynamic>> delete({
-    required String teamId,
+    required StorageScope scope,
     required String namespace,
     required String collection,
     required String key,
   }) async {
     final String name = _collectionSegment(collection);
     final String recordKey = _keyOf(key);
-    final Database database = await _database(teamId, namespace);
+    final Database database = await _database(scope, namespace);
     final StoreRef<String, Map<String, Object?>> store = storeOf(name);
     final bool deleted = await database.transaction<bool>((
       Transaction txn,
@@ -277,6 +305,7 @@ class StorageEngine {
     );
     return <String, dynamic>{
       'ok': true,
+      ..._scopeJson(scope),
       'namespace': namespace,
       'collection': name,
       'key': recordKey,
@@ -289,7 +318,7 @@ class StorageEngine {
   /// 游标 = base64url(JSON `{offset, fingerprint}`)，fingerprint 覆盖
   /// `(collection, filter, sort, descending)`：换条件再用旧游标 ⇒ `cursor_mismatch`。
   Future<Map<String, dynamic>> query({
-    required String teamId,
+    required StorageScope scope,
     required String namespace,
     required String collection,
     Map<String, dynamic> filter = const <String, dynamic>{},
@@ -319,7 +348,7 @@ class StorageEngine {
     final List<SortOrder> orders = <SortOrder>[
       if (sortField.isNotEmpty) SortOrder('value.$sortField', !descending),
     ];
-    final Database database = await _database(teamId, namespace);
+    final Database database = await _database(scope, namespace);
     final List<RecordSnapshot<String, Map<String, Object?>>> records =
         await storeOf(name).find(
           database,
@@ -347,6 +376,7 @@ class StorageEngine {
     ];
     return <String, dynamic>{
       'ok': true,
+      ..._scopeJson(scope),
       'namespace': namespace,
       'collection': name,
       'values': values,
@@ -359,7 +389,7 @@ class StorageEngine {
 
   /// 顺序扫（可按 key 前缀；只给导出/维护，业务读走 [query]）。
   Future<Map<String, dynamic>> scan({
-    required String teamId,
+    required StorageScope scope,
     required String namespace,
     required String collection,
     String prefix = '',
@@ -369,7 +399,7 @@ class StorageEngine {
     final int capped = limit < 1
         ? 1
         : (limit > maxScanLimit ? maxScanLimit : limit);
-    final Database database = await _database(teamId, namespace);
+    final Database database = await _database(scope, namespace);
     final List<RecordSnapshot<String, Map<String, Object?>>> records =
         await storeOf(name).find(
           database,
@@ -391,6 +421,7 @@ class StorageEngine {
     }
     return <String, dynamic>{
       'ok': true,
+      ..._scopeJson(scope),
       'namespace': namespace,
       'collection': name,
       'values': values,
@@ -402,7 +433,7 @@ class StorageEngine {
 
   /// 计数：与 [query] 同一套等值过滤（不受 limit 影响）。
   Future<Map<String, dynamic>> count({
-    required String teamId,
+    required StorageScope scope,
     required String namespace,
     required String collection,
     Map<String, dynamic> filter = const <String, dynamic>{},
@@ -414,7 +445,7 @@ class StorageEngine {
       ).entries)
         Filter.equals('value.${entry.key}', entry.value),
     ];
-    final Database database = await _database(teamId, namespace);
+    final Database database = await _database(scope, namespace);
     final int total = await storeOf(name).count(
       database,
       filter: filters.isEmpty
@@ -423,6 +454,7 @@ class StorageEngine {
     );
     return <String, dynamic>{
       'ok': true,
+      ..._scopeJson(scope),
       'namespace': namespace,
       'collection': name,
       'count': total,
@@ -434,7 +466,7 @@ class StorageEngine {
   /// 整个 ops 在一个 Sembast 事务里；任一 op 失败 ⇒ 整批回滚，错误码 `tx_failed`
   /// 并带第几项。写库前先做结构 / 字节上限校验，超限整批拒绝（不落半截）。
   Future<Map<String, dynamic>> tx({
-    required String teamId,
+    required StorageScope scope,
     required String namespace,
     required List<Map<String, dynamic>> ops,
   }) async {
@@ -491,7 +523,7 @@ class StorageEngine {
       );
     }
 
-    final Database database = await _database(teamId, namespace);
+    final Database database = await _database(scope, namespace);
     List<Map<String, dynamic>> results;
     try {
       results = await database.transaction<List<Map<String, dynamic>>>((
@@ -518,6 +550,7 @@ class StorageEngine {
     );
     return <String, dynamic>{
       'ok': true,
+      ..._scopeJson(scope),
       'namespace': namespace,
       'count': results.length,
       'committed': true,
@@ -527,12 +560,12 @@ class StorageEngine {
 
   /// 导出集合为 NDJSON + manifest（原子写；ST-3 / TC-ST-05）。
   Future<Map<String, dynamic>> export({
-    required String teamId,
+    required StorageScope scope,
     required String namespace,
     required String collection,
   }) async {
     final String name = _collectionSegment(collection);
-    final Database database = await _database(teamId, namespace);
+    final Database database = await _database(scope, namespace);
     final List<RecordSnapshot<String, Map<String, Object?>>> records =
         await storeOf(name).find(
           database,
@@ -554,7 +587,7 @@ class StorageEngine {
     final DateTime now = DateTime.now().toUtc();
     final String stamp = _stamp(now);
     final String dir = p.join(
-      p.dirname(databasePath(teamId: teamId, namespace: namespace)),
+      p.dirname(databasePath(scope: scope, namespace: namespace)),
       'export',
       name,
       stamp,
@@ -564,7 +597,8 @@ class StorageEngine {
     final Map<String, dynamic> manifest = <String, dynamic>{
       'format': exportFormat,
       'version': exportVersion,
-      'team_id': teamId,
+      'binding': scope.binding,
+      'team_id': scope.teamId,
       'namespace': namespace,
       'collection': name,
       'schema_version': meta == null ? 0 : _asInt(meta['schema_version'], 0),
@@ -581,6 +615,7 @@ class StorageEngine {
     );
     return <String, dynamic>{
       'ok': true,
+      ..._scopeJson(scope),
       'namespace': namespace,
       'collection': name,
       'path': dir,
@@ -592,7 +627,7 @@ class StorageEngine {
 
   /// 从导出物导入（单事务；校验失败不落半截；ST-3 / TC-ST-05）。
   Future<Map<String, dynamic>> importData({
-    required String teamId,
+    required StorageScope scope,
     required String namespace,
     required String path,
     String collection = '',
@@ -636,13 +671,28 @@ class StorageEngine {
         code: 'import_invalid',
       );
     }
-    // 只允许导入本团队 × 本命名空间的导出物：否则被 allowlist 放行的调用方
+    // 只允许导入本绑定 × 本命名空间的导出物：否则被 allowlist 放行的调用方
     // 可以拿别人的导出快照复制到自己集合里（绕过 namespace 隔离）。
+    final String manifestBinding = _text(manifest['binding']).isEmpty
+        ? 'team'
+        : _text(manifest['binding']);
+    if (manifestBinding != scope.binding) {
+      throw StorageFailure(
+        '导出物绑定是 $manifestBinding，不能导入到 ${scope.binding}',
+        code: 'import_invalid',
+      );
+    }
     final String manifestTeam = _text(manifest['team_id']);
     final String manifestNamespace = _text(manifest['namespace']);
-    if (manifestTeam.isNotEmpty && manifestTeam != teamId) {
+    if (scope.isPlugin && manifestTeam.isNotEmpty) {
       throw StorageFailure(
-        '导出物属于团队 $manifestTeam，不能导入到 $teamId',
+        'plugin 绑定不能导入带 team_id 的导出物（$manifestTeam）',
+        code: 'import_invalid',
+      );
+    }
+    if (!scope.isPlugin && manifestTeam.isNotEmpty && manifestTeam != scope.teamId) {
+      throw StorageFailure(
+        '导出物属于团队 $manifestTeam，不能导入到 ${scope.teamId}',
         code: 'import_invalid',
       );
     }
@@ -677,7 +727,7 @@ class StorageEngine {
       );
     }
 
-    final Database database = await _database(teamId, namespace);
+    final Database database = await _database(scope, namespace);
     final StoreRef<String, Map<String, Object?>> store = storeOf(name);
     final int existing = await store.count(database);
     if (existing > 0 && !replace) {
@@ -709,6 +759,7 @@ class StorageEngine {
     );
     return <String, dynamic>{
       'ok': true,
+      ..._scopeJson(scope),
       'namespace': namespace,
       'collection': name,
       'imported': rows.length,
@@ -718,11 +769,11 @@ class StorageEngine {
 
   /// 每个集合的条目数 / schema_version / 库文件字节数与路径（只读）。
   Future<Map<String, dynamic>> stats({
-    required String teamId,
+    required StorageScope scope,
     required String namespace,
   }) async {
-    final String path = databasePath(teamId: teamId, namespace: namespace);
-    final Database database = await _database(teamId, namespace);
+    final String path = databasePath(scope: scope, namespace: namespace);
+    final Database database = await _database(scope, namespace);
     final List<RecordSnapshot<String, Map<String, Object?>>> metas = await _meta
         .find(database);
     final Set<String> names = <String>{
@@ -750,6 +801,7 @@ class StorageEngine {
     final int bytes = file.existsSync() ? file.lengthSync() : 0;
     return <String, dynamic>{
       'ok': true,
+      ..._scopeJson(scope),
       'namespace': namespace,
       'path': path,
       'bytes': bytes,
@@ -759,20 +811,21 @@ class StorageEngine {
 
   /// 关闭并重开该库触发检查点（失败不影响后续读，错误可读）。
   Future<Map<String, dynamic>> compact({
-    required String teamId,
+    required StorageScope scope,
     required String namespace,
   }) async {
-    final String path = databasePath(teamId: teamId, namespace: namespace);
+    final String path = databasePath(scope: scope, namespace: namespace);
     final String key = p.dirname(path);
     final Future<Database>? cached = _databases.remove(key);
     try {
       if (cached != null) await (await cached).close();
-      await _database(teamId, namespace);
+      await _database(scope, namespace);
       final File file = File(path);
       final int bytes = file.existsSync() ? file.lengthSync() : 0;
       log?.call('compact namespace=$namespace path=$path bytes=$bytes');
       return <String, dynamic>{
         'ok': true,
+        ..._scopeJson(scope),
         'namespace': namespace,
         'path': path,
         'compacted': true,
@@ -783,6 +836,7 @@ class StorageEngine {
       log?.call('compact 失败：$error');
       return <String, dynamic>{
         'ok': true,
+        ..._scopeJson(scope),
         'namespace': namespace,
         'path': path,
         'compacted': false,
@@ -793,7 +847,7 @@ class StorageEngine {
 
   /// 删除本命名空间的库文件与空目录（必须 `confirm:true`；ST-5 / TC-ST-07）。
   Future<Map<String, dynamic>> purge({
-    required String teamId,
+    required StorageScope scope,
     required String namespace,
     required bool confirm,
   }) async {
@@ -803,7 +857,7 @@ class StorageEngine {
         code: 'confirmation_required',
       );
     }
-    final String path = databasePath(teamId: teamId, namespace: namespace);
+    final String path = databasePath(scope: scope, namespace: namespace);
     final String key = p.dirname(path);
     final Future<Database>? cached = _databases.remove(key);
     if (cached != null) {
@@ -820,7 +874,9 @@ class StorageEngine {
       removed.add(path);
     }
     String dir = p.dirname(path);
-    final String storageRoot = p.join(dataRoot, 'storage');
+    final String storageRoot = scope.isPlugin
+        ? p.join(dataRoot, 'plugin_storage')
+        : p.join(dataRoot, 'storage');
     while (p.isWithin(storageRoot, dir)) {
       final Directory directory = Directory(dir);
       if (!directory.existsSync() || directory.listSync().isNotEmpty) break;
@@ -837,6 +893,7 @@ class StorageEngine {
     );
     return <String, dynamic>{
       'ok': true,
+      ..._scopeJson(scope),
       'namespace': namespace,
       'path': path,
       'purged': true,
@@ -1069,6 +1126,12 @@ class StorageEngine {
     return fallback;
   }
 }
+
+/// 回包里的归属段：绑定类型 + 团队（plugin 绑定为空串）。
+Map<String, dynamic> _scopeJson(StorageScope scope) => <String, dynamic>{
+  'binding': scope.binding,
+  'team_id': scope.teamId,
+};
 
 /// tx 中解析后的一项 op。
 class _TxOp {

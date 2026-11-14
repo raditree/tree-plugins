@@ -68,11 +68,18 @@ class StorageService {
       );
     }
     final String teamId = _str(scope['team_id']);
-    if (teamId.isEmpty) {
-      throw StorageFailure(
-        '核心未在站请求的 scope 里带 team_id，拒绝落到公共库',
-        code: 'team_required',
-      );
+    final String binding = _bindingOf(arguments);
+    final StorageScope storageScope;
+    if (binding == 'plugin') {
+      storageScope = const StorageScope.plugin();
+    } else {
+      if (teamId.isEmpty) {
+        throw StorageFailure(
+          '核心未在站请求的 scope 里带 team_id，拒绝落到公共库（plugin 级存储请传 binding:plugin）',
+          code: 'team_required',
+        );
+      }
+      storageScope = StorageScope.team(teamId);
     }
     final String dataRoot = _dataRoot(meta);
     if (dataRoot.isEmpty) {
@@ -106,6 +113,7 @@ class StorageService {
     if (_writeCommands.contains(command)) {
       _auditCommand(
         caller: caller,
+        binding: binding,
         namespace: namespace,
         command: command,
         arguments: arguments,
@@ -114,14 +122,14 @@ class StorageService {
     switch (command) {
       case 'storage.ensure':
         return engine.ensure(
-          teamId: teamId,
+          scope: storageScope,
           namespace: namespace,
           collection: _str(arguments['collection']),
           schemaVersion: _int(arguments['schema_version'], 1),
         );
       case 'storage.put':
         return engine.put(
-          teamId: teamId,
+          scope: storageScope,
           namespace: namespace,
           collection: _str(arguments['collection']),
           key: _str(arguments['key']),
@@ -130,21 +138,21 @@ class StorageService {
         );
       case 'storage.get':
         return engine.get(
-          teamId: teamId,
+          scope: storageScope,
           namespace: namespace,
           collection: _str(arguments['collection']),
           key: _str(arguments['key']),
         );
       case 'storage.delete':
         return engine.delete(
-          teamId: teamId,
+          scope: storageScope,
           namespace: namespace,
           collection: _str(arguments['collection']),
           key: _str(arguments['key']),
         );
       case 'storage.query':
         return engine.query(
-          teamId: teamId,
+          scope: storageScope,
           namespace: namespace,
           collection: _str(arguments['collection']),
           filter: _map(arguments['filter']),
@@ -155,7 +163,7 @@ class StorageService {
         );
       case 'storage.scan':
         return engine.scan(
-          teamId: teamId,
+          scope: storageScope,
           namespace: namespace,
           collection: _str(arguments['collection']),
           prefix: _str(arguments['prefix']),
@@ -163,38 +171,38 @@ class StorageService {
         );
       case 'storage.count':
         return engine.count(
-          teamId: teamId,
+          scope: storageScope,
           namespace: namespace,
           collection: _str(arguments['collection']),
           filter: _map(arguments['filter']),
         );
       case 'storage.tx':
         return engine.tx(
-          teamId: teamId,
+          scope: storageScope,
           namespace: namespace,
           ops: _ops(arguments['ops']),
         );
       case 'storage.export':
         return engine.export(
-          teamId: teamId,
+          scope: storageScope,
           namespace: namespace,
           collection: _str(arguments['collection']),
         );
       case 'storage.import':
         return engine.importData(
-          teamId: teamId,
+          scope: storageScope,
           namespace: namespace,
           path: _str(arguments['path']),
           collection: _str(arguments['collection']),
           replace: arguments['replace'] == true,
         );
       case 'storage.stats':
-        return engine.stats(teamId: teamId, namespace: namespace);
+        return engine.stats(scope: storageScope, namespace: namespace);
       case 'storage.compact':
-        return engine.compact(teamId: teamId, namespace: namespace);
+        return engine.compact(scope: storageScope, namespace: namespace);
       case 'storage.purge':
         return engine.purge(
-          teamId: teamId,
+          scope: storageScope,
           namespace: namespace,
           confirm: arguments['confirm'] == true,
         );
@@ -210,12 +218,24 @@ class StorageService {
     _engines.clear();
   }
 
-  /// 审计：每条写命令一行结构化信息（caller/namespace/collection/op/key/bytes/at）。
+  /// 解析绑定维度：缺省 team（兼容旧调用），只接受 team / plugin。
+  static String _bindingOf(Map<String, dynamic> arguments) {
+    final String raw = _str(arguments['binding']).toLowerCase();
+    if (raw.isEmpty) return 'team';
+    if (raw == 'team' || raw == 'plugin') return raw;
+    throw StorageFailure(
+      'binding 只能是 team / plugin：$raw',
+      code: 'invalid_arguments',
+    );
+  }
+
+  /// 审计：每条写命令一行结构化信息（caller/binding/namespace/collection/op/key/bytes/at）。
   ///
   /// `storage.tx` 的 collection / key 不在顶层，这里从 ops 里汇总（逗号分隔），
   /// 保证审计行仍能定位到写到了哪些集合与 key。
   void _auditCommand({
     required String caller,
+    required String binding,
     required String namespace,
     required String command,
     required Map<String, dynamic> arguments,
@@ -237,6 +257,7 @@ class StorageService {
     }
     _audit(
       caller: caller,
+      binding: binding,
       namespace: namespace,
       collection: collection,
       op: command.substring('storage.'.length),
@@ -247,6 +268,7 @@ class StorageService {
 
   void _audit({
     required String caller,
+    required String binding,
     required String namespace,
     required String collection,
     required String op,
@@ -255,8 +277,8 @@ class StorageService {
   }) {
     final String at = DateTime.now().toUtc().toIso8601String();
     log?.call(
-      'audit caller=$caller namespace=$namespace collection=$collection '
-      'op=$op key=$key bytes=$bytes at=$at',
+      'audit caller=$caller binding=$binding namespace=$namespace '
+      'collection=$collection op=$op key=$key bytes=$bytes at=$at',
     );
   }
 
