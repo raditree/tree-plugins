@@ -78,6 +78,7 @@ void main() {
     String? dataDir,
     ProductionExecutionService? execution,
     OrchestratorService? orchestrator,
+    ProductionDedupService Function(Map<String, Object?> scope)? dedupFor,
     bool awaitDispatch = false,
   }) async {
     final Map<String, dynamic> reply = await handleProductionDelegate(
@@ -92,6 +93,7 @@ void main() {
       ),
       execution: execution,
       orchestrator: orchestrator,
+      dedupFor: dedupFor,
       awaitDispatch: awaitDispatch,
     );
     return <String, dynamic>{
@@ -171,6 +173,56 @@ void main() {
     expect(audit['json']['written'], isFalse);
     expect(audit['json']['artifact'], '');
     expect(audit['json']['report'], isA<Map<String, dynamic>>());
+  });
+
+  test('逻辑去重：GET 只读结果，POST 推进（禁用配置时 skipped）', () async {
+    final Directory workspace = Directory(p.join(temp.path, 'workspace'))
+      ..createSync(recursive: true);
+    storeWith(workspaceDir: workspace.path);
+    Future<Map<String, dynamic>> fakeStorage(
+      String command,
+      Map<String, dynamic> arguments,
+    ) async {
+      if (command == 'storage.get') {
+        return <String, dynamic>{'ok': true, 'value': null};
+      }
+      if (command == 'storage.scan') {
+        return <String, dynamic>{
+          'ok': true,
+          'values': <Object?>[],
+          'has_more': false,
+        };
+      }
+      return <String, dynamic>{'ok': true};
+    }
+
+    ProductionDedupService build() => ProductionDedupService(
+      environment: const <String, String>{},
+      storage: fakeStorage,
+      embed: (DedupEmbedRequest request) async =>
+          const DedupEmbedReply(error: '不应被调用', code: 'unexpected'),
+      settings: () async => DedupConfig.fromValues(<String, Object?>{
+        'dedup_enabled': <String, Object?>{'value': false},
+      }),
+    );
+
+    final Map<String, dynamic> status = await call(
+      'GET',
+      '/api/production/lines/pl_1/dedup',
+      dedupFor: (Map<String, Object?> _) => build(),
+    );
+    expect(status['status'], 200);
+    expect(status['json']['run'], isNull);
+
+    final Map<String, dynamic> run = await call(
+      'POST',
+      '/api/production/lines/pl_1/dedup',
+      body: <String, Object?>{'mode': 'incremental'},
+      dedupFor: (Map<String, Object?> _) => build(),
+    );
+    expect(run['status'], 200);
+    expect(run['json']['skipped'], true);
+    expect(run['json']['done'], true);
   });
 
   test('写路由：建 / 改 / 删产线', () async {

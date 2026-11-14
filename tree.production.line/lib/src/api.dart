@@ -16,6 +16,7 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 
 import 'audit_service.dart';
+import 'dedup_service.dart';
 import 'execution_service.dart';
 import 'models.dart';
 import 'orchestrator_service.dart';
@@ -33,6 +34,7 @@ const String taskPattern = '/api/production/lines/{lineId}/tasks/{taskId}';
 const String runsPattern = '/api/production/lines/{lineId}/runs';
 const String artifactsPattern = '/api/production/lines/{lineId}/artifacts';
 const String auditPattern = '/api/production/lines/{lineId}/audit';
+const String dedupPattern = '/api/production/lines/{lineId}/dedup';
 
 /// 存量迁移（§16）：把旧团队目录里的产线搬进全局作用域。
 const String migratePattern = '/api/production/migrate';
@@ -72,6 +74,8 @@ const List<Map<String, String>> kDeclaredRoutes = <Map<String, String>>[
   <String, String>{'method': 'GET', 'pattern': runsPattern},
   <String, String>{'method': 'GET', 'pattern': artifactsPattern},
   <String, String>{'method': 'GET', 'pattern': auditPattern},
+  <String, String>{'method': 'GET', 'pattern': dedupPattern},
+  <String, String>{'method': 'POST', 'pattern': dedupPattern},
   <String, String>{'method': 'GET', 'pattern': questionsPattern},
   <String, String>{'method': 'POST', 'pattern': answerPattern},
   <String, String>{'method': 'POST', 'pattern': orchestratePattern},
@@ -100,6 +104,7 @@ Future<Map<String, dynamic>> handleProductionDelegate(
   ProductionExecutionService? execution,
   PreparationService? preparation,
   OrchestratorService? orchestrator,
+  ProductionDedupService Function(Map<String, Object?> scope)? dedupFor,
   bool awaitDispatch = false,
   Map<String, String>? environment,
 }) async {
@@ -111,6 +116,7 @@ Future<Map<String, dynamic>> handleProductionDelegate(
       preparation ?? PreparationService(environment: environment),
       execution,
       orchestrator,
+      dedupFor,
       awaitDispatch,
     );
   } on ProductionFailure catch (error) {
@@ -131,6 +137,7 @@ Future<Map<String, dynamic>> _dispatch(
   PreparationService preparation,
   ProductionExecutionService? execution,
   OrchestratorService? orchestrator,
+  ProductionDedupService Function(Map<String, Object?> scope)? dedupFor,
   bool awaitDispatch,
 ) async {
   final String method = textOf(envelope['method']).toUpperCase();
@@ -491,6 +498,42 @@ Future<Map<String, dynamic>> _dispatch(
       }, meta, scope),
     );
   }
+  if (_matches(dedupPattern, path)) {
+    final String lineId = _pathParam(dedupPattern, path, 'lineId');
+    final ProductionDedupService? dedup = dedupFor?.call(scope);
+    if (dedup == null) {
+      return _error(
+        503,
+        '逻辑去重需要 tree.storage / tree.agent 通道，当前未接线',
+        code: 'dedup_unavailable',
+      );
+    }
+    if (method == 'GET') {
+      return _ok(
+        await dedup.handle(
+          'production.dedup.status',
+          <String, Object?>{'line_id': lineId},
+          meta,
+          scope,
+        ),
+      );
+    }
+    if (method == 'POST') {
+      final int limit = intOf(body['limit'], 0);
+      return _ok(
+        await dedup.handle(
+          'production.dedup.run',
+          <String, Object?>{
+            'line_id': lineId,
+            'mode': textOf(body['mode']),
+            if (limit > 0) 'limit': limit,
+          },
+          meta,
+          scope,
+        ),
+      );
+    }
+  }
   return _error(404, '未知产线路由：$method $path', code: 'not_found');
 }
 
@@ -737,7 +780,10 @@ Map<String, Object?> _bodyOf(Map<String, dynamic> envelope) {
 int _statusOf(String code) {
   if (code == 'not_found') return 404;
   if (code == 'missing_data_dir' || code == 'internal_error') return 500;
-  if (code == 'orchestrator_unavailable' || code == 'execution_unavailable') {
+  if (code == 'orchestrator_unavailable' ||
+      code == 'execution_unavailable' ||
+      code == 'storage_unavailable' ||
+      code == 'embed_unavailable') {
     return 503;
   }
   if (const <String>{
@@ -752,6 +798,8 @@ int _statusOf(String code) {
     'prepare_state',
     'dispatch_in_flight',
     'audit_in_progress',
+    'dedup_in_progress',
+    'head_moved',
     'question_pending',
     'question_state',
     'ask_limit_exceeded',

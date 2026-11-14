@@ -1,7 +1,7 @@
 name: tree_production_line
-description: tree.production.line 插件：P1 数据模型与队列（line.yaml / task.yaml / runs / state.json，状态机 + 崩溃恢复）+ P3 准备阶段（需求模板 / 侦查 / 追问 / 范围与拆任务 / 落档）+ P4 打包执行 + P5 专家工具（ask_expert / 次数上限 / 只读 / 台账）+ P6 项目整理（只读审计报告）；不得反向依赖核心包。
+description: tree.production.line 插件：P1 数据模型与队列（line.yaml / task.yaml / runs / state.json，状态机 + 崩溃恢复）+ P3 准备阶段（需求模板 / 侦查 / 追问 / 范围与拆任务 / 落档）+ P4 打包执行 + P5 专家工具（ask_expert / 次数上限 / 只读 / 台账）+ P6 项目整理（只读审计报告）+ P6+ 逻辑去重（函数级分块 / embedding / 全库 top-k，缓存落 tree.storage）；不得反向依赖核心包。
 publish_to: 'none'
-version: 0.9.0
+version: 0.10.0
 
 environment:
   sdk: ^3.13.0

@@ -28,7 +28,7 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.production.line';
 const String kDisplayName = 'Tree 标准开发流生产线';
-const String kVersion = '0.9.0';
+const String kVersion = '0.10.0';
 
 const String kStationName = 'production';
 
@@ -68,6 +68,9 @@ const String kStationReadme =
     'P6 项目整理：production.audit.run（只读扫描工作空间 → 文档审计 / TODO 台账 / '
     '重复内容与超大文件候选；报告 schema version=1 固定；唯一写入是项目资产 '
     'docs/production_lines/<line>/audit.md，write=false 时纯查询）。'
+    'P6+ 逻辑去重：production.dedup.run（git tracked → 函数级分块 → 全字节缓存 → '
+    'llm.embed 向量 → 全库 top-k → 结果落 tree.storage 的 plugin 绑定）与 '
+    'production.dedup.status（只读结果）；seed=42，支持 mode=rebuild / limit 分批。'
     'P8 并行与预算：production.queue.dispatch（依赖已 done + 写域不相交 + '
     'limits.max_parallel_tasks 决定批次；写域交叠拒绝并行，交叠对象可见；只读不改状态）'
     '与 production.task.budget（token / 时长上限、累计用量、剩余与超限原因）；'
@@ -93,7 +96,7 @@ ProductionExecutionService? _execution;
 ProductionAuditService? _audit;
 OrchestratorService? _orchestrator;
 PluginKitServer? _activeServer;
-final Set<String> _settingsTeams = <String>{};
+bool _settingsDefined = false;
 
 /// 事件 debounce：同一产线 1s 内的多次事件合并为一次 tick。
 final Map<String, Timer> _eventTimers = <String, Timer>{};
@@ -161,6 +164,7 @@ Future<void> _onReady(PluginKitServer server) async {
           ...kPreparationCommands,
           ...kExecutionCommands,
           ...kAuditCommands,
+          ...kDedupCommands,
           ...kOrchestratorCommands,
         ],
       },
@@ -574,25 +578,26 @@ Future<Map<String, dynamic>> _handleToolCall(
   }
 }
 
-/// 追问上限：先确保本团队的 schema 已注册，再读值；失败交回 null（走 line.yaml）。
+/// 追问上限：先确保全局 schema 已注册，再读值；失败交回 null（走 line.yaml）。
 Future<int?> _readQuestionLimit(Map<String, Object?> scope) async {
   final PluginKitServer? server = _activeServer;
   if (server == null) return null;
-  final String teamId = asString(scope['team_id']);
-  if (teamId.isEmpty) return null;
   try {
-    if (!_settingsTeams.contains(teamId)) {
+    if (!_settingsDefined) {
       await server.channel.command(
         'settings.define',
-        <String, dynamic>{'schema': _questionSchema()},
+        <String, dynamic>{
+          'binding': 'plugin',
+          'schema': _questionSchema(),
+        },
         '',
         scope,
       );
-      _settingsTeams.add(teamId);
+      _settingsDefined = true;
     }
     final Map<String, dynamic> payload = await server.channel.command(
       'settings.get',
-      <String, dynamic>{'key': kQuestionLimitKey},
+      <String, dynamic>{'binding': 'plugin', 'key': kQuestionLimitKey},
       '',
       scope,
     );
@@ -604,11 +609,12 @@ Future<int?> _readQuestionLimit(Map<String, Object?> scope) async {
   }
 }
 
-/// 设置在插件设置页显示的 schema（§8.4）。
+/// 设置在插件设置页显示的 schema（§8.4；v2 追加逻辑去重配置）。
 Map<String, Object?> _questionSchema() => <String, Object?>{
-  'schema_version': 1,
+  'schema_version': 2,
   'groups': <Map<String, Object?>>[
     <String, Object?>{'id': 'questions', 'title': '追问', 'order': 10},
+    <String, Object?>{'id': 'dedup', 'title': '逻辑去重', 'order': 20},
   ],
   'fields': <Map<String, Object?>>[
     <String, Object?>{
@@ -621,8 +627,236 @@ Map<String, Object?> _questionSchema() => <String, Object?>{
       'max': 10,
       'help': '准备阶段每轮新提问题的上限（1–10）；已提出的问题不受影响，下一轮生效。',
     },
+    <String, Object?>{
+      'key': 'dedup_enabled',
+      'group': 'dedup',
+      'type': 'bool',
+      'title': '启用逻辑去重',
+      'default': true,
+      'help': '关闭后 production.dedup.run 直接跳过，不影响 FNV 精确去重。',
+    },
+    <String, Object?>{
+      'key': 'dedup_model',
+      'group': 'dedup',
+      'type': 'string',
+      'title': 'Embedding 模型',
+      'default': '',
+      'help': '留空 = 使用模型池里第一个 kind=embedding 的模型。',
+    },
+    <String, Object?>{
+      'key': 'dedup_similarity_threshold',
+      'group': 'dedup',
+      'type': 'double',
+      'title': '相似度阈值',
+      'default': 0.90,
+      'min': 0.5,
+      'max': 0.99,
+    },
+    <String, Object?>{
+      'key': 'dedup_top_k',
+      'group': 'dedup',
+      'type': 'int',
+      'title': '每块召回数',
+      'default': 5,
+      'min': 1,
+      'max': 20,
+    },
+    <String, Object?>{
+      'key': 'dedup_embed_batch',
+      'group': 'dedup',
+      'type': 'int',
+      'title': 'Embedding 批大小',
+      'default': 32,
+      'min': 1,
+      'max': 64,
+    },
+    <String, Object?>{
+      'key': 'dedup_instruction_prefix',
+      'group': 'dedup',
+      'type': 'string',
+      'title': '指令前缀',
+      'default': '',
+      'help': '拼在待嵌入文本前；计入缓存键，改动会使旧向量失效。',
+    },
+    <String, Object?>{
+      'key': 'dedup_normalize',
+      'group': 'dedup',
+      'type': 'enum',
+      'title': '向量归一化',
+      'default': 'l2',
+      'options': <String>['l2', 'none'],
+    },
+    <String, Object?>{
+      'key': 'dedup_pooling',
+      'group': 'dedup',
+      'type': 'enum',
+      'title': '池化方式',
+      'default': 'mean',
+      'options': <String>['mean', 'cls'],
+      'help': '记录并计入缓存键；实际池化由模型端决定。',
+    },
+    <String, Object?>{
+      'key': 'dedup_max_file_bytes',
+      'group': 'dedup',
+      'type': 'int',
+      'title': '单文件上限（字节）',
+      'default': 262144,
+      'min': 1024,
+      'max': 8388608,
+    },
+    <String, Object?>{
+      'key': 'dedup_files_per_request',
+      'group': 'dedup',
+      'type': 'int',
+      'title': '每请求处理文件数',
+      'default': 50,
+      'min': 1,
+      'max': 500,
+    },
+    <String, Object?>{
+      'key': 'dedup_compare_per_request',
+      'group': 'dedup',
+      'type': 'int',
+      'title': '每请求比对块数',
+      'default': 100,
+      'min': 1,
+      'max': 500,
+    },
+    <String, Object?>{
+      'key': 'dedup_max_index_chunks',
+      'group': 'dedup',
+      'type': 'int',
+      'title': '索引块数上限',
+      'default': 20000,
+      'min': 100,
+      'max': 100000,
+      'help': '超过时只比较前 N 块并在 reasons 里说明。',
+    },
   ],
 };
+
+/// 逻辑去重的服务实例：storage / settings 都走 plugin 绑定，scope 只作身份透传。
+ProductionDedupService _dedupServiceFor(Map<String, Object?> scope) =>
+    ProductionDedupService(
+      environment: Platform.environment,
+      storage: (String command, Map<String, dynamic> args) =>
+          _callStorageWithScope(command, args, scope),
+      embed: (DedupEmbedRequest request) => _callEmbedDedup(request, scope),
+      settings: () => _readDedupConfig(scope),
+    );
+
+Future<Map<String, dynamic>> _callStorageWithScope(
+  String command,
+  Map<String, dynamic> arguments,
+  Map<String, Object?> scope,
+) async {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) {
+    throw ProductionFailure(
+      '插件尚未就绪：tree.storage 通道不可用',
+      code: 'storage_unavailable',
+    );
+  }
+  return server.channel.command(
+    command,
+    <String, dynamic>{...arguments, 'binding': 'plugin'},
+    '',
+    scope,
+  );
+}
+
+Future<DedupEmbedReply> _callEmbedDedup(
+  DedupEmbedRequest request,
+  Map<String, Object?> scope,
+) async {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) {
+    return const DedupEmbedReply(
+      error: '插件尚未就绪：llm.embed 通道不可用',
+      code: 'embed_unavailable',
+    );
+  }
+  try {
+    final Map<String, dynamic> payload = await server.channel.command(
+      'llm.embed',
+      <String, dynamic>{
+        'inputs': request.inputs,
+        if (request.model.isNotEmpty) 'model': request.model,
+      },
+      '',
+      scope,
+    );
+    final String reason = asString(payload['error']);
+    return DedupEmbedReply(
+      vectors: _vectorsOf(payload['vectors']),
+      model: asString(payload['model']),
+      dimensions: (payload['dimensions'] as num?)?.toInt() ?? 0,
+      error: reason.trim().isNotEmpty
+          ? reason
+          : (payload['ok'] == false ? 'llm.embed 返回 ok:false' : ''),
+      code: asString(payload['code']),
+    );
+  } on CmdFailureException catch (error) {
+    return DedupEmbedReply(
+      vectors: _vectorsOf(error.payload['vectors']),
+      model: asString(error.payload['model']),
+      dimensions: (error.payload['dimensions'] as num?)?.toInt() ?? 0,
+      error: error.message,
+      code: asString(error.payload['code']),
+    );
+  } catch (error) {
+    return DedupEmbedReply(error: 'llm.embed 异常：$error');
+  }
+}
+
+/// 读逻辑去重配置：先确保全局 schema 已注册，再 `settings.list`。
+Future<DedupConfig> _readDedupConfig(Map<String, Object?> scope) async {
+  final PluginKitServer? server = _activeServer;
+  if (server == null) return DedupConfig.defaults;
+  try {
+    if (!_settingsDefined) {
+      await server.channel.command(
+        'settings.define',
+        <String, dynamic>{
+          'binding': 'plugin',
+          'schema': _questionSchema(),
+        },
+        '',
+        scope,
+      );
+      _settingsDefined = true;
+    }
+    final Map<String, dynamic> payload = await server.channel.command(
+      'settings.list',
+      <String, dynamic>{'binding': 'plugin'},
+      '',
+      scope,
+    );
+    final Map<String, Object?> values = <String, Object?>{
+      for (final MapEntry<String, dynamic> entry
+          in asMap(payload['values']).entries)
+        entry.key: entry.value,
+    };
+    return DedupConfig.fromValues(
+      values,
+      environment: Platform.environment,
+    );
+  } catch (_) {
+    return DedupConfig.defaults;
+  }
+}
+
+List<List<double>> _vectorsOf(Object? raw) {
+  if (raw is! List) return const <List<double>>[];
+  return <List<double>>[
+    for (final Object? row in raw)
+      if (row is List)
+        <double>[
+          for (final Object? value in row)
+            if (value is num) value.toDouble(),
+        ],
+  ];
+}
 
 Future<Map<String, dynamic>?> handleRequest(
   String method,
@@ -637,6 +871,7 @@ Future<Map<String, dynamic>?> handleRequest(
       execution: _execution,
       preparation: _preparation,
       orchestrator: _orchestrator,
+      dedupFor: _dedupServiceFor,
     );
   }
   if (method != M.stationRequest) return null;
@@ -663,48 +898,58 @@ Future<Map<String, dynamic>?> handleRequest(
   final bool isPrepare = kPreparationCommands.contains(command);
   final bool isExecute = kExecutionCommands.contains(command);
   final bool isAudit = kAuditCommands.contains(command);
+  final bool isDedup = kDedupCommands.contains(command);
   final bool isOrchestrator = kOrchestratorCommands.contains(command);
   if (!isPrepare &&
       !isExecute &&
       !isAudit &&
+      !isDedup &&
       !isOrchestrator &&
       !kProductionCommands.contains(command)) {
     return null;
   }
   try {
+    final Map<String, Object?> scope = asMap(params['scope']);
     final Map<String, Object?> result = isPrepare
         ? await _preparation!.handle(
             command,
             asMap(payload['arguments']),
             asMap(params['meta']),
-            asMap(params['scope']),
+            scope,
           )
         : isExecute
         ? await _execution!.handle(
             command,
             asMap(payload['arguments']),
             asMap(params['meta']),
-            asMap(params['scope']),
+            scope,
           )
         : isAudit
         ? await _audit!.handle(
             command,
             asMap(payload['arguments']),
             asMap(params['meta']),
-            asMap(params['scope']),
+            scope,
+          )
+        : isDedup
+        ? await _dedupServiceFor(scope).handle(
+            command,
+            asMap(payload['arguments']),
+            asMap(params['meta']),
+            scope,
           )
         : isOrchestrator
         ? await _orchestrator!.handle(
             command,
             asMap(payload['arguments']),
             asMap(params['meta']),
-            asMap(params['scope']),
+            scope,
           )
         : _service.handle(
             command,
             asMap(payload['arguments']),
             asMap(params['meta']),
-            asMap(params['scope']),
+            scope,
           );
     return <String, dynamic>{
       'reply': <String, dynamic>{'payload': result},
@@ -1301,9 +1546,113 @@ Future<int> selfTest() async {
     Directory(ws).createSync(recursive: true);
     final List<Map<String, dynamic>> workerCalls = <Map<String, dynamic>>[];
     int gitCalls = 0;
+    final Map<String, Map<String, Object?>> dedupDb =
+        <String, Map<String, Object?>>{};
+    int dedupEmbedCalls = 0;
     core.onMethod(M.stationCommand, (Map<String, dynamic> params) {
       final String command = asString(params['command']);
       switch (command) {
+        case 'storage.ensure':
+          return <String, dynamic>{'ok': true, 'payload': <String, dynamic>{'ok': true}};
+        case 'storage.put':
+          dedupDb['${asMap(params['arguments'])['collection']}\u0000'
+              '${asMap(params['arguments'])['key']}'] =
+              asMap(asMap(params['arguments'])['value']);
+          return <String, dynamic>{'ok': true, 'payload': <String, dynamic>{'ok': true}};
+        case 'storage.get':
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'ok': true,
+              'value': dedupDb['${asMap(params['arguments'])['collection']}\u0000'
+                  '${asMap(params['arguments'])['key']}'],
+            },
+          };
+        case 'storage.delete':
+          dedupDb.remove('${asMap(params['arguments'])['collection']}\u0000'
+              '${asMap(params['arguments'])['key']}');
+          return <String, dynamic>{'ok': true, 'payload': <String, dynamic>{'ok': true}};
+        case 'storage.scan':
+          final String prefix = asString(asMap(params['arguments'])['prefix']);
+          final String collection =
+              asString(asMap(params['arguments'])['collection']);
+          final List<Map<String, Object?>> values = <Map<String, Object?>>[
+            for (final MapEntry<String, Map<String, Object?>> entry
+                in dedupDb.entries)
+              if (entry.key.startsWith('$collection\u0000$prefix'))
+                <String, Object?>{
+                  'key': entry.key.substring(collection.length + 1),
+                  'value': entry.value,
+                },
+          ];
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'ok': true,
+              'values': values,
+              'has_more': false,
+            },
+          };
+        case 'storage.query':
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'ok': true,
+              'values': <Object?>[],
+              'has_more': false,
+              'cursor': '',
+            },
+          };
+        case 'storage.tx':
+          for (final Object? raw
+              in (asMap(params['arguments'])['ops'] as List<dynamic>? ??
+                  const <dynamic>[])) {
+            final Map<String, dynamic> op = asMap(raw);
+            final String key = '${op['collection']}\u0000${op['key']}';
+            if (asString(op['op']) == 'delete') {
+              dedupDb.remove(key);
+            } else {
+              dedupDb[key] = asMap(op['value']);
+            }
+          }
+          return <String, dynamic>{'ok': true, 'payload': <String, dynamic>{'ok': true}};
+        case 'settings.list':
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'values': <String, Object?>{
+                'dedup_enabled': <String, Object?>{'value': true},
+              },
+            },
+          };
+        case 'llm.embed':
+          final Object? rawInputs = asMap(params['arguments'])['inputs'];
+          final List<String> inputs = <String>[
+            if (rawInputs is List)
+              for (final Object? item in rawInputs)
+                if (item is String) item,
+          ];
+          if (inputs.isNotEmpty) dedupEmbedCalls += 1;
+          return <String, dynamic>{
+            'ok': true,
+            'payload': <String, dynamic>{
+              'ok': true,
+              'model': 'fake-embed',
+              'dimensions': 4,
+              'vectors': <Object?>[
+                for (final String text in inputs)
+                  <double>[
+                    for (int i = 0; i < 4; i++)
+                      (int.parse(
+                                fnv1aHex(text).substring(i * 4, i * 4 + 4),
+                                radix: 16,
+                              ) +
+                              1) /
+                          65536,
+                  ],
+              ],
+            },
+          };
         case 'docnorm.query':
           return <String, dynamic>{
             'ok': true,
@@ -2210,6 +2559,58 @@ Future<int> selfTest() async {
       true,
       '主控决策落 runs 台账',
     );
+    // ── P6+ 逻辑去重：首轮建基线，无变更二次 0 次 embedding ──
+    final String dedupWs =
+        '${temp.path}${Platform.pathSeparator}dedup_ws';
+    Directory('$dedupWs${Platform.pathSeparator}lib').createSync(recursive: true);
+    File('$dedupWs${Platform.pathSeparator}lib${Platform.pathSeparator}a.dart')
+        .writeAsStringSync('''
+void alpha() {
+  final values = <int>[1, 2, 3];
+  for (final value in values) {
+    print(value);
+  }
+}
+''');
+    Process.runSync('git', <String>['init', '--quiet'], workingDirectory: dedupWs);
+    Process.runSync('git', <String>['add', '-A'], workingDirectory: dedupWs);
+    Process.runSync('git', <String>[
+      '-c',
+      'user.name=t',
+      '-c',
+      'user.email=t@t',
+      'commit',
+      '--quiet',
+      '--no-gpg-sign',
+      '-m',
+      'init',
+    ], workingDirectory: dedupWs);
+    ProductionStore(dataRoot: temp.path).createLine(<String, Object?>{
+      'id': 'pl_dedup',
+      'name': '逻辑去重',
+      'workspace_dir': dedupWs,
+    });
+    Future<Map<String, dynamic>> runDedup() async {
+      Map<String, dynamic> last = <String, dynamic>{};
+      for (int i = 0; i < 10; i++) {
+        final Map<String, dynamic> reply = await call(
+          'dedup-run-$i',
+          'production.dedup.run',
+          <String, Object?>{'line_id': 'pl_dedup'},
+        );
+        last = payloadOf(reply);
+        if (reply['error'] != null || last['done'] == true) break;
+      }
+      return last;
+    }
+
+    final Map<String, dynamic> dedupFirst = await runDedup();
+    check.check(dedupFirst['done'], true, '逻辑去重首轮完成（全量基线）');
+    final int dedupCalls = dedupEmbedCalls;
+    check.check(dedupCalls > 0, true, '首轮确实请求过 embedding');
+    final Map<String, dynamic> dedupSecond = await runDedup();
+    check.check(dedupSecond['done'], true, '逻辑去重二次完成');
+    check.check(dedupEmbedCalls, dedupCalls, '无变更二次运行 embedding 请求数为 0');
   } catch (error) {
     check.that(false, '自检过程未抛异常', actual: '$error');
   } finally {
