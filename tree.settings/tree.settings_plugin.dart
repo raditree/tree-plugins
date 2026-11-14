@@ -4,6 +4,7 @@
 // - headless 插件，对其它插件暴露自建执行站命令族 `settings.*`；
 // - 对 UI 暴露委派路由 `/api/plugin-settings/*`（避开核心已有的 `/api/settings/*`）；
 // - 每团队一个 Sembast 库 `<data_root>/settings/<team_id>/settings.semdb`；
+// - plugin 绑定用全局库 `<data_root>/plugin_settings/settings.semdb`（不要求 team_id）；
 // - 只存“用户覆盖值”；最终优先级由插件自己合并（设置服务 > env > config > 默认）；
 // - secret 只写不读；写入成功广播 `settings.changed`（不带值）。
 //
@@ -18,18 +19,19 @@ import '../_kit/plugin_kit.dart';
 
 const String kPluginId = 'tree.settings';
 const String kDisplayName = 'Tree 插件设置';
-const String kVersion = '0.1.0';
+const String kVersion = '0.2.0';
 
 const String kStationName = 'settings';
 const String kStationReadme =
-    '插件设置：settings.define/list/get/set/reset/export。每团队一个库 '
-    '<data_root>/settings/<team_id>/settings.semdb；owner 只认核心透传的 '
-    'meta.source_plugin_id；secret 只写不读。';
+    '插件设置：settings.define/list/get/set/reset/export。binding=team（默认）时'
+    '每团队一个库 <data_root>/settings/<team_id>/settings.semdb；binding=plugin 时'
+    '用全局库 <data_root>/plugin_settings/settings.semdb，不要求 team_id。owner 只认'
+    '核心透传的 meta.source_plugin_id；secret 只写不读。';
 
 /// 广播站名（名字不能带点；核心会拼成 plugin.tree.settings.broadcast.settings_changed）。
 const String kBroadcastName = 'settings_changed';
 const String kBroadcastReadme =
-    '插件设置变更通知：topic=settings.changed，载荷 {plugin_id, keys, generation}，'
+    '插件设置变更通知：topic=settings.changed，载荷 {plugin_id, binding, keys, generation}，'
     '不带值（secret 永不出插件）。订阅方收到后自行 settings.get。';
 
 final SettingsService _service = SettingsService();
@@ -49,6 +51,8 @@ Future<void> _onReady(PluginKitServer server) async {
   _service.onChanged = (SettingsChange change) async {
     final String stationId = _broadcastStationId;
     if (stationId.isEmpty) return;
+    // 广播站按 team 归属投递；全局变更无 team 时无法证明归属，订阅方下次读取即可。
+    if (change.teamId.isEmpty) return;
     await server.channel.request(M.stationTrigger, <String, dynamic>{
       'station_id': stationId,
       'topic': 'settings.changed',
@@ -277,6 +281,43 @@ Future<int> selfTest() async {
       team: null,
     );
     check.check(noTeam['code'], 'team_required', '缺 team_id ⇒ team_required');
+
+    // plugin 级绑定：不带 team 也能 define/set/get。
+    Map<String, dynamic> pluginReply = await call(
+      'plugin-define',
+      'settings.define',
+      <String, dynamic>{'binding': 'plugin', 'schema': schema},
+      team: null,
+    );
+    check.check(
+      payloadOf(pluginReply)['binding'],
+      'plugin',
+      'plugin 绑定 define 回 binding',
+    );
+    pluginReply = await call(
+      'plugin-set',
+      'settings.set',
+      <String, dynamic>{
+        'binding': 'plugin',
+        'values': <String, dynamic>{'stage_budget': 4321},
+      },
+      team: null,
+    );
+    check.check(payloadOf(pluginReply)['generation'], 1, 'plugin 绑定可写');
+    pluginReply = await call(
+      'plugin-get',
+      'settings.get',
+      <String, dynamic>{'binding': 'plugin', 'key': 'stage_budget'},
+      team: null,
+    );
+    check.check(payloadOf(pluginReply)['value'], 4321, 'plugin 绑定可读回');
+    pluginReply = await call(
+      'plugin-bad-binding',
+      'settings.get',
+      <String, dynamic>{'binding': 'global', 'key': 'stage_budget'},
+      team: null,
+    );
+    check.check(pluginReply['code'], 'invalid_arguments', '非法 binding 被拒');
     check.check(
       noIdentity['code'],
       'schema_not_found',

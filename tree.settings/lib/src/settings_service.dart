@@ -17,6 +17,7 @@ const List<String> kSettingsCommands = <String>[
 class SettingsChange {
   const SettingsChange({
     required this.teamId,
+    required this.binding,
     required this.pluginId,
     required this.keys,
     required this.generation,
@@ -24,6 +25,7 @@ class SettingsChange {
   });
 
   final String teamId;
+  final String binding;
   final String pluginId;
   final List<String> keys;
   final int generation;
@@ -33,6 +35,7 @@ class SettingsChange {
 
   Map<String, Object?> toPayload() => <String, Object?>{
     'plugin_id': pluginId,
+    'binding': binding,
     'keys': keys,
     'generation': generation,
     'at': at,
@@ -66,11 +69,19 @@ class SettingsService {
       );
     }
     final String teamId = _str(scope['team_id']);
-    if (teamId.isEmpty) {
-      throw SettingsFailure(
-        '核心未在站请求的 scope 里带 team_id，拒绝落到公共设置库',
-        code: 'team_required',
-      );
+    final String binding = _bindingOf(arguments);
+    final SettingsScope settingsScope;
+    if (binding == 'plugin') {
+      settingsScope = const SettingsScope.plugin();
+    } else {
+      if (teamId.isEmpty) {
+        throw SettingsFailure(
+          '核心未在站请求的 scope 里带 team_id，拒绝落到公共设置库'
+          '（plugin 级设置请传 binding:plugin）',
+          code: 'team_required',
+        );
+      }
+      settingsScope = SettingsScope.team(teamId);
     }
     final String dataRoot = _dataRoot(meta);
     if (dataRoot.isEmpty) {
@@ -86,35 +97,55 @@ class SettingsService {
         final Map<String, dynamic> schema = explicit.isNotEmpty
             ? explicit
             : arguments;
-        return engine.define(teamId: teamId, owner: caller, schema: schema);
+        return _withScope(
+          await engine.define(
+            scope: settingsScope,
+            owner: caller,
+            schema: schema,
+          ),
+          binding,
+          teamId,
+        );
       case 'settings.list':
-        return engine.list(teamId: teamId, owner: caller);
+        return _withScope(
+          await engine.list(scope: settingsScope, owner: caller),
+          binding,
+          teamId,
+        );
       case 'settings.get':
-        return engine.get(
-          teamId: teamId,
-          owner: caller,
-          key: _str(arguments['key']),
+        return _withScope(
+          await engine.get(
+            scope: settingsScope,
+            owner: caller,
+            key: _str(arguments['key']),
+          ),
+          binding,
+          teamId,
         );
       case 'settings.set':
         final Map<String, dynamic> values = _valuesOf(arguments);
         final Map<String, dynamic> result = await engine.set(
-          teamId: teamId,
+          scope: settingsScope,
           owner: caller,
           values: values,
         );
-        _notify(teamId, caller, result);
-        return result;
+        _notify(teamId, binding, caller, result);
+        return _withScope(result, binding, teamId);
       case 'settings.reset':
         final List<String> keys = _strings(arguments['keys']);
         final Map<String, dynamic> result = await engine.reset(
-          teamId: teamId,
+          scope: settingsScope,
           owner: caller,
           keys: keys,
         );
-        _notify(teamId, caller, result);
-        return result;
+        _notify(teamId, binding, caller, result);
+        return _withScope(result, binding, teamId);
       case 'settings.export':
-        return engine.export(teamId: teamId, owner: caller);
+        return _withScope(
+          await engine.export(scope: settingsScope, owner: caller),
+          binding,
+          teamId,
+        );
       default:
         throw SettingsFailure('未知设置命令：$command', code: 'unknown_command');
     }
@@ -128,9 +159,6 @@ class SettingsService {
     final String teamId = _str(envelope['team_id']).isEmpty
         ? _str(scope['team_id'])
         : _str(envelope['team_id']);
-    if (teamId.isEmpty) {
-      return _error(400, 'team_required', '委派信封缺少 team_id / scope.team_id');
-    }
     final String dataRoot = _dataRoot(envelope);
     if (dataRoot.isEmpty) {
       return _error(500, 'missing_data_dir', '委派信封缺少 data_dir');
@@ -140,10 +168,29 @@ class SettingsService {
     final Map<String, dynamic> query = _map(envelope['query']);
     final SettingsEngine engine = _engineOf(dataRoot);
     try {
+      final Map<String, dynamic> body = method == 'GET'
+          ? <String, dynamic>{}
+          : _bodyOf(envelope);
+      final String binding = _bindingFrom(query, body);
+      final SettingsScope settingsScope;
+      if (binding == 'plugin') {
+        settingsScope = const SettingsScope.plugin();
+      } else {
+        if (teamId.isEmpty) {
+          return _error(
+            400,
+            'team_required',
+            '委派信封缺少 team_id / scope.team_id（plugin 级设置请传 binding=plugin）',
+          );
+        }
+        settingsScope = SettingsScope.team(teamId);
+      }
       switch ('$method $path') {
         case 'GET /api/plugin-settings/schema':
           final String filter = _str(query['plugin_id']);
-          List<Map<String, dynamic>> schemas = await engine.listSchemas(teamId);
+          List<Map<String, dynamic>> schemas = await engine.listSchemas(
+            settingsScope,
+          );
           if (filter.isNotEmpty) {
             schemas = schemas
                 .where(
@@ -152,49 +199,57 @@ class SettingsService {
                 )
                 .toList();
           }
-          return _json(200, <String, dynamic>{'schemas': schemas});
+          return _json(200, _withScope(<String, dynamic>{
+            'schemas': schemas,
+          }, binding, teamId));
         case 'GET /api/plugin-settings/values':
           final String pluginId = _str(query['plugin_id']);
           if (pluginId.isEmpty) {
             return _error(400, 'invalid_arguments', '缺少 plugin_id');
           }
-          return _json(200, await engine.list(teamId: teamId, owner: pluginId));
+          return _json(200, _withScope(
+            await engine.list(scope: settingsScope, owner: pluginId),
+            binding,
+            teamId,
+          ));
         case 'PATCH /api/plugin-settings/values':
-          final Map<String, dynamic> body = _bodyOf(envelope);
           final String pluginId = _str(body['plugin_id']);
           if (pluginId.isEmpty) {
             return _error(400, 'invalid_arguments', '缺少 plugin_id');
           }
-          if (!await _schemaExists(engine, teamId, pluginId)) {
+          if (!await _schemaExists(engine, settingsScope, pluginId)) {
             return _error(404, 'unknown_plugin', '插件 $pluginId 未注册设置 schema');
           }
           final Map<String, dynamic> values = _map(body['values']);
           final Map<String, dynamic> result = await engine.set(
-            teamId: teamId,
+            scope: settingsScope,
             owner: pluginId,
             values: values,
           );
-          _notify(teamId, pluginId, result);
-          return _json(200, result);
+          _notify(teamId, binding, pluginId, result);
+          return _json(200, _withScope(result, binding, teamId));
         case 'POST /api/plugin-settings/reset':
-          final Map<String, dynamic> body = _bodyOf(envelope);
           final String pluginId = _str(body['plugin_id']);
           if (pluginId.isEmpty) {
             return _error(400, 'invalid_arguments', '缺少 plugin_id');
           }
-          if (!await _schemaExists(engine, teamId, pluginId)) {
+          if (!await _schemaExists(engine, settingsScope, pluginId)) {
             return _error(404, 'unknown_plugin', '插件 $pluginId 未注册设置 schema');
           }
           final Map<String, dynamic> result = await engine.reset(
-            teamId: teamId,
+            scope: settingsScope,
             owner: pluginId,
             keys: _strings(body['keys']),
           );
-          _notify(teamId, pluginId, result);
-          return _json(200, result);
+          _notify(teamId, binding, pluginId, result);
+          return _json(200, _withScope(result, binding, teamId));
         case 'POST /api/plugin-settings/apply':
           // 变更已经通过广播下发；这里只做一次显式重放的确认。
-          return _json(200, <String, dynamic>{'ok': true});
+          return _json(200, <String, dynamic>{
+            'ok': true,
+            'binding': binding,
+            'team_id': teamId,
+          });
         default:
           return _error(404, 'not_found', '未知设置路由：$method $path');
       }
@@ -217,7 +272,12 @@ class SettingsService {
     () => SettingsEngine(dataRoot: dataRoot, log: log),
   );
 
-  void _notify(String teamId, String pluginId, Map<String, dynamic> result) {
+  void _notify(
+    String teamId,
+    String binding,
+    String pluginId,
+    Map<String, dynamic> result,
+  ) {
     final SettingsChanged? callback = onChanged;
     if (callback == null) return;
     final List<String> keys = _changedKeys(result);
@@ -227,6 +287,7 @@ class SettingsService {
     callback(
       SettingsChange(
         teamId: teamId,
+        binding: binding,
         pluginId: pluginId,
         keys: keys,
         generation: generation,
@@ -236,6 +297,39 @@ class SettingsService {
       log?.call('settings.changed 广播失败：$error');
     });
   }
+
+  /// 解析绑定维度：缺省 team（兼容旧调用），只接受 team / plugin。
+  static String _bindingOf(Map<String, dynamic> arguments) =>
+      _bindingValue(arguments['binding']);
+
+  static String _bindingFrom(
+    Map<String, dynamic> query,
+    Map<String, dynamic> body,
+  ) {
+    final String fromQuery = _str(query['binding']);
+    return _bindingValue(fromQuery.isEmpty ? body['binding'] : fromQuery);
+  }
+
+  static String _bindingValue(Object? raw) {
+    final String value = _str(raw).toLowerCase();
+    if (value.isEmpty) return 'team';
+    if (value == 'team' || value == 'plugin') return value;
+    throw SettingsFailure(
+      'binding 只能是 team / plugin：$value',
+      code: 'invalid_arguments',
+    );
+  }
+
+  /// 回包统一带归属：binding + team_id（plugin 时为空串）。
+  static Map<String, dynamic> _withScope(
+    Map<String, dynamic> result,
+    String binding,
+    String teamId,
+  ) => <String, dynamic>{
+    ...result,
+    'binding': binding,
+    'team_id': binding == 'plugin' ? '' : teamId,
+  };
 
   static List<String> _changedKeys(Map<String, dynamic> result) {
     if (result['applied'] is List) return _strings(result['applied']);
@@ -307,10 +401,10 @@ class SettingsService {
   /// REST 写入前确认目标插件真的注册过 schema（没注册就不接受覆盖值）。
   static Future<bool> _schemaExists(
     SettingsEngine engine,
-    String teamId,
+    SettingsScope scope,
     String pluginId,
   ) async {
-    final List<Map<String, dynamic>> schemas = await engine.listSchemas(teamId);
+    final List<Map<String, dynamic>> schemas = await engine.listSchemas(scope);
     return schemas.any(
       (Map<String, dynamic> item) => _str(item['plugin_id']) == pluginId,
     );

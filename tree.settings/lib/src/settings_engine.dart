@@ -45,7 +45,20 @@ String safeSegment(Object? raw, {required String what}) {
   return value;
 }
 
-/// 每个 team 一份设置库：`<dataRoot>/settings/<teamId>/settings.semdb`。
+/// 设置库的绑定维度：`team`（默认，按团队隔离）或 `plugin`（插件级全局）。
+class SettingsScope {
+  const SettingsScope.team(this.teamId) : binding = 'team';
+
+  const SettingsScope.plugin() : binding = 'plugin', teamId = '';
+
+  final String binding;
+  final String teamId;
+
+  bool get isPlugin => binding == 'plugin';
+}
+
+/// 每个 team 一份设置库：`<dataRoot>/settings/<teamId>/settings.semdb`；
+/// plugin 绑定用全局库：`<dataRoot>/plugin_settings/settings.semdb`。
 class SettingsEngine {
   SettingsEngine({required this.dataRoot, this.log});
 
@@ -61,13 +74,16 @@ class SettingsEngine {
 
   final Map<String, Future<Database>> _databases = <String, Future<Database>>{};
 
-  String databasePath(String teamId) {
-    final String team = safeSegment(teamId, what: 'team_id');
+  String databasePath(SettingsScope scope) {
+    if (scope.isPlugin) {
+      return p.join(dataRoot, 'plugin_settings', 'settings.semdb');
+    }
+    final String team = safeSegment(scope.teamId, what: 'team_id');
     return p.join(dataRoot, 'settings', team, 'settings.semdb');
   }
 
-  Future<Database> _database(String teamId) async {
-    final String path = databasePath(teamId);
+  Future<Database> _database(SettingsScope scope) async {
+    final String path = databasePath(scope);
     try {
       return await _databases.putIfAbsent(path, () => _open(path));
     } catch (error) {
@@ -95,13 +111,13 @@ class SettingsEngine {
 
   /// 注册 / 升级 schema。同版本同内容幂等；同版本不同内容、或降级 ⇒ 拒绝。
   Future<Map<String, dynamic>> define({
-    required String teamId,
+    required SettingsScope scope,
     required String owner,
     required Map<String, dynamic> schema,
   }) async {
     final String ownerId = safeSegment(owner, what: 'owner_plugin_id');
     final Map<String, Object?> normalized = _normalizeSchema(schema);
-    final Database db = await _database(teamId);
+    final Database db = await _database(scope);
     return db.transaction((Transaction txn) async {
       final Map<String, Object?>? existing = await _schemas
           .record(ownerId)
@@ -134,11 +150,11 @@ class SettingsEngine {
 
   /// 读 schema + 覆盖值；secret 只回 `has_value`，不回原文。
   Future<Map<String, dynamic>> list({
-    required String teamId,
+    required SettingsScope scope,
     required String owner,
   }) async {
     final String ownerId = safeSegment(owner, what: 'owner_plugin_id');
-    final Database db = await _database(teamId);
+    final Database db = await _database(scope);
     return db.transaction((Transaction txn) async {
       final Map<String, Object?>? schema = await _schemas
           .record(ownerId)
@@ -170,12 +186,12 @@ class SettingsEngine {
   }
 
   Future<Map<String, dynamic>> get({
-    required String teamId,
+    required SettingsScope scope,
     required String owner,
     required String key,
   }) async {
     final String ownerId = safeSegment(owner, what: 'owner_plugin_id');
-    final Database db = await _database(teamId);
+    final Database db = await _database(scope);
     return db.transaction((Transaction txn) async {
       final Map<String, Object?>? schema = await _schemas
           .record(ownerId)
@@ -203,7 +219,7 @@ class SettingsEngine {
 
   /// 写覆盖值。返回实际写入的 key 与新的 generation。
   Future<Map<String, dynamic>> set({
-    required String teamId,
+    required SettingsScope scope,
     required String owner,
     required Map<String, dynamic> values,
   }) async {
@@ -218,10 +234,10 @@ class SettingsEngine {
       return <String, dynamic>{
         'plugin_id': ownerId,
         'applied': <String>[],
-        'generation': await _currentGeneration(teamId, ownerId),
+        'generation': await _currentGeneration(scope, ownerId),
       };
     }
-    final Database db = await _database(teamId);
+    final Database db = await _database(scope);
     return db.transaction((Transaction txn) async {
       final Map<String, Object?>? schema = await _schemas
           .record(ownerId)
@@ -262,7 +278,7 @@ class SettingsEngine {
 
   /// 删除覆盖值（回到 schema 默认）。
   Future<Map<String, dynamic>> reset({
-    required String teamId,
+    required SettingsScope scope,
     required String owner,
     required List<String> keys,
   }) async {
@@ -270,7 +286,7 @@ class SettingsEngine {
     if (keys.isEmpty) {
       throw SettingsFailure('keys 不能为空', code: 'invalid_arguments');
     }
-    final Database db = await _database(teamId);
+    final Database db = await _database(scope);
     return db.transaction((Transaction txn) async {
       final Map<String, Object?>? schema = await _schemas
           .record(ownerId)
@@ -304,13 +320,13 @@ class SettingsEngine {
 
   /// 诊断导出：schema + 脱敏后的值；不提供导入。
   Future<Map<String, dynamic>> export({
-    required String teamId,
+    required SettingsScope scope,
     required String owner,
-  }) => list(teamId: teamId, owner: owner);
+  }) => list(scope: scope, owner: owner);
 
   /// 所有插件的 schema（UI 首屏用）；不返回值。
-  Future<List<Map<String, dynamic>>> listSchemas(String teamId) async {
-    final Database db = await _database(teamId);
+  Future<List<Map<String, dynamic>>> listSchemas(SettingsScope scope) async {
+    final Database db = await _database(scope);
     return db.transaction((Transaction txn) async {
       final List<RecordSnapshot<String, Map<String, Object?>>> records =
           await _schemas.find(txn);
@@ -331,8 +347,8 @@ class SettingsEngine {
     });
   }
 
-  Future<int> _currentGeneration(String teamId, String owner) async {
-    final Database db = await _database(teamId);
+  Future<int> _currentGeneration(SettingsScope scope, String owner) async {
+    final Database db = await _database(scope);
     return db.transaction((Transaction txn) async => _generation(txn, owner));
   }
 

@@ -153,4 +153,135 @@ void main() {
       isFalse,
     );
   });
+
+  test('plugin 绑定：不带 team 可 define/set/get，回包带 binding', () async {
+    final Map<String, dynamic> meta = <String, dynamic>{
+      'source_plugin_id': 'tree.docnorm',
+      'data_dir': temp.path,
+    };
+    final Map<String, dynamic> defined = await service.handle(
+      'settings.define',
+      <String, dynamic>{'binding': 'plugin', 'schema': schema()},
+      meta,
+      <String, dynamic>{},
+    );
+    expect(defined['binding'], 'plugin');
+    expect(defined['team_id'], '');
+    final Map<String, dynamic> set = await service.handle(
+      'settings.set',
+      <String, dynamic>{
+        'binding': 'plugin',
+        'values': <String, dynamic>{'stage_budget': 5000},
+      },
+      meta,
+      <String, dynamic>{},
+    );
+    expect(set['generation'], 1);
+    final Map<String, dynamic> get = await service.handle(
+      'settings.get',
+      <String, dynamic>{'binding': 'plugin', 'key': 'stage_budget'},
+      meta,
+      <String, dynamic>{},
+    );
+    expect(get['value'], 5000);
+    expect(
+      File(
+        '${temp.path}${Platform.pathSeparator}plugin_settings'
+        '${Platform.pathSeparator}settings.semdb',
+      ).existsSync(),
+      isTrue,
+    );
+    expect(changes.single.binding, 'plugin');
+    expect(changes.single.toPayload()['binding'], 'plugin');
+  });
+
+  test('plugin 与 team 绑定的同名 key 互不覆盖', () async {
+    final Map<String, dynamic> meta = <String, dynamic>{
+      'source_plugin_id': 'tree.docnorm',
+      'data_dir': temp.path,
+    };
+    await service.handle(
+      'settings.define',
+      <String, dynamic>{'binding': 'plugin', 'schema': schema()},
+      meta,
+      <String, dynamic>{},
+    );
+    await service.handle(
+      'settings.set',
+      <String, dynamic>{
+        'values': <String, dynamic>{'stage_budget': 3000},
+      },
+      meta,
+      <String, dynamic>{'team_id': 'team_a'},
+    );
+    final Map<String, dynamic> global = await service.handle(
+      'settings.get',
+      <String, dynamic>{'binding': 'plugin', 'key': 'stage_budget'},
+      meta,
+      <String, dynamic>{},
+    );
+    expect(
+      global['value'],
+      1000,
+      reason: '全局库没有覆盖值，应回 schema 默认而不是团队覆盖值',
+    );
+    final Map<String, dynamic> team = await service.handle(
+      'settings.get',
+      <String, dynamic>{'key': 'stage_budget'},
+      meta,
+      <String, dynamic>{'team_id': 'team_a'},
+    );
+    expect(team['value'], 3000);
+  });
+
+  test('REST：binding=plugin 不需要 team_id', () async {
+    final Map<String, dynamic> meta = <String, dynamic>{
+      'source_plugin_id': 'tree.docnorm',
+      'data_dir': temp.path,
+    };
+    await service.handle(
+      'settings.define',
+      <String, dynamic>{'binding': 'plugin', 'schema': schema()},
+      meta,
+      <String, dynamic>{},
+    );
+    final Map<String, dynamic> reply = await service.handleDelegate(
+      <String, dynamic>{
+        'method': 'GET',
+        'path': '/api/plugin-settings/values',
+        'query': <String, dynamic>{
+          'binding': 'plugin',
+          'plugin_id': 'tree.docnorm',
+        },
+        'scope': <String, dynamic>{},
+        'data_dir': temp.path,
+      },
+    );
+    expect(reply['status'], 200);
+    final Map<String, dynamic> body = bodyOf(reply);
+    expect(body['binding'], 'plugin');
+    expect(body['team_id'], '');
+    expect(body['plugin_id'], 'tree.docnorm');
+  });
+
+  test('binding 非法 ⇒ 400 invalid_arguments', () async {
+    await expectLater(
+      service.handle(
+        'settings.get',
+        <String, dynamic>{'binding': 'global', 'key': 'stage_budget'},
+        <String, dynamic>{
+          'source_plugin_id': 'tree.docnorm',
+          'data_dir': temp.path,
+        },
+        <String, dynamic>{},
+      ),
+      throwsA(
+        isA<SettingsFailure>().having(
+          (SettingsFailure error) => error.code,
+          'code',
+          'invalid_arguments',
+        ),
+      ),
+    );
+  });
 }

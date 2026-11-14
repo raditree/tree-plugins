@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_settings/tree_settings.dart';
 
@@ -44,14 +45,14 @@ void main() {
 
   test('schema 同版本幂等、同版本不同内容拒绝、降级拒绝', () async {
     final Map<String, dynamic> first = await engine.define(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
       schema: schema(),
     );
     expect(first['schema_version'], 1);
 
     final Map<String, dynamic> again = await engine.define(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
       schema: schema(),
     );
@@ -59,7 +60,7 @@ void main() {
 
     await expectLater(
       engine.define(
-        teamId: 'team_a',
+        scope: SettingsScope.team('team_a'),
         owner: 'tree.docnorm',
         schema: <String, dynamic>{
           ...schema(),
@@ -81,7 +82,7 @@ void main() {
       ),
     );
     final Map<String, dynamic> upgraded = await engine.define(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
       schema: schema(version: 2),
     );
@@ -90,12 +91,12 @@ void main() {
 
   test('默认值取 min，secret 永不回显，reset 回默认', () async {
     await engine.define(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
       schema: schema(),
     );
     Map<String, dynamic> listed = await engine.list(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
     );
     final Map<String, dynamic> values = Map<String, dynamic>.from(
@@ -107,12 +108,12 @@ void main() {
     expect((values['api_token'] as Map)['has_value'], false);
 
     await engine.set(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
       values: <String, dynamic>{'stage_budget': 500000, 'api_token': 'sk-x'},
     );
     final Map<String, dynamic> secret = await engine.get(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
       key: 'api_token',
     );
@@ -120,11 +121,11 @@ void main() {
     expect(secret['has_value'], true);
 
     await engine.reset(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
       keys: <String>['api_token', 'stage_budget'],
     );
-    listed = await engine.list(teamId: 'team_a', owner: 'tree.docnorm');
+    listed = await engine.list(scope: SettingsScope.team('team_a'), owner: 'tree.docnorm');
     final Map<String, dynamic> resetValues = Map<String, dynamic>.from(
       listed['values'] as Map,
     );
@@ -134,13 +135,13 @@ void main() {
 
   test('类型/范围/未知 key 拒绝，且不落库', () async {
     await engine.define(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
       schema: schema(),
     );
     await expectLater(
       engine.set(
-        teamId: 'team_a',
+        scope: SettingsScope.team('team_a'),
         owner: 'tree.docnorm',
         values: <String, dynamic>{'stage_budget': '500000'},
       ),
@@ -154,7 +155,7 @@ void main() {
     );
     await expectLater(
       engine.set(
-        teamId: 'team_a',
+        scope: SettingsScope.team('team_a'),
         owner: 'tree.docnorm',
         values: <String, dynamic>{'stage_budget': 99999999},
       ),
@@ -168,7 +169,7 @@ void main() {
     );
     await expectLater(
       engine.set(
-        teamId: 'team_a',
+        scope: SettingsScope.team('team_a'),
         owner: 'tree.docnorm',
         values: <String, dynamic>{'nope': 1},
       ),
@@ -181,7 +182,7 @@ void main() {
       ),
     );
     final Map<String, dynamic> current = await engine.get(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
       key: 'stage_budget',
     );
@@ -190,12 +191,12 @@ void main() {
 
   test('跨团队隔离：另一个 team 没有 schema', () async {
     await engine.define(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
       schema: schema(),
     );
     await expectLater(
-      engine.list(teamId: 'team_b', owner: 'tree.docnorm'),
+      engine.list(scope: SettingsScope.team('team_b'), owner: 'tree.docnorm'),
       throwsA(
         isA<SettingsFailure>().having(
           (SettingsFailure error) => error.code,
@@ -209,7 +210,7 @@ void main() {
   test('未知字段类型直接拒绝，不猜默认控件', () async {
     await expectLater(
       engine.define(
-        teamId: 'team_a',
+        scope: SettingsScope.team('team_a'),
         owner: 'tree.docnorm',
         schema: <String, dynamic>{
           'schema_version': 1,
@@ -230,7 +231,7 @@ void main() {
 
   test('并发写不丢更新：generation 单调递增到最后一次', () async {
     await engine.define(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
       schema: schema(),
     );
@@ -238,7 +239,7 @@ void main() {
         <Future<Map<String, dynamic>>>[
           for (int i = 0; i < 20; i++)
             engine.set(
-              teamId: 'team_a',
+              scope: SettingsScope.team('team_a'),
               owner: 'tree.docnorm',
               values: <String, dynamic>{'stage_budget': 1000 + i},
             ),
@@ -251,7 +252,7 @@ void main() {
           ..sort();
     expect(generations, List<int>.generate(20, (int index) => index + 1));
     final Map<String, dynamic> current = await engine.get(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
       key: 'stage_budget',
     );
@@ -261,7 +262,7 @@ void main() {
   test('secret default 必须为空；schema 回包也不带默认密钥', () async {
     await expectLater(
       engine.define(
-        teamId: 'team_a',
+        scope: SettingsScope.team('team_a'),
         owner: 'tree.docnorm',
         schema: <String, dynamic>{
           'schema_version': 1,
@@ -285,12 +286,12 @@ void main() {
     );
 
     await engine.define(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
       schema: schema(),
     );
     final Map<String, dynamic> listed = await engine.list(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
     );
     final Map<String, dynamic> secretField = (listed['fields'] as List<dynamic>)
@@ -303,17 +304,17 @@ void main() {
 
   test('export 脱敏：schema 在、secret 原值不在', () async {
     await engine.define(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
       schema: schema(),
     );
     await engine.set(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
       values: <String, dynamic>{'api_token': 'sk-secret'},
     );
     final Map<String, dynamic> exported = await engine.export(
-      teamId: 'team_a',
+      scope: SettingsScope.team('team_a'),
       owner: 'tree.docnorm',
     );
     expect(exported['schema_version'], 1);
@@ -323,5 +324,41 @@ void main() {
     expect((values['api_token'] as Map)['value'], isNull);
     expect((values['api_token'] as Map)['has_value'], true);
     expect(exported.toString().contains('sk-secret'), false);
+  });
+
+  test('plugin 绑定：全局库路径与同名 key 隔离', () async {
+    const SettingsScope global = SettingsScope.plugin();
+    expect(
+      engine.databasePath(global),
+      p.join(temp.path, 'plugin_settings', 'settings.semdb'),
+    );
+    await engine.define(scope: global, owner: 'tree.docnorm', schema: schema());
+    await engine.set(
+      scope: global,
+      owner: 'tree.docnorm',
+      values: <String, dynamic>{'stage_budget': 8000},
+    );
+    expect(
+      (await engine.get(
+        scope: global,
+        owner: 'tree.docnorm',
+        key: 'stage_budget',
+      ))['value'],
+      8000,
+    );
+    await engine.define(
+      scope: SettingsScope.team('team_a'),
+      owner: 'tree.docnorm',
+      schema: schema(),
+    );
+    expect(
+      (await engine.get(
+        scope: SettingsScope.team('team_a'),
+        owner: 'tree.docnorm',
+        key: 'stage_budget',
+      ))['value'],
+      1000,
+      reason: '团队库没有覆盖值，应回 schema 默认而不是全局值',
+    );
   });
 }
