@@ -83,6 +83,64 @@ void main() {
     expect((events.last as LlmFinishEvent).reason, 'stop');
   });
 
+  test('非 OpenCode 端点不发送会话亲和头（其他 provider 完全不受影响）', () async {
+    final List<LlmStreamEvent> events = await transport()
+        .stream(
+          const LlmRequest(
+            model: 'header-echo',
+            messages: <LlmMessage>[LlmMessage.user('hi')],
+            sessionId: 'ses_20261114',
+          ),
+        )
+        .toList();
+    expect(
+      events.whereType<LlmTextDelta>().single.text,
+      'missing',
+      reason: '会话标识只发给规则表命中的 host，避免第三方端点收到未知头',
+    );
+  });
+
+  test('OpenCode 端点按规则发送会话亲和头（host 通配命中）', () async {
+    // 域名写 opencode.ai（命中规则），连接用 connectionFactory 落到本地假端点：
+    // 这样能真实验证"规则命中的 host 才发送请求头"。
+    final HttpClient routed = HttpClient()
+      ..connectionFactory =
+          (Uri uri, String? proxyHost, int? proxyPort) =>
+              Socket.startConnect(InternetAddress.loopbackIPv4, port);
+    final HttpSseTransport t = HttpSseTransport(
+      baseUrl: 'http://api.opencode.ai/v1',
+      apiKey: 'sk-test',
+      client: routed,
+      retryBackoff: const <Duration>[],
+    );
+    addTearDown(t.close);
+    final List<LlmStreamEvent> events = await t
+        .stream(
+          const LlmRequest(
+            model: 'header-echo',
+            messages: <LlmMessage>[LlmMessage.user('hi')],
+            sessionId: 'ses_opencode',
+          ),
+        )
+        .toList();
+    expect(events.whereType<LlmTextDelta>().single.text, 'ses_opencode');
+  });
+
+  test('端点会话亲和规则：host 通配命中才返回头名', () {
+    expect(sessionHeadersForEndpoint('https://opencode.ai/zen/go/v1'), <String>[
+      kLlmSessionHeader,
+    ]);
+    expect(sessionHeadersForEndpoint('https://api.opencode.ai/v1'), <String>[
+      kLlmSessionHeader,
+    ]);
+    expect(sessionHeadersForEndpoint('https://api.deepseek.com/v1'), isEmpty);
+    expect(sessionHeadersForEndpoint('http://127.0.0.1:8000/v1'), isEmpty);
+    expect(sessionHeadersForEndpoint('not a url'), isEmpty);
+    expect(matchEndpointHost('*.opencode.ai', 'api.opencode.ai'), isTrue);
+    expect(matchEndpointHost('*.opencode.ai', 'opencode.ai'), isFalse);
+    expect(matchEndpointHost('*opencode*', 'x.opencode.ai'), isTrue);
+  });
+
   test('HTTP 非 200：错误文案带状态码与端点响应体', () async {
     final List<LlmStreamEvent> events = await transport()
         .stream(
@@ -381,6 +439,22 @@ Future<void> _handle(HttpRequest request) async {
   final String model = payload['model'] as String? ?? '';
 
   switch (model) {
+    case 'header-echo':
+      // 把收到的会话标识回灌（没有则回 missing），供用例断言请求头是否发出
+      final String session = request.headers.value('x-opencode-session') ?? '';
+      final String echoed = session.isEmpty ? 'missing' : session;
+      request.response.statusCode = 200;
+      request.response.headers.contentType = ContentType(
+        'text',
+        'event-stream',
+        charset: 'utf-8',
+      );
+      request.response.write(
+        'data: {"choices":[{"delta":{"content":"$echoed"}}]}\n\n',
+      );
+      request.response.write('data: [DONE]\n\n');
+      await request.response.close();
+      return;
     case 'unauthorized':
       request.response.statusCode = 401;
       request.response.headers.contentType = ContentType.json;

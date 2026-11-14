@@ -437,6 +437,11 @@ class LlmSession {
           if (relayed.$1 != null) request = relayed.$1!;
         }
       }
+      // 会话标识必须在**所有改写点之后**再挂：中转站 / 插件回包会重建
+      // [LlmRequest]，而它不参与线协议往返（见 [LlmRequest.sessionId]）。
+      // 值用 sessionId（每个会话稳定）——OpenCode Go 据此做路由与前缀缓存；
+      // 具体写成哪个请求头由传输层的端点规则表决定。
+      request = request.withSessionId(sessionId);
       final SplayTreeMap<int, _ToolCallDraft> drafts =
           SplayTreeMap<int, _ToolCallDraft>();
       final StringBuffer text = StringBuffer();

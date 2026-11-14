@@ -19,6 +19,71 @@ import 'dart:convert';
 
 import '../util/tokens.dart';
 
+/// OpenCode 网关的会话标识请求头（Go / Zen 的路由键）。
+///
+/// 缺了它会直接 400：`{"type":"error","error":{"type":"MissingSessionID",
+/// "message":"Request is missing x-opencode-session and cannot be routed
+/// efficiently."}}`（2026-11-14 真机现场：provider `go` →
+/// `https://opencode.ai/zen/go/v1`）。
+///
+/// 它属于**传输层头部**，不进 [LlmRequest.toWire] 的请求体；每个会话用稳定值
+/// （`LlmRequest.sessionId`）才可能命中网关的前缀缓存。
+const String kLlmSessionHeader = 'x-opencode-session';
+
+/// host 通配匹配（`*` 匹配任意字符，大小写不敏感）。
+///
+/// 端点规则用通配而不是精确域名：`opencode.ai` 与 `*.opencode.ai` 两类都写进
+/// [kEndpointSessionHeaderRules]，以后接入别的网关只加一行规则，不动传输层。
+bool matchEndpointHost(String pattern, String host) {
+  final String p = pattern.trim().toLowerCase();
+  final String h = host.trim().toLowerCase();
+  if (p.isEmpty || h.isEmpty) return false;
+  final String regex = p.split('*').map(RegExp.escape).join('.*');
+  return RegExp('^$regex\$').hasMatch(h);
+}
+
+/// 一条**端点级会话亲和头**规则：host 命中 [hostPattern] ⇒ 请求带 [header]。
+class EndpointSessionHeaderRule {
+  const EndpointSessionHeaderRule({
+    required this.hostPattern,
+    required this.header,
+  });
+
+  /// host 通配模式（支持 `*`；不含端口，见 [Uri.host]）。
+  final String hostPattern;
+
+  /// 要发送的请求头名（值 = [LlmRequest.sessionId]）。
+  final String header;
+
+  bool matchesHost(String host) => matchEndpointHost(hostPattern, host);
+}
+
+/// 已知的会话亲和头规则表（**新增 provider 只加一行**）。
+///
+/// 目前只有 OpenCode 的 Go / Zen 网关要求；OpenAI / DeepSeek / vLLM / Ollama
+/// 等不会有任何额外请求头。
+const List<EndpointSessionHeaderRule> kEndpointSessionHeaderRules =
+    <EndpointSessionHeaderRule>[
+      EndpointSessionHeaderRule(
+        hostPattern: 'opencode.ai',
+        header: kLlmSessionHeader,
+      ),
+      EndpointSessionHeaderRule(
+        hostPattern: '*.opencode.ai',
+        header: kLlmSessionHeader,
+      ),
+    ];
+
+/// 这个端点要带的会话亲和头（host 通配匹配；可返回多个）。
+List<String> sessionHeadersForEndpoint(String baseUrl) {
+  final String host = (Uri.tryParse(baseUrl.trim())?.host ?? '').toLowerCase();
+  if (host.isEmpty) return const <String>[];
+  return <String>{
+    for (final EndpointSessionHeaderRule rule in kEndpointSessionHeaderRules)
+      if (rule.matchesHost(host)) rule.header,
+  }.toList();
+}
+
 /// 对话消息角色。
 enum LlmRole {
   system,
@@ -576,6 +641,7 @@ class LlmRequest {
     this.reasoningEffort,
     this.temperature,
     this.extra = const <String, dynamic>{},
+    this.sessionId = '',
   });
 
   final String model;
@@ -587,6 +653,25 @@ class LlmRequest {
 
   /// 透传端点自定义字段（如厂商专用开关）。
   final Map<String, dynamic> extra;
+
+  /// **会话亲和标识**（不是请求体）：端点规则命中时由传输层写成对应请求头
+  /// （见 [kEndpointSessionHeaderRules]）。
+  ///
+  /// 不进 [toWire]、也不参与 [tryFromWire]——中转站改写的是请求体，标识由
+  /// 会话在**所有改写点之后**重新挂上（见 `LlmSession.run`）。
+  final String sessionId;
+
+  /// 复制一份请求并换一个会话亲和标识。
+  LlmRequest withSessionId(String sessionId) => LlmRequest(
+    model: model,
+    messages: messages,
+    tools: tools,
+    maxOutputTokens: maxOutputTokens,
+    reasoningEffort: reasoningEffort,
+    temperature: temperature,
+    extra: extra,
+    sessionId: sessionId,
+  );
 
   /// 估算输入 token（用于上下文裁剪与 usage 兜底）。
   ///

@@ -221,6 +221,14 @@ class HttpSseTransport implements LlmTransport {
     final HttpClientRequest httpRequest;
     try {
       httpRequest = await _client.postUrl(uri).timeout(connectTimeout);
+      // 端点级会话亲和头（如 OpenCode Go 的 x-opencode-session）：只按规则表
+      // 给命中的 host 发送；其他 provider 的请求头与改动前逐字一致。
+      final String sessionId = request.sessionId.trim();
+      if (sessionId.isNotEmpty) {
+        for (final String name in sessionHeadersForEndpoint(baseUrl)) {
+          httpRequest.headers.set(name, sessionId);
+        }
+      }
       httpRequest.headers.set(
         HttpHeaders.authorizationHeader,
         'Bearer $apiKey',

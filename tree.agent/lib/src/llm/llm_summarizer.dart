@@ -72,6 +72,7 @@ class LlmSummarizer implements ContextSummarizer {
       prompt,
       _summaryOutputTokens(config),
       onNotice,
+      agentId: agent.id,
     );
     // 一次总结 = 一次 LLM 调用：**成败都记账**（请求确实发出去了）。放在这里而不是
     // 返回处，是因为下面几条分支都会 return/throw，而账要在所有分支上都落。
@@ -105,8 +106,9 @@ class LlmSummarizer implements ContextSummarizer {
     CoreModelConfig config,
     String prompt,
     int? budget,
-    void Function(String notice)? onNotice,
-  ) async {
+    void Function(String notice)? onNotice, {
+    required String agentId,
+  }) async {
     final StringBuffer text = StringBuffer();
     int thinkingChars = 0;
     String finishReason = '';
@@ -127,6 +129,9 @@ class LlmSummarizer implements ContextSummarizer {
         reasoningEffort: config.reasoningEffort.trim().isEmpty
             ? null
             : config.reasoningEffort.trim(),
+        // 总结是辅助请求，也必须带会话标识：压缩与对话打同一个端点，
+        // 缺了它 OpenCode Go 一类网关会直接 400（MissingSessionID）。
+        sessionId: agentId,
       ),
     )) {
       if (event is LlmTextDelta) {

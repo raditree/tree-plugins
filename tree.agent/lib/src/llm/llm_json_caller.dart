@@ -192,6 +192,9 @@ class LlmJsonCaller {
           : const <String, dynamic>{
               'response_format': <String, dynamic>{'type': 'json_object'},
             },
+      // 辅助调用与对话打同一个端点：带稳定会话标识（agent 级），
+      // 否则 OpenCode Go 一类网关会 400（MissingSessionID）。
+      sessionId: agentId,
     );
     final StringBuffer text = StringBuffer();
     LlmUsage usage = const LlmUsage();

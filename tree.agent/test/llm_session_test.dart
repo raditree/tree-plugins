@@ -50,6 +50,21 @@ void main() {
       expect(transport.turnsUsed, 1);
     });
 
+    test('每个请求都带会话亲和标识（值 = sessionId，由端点规则决定请求头）', () async {
+      final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
+        textScript('好'),
+      ]);
+      await collect(
+        session(transport).run(
+          messages: <LlmMessage>[const LlmMessage.user('hi')],
+          agentId: 'a',
+          sessionId: 'ses_abc',
+          isCancelled: () => false,
+        ),
+      );
+      expect(transport.requests.single.sessionId, 'ses_abc');
+    });
+
     test('usage 映射符合前端口径（prompt=上下文长度，completion=累计）', () async {
       final FakeTransport transport = FakeTransport(<List<LlmStreamEvent>>[
         textScript('abc'),
