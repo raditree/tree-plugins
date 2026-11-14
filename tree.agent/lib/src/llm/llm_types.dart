@@ -875,7 +875,9 @@ final class LlmFailureEvent extends LlmStreamEvent {
   /// 是否因**心跳丢失（链路失活）**而失败。
   ///
   /// 与普通端点错误区分开：这一类的正确反应是**重连 / 提示用户链路已断**，而不是
-  /// 让用户去改模型配置。判据见 HttpSseTransport（连续 N 次心跳未达，与总耗时无关）。
+  /// 让用户去改模型配置。判据见 HttpSseTransport：工具表为空的请求按"连续 N 次
+  /// 心跳未达"判死；**声明了工具的请求不按字节静默判死**（工具调用参数 / 长
+  /// prefill 期间零字节是正常的，只认 I/O 错误与显式取消）。
   final bool livenessLost;
 
   /// 是否【值得重试】（默认 true；口径见 HttpSseTransport 的「重试口径」一节）。

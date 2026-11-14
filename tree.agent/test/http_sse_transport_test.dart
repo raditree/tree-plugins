@@ -63,6 +63,14 @@ void main() {
     messages: <LlmMessage>[LlmMessage.user('hi')],
   );
 
+  /// 声明了工具的请求（对话主循环的形状）：工具调用参数 / 长 prefill 期间端点
+  /// 可能长时间零字节，这类请求**不按字节静默判死**（见 llm_transport 超时口径）。
+  LlmRequest toolRequest(String model) => LlmRequest(
+    model: model,
+    messages: const <LlmMessage>[LlmMessage.user('hi')],
+    tools: const <LlmToolSpec>[LlmToolSpec(name: 'write', description: '写文件')],
+  );
+
   test('正常流：正文/思考/工具/usage/[DONE] 全部解析；行被切在中间也能还原', () async {
     final List<LlmStreamEvent> events = await transport()
         .stream(
@@ -184,7 +192,7 @@ void main() {
     await dead.close();
   });
 
-  test('空闲超时：端点长时间不返回数据 → 失败事件', () async {
+  test('空闲超时（工具表为空）：端点长时间不返回数据 → 失败事件', () async {
     final List<LlmStreamEvent> events =
         await transport(idleTimeout: const Duration(milliseconds: 300))
             .stream(
@@ -195,6 +203,38 @@ void main() {
             )
             .toList();
     expect((events.last as LlmFailureEvent).message, contains('没有返回任何数据'));
+  });
+
+  test('带工具的请求：首字节前静默超过窗口也不判死（长 prefill / 攒工具调用）', () async {
+    final List<LlmStreamEvent> events =
+        await transport(idleTimeout: const Duration(milliseconds: 100))
+            .stream(toolRequest('slow-start-tool'))
+            .toList();
+    expect(
+      events.whereType<LlmFailureEvent>(),
+      isEmpty,
+      reason: '端点先发响应头、再沉默一段是正常行为，不能判链路失活',
+    );
+    expect(
+      events
+          .whereType<LlmTextDelta>()
+          .map((LlmTextDelta e) => e.text)
+          .join(),
+      '沉默之后才动',
+    );
+  });
+
+  test('带工具的请求：流中途静默超过窗口也不判死（工具调用参数不经流式）', () async {
+    final List<LlmStreamEvent> events =
+        await transport(idleTimeout: const Duration(milliseconds: 100))
+            .stream(toolRequest('stall-tool'))
+            .toList();
+    expect(
+      events.whereType<LlmFailureEvent>(),
+      isEmpty,
+      reason: '工具调用参数被端点攒完才发时，中途零字节不是链路死亡',
+    );
+    expect(events.whereType<LlmTextDelta>().single.text, '开始写');
   });
 
   test('取消：返回值带 cancelled 标记，且流很快结束', () async {
@@ -487,6 +527,42 @@ Future<void> _handle(HttpRequest request) async {
         'column 1751: syntax error while parsing value - invalid string: '
         'missing closing quote; last read: \\"### 3.2 热重启的两个层次\\\\n\\""}}',
       );
+      await request.response.close();
+      return;
+    case 'slow-start-tool':
+      // 长 prefill / 端点攒工具调用：先发响应头，再沉默 > 判活窗口，之后才吐内容
+      request.response.statusCode = 200;
+      request.response.headers.contentType = ContentType(
+        'text',
+        'event-stream',
+        charset: 'utf-8',
+      );
+      await request.response.flush();
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      request.response.write(
+        'data: {"choices":[{"delta":{"content":"沉默之后才动"}}]}\n\n',
+      );
+      request.response.write('data: [DONE]\n\n');
+      await request.response.close();
+      return;
+    case 'stall-tool':
+      // 工具调用参数在端点侧被攒着：先给一段，再沉默 > 判活窗口，然后收尾
+      request.response.statusCode = 200;
+      request.response.headers.contentType = ContentType(
+        'text',
+        'event-stream',
+        charset: 'utf-8',
+      );
+      request.response.write(
+        'data: {"choices":[{"delta":{"content":"开始写"}}]}\n\n',
+      );
+      await request.response.flush();
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      request.response.write(
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",'
+        '"function":{"name":"write","arguments":"{}"}}]}}]}\n\n',
+      );
+      request.response.write('data: [DONE]\n\n');
       await request.response.close();
       return;
     case 'stall':

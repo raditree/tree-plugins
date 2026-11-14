@@ -42,11 +42,17 @@ abstract interface class LlmTransport {
 /// **超时口径（M9 规约 1.1，修正版：不看静态时间，只看心跳活性）**：
 /// - **没有任何总时长上限**：本地执行不存在"多用户占着连接不放导致资源耗尽"的
 ///   后果，所以推理模型想跑多久都行，绝不会因为"总耗时到了"被丢掉；
-/// - 判死的唯一依据是**心跳丢失（链路失活）**：流式读取期间**收到任意字节即算
-///   一次心跳**；连续 [missedHeartbeatLimit] 次 [heartbeatInterval] 一个字节都
-///   没收到，才判定链路已死，并以**显式错误**结束本次请求（既不静默挂死，也不
-///   静默丢弃）。错误事件 [LlmFailureEvent.livenessLost] 为真，上层据此重连或
-///   提示用户；
+/// - 声明了工具的请求（对话主循环）**不按字节静默判死**：端点可能在工具调用
+///   参数 / 长 prefill 期间长时间零字节（llama.cpp 一类会把整段工具调用攒完再
+///   发，"工具调用内容不经流式"），此时"没字节"不是链路死亡的证据。串流照常
+///   计心跳（[missedHeartbeats] / [lastHeartbeatAt] 可观测），结束只有 I/O
+///   错误（EOF / RST）与显式取消两条；真正挂住的请求由会话层"零事件 300s 登记
+///   成可关闭运行"兜底（见 LlmSession 的 [defaultRequestSilenceTimeout]）；
+/// - 工具表为空的请求（压缩总结 / llm.call 这类短调用）仍按**心跳丢失**判死：
+///   流式读取期间**收到任意字节即算一次心跳**；连续 [missedHeartbeatLimit] 次
+///   [heartbeatInterval] 一个字节都没收到，才判定链路已死，并以**显式错误**
+///   结束本次请求（既不静默挂死，也不静默丢弃）。错误事件
+///   [LlmFailureEvent.livenessLost] 为真，上层据此重连或提示用户；
 /// - 唯一保留的短超时是 [connectTimeout]（建连 + 等响应头）：它只服务**可诊断**
 ///   ——"端点根本没起"要立刻说得清，而不是让界面一直转圈；它不限制推理时长。
 ///
@@ -122,7 +128,8 @@ class HttpSseTransport implements LlmTransport {
 
   /// 判失活的静默窗口 = [heartbeatInterval] × [missedHeartbeatLimit]。
   ///
-  /// 它**不是总时长上限**：只要还有字节进来，窗口就一直往后滚。
+  /// 只对**工具表为空**的请求生效（见类注释的超时口径）：它**不是总时长上限**，
+  /// 只要还有字节进来，窗口就一直往后滚。
   Duration get livenessWindow =>
       _idleOverride ??
       heartbeatInterval * (missedHeartbeatLimit < 1 ? 1 : missedHeartbeatLimit);
@@ -288,16 +295,22 @@ class HttpSseTransport implements LlmTransport {
         beats.beat();
         return chunk;
       });
-      // 静默窗口内一个事件都没有 ⇒ 判心跳丢失。Stream.timeout 每收到一个事件就
-      // 重新计时，所以它与"连续 N 次心跳未达"是同一件事；区别只在于计数交给
-      // [beats] 暴露给上层观测（[missedHeartbeats] / [lastHeartbeatAt]）。
-      decoded = decoded.timeout(
-        livenessWindow,
-        onTimeout: (EventSink<String> sink) {
-          sink.addError(TimeoutException(_heartbeatLostMessage()));
-          sink.close();
-        },
-      );
+      // 声明了工具的请求**不按静默判死**：端点在工具调用参数 / 长 prefill 期间
+      // 可能长时间零字节（llama.cpp 一类把整段工具调用攒完才发），没字节不能当成
+      // 链路死亡。串流仍照常计心跳（观测用），结束只认 I/O 错误与显式取消；
+      // 真挂住的请求由会话层"零事件 300s 登记成可关闭运行"兜底。
+      if (request.tools.isEmpty) {
+        // 静默窗口内一个事件都没有 ⇒ 判心跳丢失。Stream.timeout 每收到一个事件就
+        // 重新计时，所以它与"连续 N 次心跳未达"是同一件事；区别只在于计数交给
+        // [beats] 暴露给上层观测（[missedHeartbeats] / [lastHeartbeatAt]）。
+        decoded = decoded.timeout(
+          livenessWindow,
+          onTimeout: (EventSink<String> sink) {
+            sink.addError(TimeoutException(_heartbeatLostMessage()));
+            sink.close();
+          },
+        );
+      }
       await for (final String line in decoded.transform(const LineSplitter())) {
         final String? payload = parser.accept(line);
         if (payload == null) continue;
@@ -393,7 +406,7 @@ class HttpSseTransport implements LlmTransport {
       '端点解析不了半截 JSON——这是确定性失败，重试同一请求还会断在同一个地方。'
       '请调大该模型的 max_output_tokens，或让模型分多次小块写入。';
 
-  /// 心跳丢失的错误文案。
+  /// 心跳丢失的错误文案（只服务**工具表为空**的请求，见类注释的超时口径）。
   ///
   /// 必须同时点明「心跳丢失/链路失活」与"没有任何数据"：前者让日志与 UI 能一眼
   /// 区分"链路死了"和"端点在思考"，后者是历史口径（老前端/测试按这句话判断空闲）。
