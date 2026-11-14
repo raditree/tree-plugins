@@ -122,6 +122,38 @@ class _FakeCore {
           },
         ],
       };
+    } else if (path.startsWith('/api/agents/') &&
+        path.endsWith('/models-info') &&
+        method == 'GET') {
+      // 配置页的「其他（插件提供）」目录：只认 plugin__ 开头的收集站工具。
+      payload = <String, dynamic>{
+        'agent': <String, dynamic>{
+          'id': 'agt_1',
+          'model_id': 'lfm3',
+          'system_prompt': '',
+        },
+        'models': <Object?>[],
+        'overrides': <String, dynamic>{},
+        'tool_policy': null,
+        'tool_catalog': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'name': 'read',
+            'description': '读取文件',
+            'group': 'read',
+            'enabled': true,
+          },
+          <String, dynamic>{
+            'name': 'plugin__demo__hello_tool',
+            'description': '贡献工具',
+            'group': 'plugin',
+            'enabled': true,
+          },
+        ],
+        'tool_groups': <Map<String, dynamic>>[
+          <String, dynamic>{'key': 'read', 'label': '读'},
+          <String, dynamic>{'key': 'plugin', 'label': '插件 / MCP'},
+        ],
+      };
     } else if (path.endsWith('/orchestrator') && method == 'GET') {
       payload = <String, dynamic>{
         'line_id': 'pl_1',
@@ -975,6 +1007,56 @@ void main() {
     expect(
       core.bodyOf('PATCH', '/api/production/lines/pl_1/tasks/T1')['to'],
       'queued',
+    );
+  });
+
+  testWidgets('配置页：执行 / 专家可勾选收集站贡献的「其他」工具，打包 / 主控不出现', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(harness());
+    await flyIO(tester);
+    await tester.tap(find.byKey(const Key('production-line-create')));
+    await flyIO(tester, rounds: 14);
+
+    const Key executorChip = Key(
+      'production-line-tool-executor-plugin__demo__hello_tool',
+    );
+    const Key expertChip = Key(
+      'production-line-tool-expert-plugin__demo__hello_tool',
+    );
+    expect(find.byKey(executorChip), findsOneWidget);
+    expect(find.byKey(expertChip), findsOneWidget);
+    expect(
+      find.byKey(
+        const Key('production-line-tool-packer-plugin__demo__hello_tool'),
+      ),
+      findsNothing,
+      reason: '打包角色不开放插件工具',
+    );
+    expect(
+      find.byKey(
+        const Key('production-line-tool-orchestrator-plugin__demo__hello_tool'),
+      ),
+      findsNothing,
+      reason: '主控角色不开放插件工具',
+    );
+    expect(find.text('其他（插件提供）'), findsNWidgets(2));
+
+    await tester.enterText(
+      find.byKey(const Key('production-line-name')),
+      '插件工具产线',
+    );
+    tester.widget<FilterChip>(find.byKey(executorChip)).onSelected!(true);
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('production-line-submit')));
+    await flyIO(tester, rounds: 10);
+
+    final Map<String, dynamic> roles =
+        core.bodyOf('POST', '/api/production/lines')['roles']
+            as Map<String, dynamic>;
+    expect(
+      (roles['executor'] as Map<String, dynamic>)['tools'],
+      contains('plugin__demo__hello_tool'),
     );
   });
 }

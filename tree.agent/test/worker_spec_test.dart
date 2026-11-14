@@ -168,4 +168,55 @@ void main() {
     });
     expect(reuse.reuse, 'sub_1');
   });
+
+  test('贡献工具按原生名判硬边界：plugin__<插件>__team / write / ask_expert 同样拦', () {
+    for (final String tool in <String>[
+      'plugin__extra-tools__team',
+      'plugin__extra-tools__subagent',
+    ]) {
+      expect(
+        () => parseWorkerArguments(<String, Object?>{
+          'role': 'executor',
+          'task': '改文件',
+          'tools': <String>['read', 'write', tool],
+        }),
+        throwsA(
+          isA<WorkerSpecError>().having(
+            (WorkerSpecError e) => e.code,
+            'code',
+            'worker_tools_invalid',
+          ),
+        ),
+        reason: '$tool 不能绕过员工硬边界',
+      );
+    }
+    expect(
+      () => parseWorkerArguments(<String, Object?>{
+        'role': 'packer',
+        'task': '打片段',
+        'tools': <String>['read', 'plugin__demo__write'],
+      }),
+      throwsA(
+        isA<WorkerSpecError>().having(
+          (WorkerSpecError e) => e.message,
+          'message',
+          contains('不许写文件'),
+        ),
+      ),
+    );
+    expect(
+      () => parseWorkerArguments(<String, Object?>{
+        'role': 'expert',
+        'task': '查 API',
+        'tools': <String>['read', 'plugin__tree.production.line__ask_expert'],
+      }),
+      throwsA(
+        isA<WorkerSpecError>().having(
+          (WorkerSpecError e) => e.message,
+          'message',
+          contains('专家不能再召专家'),
+        ),
+      ),
+    );
+  });
 }

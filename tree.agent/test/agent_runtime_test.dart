@@ -8,6 +8,7 @@ import 'package:tree_agent_loop/src/runtime/agent_runtime.dart';
 import 'package:tree_agent_loop/src/store/file_store.dart';
 import 'package:tree_agent_loop/src/store/records.dart';
 import 'package:tree_agent_loop/src/store/tree_paths.dart';
+import 'package:tree_agent_loop/src/tool/tool_policy.dart';
 import 'package:tree_agent_loop/src/workspace/workspace_io.dart';
 
 void main() {
@@ -28,10 +29,60 @@ void main() {
 
   tearDown(() async {
     AgentRuntime.stationClient = null;
+    AgentRuntime.stationTrigger = null;
     await AgentRuntime.debugCloseAll();
     try {
       if (temp.existsSync()) temp.deleteSync(recursive: true);
     } catch (_) {}
+  });
+
+  test('工具贡献收集：信封带 team_id，插件工具进入目录（核心缺 team 会 skipped_scope）', () async {
+    final AgentRuntime runtime = AgentRuntime(
+      paths: paths,
+      engine: ScriptedAgent(chunkDelay: Duration.zero),
+    );
+    Map<String, dynamic>? seenScope;
+    AgentRuntime.stationTrigger =
+        (
+          String stationId,
+          Object? payload,
+          Map<String, dynamic> meta,
+          Map<String, dynamic> scope, {
+          String? topic,
+        }) async {
+          seenScope = scope;
+          return <String, dynamic>{
+            'ok': true,
+            'result': <String, dynamic>{
+              'items': <Map<String, dynamic>>[
+                <String, dynamic>{
+                  'plugin_id': 'extra-tools',
+                  'payload': <String, dynamic>{
+                    'tools': <Map<String, dynamic>>[
+                      <String, dynamic>{
+                        'name': 'hello_tool',
+                        'description': '贡献工具',
+                        'parameters': <String, dynamic>{
+                          'type': 'object',
+                          'properties': <String, dynamic>{},
+                        },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          };
+        };
+    await runtime.refreshContributedTools(agentId: 'agt');
+    expect(seenScope, isNotNull);
+    expect(seenScope!['team_id'], 'agt', reason: 'TOP 的团队就是自己；空 team 会被核心丢弃');
+    expect(seenScope!['mode_key'], 'local');
+    final List<String> names = runtime.stationToolRunner
+        .catalogFor(agentId: 'agt')
+        .map((ToolCatalogEntry entry) => entry.name)
+        .toList();
+    expect(names, contains('plugin__extra-tools__hello_tool'));
   });
 
   test('sendMessage：新会话 + 落库 + 脚本回复 + 帧序列；第二次复用会话', () async {

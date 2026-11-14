@@ -1216,7 +1216,7 @@ Future<Map<String, dynamic>> _dispatchDelegate(
         // 未知工具名 fail-closed：多半是插件已卸载或拼错。静默吞掉会让用户
         // 以为"已开启"，实际永远不出现；已在该 agent 存量清单里的名字放行，
         // 避免"插件临时离线时连原样保存都做不到"。
-        await runtime.refreshContributedTools();
+        await runtime.refreshContributedTools(agentId: agentId);
         final Set<String> known = <String>{
           for (final ToolCatalogEntry entry
               in runtime.stationToolRunner.catalogFor(agentId: agentId))
@@ -1531,7 +1531,7 @@ Future<Map<String, dynamic>> _dispatchDelegate(
       return _jsonReply(404, <String, dynamic>{'detail': 'agent 不存在'});
     }
     // 目录里的插件工具来自收集站：先刷新，保证"刚装的插件"这一轮就能勾选。
-    await runtime.refreshContributedTools();
+    await runtime.refreshContributedTools(agentId: agentId);
     return _jsonReply(200, <String, dynamic>{
       'agent_id': agentId,
       // null = 未配置（全量默认）；[] = 显式全关。UI 靠这个区分"全选"与"全不选"。
@@ -1590,7 +1590,7 @@ Future<Map<String, dynamic>> _dispatchDelegate(
     // 工具目录与 `GET /tool-policy` 同源（运行时的 stationToolRunner），保证
     // 两处看到的"可选工具"永远一致。
     final AgentRuntime runtime = _runtimeFor(paths, runtimeFor);
-    await runtime.refreshContributedTools();
+    await runtime.refreshContributedTools(agentId: agentId);
     return _jsonReply(200, <String, dynamic>{
       'agent': <String, dynamic>{
         'id': agent.id,

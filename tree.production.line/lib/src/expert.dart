@@ -185,10 +185,17 @@ List<String> expertToolsOf(Object? raw) {
 }
 
 /// 专家工具表里越界的工具（空 = 合规）。
+///
+/// 按**原生名**判定：`plugin__<插件>__write` 与 `write` 是同一条红线。
 List<String> expertToolViolations(Iterable<String> tools) => <String>[
   for (final String tool in tools)
-    if (kExpertForbiddenTools.contains(tool)) tool,
+    if (kExpertForbiddenTools.contains(_nativeToolName(tool))) tool,
 ];
+
+String _nativeToolName(String tool) {
+  if (!tool.startsWith('plugin__')) return tool;
+  return tool.split('__').last;
+}
 
 String expertSystemPrompt() =>
     '你是标准开发流的专家：只回答一个具体问题，不做实现、不写文件。'

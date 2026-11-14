@@ -10,6 +10,8 @@
 /// 这一层是纯函数：不读盘、不碰服务，单测零依赖。
 library;
 
+import '../tool/tool_policy.dart';
+
 /// 三种员工角色（与 `line.yaml.roles` 的键逐字一致）。
 const List<String> kWorkerRoles = <String>['packer', 'executor', 'expert'];
 
@@ -102,22 +104,24 @@ WorkerSpec parseWorkerArguments(Map<String, Object?> arguments) {
     if (!allowSpawn) 'subagent',
   };
   for (final String tool in tools) {
-    if (role == 'expert' && tool == kAskExpertTool) {
+    // 硬边界按**原生名**判定：`plugin__<插件>__team` 与 `team` 是同一条红线。
+    final String native = nativeToolName(tool);
+    if (role == 'expert' && native == kAskExpertTool) {
       throw WorkerSpecError(
         '专家不能再召专家：$kAskExpertTool 只给打包 / 执行',
         code: 'worker_tools_invalid',
       );
     }
-    if (blocked.contains(tool)) {
+    if (blocked.contains(native)) {
       throw WorkerSpecError(
-        allowSpawn && tool == 'subagent'
+        allowSpawn && native == 'subagent'
             ? '员工不能召员工（allow_spawn 也不会放开这条）：$tool'
             : '员工不能用 $tool（角色 $role 的硬边界）',
         code: 'worker_tools_invalid',
       );
     }
     if ((role == 'packer' || role == 'expert') &&
-        kWorkerWriteTools.contains(tool)) {
+        kWorkerWriteTools.contains(native)) {
       throw WorkerSpecError(
         '$role 不许写文件：工具表里不能有 $tool（打包只读、专家不落盘）',
         code: 'worker_tools_invalid',

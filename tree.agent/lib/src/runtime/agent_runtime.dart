@@ -494,9 +494,9 @@ class AgentRuntime {
     String sessionId = '',
     List<dynamic>? attachments,
   }) async {
-    await refreshContributedTools();
-    final CoreAgent? agent = store.agent(agentId);
-    if (agent == null) return null;
+    if (store.agent(agentId) == null) return null;
+    await refreshContributedTools(agentId: agentId);
+    final CoreAgent agent = store.agent(agentId)!;
     final (:CoreSession session, :bool created) = resolveSession(
       agent,
       sessionId,
@@ -924,6 +924,9 @@ class AgentRuntime {
     String agentId,
     String sessionId,
   ) async {
+    // 产线的角色工具里可能包含收集站贡献的工具（`plugin__…`）：先刷新，
+    // 保证员工建工具表时这些声明已经在 `_buildSpecs()` 里。
+    await refreshContributedTools(agentId: agentId);
     final WorkerSpec spec;
     try {
       spec = parseWorkerArguments(arguments);
@@ -1142,7 +1145,9 @@ class AgentRuntime {
           )
         : <String, dynamic>{};
     ContributedTool? contributed;
-    if (contributedTools.isEmpty) await refreshContributedTools();
+    if (contributedTools.isEmpty) {
+      await refreshContributedTools(agentId: agentId);
+    }
     for (final ContributedTool item in contributedTools) {
       if (item.name == tool || item.coreName == tool) {
         contributed = item;
@@ -1607,18 +1612,24 @@ class AgentRuntime {
 
   /// 触发工具贡献收集站并刷新缓存（无订阅者 / 未接线 ⇒ 空表，不阻断发消息）。
   ///
+  /// **信封必须带 team_id**：核心的投递闸门要求消息可证明归属，缺 team_id 时
+  /// 整条触发会被 `skipped_scope` 静默丢弃——目录里就只剩内置工具、插件与 MCP
+  /// 的工具一个都不出现。收集结果本身是全局的，这里的 team 只用于过闸门。
+  ///
   /// **工具表快照失效**（C6-b 信号 1/2）：只有贡献表**真的变了**才失效——每次发消息
   /// 都会调这里，若无条件失效，快照就退化成"每轮重建"，前缀缓存照样每轮作废。
-  Future<void> refreshContributedTools() async {
+  Future<void> refreshContributedTools({required String agentId}) async {
     final StationTriggerClient? trigger = stationTrigger;
     if (trigger == null) return;
+    // agent 不存在时拿不到可证明的归属，收集必被核心拒绝；保持空表即可。
+    if (store.agent(agentId) == null) return;
     final String before = _contributedToolsSignature();
     try {
       final Map<String, dynamic> response = await trigger(
         toolCollectStationId(pluginId),
         <String, dynamic>{'action': 'list'},
         <String, dynamic>{'purpose': 'agent.tools'},
-        <String, dynamic>{'mode_key': 'local'},
+        _stationScopeFor(agentId, ''),
       );
       contributedTools
         ..clear()

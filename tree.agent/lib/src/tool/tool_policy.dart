@@ -70,6 +70,11 @@ String toolGroupOf(String toolName) {
 }
 
 /// 取贡献工具的原生名（`plugin__extra-tools__team` → `team`；其余原样）。
+///
+/// 硬边界（员工不许 team / 专家不许 write …）必须按原生名判定，否则
+/// `plugin__<插件>__team` 能绕过白名单。
+String nativeToolName(String toolName) => _nativeName(toolName);
+
 String _nativeName(String toolName) {
   if (!toolName.startsWith('plugin__')) return toolName;
   return toolName.split('__').last;

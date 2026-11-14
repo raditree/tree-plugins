@@ -117,6 +117,28 @@ const Map<String, Set<String>> _roleAllowedTools = <String, Set<String>>{
   'expert': <String>{'read', 'list', 'grep'},
 };
 
+/// 收集站贡献的工具（`plugin__<插件>__<原生名>`）开放给哪些角色。
+///
+/// 与 recon §6.4 一致：打包 / 主控不选，执行与专家可选；执行仍必须带写工具。
+const Set<String> _pluginToolRoles = <String>{'executor', 'expert'};
+
+/// 插件工具的原生名（`plugin__<插件>__<原生名>` → `<原生名>`）。
+String _pluginNativeName(String tool) =>
+    tool.startsWith('plugin__') ? tool.split('__').last : tool;
+
+/// 角色对插件工具的硬边界（与 tree.agent 的 worker_spec 同口径）。
+const Set<String> _pluginForbiddenExecutor = <String>{'subagent', 'team'};
+const Set<String> _pluginForbiddenExpert = <String>{
+  'write',
+  'edit',
+  'subagent',
+  'team',
+  'ask_expert',
+};
+
+Set<String> _pluginForbiddenTools(String role) =>
+    role == 'expert' ? _pluginForbiddenExpert : _pluginForbiddenExecutor;
+
 class _CreateProductionLineDialogState
     extends State<CreateProductionLineDialog> {
   late final TextEditingController _name = TextEditingController(
@@ -141,6 +163,14 @@ class _CreateProductionLineDialogState
 
   /// 存量产线里出现过、但不属于该角色的工具（保存时剔除；如实提示一次）。
   final Map<String, List<String>> _droppedTools = <String, List<String>>{};
+
+  /// 收集站贡献的工具（core 名 `plugin__<插件>__<原生名>`）。
+  ///
+  /// 目录随执行 Agent 走：UI 读它的 `models-info.tool_catalog`，把 `plugin__`
+  /// 开头的条目显示成「其他（插件提供）」；运行期由 tree.agent 收集站提供。
+  List<(String, String)> _pluginToolDefs = <(String, String)>[];
+  bool _pluginToolsLoading = false;
+  String _pluginToolsError = '';
 
   /// `roles.expert.enabled` / `max_per_task`（默认关闭，与后端一致）。
   bool _expertEnabled = false;
@@ -170,6 +200,14 @@ class _CreateProductionLineDialogState
       _roleModels[role.key] = model;
       final Set<String> allowed =
           _roleAllowedTools[role.key] ?? const <String>{};
+      // 插件工具在目录加载前也要保留：否则编辑存量产线时会被当成"非法工具"剔除。
+      final bool allowPluginTools = _pluginToolRoles.contains(role.key);
+      final Set<String> pluginForbidden = _pluginForbiddenTools(role.key);
+      bool isAllowed(String tool) =>
+          allowed.contains(tool) ||
+          (allowPluginTools &&
+              tool.startsWith('plugin__') &&
+              !pluginForbidden.contains(_pluginNativeName(tool)));
       final List<String> configured = <String>[
         for (final Object? item
             in (data['tools'] as List<dynamic>? ?? role.defaultTools))
@@ -177,11 +215,11 @@ class _CreateProductionLineDialogState
       ];
       _roleTools[role.key] = <String>{
         for (final String tool in configured)
-          if (allowed.contains(tool)) tool,
+          if (isAllowed(tool)) tool,
       };
       final List<String> dropped = <String>[
         for (final String tool in configured)
-          if (!allowed.contains(tool)) tool,
+          if (!isAllowed(tool)) tool,
       ];
       if (dropped.isNotEmpty) _droppedTools[role.key] = dropped;
       if (role.key == 'expert') {
@@ -251,7 +289,75 @@ class _CreateProductionLineDialogState
         _loadError = productionReadable(error, '执行 Agent / 模型池加载失败');
       });
     }
+    await _loadPluginTools(_executorAgentId);
   }
+
+  /// 拉取执行 Agent 的插件工具目录（只认 `plugin__` 开头的收集站工具）。
+  ///
+  /// 目录失败不阻断配置页：显示一行可读错误，角色仍可只选内置工具。
+  Future<void> _loadPluginTools(String agentId) async {
+    if (!mounted) return;
+    if (agentId.trim().isEmpty) {
+      setState(() {
+        // 没选执行 Agent 时拿不到目录，但存量配置里的插件工具仍要可见、可取消。
+        _pluginToolDefs = _configuredPluginTools();
+        _pluginToolsLoading = false;
+        _pluginToolsError = '';
+      });
+      return;
+    }
+    setState(() {
+      _pluginToolsLoading = true;
+      _pluginToolsError = '';
+    });
+    try {
+      final Map<String, dynamic> data = await ApiService.getAgentModelsInfo(
+        agentId,
+      );
+      final List<(String, String)> defs = <(String, String)>[];
+      void addTool(String name) {
+        if (!name.startsWith('plugin__')) return;
+        if (defs.any(((String, String) d) => d.$1 == name)) return;
+        defs.add((name, _pluginToolLabel(name)));
+      }
+
+      for (final dynamic entry
+          in (data['tool_catalog'] as List<dynamic>? ?? const <dynamic>[])) {
+        if (entry is! Map) continue;
+        addTool('${entry['name'] ?? ''}'.trim());
+      }
+      // 已配置但此刻离线（目录里没有）的插件工具保留：编辑页不能把它弄丢。
+      for (final (String, String) tool in _configuredPluginTools()) {
+        addTool(tool.$1);
+      }
+      if (!mounted) return;
+      setState(() {
+        _pluginToolDefs = defs;
+        _pluginToolsLoading = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _pluginToolsLoading = false;
+        _pluginToolsError = productionReadable(error, '插件工具目录加载失败');
+      });
+    }
+  }
+
+  /// `plugin__<插件>__<原生名>` → 原生名（完整 core 名放在 tooltip 里）。
+  String _pluginToolLabel(String coreName) {
+    final List<String> parts = coreName.split('__');
+    return parts.length >= 3 && parts.first == 'plugin'
+        ? parts.sublist(2).join('__')
+        : coreName;
+  }
+
+  /// 存量配置里已选中的插件工具（离线时目录里没有，但必须继续可见）。
+  List<(String, String)> _configuredPluginTools() => <(String, String)>[
+    for (final String role in _pluginToolRoles)
+      for (final String name in _roleTools[role] ?? const <String>{})
+        if (name.startsWith('plugin__')) (name, _pluginToolLabel(name)),
+  ];
 
   Future<void> _browse() async {
     final String? picked = await pickProductionDirectory('选择产线工作空间');
@@ -447,8 +553,9 @@ class _CreateProductionLineDialogState
                     ],
                     onChanged: _loading
                         ? null
-                        : (String? value) {
+                        : (String? value) async {
                             setState(() => _executorAgentId = value ?? '');
+                            await _loadPluginTools(_executorAgentId);
                           },
                   ),
                 ),
@@ -579,6 +686,21 @@ class _CreateProductionLineDialogState
     ),
   );
 
+  /// 勾选 / 取消一个角色工具（内置与插件工具共用）。
+  void _toggleRoleTool(String role, String tool, bool selected) {
+    setState(() {
+      final Set<String> next = _roleTools.putIfAbsent(
+        role,
+        () => <String>{},
+      );
+      if (selected) {
+        next.add(tool);
+      } else {
+        next.remove(tool);
+      }
+    });
+  }
+
   /// 一张角色卡：模型下拉 + 该角色允许的工具 chips（+ 专家开关）。
   Widget _roleCard(_RoleDef role) {
     final ColorScheme cs = Theme.of(context).colorScheme;
@@ -586,6 +708,12 @@ class _CreateProductionLineDialogState
         _roleAllowedTools[role.key] ?? const <String>{};
     final Set<String> selected = _roleTools[role.key] ?? <String>{};
     final List<String> dropped = _droppedTools[role.key] ?? const <String>[];
+    // 角色硬边界：专家不能拿写 / 再召 / 建团队 / 造专家；执行不能建团队 / 再召。
+    final Set<String> pluginForbidden = _pluginForbiddenTools(role.key);
+    final List<(String, String)> pluginDefs = <(String, String)>[
+      for (final (String, String) tool in _pluginToolDefs)
+        if (!pluginForbidden.contains(_pluginNativeName(tool.$1))) tool,
+    ];
     return Container(
       key: Key('production-line-role-${role.key}'),
       padding: const EdgeInsets.all(10),
@@ -635,22 +763,52 @@ class _CreateProductionLineDialogState
                     label: Text(label, style: const TextStyle(fontSize: 12)),
                     selected: selected.contains(tool),
                     visualDensity: VisualDensity.compact,
-                    onSelected: (bool value) {
-                      setState(() {
-                        final Set<String> next = _roleTools.putIfAbsent(
-                          role.key,
-                          () => <String>{},
-                        );
-                        if (value) {
-                          next.add(tool);
-                        } else {
-                          next.remove(tool);
-                        }
-                      });
-                    },
+                    onSelected: (bool value) =>
+                        _toggleRoleTool(role.key, tool, value),
                   ),
             ],
           ),
+          if (_pluginToolRoles.contains(role.key)) ...<Widget>[
+            const SizedBox(height: 6),
+            Text(
+              '其他（插件提供）',
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+            ),
+            if (_pluginToolsLoading)
+              Text('加载中…', style: TextStyle(fontSize: 11, color: cs.outline))
+            else if (_pluginToolsError.isNotEmpty)
+              Text(
+                _pluginToolsError,
+                style: TextStyle(fontSize: 11, color: cs.error),
+              )
+            else if (pluginDefs.isEmpty)
+              Text(
+                '暂无插件工具',
+                style: TextStyle(fontSize: 11, color: cs.outline),
+              )
+            else
+              Wrap(
+                spacing: 6,
+                runSpacing: 2,
+                children: <Widget>[
+                  for (final (String tool, String label) in pluginDefs)
+                    Tooltip(
+                      message: tool,
+                      child: FilterChip(
+                        key: Key('production-line-tool-${role.key}-$tool'),
+                        label: Text(
+                          label,
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                        selected: selected.contains(tool),
+                        visualDensity: VisualDensity.compact,
+                        onSelected: (bool value) =>
+                            _toggleRoleTool(role.key, tool, value),
+                      ),
+                    ),
+                ],
+              ),
+          ],
           if (role.key == 'orchestrator')
             Text(
               '仅准备阶段参考，不参与执行决策',
