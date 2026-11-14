@@ -113,9 +113,15 @@ class _RightPanelHostState extends State<RightPanelHost> {
   /// 窗口 chip 行的滚动控制器：标签太多时靠它出滑动条 / 吞鼠标滚轮。
   final ScrollController _chipScroll = ScrollController();
 
+  /// 已经处理过的选中项身份版本（见 [_onDetailSelected]）。
+  ///
+  /// initState 里取当前值：挂载前就选中的那一条不该在挂载那一刻把窗口抢出来。
+  late int _seenSelectionRevision;
+
   @override
   void initState() {
     super.initState();
+    _seenSelectionRevision = DetailSelection.instance.selectionRevision;
     _open = <String>[
       for (final RightPanelEntry e in widget.entries)
         if (e.openByDefault) e.id,
@@ -230,10 +236,18 @@ class _RightPanelHostState extends State<RightPanelHost> {
   }
 
   /// 中栏选中 / 注入详情：把「详情」窗叫出来（清空时不动，避免强拽）。
+  ///
+  /// **只在选中项身份变化时动作**（[DetailSelection.selectionRevision]）：工具在跑 /
+  /// 思考流式追加时消息流会一直 [DetailSelection.refresh]，即查详情也有一次异步回包，
+  /// 这些都只是"同一条内容变了"——以前它们会把用户刚切走的窗口硬拽回详情
+  /// （用户 2026-11-14：「右栏即使切到其他页，仍旧会在某些情况下跳回那个详情页」）。
   void _onDetailSelected() {
     if (!mounted) return;
-    if (DetailSelection.instance.message == null &&
-        DetailSelection.instance.injected == null) {
+    final DetailSelection selection = DetailSelection.instance;
+    final int revision = selection.selectionRevision;
+    if (revision == _seenSelectionRevision) return;
+    _seenSelectionRevision = revision;
+    if (selection.message == null && selection.injected == null) {
       return;
     }
     RightPanelEntry? target;

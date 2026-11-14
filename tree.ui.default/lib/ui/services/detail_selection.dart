@@ -40,6 +40,16 @@ class DetailSelection extends ChangeNotifier {
 
   ChatMessage? _message;
 
+  /// 选中项**身份**变化的版本号（[select] / [inject] / [clear] 才自增）。
+  ///
+  /// [_fetchDetail] 回填与 [refresh] 只换内容、不换选中项，因此**不自增**：右栏据此
+  /// 区分「用户又点了一条」（该把「详情」窗叫出来）与「内容刷新 / 即查回包」
+  /// （不该把用户正在看的别的窗口抢回详情——用户 2026-11-14 反馈的跳回问题）。
+  int _selectionRevision = 0;
+
+  /// 选中项身份版本号（同上：内容刷新不变，换选中项 / 清空才变）。
+  int get selectionRevision => _selectionRevision;
+
   /// 当前快照是不是**即查回来的全量详情**：是的话 [refresh] 不许把它降级回显示行。
   bool _detailFetched = false;
 
@@ -66,6 +76,7 @@ class DetailSelection extends ChangeNotifier {
     _message = message;
     _detailFetched = false;
     _injected = null;
+    _selectionRevision++;
     notifyListeners();
   }
 
@@ -73,6 +84,7 @@ class DetailSelection extends ChangeNotifier {
   void inject(Widget page) {
     _injected = page;
     _message = null;
+    _selectionRevision++;
     notifyListeners();
   }
 
@@ -137,6 +149,7 @@ class DetailSelection extends ChangeNotifier {
     _message = null;
     _detailFetched = false;
     _injected = null;
+    _selectionRevision++;
     notifyListeners();
   }
 

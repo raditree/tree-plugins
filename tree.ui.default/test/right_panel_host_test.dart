@@ -1,6 +1,7 @@
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:tree_ui_default/ui/models/message.dart';
 import 'package:tree_ui_default/ui/services/detail_selection.dart';
 import 'package:tree_ui_default/ui/widgets/detail_panel.dart';
 import 'package:tree_ui_default/ui/widgets/right_panel_host.dart';
@@ -350,5 +351,55 @@ void main() {
     // 位置随窗口序列走，右侧还留着一大段空档（不是隔着半屏贴右端）
     expect(hostRect.right - plusRect.right, greaterThan(100),
         reason: '「+」要跟着窗口序列末端，而不是钉在最右边');
+  });
+
+  // ── 用户 2026-11-14：切到别的窗口后不被"内容刷新"拽回详情 ─────────────
+
+  testWidgets('选中详情后切走：内容刷新不抢焦点，换一条仍自动打开详情',
+      (WidgetTester tester) async {
+    await pumpHost(tester, entries());
+
+    // 中栏点工具行 / 思考行 → 详情窗自动打开并聚焦
+    DetailSelection.instance.select(ChatMessage(
+      id: 'm1',
+      role: 'assistant',
+      content: '思考第一段',
+      timestamp: DateTime(2026, 11, 14),
+      kind: 'thinking',
+    ));
+    await tester.pump();
+    expect(chip('detail'), findsOneWidget);
+    expect(find.text('文件身体'), findsNothing,
+        reason: '详情被聚焦时「文件」窗只是隐藏（IndexedStack）');
+
+    // 用户主动切到「文件」窗
+    await tester.tap(chip('files'));
+    await tester.pump();
+    expect(find.text('文件身体'), findsOneWidget);
+
+    // 同一条消息原地更新（流式追加 / 工具结果回来）→ 只是内容变了
+    DetailSelection.instance.refresh(<ChatMessage>[
+      ChatMessage(
+        id: 'm1',
+        role: 'assistant',
+        content: '思考第一段 + 追加',
+        timestamp: DateTime(2026, 11, 14),
+        kind: 'thinking',
+      ),
+    ]);
+    await tester.pump();
+    expect(find.text('文件身体'), findsOneWidget,
+        reason: '内容刷新不是换选中项，不能把用户刚切走的窗口拽回详情');
+
+    // 用户又点了另一条 → 照旧自动打开并聚焦详情
+    DetailSelection.instance.select(ChatMessage(
+      id: 'm2',
+      role: 'assistant',
+      content: '另一条思考',
+      timestamp: DateTime(2026, 11, 14),
+      kind: 'thinking',
+    ));
+    await tester.pump();
+    expect(find.text('文件身体'), findsNothing, reason: '换选中项仍要聚焦详情窗');
   });
 }

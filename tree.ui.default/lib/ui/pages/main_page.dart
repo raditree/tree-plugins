@@ -76,6 +76,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   // 折叠状态
   bool _leftCollapsed = false;
   bool _rightCollapsed = false;
+
+  /// 已经处理过的详情选中项身份版本（见 [_onDetailSelected]）。
+  int _seenDetailRevision = DetailSelection.instance.selectionRevision;
   /// 中栏（消息交互）是否折叠成窄条
   ///
   /// 用户 2026-10-04：「中间页支持折叠（右侧面板文件浏览时还是不够用）」——
@@ -553,10 +556,17 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     });
   }
 
-  /// 中栏选中了详情：右栏收着就展开（选中项被清空时什么都不做）
+  /// 中栏选中了详情：右栏收着就展开（选中项被清空时什么都不做）。
+  ///
+  /// **只在选中项身份变化时展开**：消息流 [DetailSelection.refresh] / 即查回包
+  /// 只是同一条内容变了，不该把用户自己收起的右栏又拽出来
+  /// （用户 2026-11-14 反馈的"跳回详情页"同源）。
   void _onDetailSelected() {
-    if (DetailSelection.instance.message == null &&
-        DetailSelection.instance.injected == null) {
+    final DetailSelection selection = DetailSelection.instance;
+    final int revision = selection.selectionRevision;
+    if (revision == _seenDetailRevision) return;
+    _seenDetailRevision = revision;
+    if (selection.message == null && selection.injected == null) {
       return;
     }
     if (!_rightCollapsed) return;

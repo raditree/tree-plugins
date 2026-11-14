@@ -217,4 +217,45 @@ void main() {
           reason: '右栏详情显示的是即查回来的全量正文');
     });
   });
+
+  // 用户 2026-11-14：「从工具调用 / 思考进入详情页后，右栏切到其他页，某些情况下
+  // 会跳回详情页」——右栏只该在**选中项身份变化**时动作，内容刷新与即查回包不算。
+  group('选中项身份版本（selectionRevision）', () {
+    test('换选中 / 注入 / 清空才自增；内容刷新与即查回包不自增', () async {
+      final int base = DetailSelection.instance.selectionRevision;
+
+      DetailSelection.instance.select(toolDisplayRow());
+      final int afterSelect = DetailSelection.instance.selectionRevision;
+      expect(afterSelect, base + 1);
+
+      // 同一条消息原地更新（流式追加 / 工具结果回来）：内容变了，选中项没变
+      DetailSelection.instance.refresh(<ChatMessage>[
+        ChatMessage.fromJson(<String, dynamic>{
+          ...toolDetailJson('t1'),
+          'preview': '新预览',
+        }),
+      ]);
+      expect(DetailSelection.instance.selectionRevision, afterSelect,
+          reason: '内容刷新不是换选中项，否则右栏会被拽回详情窗');
+
+      // 即查回包：快照从显示行升级为全量，但仍是同一条
+      DetailSelection.detailFetcher =
+          (String a, String id, String s) async => toolDetailJson(id);
+      DetailSelection.instance.clear();
+      DetailSelection.instance.toggle(toolDisplayRow());
+      final int afterToggle = DetailSelection.instance.selectionRevision;
+      expect(afterToggle, afterSelect + 2, reason: '清空 + 选中各记一次');
+      await Future<void>.delayed(Duration.zero);
+      expect(DetailSelection.instance.message?.toolResult, contains('第一行结果'),
+          reason: '即查回包确实发生了（快照已升级为全量）');
+      expect(DetailSelection.instance.selectionRevision, afterToggle,
+          reason: '即查回包只换内容，不算换选中项');
+
+      DetailSelection.instance.inject(const SizedBox());
+      expect(DetailSelection.instance.selectionRevision, afterToggle + 1);
+
+      DetailSelection.instance.clear();
+      expect(DetailSelection.instance.selectionRevision, afterToggle + 2);
+    });
+  });
 }
