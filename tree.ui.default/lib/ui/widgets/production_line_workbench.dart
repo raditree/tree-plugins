@@ -184,7 +184,7 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
     }
   }
 
-  Future<void> _loadAudit({bool force = false}) async {
+  Future<void> _loadAudit({bool force = false, bool refresh = false}) async {
     final String? lineId = _lineId;
     if (lineId == null) return;
     if (!force && _audit != null) {
@@ -201,6 +201,7 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
         lineId,
         teamId: _teamId,
         limit: limit,
+        refresh: refresh,
       );
       if (!mounted) return;
       setState(() => _audit = data);
@@ -1226,6 +1227,10 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
         report['notes'] as List<dynamic>? ?? <dynamic>[];
     final Map<String, dynamic> progress = productionMap(data['progress']);
     final bool done = progress.isEmpty || progress['done'] == true;
+    final bool cached = data['cached'] == true;
+    final bool stale = data['stale'] == true;
+    final int changed = (data['changed'] as num?)?.toInt() ?? 0;
+    final String cacheAt = '${data['cache_generated_at'] ?? ''}';
     final int index = (progress['index'] as num?)?.toInt() ?? scanned;
     final int total = (progress['total'] as num?)?.toInt() ?? scanned;
     final int percent = (progress['percent'] as num?)?.toInt() ?? 100;
@@ -1239,6 +1244,34 @@ class _ProductionLineWorkbenchState extends State<ProductionLineWorkbench> {
           style: const TextStyle(fontSize: 11),
         ),
       ),
+      if (cached || done)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
+          child: Row(
+            children: <Widget>[
+              Expanded(
+                child: Text(
+                  cached
+                      ? (stale
+                            ? '缓存于 $cacheAt · 检测到 $changed 个文件有变化'
+                            : '缓存于 $cacheAt（无变化）')
+                      : '本次为最新扫描结果',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: stale ? cs.error : cs.onSurfaceVariant,
+                  ),
+                ),
+              ),
+              TextButton(
+                key: Key('production-audit-refresh-$lineId'),
+                onPressed: busy
+                    ? null
+                    : () => _loadAudit(force: true, refresh: true),
+                child: Text(busy ? '扫描中…' : '重新扫描'),
+              ),
+            ],
+          ),
+        ),
       if (!done) ...<Widget>[
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 3, 16, 3),

@@ -1464,11 +1464,13 @@ class ApiService {
     String lineId, {
     String teamId = '',
     int? limit,
+    bool refresh = false,
   }) => _getJson(
     '/api/production/lines/${Uri.encodeComponent(lineId)}/audit',
     query: <String, String>{
       ..._teamQuery(teamId),
       if (limit != null && limit > 0) 'limit': '$limit',
+      if (refresh) 'refresh': 'true',
     },
   );
 
