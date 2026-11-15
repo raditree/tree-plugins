@@ -12,7 +12,7 @@ import 'io/core_attachment.dart';
 /// 漂移会让测试红，而不是让用户看到一个假版本号。
 /// 2026-11-10：pubspec 已在 S5 升到 `1.0.6+1`，常量同步（发版前审查修复漂移）。
 /// 2026-11-11：产线创建配置页 + 中栏工作台（切片 2/3）⇒ 升 `1.0.8`。
-const String kAppVersion = '1.0.10';
+const String kAppVersion = '1.0.14';
 
 /// 应用构建号（pubspec `version:` 的 `+` 后半段，同一处测试钉住）。
 ///

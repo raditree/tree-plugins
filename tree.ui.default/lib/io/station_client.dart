@@ -160,6 +160,9 @@ class StationClient {
     _cancelAllRetries();
     _retryAttempts.clear();
     _subscribed.clear();
+    _lastSeq.clear();
+    dataFrames = 0;
+    framesSeen = 0;
     subscribePasses += 1;
     for (final String stationId in _stations) {
       _sendSubscription(ws, WsInboundType.stationSubscribe, stationId);
@@ -215,6 +218,15 @@ class StationClient {
   /// 检测到的**跳号次数**（诊断用；跳号意味着丢过帧，应按 `lagged` 处理）。
   int seqGaps = 0;
 
+  /// 本次订阅后收到的**数据帧数**（诊断：证明"这条路到底通不通"）。
+  ///
+  /// 只靠 `delivered` 这类核心侧计数分不清"发了没入队"和"入队了没人读"：
+  /// 这里在**消费端**记首帧，日志里一行就能定性。
+  int dataFrames = 0;
+
+  /// 已进入 [handleFrame] 的帧数（诊断：区分"没到"与"到了被过滤"）。
+  int framesSeen = 0;
+
   /// 某个 topic 的当前水位（测试与排障用）。
   int? lastSeqFor(String topic) => _lastSeq[topic];
 
@@ -222,6 +234,13 @@ class StationClient {
   ///
   /// 公开可见是为了让测试在不起真实 socket 的情况下验证四态语义。
   void handleFrame(Map<String, dynamic> frame) {
+    framesSeen += 1;
+    if (framesSeen <= 40) {
+      debugPrint(
+        '[Station] 收帧 #$framesSeen type=${frame['type']} '
+        'state=${frame['state']}',
+      );
+    }
     // 协议 1.1：每条站点请求都有一条 station_ack（成功也回）。
     final StationAck? ack = StationAck.fromFrame(frame);
     if (ack != null) {
@@ -241,6 +260,11 @@ class StationClient {
       case StationDeliveryState.data:
         if (!_acceptSeq(delivery)) return;
         _noteHealthy(delivery.stationId);
+        dataFrames += 1;
+        if (dataFrames == 1) {
+          // 每次（重）订阅只打一行：既证明链路通，也不刷屏。
+          debugPrint('[Station] 首帧到达：${delivery.topic}（${delivery.stationId}）');
+        }
         _deliveries.add(delivery);
       case StationDeliveryState.closed:
         // 终止订阅：必须先让用户看见，不能静默失效。

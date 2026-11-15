@@ -83,6 +83,9 @@ class WebSocketService {
   /// [registerKnownSessions] 同步；未注册时视为全部未知）。
   final Set<String> knownSessionIds = <String>{};
 
+  /// 本次连接已收到的入站帧数（只用于"首见"诊断日志，每连接清零）。
+  int _inboundCount = 0;
+
   /// 同步已知会话 id（增量合并，供未知会话判定）。
   void registerKnownSessions(Iterable<String> ids) {
     knownSessionIds.addAll(ids);
@@ -228,6 +231,7 @@ class WebSocketService {
     // 因此 hello 必须排在它前面；放在后面会让首轮订阅必然被拒、站点帧永久收不到。
     _sendHello();
     onConnectionChange?.call(true);
+    _inboundCount = 0;
     // 连接确认：宽限期内未收到错误/正常关闭，则视为握手成功，此时才清零
     // 重连计数（使下一轮故障重新从 0 开始退避，而非叠加历史失败次数）。
     _connectedTimer?.cancel();
@@ -295,6 +299,7 @@ class WebSocketService {
       final int total = (frame['total'] as num?)?.toInt() ?? 0;
       if (total <= 0) return true;
       _inboundFrames[id] = _InboundFrames(total, now);
+      debugPrint('[WS] 分片开始 id=$id total=$total');
       return true;
     }
 
@@ -332,7 +337,9 @@ class WebSocketService {
     try {
       _dispatchFrame(jsonDecode(raw) as Map<String, dynamic>);
     } catch (e) {
-      // 忽略解析失败的包
+      // 过去这里完全静默：**一帧解析/分发失败就等于这一帧凭空消失**，
+      // 界面只会表现为"没有实时更新"。至少留下帧长与异常类型。
+      debugPrint('[WS] 帧分发失败（已忽略）len=${raw.length}：$e');
     }
   }
 
@@ -345,6 +352,14 @@ class WebSocketService {
 
   /// 一帧已解析 JSON 的业务分发（WS 下行与站点转投共用）。
   void _dispatchFrame(Map<String, dynamic> json) {
+    // 入站首帧日志：每条连接只打前 5 帧（含 heartbeat）。
+    //
+    // 为什么要有：业务日志分不清"帧没到"和"帧到了但被过滤"。这一行是传输层
+    // 的"我收到了"，连 heartbeat 都算——有心跳 = 这条 socket 至少是通的。
+    _inboundCount += 1;
+    if (_inboundCount <= 40) {
+      debugPrint('[WS] 入站 #$_inboundCount type=${json['type']}');
+    }
     // 过滤心跳响应
     final String? type = json['type'] as String?;
     if (type == 'heartbeat' || type == 'pong') {

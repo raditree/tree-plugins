@@ -3068,15 +3068,33 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 面板在初始化 / 连接建立 / 站点重对齐三处各对齐一次即可自愈。
   ///
   /// 失败**保持现状**（不能让一次网络抖动把已确认的 working 抹掉）。
-  Future<void> _syncRunningState() async {
-    final Map<String, dynamic> data;
-    try {
-      data = await ApiService.getAgentStates();
-    } catch (error) {
-      debugPrint('[消息] 运行状态快照拉取失败（保持现状）：$error');
-      return;
+  ///
+  /// 为什么是"退避重试"而不是"失败就放弃"：核心先起 UI、后起 `tree.agent`
+  /// （实测差 ~20s），UI 启动时这一次请求会拿到「agent 不存在」。只发一次的话，
+  /// 重启后第一轮的停止键就永远没有真值来源。
+  Future<void> _syncRunningState({int attempts = 3}) async {
+    const List<Duration> retryDelays = <Duration>[
+      Duration(seconds: 2),
+      Duration(seconds: 5),
+      Duration(seconds: 10),
+    ];
+    Map<String, dynamic>? data;
+    for (int attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        data = await ApiService.getAgentStates();
+        break;
+      } catch (error) {
+        final bool last = attempt == attempts - 1;
+        debugPrint(
+          '[消息] 运行状态快照拉取失败（第 ${attempt + 1}/$attempts 次'
+          '${last ? '，保持现状' : '，稍后重试'}）：$error',
+        );
+        if (last || !mounted) return;
+        await Future<void>.delayed(retryDelays[attempt % retryDelays.length]);
+        if (!mounted) return;
+      }
     }
-    if (!mounted) return;
+    if (data == null || !mounted) return;
     final List<dynamic> agents = data['agents'] as List<dynamic>? ?? const [];
     final Set<String> working = <String>{};
     final Set<String> compacting = <String>{};
