@@ -46,14 +46,18 @@ class MessageRange {
 ///
 /// **用户口径（2026-10-03）**：「计算当前窗口在整个历史中的坐标，右侧拇指位置按坐标计算」。
 /// 它是右侧滑块几何的唯一输入，也是面板"滑到哪加载哪 / 只缓存坐标附近"的唯一口径：
-/// 列表每帧把**本帧构建到的下标区间**算成它（见 [MessageList.onWindowChanged]），
+/// 列表每帧把**真正显示在视口里的下标区间**算成它（见 `MessageList.onWindowChanged`），
 /// 拇指监听它（滚动时只重绘拇指，不重建列表）。
+///
+/// 口径是"**屏幕上看得见的**那几条"：不含视口上下的缓存区，也不含折叠组里零高度的
+/// 组员（长工具组折叠时它们成百格地挂在视口边界上，按构建区间算会让拇指跟着跳）。
 @immutable
 class MessageWindowCoordinate {
   const MessageWindowCoordinate({
     required this.first,
     required this.last,
     required this.total,
+    this.scrollDirection = 0,
   });
 
   /// 视口内第一条的全局下标（-1 = 还没量出来）。
@@ -64,6 +68,13 @@ class MessageWindowCoordinate {
 
   /// 整份会话的条数（= [MessageWindow.total]，只随新消息增长）。
   final int total;
+
+  /// 本帧滚动方向（-1 上 / +1 下 / 0 没动）。
+  ///
+  /// 滑块用它区分"用户真的在往回滚"和"下标估算在抖"：折叠组里成百条组员是零高度的，
+  /// 补页/淘汰会让"视口顶那一格"的下标一次跳几十格，但屏幕上那些内容根本没动。
+  /// 不参与 [==]（它只是随包带来的提示，不该单独触发一次坐标广播）。
+  final int scrollDirection;
 
   /// 还没量出来（首帧之前）。
   static const MessageWindowCoordinate unknown = MessageWindowCoordinate(

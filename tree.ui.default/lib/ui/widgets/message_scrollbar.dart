@@ -57,6 +57,16 @@ const double kMessageScrollbarMinFraction = 0.06;
 /// 拇指（那条能拖的短棒）的 key：用例直接量它的位置——「拖拽时抓哪儿是哪儿」只能靠量位置钉住。
 const Key messageScrollbarThumbKey = ValueKey<String>('message-scrollbar-thumb');
 
+/// 拇指**显示位置**的单帧最大位移（px）：估算跳变摊到几帧里，看上去就是匀速。
+///
+/// 只影响"画"：位置反解（[messageScrollbarIndexAt]）与拖拽仍按真实几何走，
+/// 两者严格互逆的前提不变（见 [_MessageScrollbarState._smoothTop]）。
+const double kMessageScrollbarMaxStep = 4;
+
+/// 超过这个位移就**直接对齐**（不摊帧）：那是真的跳转（拖滑块、定位、重载），
+/// 摊到几帧里反而像"卡住慢慢爬"。
+const double kMessageScrollbarSnapAbove = 30;
+
 /// 要不要画滑块：视口里装得下整份会话就不画（没得滚）。
 bool messageScrollbarVisible({
   required int total,
@@ -196,6 +206,18 @@ class _MessageScrollbarState extends State<MessageScrollbar> {
   /// 松手后交回真实下标（会跳一下——那是列表的真实位置，不是抖动）。
   double? _dragFraction;
 
+  /// 拇指**显示位置**（相对轨道顶部，px）；null = 还没画过。
+  double? _shownTop;
+
+  /// [_shownTop] 对应的"可走区间"高度（轨道尺寸变了就重新对齐，不跨尺寸平滑）。
+  double _shownRoom = -1;
+
+  /// 最近一次**非零**的滚动方向（-1 上 / +1 下 / 0 还没有）。
+  ///
+  /// 坐标里只在"这几帧的滚动位置变了"时才带方向；补页/淘汰那几帧方向是 0，
+  /// 但那时更不能放开反向移动（正是估算抖得最厉害的时候）。所以沿用上一次的方向。
+  int _lastScrollDir = 0;
+
   int get _total => _dragTotal ?? widget.coordinate.value.total;
   int get _first => _dragFirst ?? widget.coordinate.value.first;
   int get _last => _dragLast ?? widget.coordinate.value.last;
@@ -209,6 +231,49 @@ class _MessageScrollbarState extends State<MessageScrollbar> {
         firstVisible: _first,
         lastVisible: _last,
       );
+
+  /// 把真实几何位置 [target] 平滑成**显示位置**（只影响画，不影响反解与拖拽）。
+  ///
+  /// 为什么需要：拇指几何按**全局下标**算，而折叠组里成百条组员是零高度的
+  /// （不进"视口里看得见的区间"，见 `MessageList.onWindowChanged` 的口径）。
+  /// 补页把一片占位槽换成组员时，屏幕上的内容一动不动，但"视口顶那一格"的下标
+  /// 会一次跳掉几十格 ⇒ 拇指一跳 7~17px；淘汰换回来时再往反方向跳一次。
+  ///
+  /// 口径：
+  /// - **逆着滚动方向的目标一律不动**：那种回摆是下标估算在抖，不是用户在往回滚；
+  /// - 顺着方向的位移单帧最多走 [kMessageScrollbarMaxStep]（跳变摊到几帧里）；
+  /// - 大幅位移（> [kMessageScrollbarSnapAbove]，拖滑块 / 定位 / 重载）直接对齐；
+  /// - 滚动停住（`scrollDirection == 0`）时直接对齐真实位置；
+  /// - 轨道尺寸变了就重新对齐（不跨尺寸平滑）。
+  double _smoothTop(double target, double room) {
+    if (room <= 0) {
+      _shownTop = 0;
+      _shownRoom = room;
+      return 0;
+    }
+    final double? shown = _shownTop;
+    if (shown == null || (_shownRoom - room).abs() > 0.5) {
+      _shownTop = target;
+      _shownRoom = room;
+      return target;
+    }
+    final double delta = target - shown;
+    if (delta.abs() <= 0.5) return shown;
+    final int dir = delta > 0 ? 1 : -1;
+    final int reported = widget.coordinate.value.scrollDirection;
+    if (reported != 0) _lastScrollDir = reported;
+    final int scrollDir = _lastScrollDir;
+    if (scrollDir != 0 && dir != scrollDir) return shown;
+    if (delta.abs() > kMessageScrollbarSnapAbove) {
+      _shownTop = target;
+      _shownRoom = room;
+      return target;
+    }
+    final double next = shown +
+        delta.clamp(-kMessageScrollbarMaxStep, kMessageScrollbarMaxStep);
+    _shownTop = next;
+    return next;
+  }
 
   /// 指针位置 → 拇指顶端该在的位置（减掉抓取偏移、夹进轨道）。
   double _topFor(double dy, double track, ScrollbarThumb thumb) {
@@ -233,6 +298,8 @@ class _MessageScrollbarState extends State<MessageScrollbar> {
       _dragFirst = null;
       _dragLast = null;
       _dragFraction = null;
+      // 松手后直接对齐真实几何（不要平滑：那一段位移是列表真实落点，不是抖动）
+      _shownTop = null;
     });
     widget.onSeekSettled?.call(settled);
   }
@@ -262,10 +329,10 @@ class _MessageScrollbarState extends State<MessageScrollbar> {
         final double track = constraints.maxHeight;
         final ScrollbarThumb thumb = _thumb(track);
         final double room = track - thumb.length;
-        // 拖拽中钉在指针下（见 [_dragFraction]），否则按全局下标画。
-        final double top = _dragFraction == null
-            ? thumb.top
-            : (room <= 0 ? 0 : room * _dragFraction!);
+        // 拖拽中钉在指针下（见 [_dragFraction]），否则按全局下标画（并做一次显示平滑）
+        final double top = _dragFraction != null
+            ? (room <= 0 ? 0 : room * _dragFraction!)
+            : _smoothTop(thumb.top, room);
         return MouseRegion(
           cursor: SystemMouseCursors.basic,
           onEnter: (_) => setState(() => _active = true),

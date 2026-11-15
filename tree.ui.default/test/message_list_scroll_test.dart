@@ -272,9 +272,9 @@ void main() {
 
       expect(find.text('消息内容 0'), findsNothing,
           reason: '没加载的槽位不画真消息（画的是等高占位槽）');
-      // 报上来的是"构建到哪"（含视口上下各一段缓存），贴着末尾那几条
+      // 报上来的是"视口里真正看得见的那几条"（不含缓存区、不含零高度行），贴着末尾
       expect(key.currentState!.windowFirst, greaterThanOrEqualTo(25),
-          reason: '帧后要把构建到的下标区间报给面板（补页 / 淘汰都以它为准）');
+          reason: '帧后要把视口坐标报给面板（补页 / 淘汰都以它为准）');
     });
 
     testWidgets('滚到顶：把顶部的下标区间报上去（滑到哪加载哪）',
@@ -288,9 +288,10 @@ void main() {
       await tester.pump();
       await tester.pump();
 
-      // 滚到顶 = 把顶部那一段报上去（补页就以它为准）。允许差几条：懒构建列表在
-      // 大跨度跳转后，RenderSliverList 会按已建子项的估算位置校正一次 offset
-      expect(key.currentState!.windowFirst, lessThan(5),
+      // 滚到顶 = 把顶部那一段报上去（补页就以它为准）。报上来的是**视口里真正
+      // 看得见**的那几条（不含缓存区），大跨度跳转后 `RenderSliverList` 会先按
+      // 已建子项估算位置校一次 offset，所以允许差几条。
+      expect(key.currentState!.windowFirst, lessThan(10),
           reason: '滚到顶却没把顶部区间报上来');
       expect(key.currentState!.windowLast, lessThan(20),
           reason: '报上来的是顶部那一段，不是原来贴底时的 28..39');

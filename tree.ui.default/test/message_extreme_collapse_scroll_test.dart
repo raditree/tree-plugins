@@ -8,15 +8,16 @@
 //     位移必须正好是一个步长（±1px）。只看像素位移不可靠：补页/淘汰会让内容总高在
 //     一帧里变上万像素，`pixels` 跟着补偿是**正确**行为，用户看到的是那一格有没有被推走。
 //  ② **拇指不异常抖动**：均匀滚动下，拇指相邻帧的位移 ≤ 8px、长度变化 ≤ 2px，
-//     且方向不反复（构建区间成百格地跳，拇指就会跟着跳）。
+//     且方向不反复。
 //
-// **本用例目前应当为红**（两项判据都在这个极端现场被抓到）：
-//  · 拇指：几何仍按"本帧已构建的下标区间"算（`MessageWindowCoordinate`），折叠的零高度
-//    行会把它撑大 —— 滚过折叠组时 first/last 成百格地跳，拇指跟着跳
-//    （实测单步位移 ~16px / 上限 8px，方向反复 40+ 次）；
-//  · 页面：补页（占位槽 → 折叠组一行）与淘汰（折叠组一行 → 占位槽）同帧/相邻帧发生时，
-//    内容高度一帧内变动上万像素，实测有 ~9/1400 步「稳定锚点」被推走（最大 262px）。
-// 修法（拇指坐标口径改成"真正与视口相交的显示行"、大高度差补偿）未做，本条即验收闸门。
+// 这条用例是"长工具组折叠 + 窗口化懒加载"的压力闸门，钉住的三处修法：
+//  · **坐标口径**改成"真正与视口相交的显示行"（`MessageList._visibleRangeFromRenderTree`）：
+//    按"本帧构建到的下标区间"算时，折叠的零高度组员会把区间撑大成百格，拇指跟着跳；
+//  · **补偿目标是绝对值**（`_BottomAnchorScrollController.shiftBasePixels`）：布局期间
+//    框架自己也会做一次 `scrollOffsetCorrection`（`ViewportOffset.correctBy` 直接改
+//    `_pixels`），按"当前 pixels + 位移"叠加就会补两遍，视口反而被推走；
+//  · **拇指显示位置限速 + 反向死区**（`MessageScrollbar._smoothTop`）：补页把一片占位槽
+//    换成折叠组员时，屏幕内容不动但"视口顶那一格"的全局下标会一次跳几十格。
 
 import 'dart:convert';
 import 'dart:io';
@@ -494,7 +495,16 @@ void main() {
 
           // ① 页面不跳：视口顶附近**某一格高度没变**的内容，屏幕位移必须正好等于步长
           //    （上滚 = 内容整体往下走 = 屏幕 y 变大）
-          if (!clamped) {
+          //
+          //    边界附近（顶/底两屏步长内）不判：走到顶之后视口**没有地方可以让补偿**
+          //    （内容在顶上长高也只能把 pixels 夹在 0），"内容位移 = 步长"本来就不成立；
+          //    这一带本来也没有"滚动到一段内容中间"的语义（那些行就是列表的开头/结尾）。
+          const double edge = 2 * step;
+          final bool atEdge = pos.pixels < edge ||
+              pos.pixels > pos.maxScrollExtent - edge ||
+              before < edge ||
+              before > max - edge;
+          if (!clamped && !atEdge) {
             final double expected = up ? step : -step;
             for (final ({int index, double y, double h}) a in anchors) {
               final double? afterY = _screenYOfIndex(tester, a.index);
@@ -533,7 +543,8 @@ void main() {
             final double dLen = thumb1.height - thumb0.height;
             thumbSteps.add(dTop.abs());
             thumbLenDeltas.add(dLen.abs());
-            if (up ? dTop > 1.0 : dTop < -1.0) {
+            final bool reversed = up ? dTop > 1.0 : dTop < -1.0;
+            if (reversed) {
               thumbReversals.add(
                 '第 $i 步拇指反向：${up ? '上滚' : '下滚'} dTop=${dTop.toStringAsFixed(1)}px',
               );
@@ -600,6 +611,7 @@ void main() {
       await tester.pumpWidget(const SizedBox());
       await tester.pump(const Duration(seconds: 6));
     },
-    timeout: const Timeout(Duration(minutes: 3)),
+    // 全量跑时同机并发多个测试文件，这条压力用例本身要两分钟左右 ⇒ 给足超时
+    timeout: const Timeout(Duration(minutes: 8)),
   );
 }

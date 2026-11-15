@@ -29,8 +29,8 @@ import 'welcome_mark.dart';
 ///
 /// - 槽位表长度**只随新消息增长**，加载/淘汰都不改变它 ⇒ 右侧滑块
 ///   （[MessageScrollbar]，按全局下标算几何）上滑补页时不会跳来跳去；
-/// - 列表把**本帧构建到的下标区间**帧后报给面板（[onWindowChanged]），面板据此
-///   只补那一段、并淘汰离得远的槽位（限制缓存长度）；
+/// - 列表把**本帧真正显示在视口里的下标区间**帧后报给面板（[onWindowChanged]），
+///   面板据此只补那一段、并淘汰离得远的槽位（限制缓存长度）；
 /// - 「回到底部」= 请面板**重载末尾一段**（[onReloadTail]），不再在几千条估算高度里
 ///   做一次动画——落点确定，必然到底。
 class MessageList extends StatelessWidget {
@@ -81,7 +81,10 @@ class MessageList extends StatelessWidget {
   /// "这一帧变的是哪一类"，也让测试能分别钉住（回归用例 N5/N6/N7）。
   final int contentShiftStamp;
 
-  /// 本帧构建到的下标区间（帧后回调；面板据此补页 + 淘汰）。
+  /// 本帧**真正显示在视口里**的下标区间（帧后回调；面板据此补页 + 淘汰）。
+  ///
+  /// 口径见 [_MessageListViewState._visibleRangeFromRenderTree]：不含缓存区、不含
+  /// 折叠组里零高度的组员——否则长工具组折叠/展开时区间会成百格地跳。
   final void Function(int first, int last)? onWindowChanged;
 
   /// 展开中的折叠组的**槽位区间**（`[组首, 组尾+1)`；null = 没有展开组）。
@@ -278,9 +281,41 @@ class _BottomAnchorScrollController extends ScrollController {
   /// 由 [_MessageListViewState] 注入（它拿着列表的 [GlobalKey]）。
   double? Function(int index)? readChildTop;
 
+  /// 布防（[shiftAbove]）那一刻的滚动位置：补偿的**绝对目标**以它为基准。
+  ///
+  /// 为什么不能用"当前 pixels + 位移量"：布局期间 `RenderViewport` 自己也会做
+  /// `scrollOffsetCorrection`（`ViewportOffset.correctBy` 直接改 `_pixels`，**不**走
+  /// `correctPixels` 也不发通知）。这时再叠加一次同样的位移就补了两遍
+  /// （实测：视口顶那一行本来该位移 120px，结果位移 -56px）。
+  /// 绝对目标 = 布防时的 pixels + 用户此后的滚动量 + 锚点位移，与框架补了几次无关。
+  double? shiftBasePixels;
+
+  /// 自布防以来**用户/程序**滚动过的量（[ScrollPosition.didUpdateScrollPositionBy] 累计；
+  /// 框架自己的 `correctBy` 不走这条路，正是我们要区分开的）。
+  double scrollSinceArm = 0;
+
+  /// 最近一次**用户/程序**滚动方向（-1 上 / +1 下 / 0 还不知道）。
+  ///
+  /// 只认 `didUpdateScrollPositionBy`（真滚动）：补页补偿、框架的 `correctBy`
+  /// 也会改 `pixels`，按"像素差"判方向会把一次补页当成用户往下滚。
+  int userScrollDirection = 0;
+
   /// 上一帧内容的总高度（-1 = 还不知道）。用来判断"刚才是不是贴着底"，
   /// 并作为补页补偿的**兜底**估算值（实测拿不到时才用，且有限幅）。
   double lastMaxExtent = -1;
+
+  /// 这一次补偿在**布局阶段没量出来**（[resolveShiftAbove] 返回 null）：
+  /// 请求帧后重试一次（渲染树这时已经稳定，锚点通常已经在布局范围里）。
+  bool retryShiftRequested = false;
+
+  /// 这一帧算出来的**绝对目标**：帧后再核一次（null = 没有要核的）。
+  ///
+  /// 为什么还要核：`correctPixels` 之后我们返回 false 让 RenderViewport 同帧重跑布局，
+  /// 那一趟里框架**还会**按它自己的 `scrollOffsetCorrection` 再挪一次（`correctBy`
+  /// 是增量、直接改 `_pixels`），于是最终位置可能偏离我们算好的目标几十像素
+  /// （实测：目标 341，最终落在 294，视口顶那一行位移差 205px）。帧后位置已定，
+  /// 再对一次绝对目标即可（不动就一直不动，不存在来回抢）。
+  double? assertPixels;
 
   @override
   ScrollPosition createScrollPosition(
@@ -307,6 +342,17 @@ class _BottomAnchorScrollPosition extends ScrollPositionWithSingleContext {
   });
 
   final _BottomAnchorScrollController controller;
+
+  /// 用户/程序发起的滚动量（`setPixels` / `jumpTo` 都会报；框架自己的
+  /// `correctBy` 不报——补偿的绝对目标要把这两者分开，见 [shiftBasePixels]）。
+  @override
+  void didUpdateScrollPositionBy(double delta) {
+    if (delta.abs() > 0.5) {
+      controller.userScrollDirection = delta > 0 ? 1 : -1;
+    }
+    if (controller.shiftBasePixels != null) controller.scrollSinceArm += delta;
+    super.didUpdateScrollPositionBy(delta);
+  }
 
   @override
   bool applyContentDimensions(double minScrollExtent, double maxScrollExtent) {
@@ -354,6 +400,11 @@ class _BottomAnchorScrollPosition extends ScrollPositionWithSingleContext {
     controller.shiftAbove = false;
     final double? Function()? resolveShift = controller.resolveShiftAbove;
     controller.resolveShiftAbove = null;
+    if (!shiftAbove) {
+      // 没布防（或已被贴底接管）：基准作废
+      controller.shiftBasePixels = null;
+      controller.scrollSinceArm = 0;
+    }
     // 兜底口径：上一帧"内容总高"的差。**只在实测拿不到时用**，而且要限幅——
     // 长列表里它是外推值（见下面 shiftAbove 分支的注释）。
     final double estimatedDelta = controller.lastMaxExtent >= 0
@@ -373,19 +424,40 @@ class _BottomAnchorScrollPosition extends ScrollPositionWithSingleContext {
       // 视口被随机搬走（用户 2026-10-03：「触发一次懒加载后抖动非常厉害」）。
       //
       // 实测口径见 [_MessageListViewState._resolveShiftAbove]：
-      // 锚点 = "用户**当时**正在看的第一条真消息"（跳过这一帧刚换过的格子），
+      // 锚点 = "用户**当时**正在看的第一条内容"（跳过这一帧刚换过高度的格子），
       // 补偿量 = 锚点**底边**的实测位移（`layoutOffset` 是实测子项高度逐个累加的真值）。
-      double? shift = resolveShift?.call();
-      if (shift == null && estimatedDelta.abs() <= viewportDimension * 2) {
+      //
+      // **目标是绝对值**（不是 `pixels + 位移`）：布防之后框架自己可能已经做过一次
+      // `scrollOffsetCorrection`，叠加就会补两遍（见 [shiftBasePixels]）。
+      final double? resolved = resolveShift?.call();
+      final double? base = controller.shiftBasePixels;
+      final double sinceArm = controller.scrollSinceArm;
+      double? target;
+      if (resolved != null) {
+        target = (base ?? pixels) + sinceArm + resolved;
+      } else if (estimatedDelta.abs() <= viewportDimension * 2) {
         // 实测拿不到（还没布局过 / 锚点不在这一趟布局里）：退回估算值，
         // 且**只在不超过两屏时采信**——宁可不补，也不要错补上千像素。
-        shift = estimatedDelta;
+        target = pixels + estimatedDelta;
+      } else if (resolveShift != null) {
+        // 实测彻底拿不到（这一趟布局里没有"高度没变"的锚点）：请求帧后重试一次。
+        // 帧后渲染树已经稳定，锚点通常已经在布局范围里；补完再画下一帧，
+        // 比"这一帧整个不补、视口被推走几百像素"好得多。
+        controller.retryShiftRequested = true;
       }
-      if (shift != null && shift.abs() > 0.01) {
-        correctPixels((pixels + shift).clamp(minScrollExtent, maxScrollExtent));
-        return false;
+      if (target == null) return ok;
+      if ((target - pixels).abs() <= 0.01) {
+        // 已经在对的位置：清掉基准（这一趟不需要再补）
+        controller.shiftBasePixels = null;
+        controller.scrollSinceArm = 0;
+        return ok;
       }
-      return ok;
+      correctPixels(target.clamp(minScrollExtent, maxScrollExtent));
+      controller.assertPixels = target;
+      controller.shiftBasePixels = null;
+      controller.scrollSinceArm = 0;
+
+      return false;
     }
     if (!ok || !following) return ok;
     if (!requested && !glued) return ok;
@@ -657,6 +729,10 @@ class _MessageListViewState extends State<_MessageListView> {
 
   void _flushCoordinate() {
     if (!mounted) return;
+    // 上一帧的补页补偿没量出来：帧后补一次（见 [_retryShift]）
+    _retryShift();
+    // 布局阶段算好的绝对目标，帧后再核一次（见 [assertPixels]）
+    _assertShiftTarget();
     // **空槽位表没有坐标可报**：这一刻 `_builtFirst/_builtLast` 里是上一份内容的残留，
     // 报上去只会让面板为"还不存在的窗口"发一串补页请求（切 agent 时实测：
     // 新 agent 的窗口刚被清空，就照着旧坐标发了 from=… 的请求）。
@@ -665,7 +741,12 @@ class _MessageListViewState extends State<_MessageListView> {
       _builtLast = -1;
       return;
     }
-    final MessageRange? authoritative = _builtRangeFromRenderTree();
+    // **坐标口径 = "真正与视口相交的显示行"**（不是"本帧构建到的下标区间"）。
+    // 后者含视口上下各一段缓存、以及折叠组里那些零高度的组员：长工具组折叠时，
+    // 滚过它的一帧里 `first/last` 会成百格地跳，右侧拇指就跟着跳
+    // （用户 2026-11-15「展开工具调用后拇指乱跳」）。见 [_visibleRangeFromRenderTree]。
+    final MessageRange? authoritative =
+        _visibleRangeFromRenderTree() ?? _builtRangeFromRenderTree();
     final int first;
     final int last;
     if (authoritative != null) {
@@ -679,10 +760,14 @@ class _MessageListViewState extends State<_MessageListView> {
     _builtFirst = -1;
     _builtLast = -1;
     if (first < 0 || last < first) return;
+    // 本帧滚动方向（拇指据此区分"用户真的在往回滚"和"下标估算在抖"）。
+    // 在 `next == _coordinate.value` 之前算：方向变了不广播坐标，但要跟着最新坐标走。
+    final int dir = _controller.userScrollDirection;
     final MessageWindowCoordinate next = MessageWindowCoordinate(
       first: first,
       last: last.clamp(first, widget.slots.length - 1),
       total: widget.slots.length,
+      scrollDirection: dir,
     );
     if (next == _coordinate.value) return;
     _coordinate.value = next;
@@ -690,6 +775,50 @@ class _MessageListViewState extends State<_MessageListView> {
     widget.onWindowChanged?.call(next.first, next.last);
     // 有落点校正在进行：拿这次实测的落点反馈下一步（见 [_pumpSeekCorrection]）
     _pumpSeekCorrection();
+  }
+
+  /// 从渲染树读**视口坐标**：真正**显示在视口里**的第一条 / 最后一条下标。
+  ///
+  /// 与 [_builtRangeFromRenderTree] 的区别（这条是滑块几何的口径）：
+  /// - **不算缓存区**：滑出视口上下各一段缓存的子项仍被布局，但它们不在屏幕上；
+  /// - **不算零高度行**：折叠组里被收起的组员是 `SizedBox.shrink()`，它们不占版面，
+  ///   长组（上百条）折叠时"构建到哪"会被它们撑大成百格，拇指随每帧的构建区间
+  ///   来回跳（用户 2026-11-15：「展开工具调用后右侧拇指乱跳」）。
+  ///
+  /// 判据：有正高度、且 `[top, bottom)` 与视口 `[scrollOffset, scrollOffset+剩余绘制范围)`
+  /// 相交。逐行扫（视口里就那么几十格），结果稳定 ⇒ 匀速滚动时拇指单调、单步位移小。
+  ///
+  /// 一格都量不到（还没布局 / 内容全零高度）时返回 null，调用方退回构建区间。
+  MessageRange? _visibleRangeFromRenderTree() {
+    final RenderSliverList? target = _sliverListFromRenderTree();
+    if (target == null || !target.attached) return null;
+    final double top = target.constraints.scrollOffset;
+    final double bottom = top + target.constraints.remainingPaintExtent;
+    int? first;
+    int? last;
+    RenderBox? item = target.firstChild;
+    while (item != null) {
+      final double? at = target.childScrollOffset(item);
+      final ParentData? data = item.parentData;
+      if (at != null &&
+          data is SliverMultiBoxAdaptorParentData &&
+          data.index != null) {
+        // 帧后扫（不在布局里）⇒ 读 size 是安全的
+        final double extent = item.size.height;
+        if (extent > 0.5 && at < bottom - 0.01 && at + extent > top + 0.01) {
+          first ??= data.index!;
+          last = data.index!;
+        }
+      }
+      item = target.childAfter(item);
+    }
+    if (first == null || last == null) return null;
+    final int slotCount = widget.slots.length;
+    if (slotCount <= 0) return null;
+    return MessageRange(
+      first.clamp(0, slotCount - 1),
+      (last + 1).clamp(1, slotCount),
+    );
   }
 
   /// 从渲染树读**权威**的"构建到哪"：SliverList 实际持有的子项区间。
@@ -802,40 +931,69 @@ class _MessageListViewState extends State<_MessageListView> {
     );
   }
 
-  /// 布局**后**再扫一遍 → 算出补偿量（null = 实测拿不到，调用方退回估算 + 限幅）。
+  /// 布局**后**再扫一遍 → 算出补偿量（null = 实测拿不到，调用方退回估算 / 帧后重试）。
   ///
-  /// 锚点 = "用户**当时**正在看的第一条真消息"，两条口径缺一不可：
-  /// - **按布局前的位置挑**（`top >= 布局前视口顶`），否则内容一长高就挑到新补的格子；
-  /// - **跳过这一帧刚换过高度的子项**（占位槽 → 真消息 / 流式增长）：它们属于
-  ///   "刚出现的新内容"，不是用户正在读的那一段。真机补页**先补横跨视口顶的那一份**，
-  ///   紧贴视口顶的那一格往往**自身就是**被换掉的那一格；锚在它身上会漏补
-  ///   它下面已经加载的内容（回归用例 N5：漏补 104px，用户看到的就是"整段下移"）。
-  /// - 视口顶之下没有稳定真消息时，退而取视口顶之上最后一条稳定真消息。
+  /// 锚点 = 布局前**视口里（含压着视口顶那一格）第一条这一帧高度没变的内容**
+  /// （占位槽也算）：
+  /// - 高度变了的（占位槽 → 真消息 / 折叠组展开 / 流式长高）是"刚出现的新内容"，
+  ///   不是用户正在读的那一段：真机补页**先补横跨视口顶的那一份**，紧贴视口顶的
+  ///   那一格往往**自身就是**被换掉的那一格，锚在它身上会漏补它下面已经加载的内容
+  ///   （回归用例 N5：漏补 104px，用户看到的就是"整段下移"）；
+  /// - 视口里没有稳定的内容时，退而取视口顶之上最后一条稳定内容。
   ///
   /// 补偿量 = 锚点**底边**的实测位移（= 它下一条子项顶边的差）：于是锚点**以下整段**
   /// 在屏幕上的位置也不动（N5 断言 ②）。
   double? _resolveShiftAbove(_BuiltTopsSnapshot before) {
     final Map<int, double> after = _builtTopsFromRenderTree();
     if (before.tops.isEmpty || after.isEmpty) return null;
-    bool isReal(int index) =>
-        index >= 0 && index < widget.slots.length && widget.slots[index] != null;
-    // "这一帧高度没变" = 它与其**下一条**顶边差不变（只用 childScrollOffset，不读 .size）
-    bool stable(int index) {
+
+    /// 这一格**自身高度**这一帧变了没有（null = 量不到：两个快照里缺相邻顶边）。
+    ///
+    /// 高度 = 下一条子项的顶边 - 它自己的顶边（渲染树里子项连续排布）。
+    /// 两个快照都得有这一对才量得出来——只有一边有（这一帧才构建出来 / 已经不在
+    /// 这一趟布局里）时返回 null，不能当成"没变"。
+    bool? heightChanged(int index) {
       final double? t0 = before.tops[index];
       final double? t1 = after[index];
-      if (t0 == null || t1 == null) return false;
       final double? n0 = before.tops[index + 1];
       final double? n1 = after[index + 1];
-      // 下一条读不到（视口末尾那一格）：量不到高度变化，按"稳定"处理（它的顶边即锚点底边）
-      if (n0 == null || n1 == null) return true;
-      return ((n1 - t1) - (n0 - t0)).abs() <= 0.01;
+      if (t0 == null || t1 == null || n0 == null || n1 == null) return null;
+      return ((n1 - t1) - (n0 - t0)).abs() > 0.01;
     }
 
+    /// 这一格**底边**的位移（内容坐标）：优先用它下一条的顶边（那就是底边），
+    /// 那条读不到就退回它自己的顶边。
+    ///
+    /// 早先只按 `after` 判断下一条在不在，`before` 里没有（锚点正好是上一帧最后一格）
+    /// 时整次实测作废 ⇒ 退化成估算，而"大高度差"那一帧估算被限幅丢掉 ⇒
+    /// 补偿整个不发生，视口被推走几百像素。
+    double? shiftOf(int index) {
+      final double? was1 = before.tops[index + 1];
+      final double? now1 = after[index + 1];
+      if (was1 != null && now1 != null) return now1 - was1;
+      final double? was0 = before.tops[index];
+      final double? now0 = after[index];
+      if (was0 != null && now0 != null) return now0 - was0;
+      return null;
+    }
+
+    // 锚点 = 布局前**视口里（含压着视口顶那一格）第一条高度没变的内容**（占位槽也算）。
+    //
+    // 为什么允许占位槽：快速滑进还没加载的一段时，视口里全是占位槽，一页补回来
+    // 它们**全体**都变了高度——这时"第一条没变的"常常就在视口下方（缓存区里的
+    // 占位槽）。钉住它照样把视口里那一段钉住；只认真消息的话这一帧就没有锚点，
+    // 补偿整个不发生（实测：一页占位变真消息，视口被推走几百像素）。
+    //
+    // 为什么"压着视口顶那一格"也要算：它的顶边在视口上方，但它占着视口最上面一截，
+    // 正是用户眼睛落着的那一行。跳过它去钉下面那几行，一旦它们之间某一格高度变了，
+    // 这一行就会被推走（实测：一页补进视口，顶部那一行位移差几十像素）。
     int? below;
     int? above;
     before.tops.forEach((int index, double top) {
-      if (!isReal(index) || !stable(index)) return;
-      if (top >= before.viewportTop - _bottomEpsilon) {
+      if (heightChanged(index) != false) return; // 变了 / 量不到：不是"正在读的那一段"
+      // 底边用下一条的顶边（渲染树里子项连续排布）；最末一格读不到就按自己的顶边算
+      final double bottom = before.tops[index + 1] ?? top;
+      if (bottom > before.viewportTop + 0.01) {
         if (below == null || top < before.tops[below]!) below = index;
       } else if (above == null || top > before.tops[above]!) {
         above = index;
@@ -843,12 +1001,7 @@ class _MessageListViewState extends State<_MessageListView> {
     });
     final int? anchor = below ?? above;
     if (anchor == null) return null;
-    // 量锚点的**底边**：它下一条子项（读不到就退回锚点自己的顶边）
-    final int probe = after.containsKey(anchor + 1) ? anchor + 1 : anchor;
-    final double? now = after[probe];
-    final double? was = before.tops[probe];
-    if (now == null || was == null) return null;
-    return now - was;
+    return shiftOf(anchor);
   }
 
   /// 开始一次"补页补偿"：布局前拍照 + 把解析器挂到控制器上（布局时消费一次）。
@@ -858,9 +1011,62 @@ class _MessageListViewState extends State<_MessageListView> {
   /// [_resolveShiftAbove] 按"用户当时在看哪一条"现场判定。
   void _beginShiftCompensation() {
     final _BuiltTopsSnapshot? snapshot = _snapshotBuiltTops();
+    _pendingShiftSnapshot = snapshot;
+    _controller.retryShiftRequested = false;
+    // 绝对目标的基准：布防这一刻的滚动位置（此后的用户滚动量单独累计，见
+    // [_BottomAnchorScrollController.scrollSinceArm]）
+    _controller.shiftBasePixels =
+        _controller.hasClients ? _controller.position.pixels : null;
+    _controller.scrollSinceArm = 0;
     _controller.resolveShiftAbove =
         snapshot == null ? null : () => _resolveShiftAbove(snapshot);
     _controller.shiftAbove = true;
+  }
+
+  /// 布局阶段没量出来的那次补偿的**布局前快照**（帧后重试用，见 [_retryShift]）。
+  _BuiltTopsSnapshot? _pendingShiftSnapshot;
+
+  /// 布局阶段没量出补偿量时，帧后**再量一次**并校正偏移。
+  ///
+  /// 为什么需要：`_resolveShiftAbove` 只能在布局阶段读渲染树，而"大高度差"那一帧
+  /// （一整页占位变真消息 / 长折叠组进出视口）里，这一趟布局过的子项可能**全都**
+  /// 换过高度、或者锚点还没被布局到 ⇒ 量不出来。这一帧就整个不补，视口被推走
+  /// 几百像素（实测：814 条会话匀速滚动时有 0.4% 的帧这样）。
+  ///
+  /// 帧后渲染树已经稳定，同样的量法通常就能拿到 ⇒ 补一次偏移。代价是那一帧
+  /// 先画出去再校正（一帧的位移），换掉的是"整段内容被永久推走"。
+  void _retryShift() {
+    if (!_controller.retryShiftRequested) return;
+    _controller.retryShiftRequested = false;
+    final _BuiltTopsSnapshot? before = _pendingShiftSnapshot;
+    if (before == null || !mounted || !_controller.hasClients) return;
+    final double? shift = _resolveShiftAbove(before);
+    if (shift == null) return;
+    final double? base = _controller.shiftBasePixels;
+    final ScrollPosition pos = _controller.position;
+    final double target =
+        ((base ?? pos.pixels) + _controller.scrollSinceArm + shift)
+            .clamp(pos.minScrollExtent, pos.maxScrollExtent);
+    _controller.shiftBasePixels = null;
+    _controller.scrollSinceArm = 0;
+    if ((target - pos.pixels).abs() <= 0.01) return;
+    pos.correctPixels(target);
+
+  }
+
+  /// 帧后核对补偿的**绝对目标**：框架在同一帧的重跑布局里还会按它自己的
+  /// `scrollOffsetCorrection` 再挪一次，最终位置可能偏离我们算好的目标（见
+  /// [_BottomAnchorScrollController.assertPixels]）。这里对一次就收工。
+  void _assertShiftTarget() {
+    final double? target = _controller.assertPixels;
+    if (target == null) return;
+    _controller.assertPixels = null;
+    if (!mounted || !_controller.hasClients) return;
+    final ScrollPosition pos = _controller.position;
+    if ((pos.pixels - target).abs() <= 0.5) return;
+    pos.correctPixels(target.clamp(pos.minScrollExtent, pos.maxScrollExtent));
+
+
   }
 
   /// 滚动定位到指定消息并短暂高亮。
