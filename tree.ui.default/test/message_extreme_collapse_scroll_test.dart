@@ -488,7 +488,10 @@ void main() {
           final bool clamped = up ? target <= 0.01 : target >= max - 0.01;
 
           pos.jumpTo(target);
-          // 两帧：第一帧布局 + 帧后刷新视口坐标，第二帧让拇指按新坐标重绘
+          // 三帧：①布局 + 帧后刷新视口坐标 ②拇指按新坐标重绘 ③帧后核对补偿目标后
+          // 再排一次布局（`MessageList` 的 `_assertShiftTarget` / `_retryShift` 在帧后
+          // 才校正偏移，那一帧的位移要下一帧才画出来——少这一帧，恰好被校的步会被误判）
+          await tester.pump();
           await tester.pump();
           await tester.pump();
           if (i % 3 == 0) await _flyIO(tester, rounds: 1);

@@ -160,6 +160,9 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 消息版本号：消息列表每次结构性变化时递增，驱动 MessageList 滚动到底部
   int _scrollRevision = 0;
 
+  /// 运行状态快照的退避重试定时器（[dispose] 时取消，见 [_syncRunningState]）。
+  Timer? _runningStateRetry;
+
   /// 消息列表滚动模式标志：历史整批重载时置 true（MessageList 无动画直达
   /// 底部、迭代校正确保超长会话真正落底）；流式追加/增量更新时置 false
   /// （平滑滚动跟随）。
@@ -2314,6 +2317,8 @@ class _MessagePanelState extends State<MessagePanel> {
     TerminalToggleRequest.instance.removeListener(_onTerminalToggleRequested);
     WorkspacePickRequest.instance.removeListener(_onWorkspacePickRequested);
     LegacyFrameBus.remove(_handleIncomingMessage);
+    _runningStateRetry?.cancel();
+    _runningStateRetry = null;
     _webSocket.disconnect();
     super.dispose();
   }
@@ -3083,27 +3088,35 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 为什么是"退避重试"而不是"失败就放弃"：核心先起 UI、后起 `tree.agent`
   /// （实测差 ~20s），UI 启动时这一次请求会拿到「agent 不存在」。只发一次的话，
   /// 重启后第一轮的停止键就永远没有真值来源。
-  Future<void> _syncRunningState({int attempts = 3}) async {
+  Future<void> _syncRunningState({int attempts = 3, int attempt = 0}) async {
     const List<Duration> retryDelays = <Duration>[
       Duration(seconds: 2),
       Duration(seconds: 5),
       Duration(seconds: 10),
     ];
     Map<String, dynamic>? data;
-    for (int attempt = 0; attempt < attempts; attempt += 1) {
-      try {
-        data = await ApiService.getAgentStates();
-        break;
-      } catch (error) {
-        final bool last = attempt == attempts - 1;
-        debugPrint(
-          '[消息] 运行状态快照拉取失败（第 ${attempt + 1}/$attempts 次'
-          '${last ? '，保持现状' : '，稍后重试'}）：$error',
-        );
-        if (last || !mounted) return;
-        await Future<void>.delayed(retryDelays[attempt % retryDelays.length]);
-        if (!mounted) return;
-      }
+    try {
+      data = await ApiService.getAgentStates();
+    } catch (error) {
+      final bool last = attempt >= attempts - 1;
+      debugPrint(
+        '[消息] 运行状态快照拉取失败（第 ${attempt + 1}/$attempts 次'
+        '${last ? '，保持现状' : '，稍后重试'}）：$error',
+      );
+      if (last || !mounted) return;
+      // **定时器要能被 dispose 取消**：`Future.delayed` 在组件销毁之后仍是一个
+      // pending timer（离屏的 MessagePanel 不该还在等重试），测试里会直接判
+      // "A Timer is still pending even after the widget tree was disposed"。
+      _runningStateRetry?.cancel();
+      _runningStateRetry = Timer(
+        retryDelays[attempt % retryDelays.length],
+        () {
+          if (mounted) {
+            unawaited(_syncRunningState(attempts: attempts, attempt: attempt + 1));
+          }
+        },
+      );
+      return;
     }
     if (data == null || !mounted) return;
     final List<dynamic> agents = data['agents'] as List<dynamic>? ?? const [];

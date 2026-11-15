@@ -232,6 +232,13 @@ void main() {
       'heartbeat_interval': 4,
       'missed_heartbeat_limit': 5,
     });
+    // 第二次保存的响应回来之前，上一轮"已按安全下限夹取"还在；并发跑全量时机器慢，
+    // 不能"一帧就断言它没了"——等它消失（同一套 _pumpUntil，别的断言都这么等）
+    await _pumpUntil(
+      tester,
+      () => find.textContaining('已按安全下限夹取').evaluate().isEmpty,
+      reason: '夹取原因消失',
+    );
     expect(find.textContaining('已按安全下限夹取'), findsNothing);
     expect(find.textContaining('判活窗口 20s'), findsOneWidget);
   });

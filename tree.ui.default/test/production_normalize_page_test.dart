@@ -112,6 +112,22 @@ Future<void> _flyIO(WidgetTester tester, {int rounds = 8}) async {
   }
 }
 
+/// 等到某个条件成立（真 I/O + 帧）。并发跑全量时机器慢，固定轮数的 `_flyIO`
+/// 可能还没把页面建出来 ⇒ `tester.widget` 会抛 "No element"（不是断言失败）。
+Future<void> _pumpUntil(
+  WidgetTester tester,
+  bool Function() done, {
+  int rounds = 80,
+}) async {
+  for (int i = 0; i < rounds; i++) {
+    if (done()) return;
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 25)),
+    );
+    await tester.pump();
+  }
+}
+
 void main() {
   late _FakeCore core;
 
@@ -154,6 +170,14 @@ void main() {
   ) async {
     await tester.pumpWidget(_harness());
     await _flyIO(tester);
+    // 并发跑全量时机器慢：等页面把 apply 按钮建出来再读它（见 [_pumpUntil]）
+    await _pumpUntil(
+      tester,
+      () => find
+          .byKey(const Key('production-normalize-apply'))
+          .evaluate()
+          .isNotEmpty,
+    );
 
     FilledButton apply() => tester.widget<FilledButton>(
       find.byKey(const Key('production-normalize-apply')),
