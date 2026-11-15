@@ -775,8 +775,8 @@ class LocalExecutor {
       workingDirectory: root,
       runInShell: false,
     );
-    final Future<String> stdout = process.stdout.transform(utf8.decoder).join();
-    final Future<String> stderr = process.stderr.transform(utf8.decoder).join();
+    final Future<List<int>> stdout = _collectBytes(process.stdout);
+    final Future<List<int>> stderr = _collectBytes(process.stderr);
     int code;
     if (timeout > 0) {
       code = await process.exitCode.timeout(
@@ -789,8 +789,8 @@ class LocalExecutor {
     } else {
       code = await process.exitCode;
     }
-    final String out = await stdout;
-    final String err = await stderr;
+    final String out = _decodeCommandOutput(await stdout);
+    final String err = _decodeCommandOutput(await stderr);
     final String text = <String>[
       if (out.isNotEmpty) out.trimRight(),
       if (err.isNotEmpty) err.trimRight(),
@@ -879,7 +879,7 @@ class _HookTask {
 
   Future<String> readLog() async {
     try {
-      return await logFile.readAsString();
+      return _decodeCommandOutput(await logFile.readAsBytes());
     } catch (_) {
       return '';
     }
@@ -903,7 +903,7 @@ class _HookTask {
     String tail = '';
     try {
       if (logFile.existsSync()) {
-        final String all = await logFile.readAsString();
+        final String all = await readLog();
         tail = all.length > 4000 ? all.substring(all.length - 4000) : all;
       }
     } catch (_) {}
@@ -924,5 +924,33 @@ class _HookTask {
       'running': running,
       if (code != null) 'exit_code': code,
     };
+  }
+}
+
+/// 收齐一条命令输出流（**不能**直接 `utf8.decoder`：Windows 上 cmd 的报错/内建命令
+/// 输出是系统代码页字节，严格 UTF-8 解码会抛异常，整段输出就丢了）。
+Future<List<int>> _collectBytes(Stream<List<int>> stream) =>
+    stream.fold<List<int>>(<int>[], (List<int> acc, List<int> chunk) {
+      acc.addAll(chunk);
+      return acc;
+    });
+
+/// 命令输出的解码链：**严格 UTF-8 → 系统 ANSI 代码页 → latin1 兜底**
+/// （与 `tree_local_exec` 的 `PlatformTextDecoder` 同口径）。
+///
+/// 为什么必须兜底：中文 Windows 上 cmd 的报错是 GBK 字节，严格 UTF-8 解码会抛
+/// `FormatException`；旧实现把异常吞成空串，工具只回「退出码 1」，调用方看不到
+/// 失败原因（现场：`ls -la` 只回退出码、日志里其实有 `'ls' 不是内部或外部命令`）。
+String _decodeCommandOutput(List<int> bytes) {
+  if (bytes.isEmpty) return '';
+  try {
+    return utf8.decode(bytes);
+  } on FormatException {
+    // 不是严格 UTF-8：往下试系统代码页（Windows = CP_ACP，中文机器即 GBK）。
+  }
+  try {
+    return systemEncoding.decode(bytes);
+  } catch (_) {
+    return latin1.decode(bytes);
   }
 }
