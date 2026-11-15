@@ -323,7 +323,8 @@ class StationClient {
     _retryTimers.clear();
   }
 
-  /// 水位判定：重复 / 回退直接丢弃；跳号记一次 gap 但仍然投递（不静默丢）。
+  /// 水位判定：重复直接丢弃；**序号倒退按「新订阅」重对齐**（不能静默丢）；
+  /// 跳号记一次 gap 但仍然投递（不静默丢）。
   ///
   /// 没有 `topic` 或没有 `seq` 的投递（如生命周期站）不参与水位。
   bool _acceptSeq(StationDelivery delivery) {
@@ -331,12 +332,26 @@ class StationClient {
     final int? seq = delivery.seq;
     if (topic == null || topic.isEmpty || seq == null) return true;
     final int? last = _lastSeq[topic];
-    if (last != null) {
-      if (seq <= last) return false;
-      if (seq > last + 1) {
-        seqGaps += 1;
-        debugPrint('[Station] $topic 跳号：$last → $seq（已记 gap，不静默）');
-      }
+    if (last != null && seq <= last) {
+      if (seq == last) return false; // 同一帧重播：正常丢弃
+      // 倒退 = 对端已从 1 重新计数（新订阅 / 核心重启），而 `reset` 没到。
+      // 过去这里按重复静默丢弃 ⇒ 之后每一帧都更小 ⇒ 全部丢光，界面只剩快照
+      // 同步、停止键永远不亮。现在按新订阅处理：清空水位（全部 topic，因为
+      // reset 本就清全部）、记一次重对齐，并**请求上层重拉一次快照**。
+      _lastSeq.clear();
+      seqGaps += 1;
+      debugPrint('[Station] $topic 序号倒退：$last → $seq（按新订阅重对齐，已请求重拉快照）');
+      _deliveries.add(
+        StationDelivery(
+          stationId: delivery.stationId,
+          point: delivery.point,
+          state: StationDeliveryState.lagged,
+          reason: '序号倒退（$last → $seq），按新订阅重新对齐',
+        ),
+      );
+    } else if (last != null && seq > last + 1) {
+      seqGaps += 1;
+      debugPrint('[Station] $topic 跳号：$last → $seq（已记 gap，不静默）');
     }
     _lastSeq[topic] = seq;
     return true;

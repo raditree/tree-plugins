@@ -38,6 +38,7 @@ const String subagentsPattern = '/api/agents/{agentId}/subagents'; // 子 agent 
 const String subagentTranscriptPattern =
     '/api/agents/{agentId}/subagents/{subagentId}/transcript'; // 子 agent #9
 const String agentsPattern = '/api/agents'; // agent 列表 #1
+const String agentsStatePattern = '/api/agents/state'; // 运行状态快照（晚订阅者）
 const String agentDetailPattern = '/api/agents/{agentId}'; // agent 详情 #3
 const String sessionsPattern =
     '/api/agents/{agentId}/sessions'; // 会话列表 #3（会话/历史组）
@@ -1497,6 +1498,23 @@ Future<Map<String, dynamic>> _dispatchDelegate(
       ),
       'messages': messages,
     });
+  }
+
+  // 运行状态快照（`agent.state.list` 的 REST 读法）：**必须排在
+  // `/api/agents/{agentId}` 之前**，否则 `state` 会被当成一个 agentId。
+  //
+  // 为什么需要它：`agent_status` 是瞬时帧，UI 热应用 / 断线 / 队列溢出丢一帧后
+  // 「工作中」就没有任何恢复路径（只剩停止键不亮的表象）。快照是晚订阅者的
+  // 权威读法，UI 据此在连接与重对齐时补齐。
+  if (method == 'GET' && _matches(agentsStatePattern, path)) {
+    final AgentRuntime runtime = _runtimeFor(paths, runtimeFor);
+    return _jsonReply(
+      200,
+      runtime.agentStateSnapshot(
+        agentId: _queryString(query, 'agent_id'),
+        sessionId: _queryString(query, 'session_id'),
+      ),
+    );
   }
 
   // 单个 agent（含 SSH 非机密视图；不回密钥）。

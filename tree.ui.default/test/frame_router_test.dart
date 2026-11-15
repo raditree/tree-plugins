@@ -133,7 +133,7 @@ void main() {
     expect(router.routed, 0, reason: 'resync 是合成帧，不计入转投数');
   });
 
-  test('seq 水位：重复/回退丢弃，跳号记账，reset 清零', () async {
+  test('seq 水位：重复丢弃，跳号记账，回退按新订阅重对齐，reset 清零', () async {
     final StationClient client = StationClient();
     final List<StationDelivery> got = <StationDelivery>[];
     final StreamSubscription<StationDelivery> sub = client.deliveries.listen(
@@ -156,12 +156,15 @@ void main() {
     data(1); // 重复 ⇒ 丢
     data(2);
     data(4); // 跳号 ⇒ 收下但记一次 gap
-    data(3); // 回退 ⇒ 丢
+    // 回退 ⇒ 不能静默丢（旧实现会让整条订阅永久失效、只剩快照同步）：
+    // 先合成一条 lagged 通知上层重拉快照，再照常投递这一帧。
+    data(3);
     await Future<void>.delayed(Duration.zero);
 
-    expect(got.map((StationDelivery d) => d.seq), <int?>[1, 2, 4]);
-    expect(client.lastSeqFor('tree.agent.s1.msg_chunk'), 4);
-    expect(client.seqGaps, 1);
+    expect(got.map((StationDelivery d) => d.seq), <int?>[1, 2, 4, null, 3]);
+    expect(got[3].state, StationDeliveryState.lagged);
+    expect(client.lastSeqFor('tree.agent.s1.msg_chunk'), 3);
+    expect(client.seqGaps, 2, reason: '一次跳号 + 一次倒退');
 
     client.handleFrame(
       StationDelivery(

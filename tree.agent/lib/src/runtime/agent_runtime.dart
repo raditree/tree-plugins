@@ -810,9 +810,9 @@ class AgentRuntime {
       case 'agent.message.send':
         return _agentMessageSend(arguments, meta);
       case 'agent.state.list':
-        return _agentStateSnapshot();
+        return agentStateSnapshot();
       case 'agent.state.get':
-        return _agentStateSnapshot(
+        return agentStateSnapshot(
           agentId: _text(arguments['agent_id']),
           sessionId: _text(arguments['session_id']),
         );
@@ -878,8 +878,9 @@ class AgentRuntime {
     );
   }
 
-  /// 状态快照（`agent.state.list` / `agent.state.get`）：晚订阅者的权威读法。
-  Map<String, dynamic> _agentStateSnapshot({
+  /// 状态快照（`agent.state.list` / `agent.state.get` / REST `/api/agents/state`）：
+  /// 晚订阅者的权威读法。
+  Map<String, dynamic> agentStateSnapshot({
     String agentId = '',
     String sessionId = '',
   }) {

@@ -762,6 +762,15 @@ class ApiService {
         .toList();
   }
 
+  /// 运行状态快照（`GET /api/agents/state`）。
+  ///
+  /// 原样返回 `{agents: [{agent_id, state, sessions: [{session_id, own_running,
+  /// subagent_running, ...}]}]}`。**这是「工作中」的权威读法**：`agent_status`
+  /// 是瞬时帧，UI 热应用 / 断线 / 站点队列溢出丢一帧后，停止键与工作中标识只能
+  /// 靠它重新对齐（与 tree.agent 的 `agent.state.list` 同一份实现）。
+  static Future<Map<String, dynamic>> getAgentStates() =>
+      _getJson('/api/agents/state');
+
   /// 创建一个 agent 并持久化到后端
   ///
   /// 调用 `POST /api/agents`，请求体为

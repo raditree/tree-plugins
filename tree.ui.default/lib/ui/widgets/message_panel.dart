@@ -358,15 +358,19 @@ class _MessagePanelState extends State<MessagePanel> {
     // （跨 team 推送等）的消息在会话列表可见
     _webSocket.onUnknownSession = _ensureLocalSessionEntry;
     _syncKnownSessions();
-    // 连接建立/重连时清空 working 集合：后端重启会清空其内存态 _active_tasks，
-    // 若不清空，前端会残留旧的 working（无 API 调用却显示工作中）。
-    // 清空后由后端在 WS 建立时补推真实的 agent_status（仍在工作的才重新标记）。
+    // 连接建立/重连时清空 working 集合：核心重启会清空它的在途任务，若不清空，
+    // 前端会残留旧的 working（无 API 调用却显示工作中）。清空只是「本连接还没
+    // 确认过」，真值由紧跟的运行状态快照补回（见 _syncRunningState）。
     _webSocket.onConnectionChange = (bool connected) {
       if (connected && mounted) {
         setState(() {
           _workingAgents.clear();
           _compactingAgents.clear();
         });
+        // 清空只描述「这条连接还没确认过」：立刻用快照补回真值。后端不再在
+        // WS 建立时补推 agent_status（领域帧已搬到事件站），少了这一跳，正在
+        // 生成的那一轮会一直显示发送键。
+        unawaited(_syncRunningState());
         // 重连后刷新当前 agent 的运行模式显示（本地/SSH 写的是 agent 配置，
         // 不存在"重新注册执行器"这回事）。
         final String? curId = widget.selectedAgent?.id;
@@ -379,6 +383,9 @@ class _MessagePanelState extends State<MessagePanel> {
     // WebSocket 连接；执行器注册由懒激活（发送前 ensureTeam）与重连
     // 恢复（syncRegisteredTeams）按 per-team 状态完成
     _initAsync();
+    // 首屏直接对齐一次运行状态：面板可能是热应用 / 重启后新建的，那时订阅
+    // 刚建立、错过了一整段 agent_status（停止键的唯一恢复路径）。
+    unawaited(_syncRunningState());
     // 首次进入时若已选中 agent 则加载会话与历史
     if (widget.selectedAgent != null) {
       // 首载也**并发**发两跳（会话列表 + 末尾页，症状 3），并且先进入"加载中"：
@@ -1380,6 +1387,8 @@ class _MessagePanelState extends State<MessagePanel> {
       if (widget.selectedAgent == null) return;
       debugPrint('[消息] 站点 ${data['state']} ⇒ 重拉快照对齐');
       unawaited(_loadHistory());
+      // 增量断过 ⇒ 运行态也断过：快照里一并把停止键/工作中标识拉回真值。
+      unawaited(_syncRunningState());
       return;
     }
 
@@ -3048,6 +3057,51 @@ class _MessagePanelState extends State<MessagePanel> {
     final String viewId = _effectiveViewId;
     if (viewId.isNotEmpty) return _workingSubagents.contains(viewId);
     return agentId.isNotEmpty && _workingAgents.contains(agentId);
+  }
+
+  /// 拉一次运行状态快照，补齐「工作中」真值（停止键的唯一恢复路径）。
+  ///
+  /// 为什么必须有这条：`agent_status` 是**瞬时帧**，界面只靠它记 `_workingAgents`。
+  /// UI 热应用重启、断线重连、站点队列溢出丢帧之后，这一帧就再也补不回来——
+  /// 表现正是「在生成，但右下角还是发送键」。`GET /api/agents/state` 与
+  /// tree.agent 的 `agent.state.list` 是同一份实现（晚订阅者的权威读法），
+  /// 面板在初始化 / 连接建立 / 站点重对齐三处各对齐一次即可自愈。
+  ///
+  /// 失败**保持现状**（不能让一次网络抖动把已确认的 working 抹掉）。
+  Future<void> _syncRunningState() async {
+    final Map<String, dynamic> data;
+    try {
+      data = await ApiService.getAgentStates();
+    } catch (error) {
+      debugPrint('[消息] 运行状态快照拉取失败（保持现状）：$error');
+      return;
+    }
+    if (!mounted) return;
+    final List<dynamic> agents = data['agents'] as List<dynamic>? ?? const [];
+    final Set<String> working = <String>{};
+    final Set<String> compacting = <String>{};
+    for (final dynamic raw in agents) {
+      if (raw is! Map) continue;
+      final String id = (raw['agent_id'] ?? '').toString();
+      if (id.isEmpty) continue;
+      if ((raw['state'] ?? '').toString() == 'compacting') compacting.add(id);
+      // `own_running` 是「这个 agent 自己这一轮在跑」，与主视角停止键的口径
+      // 逐字一致（名下临时员工在跑不算）。
+      final List<dynamic> sessions =
+          raw['sessions'] as List<dynamic>? ?? const <dynamic>[];
+      final bool ownRunning = sessions.any(
+        (dynamic s) => s is Map && s['own_running'] == true,
+      );
+      if (ownRunning) working.add(id);
+    }
+    setState(() {
+      _workingAgents
+        ..clear()
+        ..addAll(working);
+      _compactingAgents
+        ..clear()
+        ..addAll(compacting);
+    });
   }
 
   /// 临时员工视角的正文区：一行身份条 + 它的完整过程（**同一个窗口**里换掉消息列表）。

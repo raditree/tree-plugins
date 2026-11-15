@@ -18,6 +18,7 @@ import 'src/delegate.dart'
         agentDetailPattern,
         agentModelsInfoPattern,
         agentsPattern,
+        agentsStatePattern,
         cancelPattern,
         conversationsPattern,
         messageDetailPattern,
@@ -120,7 +121,7 @@ export 'src/ws/ws_hub.dart';
 export 'src/yaml_utils.dart';
 
 /// 插件版本（与 `plugin.json` 的 version 同源；发布时两处一起改）。
-const String kTreeAgentVersion = '0.32.0';
+const String kTreeAgentVersion = '0.32.1';
 
 /// 收集站 id：插件经它申报自己承担的 `{method, pattern}` 委派路由。
 const String kApiRoutesStation = 'system.collect.api.routes';
@@ -149,6 +150,7 @@ const String kAgentEventsReadme =
 /// 核心会把它标注为 shadowed 并继续由核心承接（查表顺序），交接删除后自动生效。
 const List<Map<String, String>> kDeclaredRoutes = <Map<String, String>>[
   <String, String>{'method': 'GET', 'pattern': agentsPattern},
+  <String, String>{'method': 'GET', 'pattern': agentsStatePattern},
   <String, String>{'method': 'GET', 'pattern': conversationsPattern},
   <String, String>{'method': 'GET', 'pattern': messageDetailPattern},
   <String, String>{'method': 'GET', 'pattern': agentDetailPattern},

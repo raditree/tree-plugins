@@ -49,6 +49,7 @@ Map<String, dynamic> delivery({
   String stationId = StationClient.pluginStateStation,
   String? reason,
   Object? payload,
+  int seq = 1,
 }) {
   final Map<String, dynamic> frame = <String, dynamic>{
     'type': 'station_delivery',
@@ -59,7 +60,7 @@ Map<String, dynamic> delivery({
     'scope': <String, dynamic>{},
     'origin_plugin_id': 'tree.core',
     'state': state,
-    'seq': 1,
+    'seq': seq,
   };
   if (reason != null) frame['reason'] = reason;
   return frame;
@@ -252,5 +253,33 @@ void main() {
     expect(seen.single.state, StationDeliveryState.data);
     expect((seen.single.payload as Map<String, dynamic>)['a'], 1);
     expect(client.isOffline, isFalse);
+  });
+
+  test('序号倒退不得静默丢弃：按新订阅重对齐并请求重拉快照', () async {
+    client.start();
+    final List<StationDelivery> seen = <StationDelivery>[];
+    final StreamSubscription<StationDelivery> sub =
+        client.deliveries.listen(seen.add);
+    addTearDown(sub.cancel);
+
+    client.handleFrame(delivery(state: 'data', seq: 9));
+    await Future<void>.delayed(Duration.zero);
+    expect(seen, hasLength(1));
+
+    // 对端重新从 1 计数（新订阅 / 核心重启）而 reset 没到：旧实现把它当重复
+    // 丢掉，之后每一帧都更小 ⇒ 整条订阅全丢，界面只剩快照同步。
+    client.handleFrame(delivery(state: 'data', seq: 1));
+    await Future<void>.delayed(Duration.zero);
+    expect(seen, hasLength(3), reason: '先一条 lagged（请求重拉快照），再照常投递该帧');
+    expect(seen[1].state, StationDeliveryState.lagged);
+    expect(seen[2].state, StationDeliveryState.data);
+    expect(client.lastSeqFor('tree.ui.default.s1.state'), 1);
+    expect(client.seqGaps, greaterThan(0));
+
+    // 重对齐后的正常帧不得再触发一次（否则会形成快照风暴）。
+    client.handleFrame(delivery(state: 'data', seq: 2));
+    await Future<void>.delayed(Duration.zero);
+    expect(seen, hasLength(4));
+    expect(seen.last.state, StationDeliveryState.data);
   });
 }

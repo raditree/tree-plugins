@@ -1453,6 +1453,37 @@ void main() {
       );
     });
   });
+
+  group('GET /api/agents/state', () {
+    test('返回晚订阅者快照，且 state 不会被当成 agentId', () async {
+      final Map<String, dynamic> created = await _call(
+        'POST',
+        '/api/agents',
+        paths,
+        body: <String, dynamic>{'name': '夹具', 'model_id': 'm1'},
+      );
+      final String id = ((_bodyOf(created)['agent'] as Map)['id']).toString();
+
+      final Map<String, dynamic> reply = await _call(
+        'GET',
+        '/api/agents/state',
+        paths,
+      );
+      expect(reply['status'], 200);
+      final Map<String, dynamic> body = _bodyOf(reply);
+      expect(body['ok'], true);
+      final Map<String, dynamic> mine = (body['agents'] as List<dynamic>)
+          .cast<Map<String, dynamic>>()
+          .firstWhere((Map<String, dynamic> a) => a['agent_id'] == id);
+      // 空闲夹具：agent 与它自己的会话都必须报 idle / own_running=false
+      // （界面据此把停止键换回发送键）。
+      expect(mine['state'], 'idle');
+      final Map<String, dynamic> session =
+          (mine['sessions'] as List<dynamic>).cast<Map<String, dynamic>>().first;
+      expect(session['own_running'], false);
+      expect(session['subagent_running'], false);
+    });
+  });
 }
 
 ModelMeta _meta({String modelId = 'm1'}) => ModelMeta(
