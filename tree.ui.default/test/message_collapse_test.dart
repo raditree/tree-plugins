@@ -3,6 +3,7 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:tree_ui_default/ui/models/message.dart';
+import 'package:tree_ui_default/ui/services/message_window.dart';
 import 'package:tree_ui_default/ui/widgets/collapsed_run_row.dart';
 import 'package:tree_ui_default/ui/widgets/message_list.dart';
 import 'package:tree_ui_default/ui/widgets/thinking_card.dart';
@@ -228,6 +229,65 @@ void main() {
     await tester.tap(find.byKey(const ValueKey<String>('collapsed-run-m1')));
     await tester.pumpAndSettle();
     expect(find.byType(ThinkingCard), findsNWidgets(2));
+  });
+
+  testWidgets('展开组上报槽位区间：补页在组首之前接进成员，展开态不丢', (
+    WidgetTester tester,
+  ) async {
+    // 用户 2026-11-15：展开一组长工具调用后滚动会突然往下跳。两个成因都在这里钉住：
+    // ① 面板要拿到展开组的**槽位区间**并在淘汰时整段钉住（打洞会把组切碎）；
+    // ② 组首变了（补页在组首之前接进更多工具）也不许把展开态判成折叠。
+    final List<ChatMessage?> slots = <ChatMessage?>[
+      _text(0),
+      _tool(1, 'read'),
+      _tool(2, 'read'),
+      _tool(3, 'grep'),
+      _tool(4, 'edit'),
+      _text(5),
+    ];
+    MessageRange? reported;
+    int revision = 1;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MessageList(
+            slots: slots,
+            revision: revision,
+            onExpandedRunChanged: (MessageRange? range) => reported = range,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(reported, isNull, reason: '默认没有展开组');
+
+    await tester.tap(find.byKey(const ValueKey<String>('collapsed-run-m1')));
+    await tester.pumpAndSettle();
+    expect(reported, const MessageRange(1, 5),
+        reason: '展开后要把整组的槽位区间报给面板（面板据此在淘汰时钉住）');
+
+    // 补页在组首之前接进一条工具（组首从 m1 换成 m0）：仍然是同一段展开组
+    slots[0] = _tool(0, 'read');
+    revision++;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MessageList(
+            slots: slots,
+            revision: revision,
+            onExpandedRunChanged: (MessageRange? range) => reported = range,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.textContaining('点击收起'), findsOneWidget,
+        reason: '组首换人不能把展开组判成折叠（否则内容瞬间塌回一行）');
+    expect(reported, const MessageRange(0, 5), reason: '区间要跟着往左长');
+
+    await tester.tap(find.byKey(const ValueKey<String>('collapsed-run-m0')));
+    await tester.pumpAndSettle();
+    expect(reported, isNull, reason: '收起后要通知面板解除钉住');
   });
 
   testWidgets('提问是分隔标志；全局同时只展开一个组', (WidgetTester tester) async {

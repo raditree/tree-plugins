@@ -185,6 +185,24 @@ void main() {
       expect(w.at(2)!.id, 'c');
     });
 
+    test('展开中的折叠组整段钉住（keepAlso）：不打洞、不切碎组', () {
+      // 用户 2026-11-15：长工具组展开后滚动会跳。面板把展开组的区间传进 keepAlso，
+      // 组内一格都不许被淘汰回占位槽 —— 打洞会让组被切成两段，展开态当场丢失。
+      final MessageWindow w = MessageWindow(tailKeep: 0);
+      w.ensureTotal(120);
+      w.place(offset: 0, messages: page(0, 120));
+      final int removed = w.evict(
+        keep: const MessageRange(100, 106),
+        keepAlso: <MessageRange>[const MessageRange(20, 60)],
+      );
+      expect(removed, 120 - 6 - 40);
+      for (int i = 20; i < 60; i++) {
+        expect(w.at(i), isNotNull, reason: '展开组第 $i 格被淘汰了：组会被切碎');
+      }
+      expect(w.at(19), isNull);
+      expect(w.at(60), isNull);
+    });
+
     test('加载与淘汰都不改变槽位表长度（滑块的全局长度口径）', () {
       final MessageWindow w = MessageWindow(tailKeep: 1);
       w.ensureTotal(100);

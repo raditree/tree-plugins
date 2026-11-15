@@ -339,6 +339,13 @@ class _MessagePanelState extends State<MessagePanel> {
   /// 刚定位过的那一页（淘汰时额外留着：它可能离视口很远，但用户正看着它）。
   MessageRange? _locateKeep;
 
+  /// 展开中的折叠组的槽位区间（[MessageList.onExpandedRunChanged] 报上来的）。
+  ///
+  /// 淘汰时必须把它**整段钉住**：在组中间打洞（真消息 → 88px 占位槽）会把组切成
+  /// 几段——后一段的组首换了 id，展开态就丢了，整组塌回一行，视口跟着跳一大截
+  /// （用户 2026-11-15：「展开的长工具组滚到一半突然往下跳」）。
+  MessageRange? _expandedRunKeep;
+
   @override
   void initState() {
     super.initState();
@@ -1262,7 +1269,7 @@ class _MessagePanelState extends State<MessagePanel> {
         _visibleFrom - _cacheMargin,
         _visibleTo + 1 + _cacheMargin,
       ),
-      keepAlso: <MessageRange>[?locate],
+      keepAlso: <MessageRange>[?locate, ?_expandedRunKeep],
     );
     if (removed == 0) return;
     setState(() {
@@ -2387,6 +2394,10 @@ class _MessagePanelState extends State<MessagePanel> {
                         contentShiftStamp: _contentShiftStamp,
                         // 滑到哪加载哪 + 淘汰离得远的槽位（限制缓存长度）
                         onWindowChanged: _onWindowChanged,
+                        // 展开中的折叠组整段钉住（见 [_expandedRunKeep]）：
+                        // 只记字段、不 setState（回调在列表的布局之前发出）
+                        onExpandedRunChanged: (MessageRange? range) =>
+                            _expandedRunKeep = range,
                         // 「回到底部」= 重载末尾一段（用户 2026-10-04）
                         onReloadTail: _reloadTail,
                         onAskAnswer: _handleAskAnswer,

@@ -84,6 +84,16 @@ class MessageList extends StatelessWidget {
   /// 本帧构建到的下标区间（帧后回调；面板据此补页 + 淘汰）。
   final void Function(int first, int last)? onWindowChanged;
 
+  /// 展开中的折叠组的**槽位区间**（`[组首, 组尾+1)`；null = 没有展开组）。
+  ///
+  /// 面板据此在淘汰时**整段钉住**这一组：展开组一旦被窗口打洞（真消息 → 88px 占位槽），
+  /// 分组边界就变了 —— 组首一换，展开态判定就对不上，整组瞬间塌回一行，
+  /// 视口跟着跳一大截（长组滚到一半时最明显）。
+  ///
+  /// 回调可能在本帧布局**之前**同步发出（组边界是渲染层现算的），接收方只许
+  /// 记字段、不许 setState。
+  final ValueChanged<MessageRange?>? onExpandedRunChanged;
+
   /// 「回到底部」：请面板重载末尾一段（空 = 退回旧的平滑回底行为）。
   final VoidCallback? onReloadTail;
 
@@ -109,6 +119,7 @@ class MessageList extends StatelessWidget {
     this.padAboveStamp = 0,
     this.contentShiftStamp = 0,
     this.onWindowChanged,
+    this.onExpandedRunChanged,
     this.onReloadTail,
     this.trailingCards = const <Widget>[],
     this.loading = false,
@@ -127,6 +138,7 @@ class MessageList extends StatelessWidget {
       padAboveStamp: padAboveStamp,
       contentShiftStamp: contentShiftStamp,
       onWindowChanged: onWindowChanged,
+      onExpandedRunChanged: onExpandedRunChanged,
       onReloadTail: onReloadTail,
       trailingCards: trailingCards,
       loading: loading,
@@ -146,6 +158,7 @@ class _MessageListView extends StatefulWidget {
   final int padAboveStamp;
   final int contentShiftStamp;
   final void Function(int first, int last)? onWindowChanged;
+  final ValueChanged<MessageRange?>? onExpandedRunChanged;
   final VoidCallback? onReloadTail;
   final List<Widget> trailingCards;
   final bool loading;
@@ -161,6 +174,7 @@ class _MessageListView extends StatefulWidget {
     this.padAboveStamp = 0,
     this.contentShiftStamp = 0,
     this.onWindowChanged,
+    this.onExpandedRunChanged,
     this.onReloadTail,
     this.trailingCards = const <Widget>[],
     this.loading = false,
@@ -207,7 +221,7 @@ class _RunInfo {
   /// 组标识 = 组首条消息 id（展开态记它；全局同时只展开一个）
   final String runId;
 
-  /// 是否处于折叠态（「有就折叠」：默认折叠，只有 [_MessageListViewState._expandedRunId]
+  /// 是否处于折叠态（「有就折叠」：默认折叠，只有 [_MessageListViewState._expandedAnchorId]
   /// 命中的那一组展开）
   final bool collapsed;
 
@@ -453,11 +467,60 @@ class _MessageListViewState extends State<_MessageListView> {
   /// 程序化的"直达底部"进行中：期间不把滚动通知当成用户上滚。
   bool _jumpingToBottom = false;
 
-  /// 当前展开的折叠组（runId = 组首条消息 id）。
+  /// 当前展开的折叠组（锚点 = 展开时组首那条消息）。
   ///
   /// 全局同时只允许一个展开组（规格 Q5）：点开新组时旧组自动收起。展开态是
-  /// O(1) 的单个 id，渲染负担上限 = 一个 run + 视口。
-  String? _expandedRunId;
+  /// O(1) 的单个 id + 下标，渲染负担上限 = 一个 run + 视口。
+  ///
+  /// 判定"这一段是不是展开组"用**锚点下标是否落在 [head, tail] 内**，而不是
+  /// "组首 id 相等"：补页可能在组首之前接进更多工具/思考（组首换人），按 id 判
+  /// 会把用户正看着的展开组当场判成折叠，视口跳一大截。
+  String? _expandedAnchorId;
+
+  /// 展开锚点的槽位下标（-1 = 没有展开组）。
+  int _expandedAnchor = -1;
+
+  /// 上一次报给面板的展开组区间（去重用；组边界沿锚点现算，不缓存组首）。
+  MessageRange? _reportedExpandedRun;
+
+  /// 把"展开中的折叠组的槽位区间"报给面板（面板据此在淘汰时整段钉住）。
+  ///
+  /// 为什么不钉：长组里只要有一格被淘汰回 88px 占位槽，组就被切成两段——
+  /// 后一段的组首换了 id，展开态判定（[_RunInfo.collapsed]）就对不上，
+  /// 整组塌回一行，视口瞬跳。
+  void _publishExpandedRun() {
+    final String? id = _expandedAnchorId;
+    MessageRange? range;
+    if (id != null) {
+      final List<ChatMessage?> slots = widget.slots;
+      int anchor = _expandedAnchor;
+      if (anchor < 0 || anchor >= slots.length || slots[anchor]?.id != id) {
+        // 只在这种"缓存失效"的稀有路径上扫一次（锚点一般稳定：面板已钉住它）
+        anchor = slots.indexWhere((ChatMessage? m) => m?.id == id);
+      }
+      if (anchor < 0) {
+        // 锚点已经不在了（窗口整表换过内容）：展开态没有落点，按"没有展开组"上报
+        _expandedAnchorId = null;
+        _expandedAnchor = -1;
+      } else {
+        _expandedAnchor = anchor;
+        int from = anchor;
+        while (_groupableAt(from - 1)) {
+          from--;
+        }
+        int to = anchor;
+        while (_groupableAt(to + 1)) {
+          to++;
+        }
+        range = MessageRange(from, to + 1);
+      }
+    } else {
+      _expandedAnchor = -1;
+    }
+    if (range == _reportedExpandedRun) return;
+    _reportedExpandedRun = range;
+    widget.onExpandedRunChanged?.call(range);
+  }
 
   @override
   void initState() {
@@ -496,6 +559,9 @@ class _MessageListViewState extends State<_MessageListView> {
       // 槽位表变了：刷新一次视口坐标（面板可能还要按它补页 / 淘汰）
       _scheduleCoordinateFlush();
       _pruneItemKeys();
+      // 展开组可能因为补页接进了更多成员 ⇒ 区间要跟着往两边长，
+      // 面板才能在**这一帧之后**的淘汰里把整段钉住（必须早于淘汰发生）。
+      _publishExpandedRun();
       if (widget.bottomJump) {
         // 重载（切会话 / 切 agent / 回到底部 / 清空重拉）：恢复跟随并直达底部
         _jumpToBottomSettling();
@@ -813,8 +879,11 @@ class _MessageListViewState extends State<_MessageListView> {
     final _RunInfo? run = _runAt(idx);
     if (run != null && run.collapsed) {
       setState(() {
-        _expandedRunId = run.runId;
+        _expandedAnchorId = run.runId;
+        _expandedAnchor = run.head;
       });
+      // 展开组整段钉住（与点开折叠行走同一条口径，见 [_publishExpandedRun]）
+      _publishExpandedRun();
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _scrollToMessage(id);
       });
@@ -1064,7 +1133,10 @@ class _MessageListViewState extends State<_MessageListView> {
       head: head,
       tail: tail,
       runId: runId,
-      collapsed: _expandedRunId != runId,
+      // 展开态按**锚点下标落不落在这一段里**判，不按"组首 id 相等"：
+      // 补页可能在组首之前接进更多工具/思考（组首 id 变了），按 id 判会把用户
+      // 正看着的展开组当场判成折叠 —— 内容突然塌回一行，视口跳一大截。
+      collapsed: _expandedAnchor < head || _expandedAnchor > tail,
       toolCount: toolCount,
       thinkingCount: thinkingCount,
       toolCountsByLabel: toolCountsByLabel,
@@ -1074,11 +1146,17 @@ class _MessageListViewState extends State<_MessageListView> {
   /// 点开/收起折叠组：走既有「上方补页补偿」通路（[_beginShiftCompensation]），
   /// 保证上方内容零位移（TC-COLLAPSE-01）。控制条两态同高 ⇒ 增量只发生在它下方；
   /// 组横跨视口顶时由实测锚点精确补偿，净位移仍为 0。
-  void _toggleRun(String runId) {
+  ///
+  /// 展开后立刻把区间报给面板（[_publishExpandedRun]）：面板从下一帧起会把它整段
+  /// 钉在缓存里，避免滚动时淘汰在组中间打洞、整组塌陷引发视口跳变。
+  void _toggleRun(_RunInfo run) {
     _beginShiftCompensation();
     setState(() {
-      _expandedRunId = _expandedRunId == runId ? null : runId;
+      final bool expanding = run.collapsed;
+      _expandedAnchorId = expanding ? run.runId : null;
+      _expandedAnchor = expanding ? run.head : -1;
     });
+    _publishExpandedRun();
   }
 
   /// 一个槽位（或末尾的插件内联卡片）。
@@ -1126,7 +1204,7 @@ class _MessageListViewState extends State<_MessageListView> {
             thinkingCount: run.thinkingCount,
             toolCountsByLabel: run.toolCountsByLabel,
             expanded: !run.collapsed,
-            onTap: () => _toggleRun(run.runId),
+            onTap: () => _toggleRun(run),
           ),
         ),
         if (!run.collapsed) card,
