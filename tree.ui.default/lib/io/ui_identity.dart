@@ -18,6 +18,7 @@ class UiIdentity {
     required this.capabilities,
     required this.fromManifest,
     this.error = '',
+    this.brandingIcon,
   });
 
   /// 打包清单里的默认 id（与 `plugin.json` 一致）。
@@ -28,6 +29,15 @@ class UiIdentity {
 
   /// `ui.hello` 的帧类型名（协议包里的同一字面量）。
   static const String helloType = 'ui.hello';
+
+  /// 品牌图标在插件目录内的相对路径。
+  ///
+  /// `assets/tray_icon.ico` 由 Flutter 复制到 `data/flutter_assets/assets/`，
+  /// 打包脚本整目录拷贝，所以安装后这个路径稳定存在。品牌申报用 `role: exe`
+  /// （Windows 快捷方式只认 `.ico`），文件缺失时**不申报**，让核心回默认图标，
+  /// 而不是报一个坏路径。
+  static const String brandingIconRelativePath =
+      'data/flutter_assets/assets/tray_icon.ico';
 
   final String pluginId;
   final String version;
@@ -40,6 +50,9 @@ class UiIdentity {
 
   /// 清单读取失败的可读原因（仅诊断用，不阻断启动）。
   final String error;
+
+  /// 品牌图标的绝对路径；null = 文件不存在，不申报（核心回默认图标）。
+  final String? brandingIcon;
 
   /// 连上核心后要发的握手帧；`fromManifest` 为 false 时返回 null（不发）。
   ///
@@ -54,6 +67,11 @@ class UiIdentity {
         'version': version,
         'capabilities': capabilities,
         if (windowId.isNotEmpty) 'window_id': windowId,
+        if (brandingIcon != null)
+          'branding': <String, dynamic>{
+            'icon': brandingIcon,
+            'role': 'exe',
+          },
       },
     };
   }
@@ -62,11 +80,9 @@ class UiIdentity {
   ///
   /// [appDir] / [manifestPath] 仅供测试注入。
   static UiIdentity load({Directory? appDir, String? manifestPath}) {
-    final String path = manifestPath ??
-        p.join(
-          (appDir ?? File(Platform.resolvedExecutable).parent).path,
-          'plugin.json',
-        );
+    final Directory baseDir =
+        appDir ?? File(Platform.resolvedExecutable).parent;
+    final String path = manifestPath ?? p.join(baseDir.path, 'plugin.json');
     final File file = File(path);
     if (!file.existsSync()) {
       return const UiIdentity(
@@ -93,6 +109,7 @@ class UiIdentity {
         version: version.isEmpty ? kAppVersion : version,
         capabilities: const <String>[capabilityPluginManage],
         fromManifest: true,
+        brandingIcon: _brandingIconOf(baseDir),
       );
     } catch (error) {
       return _fallback('读 $path 失败：$error');
@@ -106,4 +123,15 @@ class UiIdentity {
     fromManifest: false,
     error: error,
   );
+
+  /// 品牌图标绝对路径；文件不存在 ⇒ null（不申报，核心回默认）。
+  static String? _brandingIconOf(Directory baseDir) {
+    final File icon = File(
+      p.joinAll(<String>[
+        baseDir.path,
+        ...brandingIconRelativePath.split('/'),
+      ]),
+    );
+    return icon.existsSync() ? icon.path : null;
+  }
 }

@@ -66,6 +66,33 @@ void main() {
     expect(singleData.containsKey('window_id'), isFalse);
   });
 
+  test('插件目录里有品牌 ico 时，hello 带 branding（role=exe + 绝对路径）', () {
+    writeManifest(<String, Object>{'id': 'tree.ui.default'});
+    final File icon = File(
+      p.join(temp.path, 'data', 'flutter_assets', 'assets', 'tray_icon.ico'),
+    )..createSync(recursive: true);
+    icon.writeAsBytesSync(<int>[0, 0, 1, 0]);
+
+    final UiIdentity identity = UiIdentity.load(appDir: temp);
+
+    final Map<String, dynamic> data =
+        identity.helloFrame()!['data'] as Map<String, dynamic>;
+    final Map<String, dynamic> branding =
+        data['branding'] as Map<String, dynamic>;
+    expect(branding['role'], 'exe');
+    expect(branding['icon'], icon.path);
+  });
+
+  test('品牌 ico 不存在时不申报 branding（核心回默认图标）', () {
+    writeManifest(<String, Object>{'id': 'tree.ui.default'});
+
+    final UiIdentity identity = UiIdentity.load(appDir: temp);
+
+    final Map<String, dynamic> data =
+        identity.helloFrame()!['data'] as Map<String, dynamic>;
+    expect(data.containsKey('branding'), isFalse);
+  });
+
   test('没有清单时退回默认 id 且不发握手（开发期不能把自己踢下线）', () {
     final UiIdentity identity = UiIdentity.load(appDir: temp);
 
