@@ -164,7 +164,11 @@ class StationToolRunner implements ToolRunner {
         ),
         ToolSpec(
           name: 'terminal',
-          description: '在目标工作空间执行一条 shell 命令并返回输出。',
+          description:
+              '在目标工作空间执行一条 shell 命令并返回输出（命令失败时也返回输出与退出码）。'
+              'Windows 本机由 PowerShell 执行（优先 pwsh，其次 Windows PowerShell，'
+              '都没有才回退 cmd）：`ls` / `dir` 是 Get-ChildItem 的别名，'
+              '没有 GNU 的 `-la` 这类参数；POSIX 与 SSH 走 sh -c。',
           parameters: <String, dynamic>{
             'type': 'object',
             'properties': <String, dynamic>{
