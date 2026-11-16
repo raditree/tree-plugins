@@ -8,6 +8,12 @@ environment:
 
 dependencies:
   path: ^1.9.0
+  # 本机命令的 shell 语义（pwsh → Windows PowerShell → cmd 回退、`&&` 兼容翻译、
+  # UTF-8 输出编码、退出码透传）与输出解码链只住一处：直接复用桌面仓的实现，
+  # 不在插件里抄第二份。代价与 ssh_executor 的 tree_tunnel_protocol 相同——
+  # 本仓必须挂在桌面仓的 `plugins/` 下才能编（见 plugins/README.md「三种形状」）。
+  tree_local_exec:
+    path: ../../packages/tree_local_exec
 
 dev_dependencies:
   lints: ^6.0.0

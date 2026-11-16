@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:test/test.dart';
+import 'package:tree_local_exec/tree_local_exec.dart' show Shell;
 import 'package:tree_local_executor/tree_local_executor.dart';
 
 /// terminal 失败时**输出不许丢**（2026-11-15 现场回归）。
@@ -51,8 +52,11 @@ void main() {
   });
 
   /// 打印非 UTF-8 内容后**以 1 退出**（模拟 `ls -la` 这种"失败 + 有输出"）。
+  ///
+  /// `&&` 三种 shell 都认（PowerShell 5.1 由包装层翻译，7 原生支持，cmd 原生支持），
+  /// 所以这条用例不依赖本机最终选中的是哪一个。
   String failingOutput() => Platform.isWindows
-      ? 'type gbk.txt & exit 1'
+      ? 'type gbk.txt && exit 1'
       : 'cat gbk.txt; exit 1';
 
   void expectOutputKept(Map<String, dynamic> result) {
@@ -77,5 +81,19 @@ void main() {
       'timeout_seconds': 0,
     });
     expectOutputKept(result);
+  });
+
+  test('Windows 上命令走 PowerShell：pwd 有输出、ls 能列目录', () async {
+    // cmd 下 `pwd` 不存在、`ls` 也不存在；这两条只有在 PowerShell 里才成立。
+    if (!Platform.isWindows) return;
+    if (Shell.windowsShell.toLowerCase().endsWith('cmd.exe')) return;
+
+    final Map<String, dynamic> pwd = await run('pwd', {'timeout_seconds': 10});
+    expect(pwd['exit_code'], 0, reason: '${pwd['text']}');
+    expect('${pwd['text']}', contains(temp.path), reason: 'pwd 的输出不能被吞');
+
+    final Map<String, dynamic> ls = await run('ls', {'timeout_seconds': 10});
+    expect(ls['exit_code'], 0, reason: '${ls['text']}');
+    expect('${ls['text']}', contains('gbk.txt'));
   });
 }

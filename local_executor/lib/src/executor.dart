@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
+import 'package:tree_local_exec/tree_local_exec.dart'
+    show PlatformTextDecoder, Shell;
 
 /// 自建执行站的**站名段**（核心拼成 `plugin.local_executor.execute.local`）。
 const String kLocalWorkspaceStationName = 'local';
@@ -768,13 +770,15 @@ class LocalExecutor {
       }
     }
     final int timeout = ((args['timeout'] as num?)?.toInt() ?? 0);
-    final bool windows = Platform.isWindows;
     final Process process = await Process.start(
-      windows ? 'cmd' : '/bin/sh',
-      windows ? <String>['/c', command] : <String>['-c', command],
+      Shell.executable,
+      Shell.argsFor(command),
       workingDirectory: root,
       runInShell: false,
     );
+    // 子进程 stdin 立刻关掉：任何"等输入"的命令（Read-Host / pause / git 凭据）
+    // 都会立刻拿到 EOF 报错，而不是静默挂到软超时（`date` 这类 cmd 内建命令同理）。
+    await process.stdin.close();
     final Future<List<int>> stdout = _collectBytes(process.stdout);
     final Future<List<int>> stderr = _collectBytes(process.stderr);
     int code;
@@ -789,8 +793,8 @@ class LocalExecutor {
     } else {
       code = await process.exitCode;
     }
-    final String out = _decodeCommandOutput(await stdout);
-    final String err = _decodeCommandOutput(await stderr);
+    final String out = PlatformTextDecoder.decodeToString(await stdout);
+    final String err = PlatformTextDecoder.decodeToString(await stderr);
     final String text = <String>[
       if (out.isNotEmpty) out.trimRight(),
       if (err.isNotEmpty) err.trimRight(),
@@ -812,13 +816,14 @@ class LocalExecutor {
     final File logFile = File(p.join(root, relative));
     await logFile.parent.create(recursive: true);
     final IOSink sink = logFile.openWrite();
-    final bool windows = Platform.isWindows;
     final Process process = await Process.start(
-      windows ? 'cmd' : '/bin/sh',
-      windows ? <String>['/c', command] : <String>['-c', command],
+      Shell.executable,
+      Shell.argsFor(command),
       workingDirectory: root,
       runInShell: false,
     );
+    // 与同步路径同口径：后台任务也不该跟用户要输入（否则一直挂到软超时）。
+    unawaited(process.stdin.close());
     final _HookTask task = _HookTask(
       id: id,
       command: command,
@@ -879,7 +884,7 @@ class _HookTask {
 
   Future<String> readLog() async {
     try {
-      return _decodeCommandOutput(await logFile.readAsBytes());
+      return PlatformTextDecoder.decodeToString(await logFile.readAsBytes());
     } catch (_) {
       return '';
     }
@@ -929,28 +934,11 @@ class _HookTask {
 
 /// 收齐一条命令输出流（**不能**直接 `utf8.decoder`：Windows 上 cmd 的报错/内建命令
 /// 输出是系统代码页字节，严格 UTF-8 解码会抛异常，整段输出就丢了）。
+///
+/// 解码交给 [PlatformTextDecoder]（严格 UTF-8 → 系统 ANSI 代码页 → latin1 兜底），
+/// 与桌面仓本机执行层同一条链——插件不再自带第二份解码实现。
 Future<List<int>> _collectBytes(Stream<List<int>> stream) =>
     stream.fold<List<int>>(<int>[], (List<int> acc, List<int> chunk) {
       acc.addAll(chunk);
       return acc;
     });
-
-/// 命令输出的解码链：**严格 UTF-8 → 系统 ANSI 代码页 → latin1 兜底**
-/// （与 `tree_local_exec` 的 `PlatformTextDecoder` 同口径）。
-///
-/// 为什么必须兜底：中文 Windows 上 cmd 的报错是 GBK 字节，严格 UTF-8 解码会抛
-/// `FormatException`；旧实现把异常吞成空串，工具只回「退出码 1」，调用方看不到
-/// 失败原因（现场：`ls -la` 只回退出码、日志里其实有 `'ls' 不是内部或外部命令`）。
-String _decodeCommandOutput(List<int> bytes) {
-  if (bytes.isEmpty) return '';
-  try {
-    return utf8.decode(bytes);
-  } on FormatException {
-    // 不是严格 UTF-8：往下试系统代码页（Windows = CP_ACP，中文机器即 GBK）。
-  }
-  try {
-    return systemEncoding.decode(bytes);
-  } catch (_) {
-    return latin1.decode(bytes);
-  }
-}
