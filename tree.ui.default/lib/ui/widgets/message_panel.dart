@@ -3094,7 +3094,7 @@ class _MessagePanelState extends State<MessagePanel> {
       Duration(seconds: 5),
       Duration(seconds: 10),
     ];
-    Map<String, dynamic>? data;
+    Map<String, dynamic> data;
     try {
       data = await ApiService.getAgentStates();
     } catch (error) {
@@ -3118,7 +3118,7 @@ class _MessagePanelState extends State<MessagePanel> {
       );
       return;
     }
-    if (data == null || !mounted) return;
+    if (!mounted) return;
     final List<dynamic> agents = data['agents'] as List<dynamic>? ?? const [];
     final Set<String> working = <String>{};
     final Set<String> compacting = <String>{};
